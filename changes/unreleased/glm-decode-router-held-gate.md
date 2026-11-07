@@ -1,0 +1,3 @@
+## New features and improvements
+
+- The fused decode router of GLM-5.3-Flash (fp16 input, 4096 inputs) now loads each warp's gate row into registers before it waits for the previous kernel, and gives a warp up to 8 rows. Every logit, pick and weight is the same bits as before (the router tests' host mirror and row-invariance checks pass). In a standalone run with L2 flushed and a 9 us predecessor, the router's time after the predecessor went from 21 to 9 us at 1 row, 36 to 15 us at 8 rows and 65 to 30 us at 16 rows. In the TP=2 engine the decode windows did not get measurably faster: the shared expert's side branch already fills the router's time.
