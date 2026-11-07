@@ -796,8 +796,13 @@ pub fn build_leader(
     let gate = gate_of(o, &p, tp_o)?;
     // rank 0's speculation settings (`REXL3_MTP_DEPTH`, `REXL3_GLM_DRAFT_NOISE`), refused by name BEFORE the group loads
     let spec_cfg = if o.drafting && o.spec.drafts() {
-        // a two-rank group prices its rounds with the tables measured on two ranks (lane T: `spec::VERIFY_MS_TP`)
-        Some(super::spec::SpecConfig { two_ranks: tp_o.ranks == 2, ..super::spec::SpecConfig::from_env(o.spec)? })
+        // a two-rank group prices its rounds with the tables measured on two ranks (lane T: `spec::VERIFY_MS_TP`; with the DFlash2
+        // drafter, RED-SNOW's `spec::VERIFY_MS_TP_DFLASH`)
+        Some(super::spec::SpecConfig {
+            two_ranks: tp_o.ranks == 2,
+            dflash: super::dflash::wanted(o),
+            ..super::spec::SpecConfig::from_env(o.spec)?
+        })
     } else {
         None
     };

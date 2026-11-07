@@ -80,6 +80,8 @@ pub struct SpecConfig {
     /// Rank 0 of a two-rank tensor-parallel group (the sc_4.10bpw pack on two GB10s): the arbiter prices rounds with the tables measured
     /// there ([`VERIFY_MS_TP`], [`MTP_COST_TP`] / [`MTP_COST_TP_RESTRICTED`]) instead of the single-node 2.25bpw ones. Set by the TP boot.
     pub two_ranks: bool,
+    /// Rank 0 drafts with DFlash2 (`--draft DIR`): a two-rank group then prices its windows with [`VERIFY_MS_TP_DFLASH`]. Set by the TP boot.
+    pub dflash: bool,
 }
 
 /// Keyed-noise drafting unless `REXL3_GLM_DRAFT_NOISE=0` (the result of the live A/B is in `docs/GLM53.md`, "Keyed-noise drafting").
@@ -87,7 +89,7 @@ pub const DRAFT_NOISE_DEFAULT: DraftPick = DraftPick::Keyed;
 
 impl SpecConfig {
     pub fn new(mode: SpecMode) -> Self {
-        Self { mode, mtp_depth: MTP_DEFAULT_DEPTH, restricted_head: false, noise: DRAFT_NOISE_DEFAULT, two_ranks: false }
+        Self { mode, mtp_depth: MTP_DEFAULT_DEPTH, restricted_head: false, noise: DRAFT_NOISE_DEFAULT, two_ranks: false, dflash: false }
     }
 
     /// `new`, with the depth from `REXL3_MTP_DEPTH` when it is set (a malformed value is an error: a measurement must not silently run at the
@@ -235,10 +237,14 @@ impl GlmCost {
         self.per_stream_ms = ms;
         self
     }
-    /// The tables a backend prices with: the two-rank group's when `cfg.two_ranks`, one node's otherwise; the restricted head's draft model
-    /// when `cfg.restricted_head`.
+    /// The tables a backend prices with: the two-rank group's when `cfg.two_ranks` (RED-SNOW's, measured with its DFlash2 drafter, when
+    /// `cfg.dflash`: a DFlash2 round prices only its window), one node's otherwise; the restricted head's draft model when
+    /// `cfg.restricted_head`.
     pub fn for_config(cfg: &SpecConfig) -> Self {
         match (cfg.two_ranks, cfg.restricted_head) {
+            (true, _) if cfg.dflash => {
+                Self::with_tables(VERIFY_MS_TP_DFLASH, MTP_COST_TP_RESTRICTED).with_per_stream(VERIFY_PER_STREAM_MS_TP_DFLASH)
+            }
             (true, true) => Self::with_tables(VERIFY_MS_TP, MTP_COST_TP_RESTRICTED).with_per_stream(VERIFY_PER_STREAM_MS_TP),
             (true, false) => Self::with_tables(VERIFY_MS_TP, MTP_COST_TP).with_per_stream(VERIFY_PER_STREAM_MS_TP),
             (false, true) => Self::new(MTP_COST_RESTRICTED),
@@ -339,6 +345,44 @@ pub const VERIFY_MS_TP: &[(usize, f64)] = &[
 /// What a window of a two-rank group costs per sequence past the first, beyond its rows (attention and recurrent state per sequence).
 /// MEASURED as above: the median over 10 row counts measured at two stream counts.
 pub const VERIFY_PER_STREAM_MS_TP: f64 = 4.38;
+
+/// The step table of RED-SNOW-5.3-Flash (EXL3 4.91bpw, the expert width split, RoCE) on two GB10s drafting with DFlash2: rank 0's verify
+/// window by total rows, in milliseconds. MEASURED 2026-11-07 on pair B (dgx-worker-2 + dgx-worker-3), P1 prefill, fp16 KV, 8 slots:
+/// the windows of the bench's chats in five runs (`REXL3_GLM_COST_LOG`: alone, at C = 1 / 2 / 4, and 3, 6 and 8 distinct salted chats),
+/// each point the fit `ms = T[rows] + VERIFY_PER_STREAM_MS_TP_DFLASH * (streams - 1)` over the per-shape medians. The windows of the
+/// bench's C = 8 are left out: three of its chats are sent twice, and two streams of the same tokens route to the same experts.
+///
+/// What the numbers say:
+/// - 35 ms for one row, then 8-9 ms a row to 12 rows (each row's routed experts not already read: the union grows ~5 experts a row),
+///   falling to ~3.5 ms a row past 24 rows.
+/// - Measured to 36 rows; 40, 48 and 64 rows are the last measured slope (ESTIMATED).
+/// - Window graphs captured at first sighting add their capture (~5.5 ms) to the first window of a shape only.
+pub const VERIFY_MS_TP_DFLASH: &[(usize, f64)] = &[
+    (1, 35.3),
+    (2, 44.2),
+    (3, 52.0),
+    (4, 60.4),
+    (5, 69.0),
+    (6, 77.4),
+    (7, 85.7),
+    (8, 93.4),
+    (10, 109.9),
+    (12, 125.6),
+    (14, 137.6),
+    (16, 147.2),
+    (20, 172.0),
+    (24, 188.0),
+    (28, 201.6),
+    (32, 215.0),
+    (36, 229.4),
+    (40, 241.0),
+    (48, 265.0),
+    (64, 313.0),
+];
+
+/// What a window of [`VERIFY_MS_TP_DFLASH`]'s group costs per sequence past the first, beyond its rows. MEASURED as there (the fit's
+/// per-sequence term over the windows of 2 to 8 sequences).
+pub const VERIFY_PER_STREAM_MS_TP_DFLASH: f64 = 2.9;
 
 /// The draft-call model of a two-rank group with the trunk's full `lm_head` (`REXL3_MTP_VOCAB=0`), the call graphed. MEASURED as
 /// [`VERIFY_MS_TP`]:
@@ -613,7 +657,11 @@ impl SpecRuntime {
         if cfg.mode.uses_mtp() {
             eprintln!(
                 "rexl3 event=spec_cost_tables basis={} head={}",
-                if cfg.two_ranks { "two_ranks (VERIFY_MS_TP, MTP_COST_TP*)" } else { "one_node (VERIFY_MS, MTP_COST*)" },
+                match (cfg.two_ranks, cfg.dflash) {
+                    (true, true) => "two_ranks_dflash (VERIFY_MS_TP_DFLASH)",
+                    (true, false) => "two_ranks (VERIFY_MS_TP, MTP_COST_TP*)",
+                    (false, _) => "one_node (VERIFY_MS, MTP_COST*)",
+                },
                 if cfg.restricted_head { "restricted" } else { "full" }
             );
         }
@@ -1077,6 +1125,19 @@ mod tests {
         // the restricted head saves its share of every head the call runs: one in the first draft, one in each chained draft
         assert!(MTP_COST_RESTRICTED.ms(1, 3, 2) < MTP_COST.ms(1, 3, 2) - 2.0);
         assert!(MTP_COST_RESTRICTED.ms(1, 3, 0) <= MTP_COST.ms(1, 3, 0) + 0.2, "an absorb alone runs no head");
+    }
+
+    #[test]
+    fn a_two_rank_group_drafting_with_dflash_prices_with_red_snows_table() {
+        let c = GlmCost::for_config(&SpecConfig { two_ranks: true, dflash: true, ..SpecConfig::new(SpecMode::Auto) });
+        for &(rows, ms) in VERIFY_MS_TP_DFLASH {
+            assert!((c.verify_ms(rows) - ms).abs() < 1e-9, "{rows}");
+        }
+        assert!((c.verify_ms_of(4, 12) - (125.6 + 3.0 * VERIFY_PER_STREAM_MS_TP_DFLASH)).abs() < 1e-9);
+        // the table rises with every row (the allocation's rate assumes it), and one node with DFlash2 keeps its own table
+        assert!(VERIFY_MS_TP_DFLASH.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 < w[1].1));
+        let one = GlmCost::for_config(&SpecConfig { dflash: true, ..SpecConfig::new(SpecMode::Auto) });
+        assert!((one.verify_ms(1) - VERIFY_MS[0].1).abs() < 1e-9);
     }
 
     #[test]
