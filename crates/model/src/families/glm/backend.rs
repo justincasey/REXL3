@@ -226,6 +226,8 @@ impl GlmBackend {
             }
             // set on every slice, not only the first: a slot that restored a cached prefix starts at `done > 0`
             self.slot_images[slot] = images.iter().map(|im| im.start..im.start + im.tokens).collect();
+            // the drafter absorbs only the rows that reach its ring after the prompt
+            self.m.dflash_prompt_end(slot, Some(n));
             // one chunk of the grid a whole-prompt prefill would use. A chunk of two rows or more takes the cuts inside it in the same forward; a model
             // without the large-row scratch ends the chunk at the first cut (`prefix::plan_slice`). Only as many cuts are taken as there are free snapshot slots.
             let free = self.m.prefix_free_snapshots();
@@ -349,7 +351,6 @@ impl Backend for GlmBackend {
     }
 
     fn prefill_piece(&mut self, slot: usize, start: u64, tokens: &[u32], total: usize, candidates: usize) -> RowOutput {
-        let _ = total; // the arithmetic does not depend on the prompt's length: every row is one window row
         if self.dead() {
             return nan_row(candidates);
         }
@@ -362,6 +363,7 @@ impl Backend for GlmBackend {
                 }
                 self.digests.begin(slot);
             }
+            self.m.dflash_prompt_end(slot, Some(total.max(start as usize + tokens.len())));
             let (mut pos, n) = (start as usize, tokens.len());
             let mut at = 0;
             let mut last = None;

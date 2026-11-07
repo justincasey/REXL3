@@ -71,9 +71,37 @@ pub const P2_MLA: &str = gb_cuda::glm_p2_mla::ARITH_ID;
 /// The form of P2's tensor-parallel exchange (Lane P step (c), `model/tp/p2.rs`): each rank's part of the routed sum swapped as one fp32
 /// row a prompt row, the parts added in rank order; v2: a chunk of two slabs or more is row-split (the peer's rows of the part go, the
 /// shared expert, the parts' sum, the dense MLP and the MLA layers' per-row tail run on the rank's rows, their output rows swapped). A fact of
-/// the TP Hello under P2 (in [`prefill_fingerprint`]), so ranks on another form are refused by name. Bump it with any change to what crosses
-/// or how it is summed.
+/// the TP Hello under P2 (in [`prefill_fingerprint`], through [`p2_exchange`]), so ranks on another form are refused by name. Bump it with
+/// any change to what crosses or how it is summed.
 pub const P2_EXCHANGE: &str = "part-swap-v2";
+
+/// [`P2_EXCHANGE`] under the sequence-parallel residual ([`p2_sp_on`], `GlmModel::run`'s `sp`): a row-split chunk keeps only the rank's
+/// rows of the mHC streams; the fp16 hidden rows cross before a mixer, the routed experts and the head, the router's picks and weights
+/// after it, the KDA core output's peer columns of the rank's rows before its o_proj, and (a drafting group) the drafter's tap rows; no
+/// output rows cross.
+pub const P2_EXCHANGE_SP: &str = "part-swap-v3-sp";
+
+/// `REXL3_GLM_P2_SP`: the sequence-parallel residual of a row-split P2 prompt chunk at TP=2 (unset, `1`/`on`: on; `0`/`off`: the v2
+/// exchange). Never a bit (every op it moves is row-independent): what crosses the link and which rank computes which rows. A fact of
+/// the Hello through [`p2_exchange`]. Read once a process.
+pub const SP_VAR: &str = "REXL3_GLM_P2_SP";
+
+/// Whether this process runs the sequence-parallel residual ([`SP_VAR`]; any value but `0`, `off`, `false` or `no` is on).
+pub fn p2_sp_on() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !matches!(std::env::var(SP_VAR).as_deref().map(str::trim), Ok("0" | "off" | "false" | "no"))
+    });
+    *ON
+}
+
+/// The P2 exchange id of this process: [`P2_EXCHANGE_SP`] with the sequence-parallel residual on, [`P2_EXCHANGE`] with it off.
+pub fn p2_exchange() -> &'static str {
+    if p2_sp_on() {
+        P2_EXCHANGE_SP
+    } else {
+        P2_EXCHANGE
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PrefillContract {
@@ -176,7 +204,8 @@ pub fn prefill_fingerprint_for(c: PrefillContract) -> String {
         PrefillContract::P1 => "contract=p1".into(),
         PrefillContract::P2 => {
             format!(
-                "contract=p2,dense={P2_DENSE},experts={P2_EXPERTS},split-gu={P2_SPLIT_GU},kda={P2_KDA},mla-ae={P2_MLA},p2x={P2_EXCHANGE}"
+                "contract=p2,dense={P2_DENSE},experts={P2_EXPERTS},split-gu={P2_SPLIT_GU},kda={P2_KDA},mla-ae={P2_MLA},p2x={}",
+                p2_exchange()
             )
         }
     }
@@ -240,7 +269,8 @@ mod tests {
         assert_eq!(
             prefill_fingerprint_for(PrefillContract::P2),
             format!(
-                "contract=p2,dense={P2_DENSE},experts={P2_EXPERTS},split-gu={P2_SPLIT_GU},kda={P2_KDA},mla-ae={P2_MLA},p2x={P2_EXCHANGE}"
+                "contract=p2,dense={P2_DENSE},experts={P2_EXPERTS},split-gu={P2_SPLIT_GU},kda={P2_KDA},mla-ae={P2_MLA},p2x={}",
+                p2_exchange()
             )
         );
         assert_ne!(prefill_fingerprint_for(PrefillContract::P1), prefill_fingerprint_for(PrefillContract::P2));

@@ -38,7 +38,7 @@ mod layers;
 pub mod mtp;
 pub mod snapshot;
 pub mod tp;
-pub use dflash::{DflashAsk, DflashState};
+pub use dflash::{DflashAsk, DflashState, TapRelay};
 pub use graphs::{GraphKey, GraphMutant, GraphStats, Wait};
 pub use mtp::{
     vocab_ranges, BookError, ChainPick, DraftAsk, Drafts, HeadList, MtpCapture, MtpMutant, SubHead, TapBook, VocabMode, MTP_SHARE,
@@ -168,7 +168,8 @@ pub struct Profile {
 /// One P2 MoE layer on a tensor-parallel rank (Lane P step (c), `model/tp/p2.rs`): the rank's pairs and part, the parts' swap queued, then
 /// the layer's shared expert when it is owed (`owed`: deferred by `MoeShared` to overlap the swap), then the parts' sum with the shared
 /// expert last into `mixer_out`. A chunk of two slabs or more is row-split (`tp::RowSplit`): the shared expert and the sum run on this
-/// rank's rows, the output rows are swapped with the peer's.
+/// rank's rows, the output rows are swapped with the peer's, unless the residual is sequence-parallel (`sp_res`: the rank needs only its
+/// own rows).
 #[allow(clippy::too_many_arguments)]
 fn p2_rank_layer(
     t: &mut tp::GlmTp,
@@ -179,6 +180,7 @@ fn p2_rank_layer(
     rows: usize,
     st: &Stream,
     path: layers::LinPath,
+    sp_res: bool,
     mark: &mut dyn FnMut(&'static str) -> Result<(), gb_cuda::CudaError>,
 ) -> Result<(), ModelError> {
     let split = t.p2_row_split(rows);
@@ -197,7 +199,10 @@ fn p2_rank_layer(
         }
     }
     let shared = with_shared.then_some(&s.moe_shared_out);
-    t.p2_finish(&ex.dims(), moe_sc, shared, &mut s.mixer_out, split, st)?;
+    match split {
+        Some(sp) if sp_res => t.p2_finish_own_rows(&ex.dims(), shared, &mut s.mixer_out, sp, st)?,
+        _ => t.p2_finish(&ex.dims(), moe_sc, shared, &mut s.mixer_out, split, st)?,
+    }
     Ok(())
 }
 
@@ -310,6 +315,9 @@ pub struct GlmModel {
     mtp: Option<mtp::MtpState>,
     /// The DFlash2 drafter (`--draft DIR`, `attach_dflash`): its taps, context ring and scratch. Rank 0 alone on a tensor-parallel group.
     dflash: Option<dflash::DflashState>,
+    /// On both ranks of a group whose rank 0 drafts with DFlash2 (`enable_tap_relay`): the stage the drafter's taps of the peer's rows
+    /// cross in under the sequence-parallel residual of a P2 prompt chunk (`dflash::TapRelay`).
+    tap_relay: Option<dflash::TapRelay>,
     /// The CUDA graphs of the decode windows (see `graphs.rs`).
     graphs: graphs::GraphCache,
     /// The shared expert's side stream and its two events (fork: the layer's input is ready, join: the expert's output is).
@@ -349,13 +357,11 @@ pub struct GlmModel {
     /// Under P2, the prompt rows' KDA recurrence chunked (`kda::prefill_chunked`, the contract's arithmetic: true) or P1's row-by-row path
     /// (false: the benches' A/B of step (e) on one load, [`GlmModel::set_p2_kda_chunked`]; NOT P2's tag, never a server setting).
     p2_kda_chunked: bool,
+    /// Prompt chunks this model ran under the sequence-parallel residual (`run`'s `sp`; the tests' audit).
+    sp_chunks: u64,
     /// `REXL3_GLM_PROFILE_SLICES` (`profile_slices.rs`): the forward calls a rank's runtime brackets with the profiler API. Host
     /// counters only; inert without the setting.
     pub(in crate::families::glm) slices: crate::families::glm::profile_slices::SliceProfiler,
-}
-
-fn cu(b: &DevBuf) -> *const c_void {
-    b.ptr() as *const c_void
 }
 
 fn zeroed(bytes: usize) -> Result<DevBuf, ModelError> {
@@ -551,12 +557,14 @@ impl GlmModel {
             own_s,
             mtp,
             dflash: None,
+            tap_relay: None,
             graphs: graphs::GraphCache::new(),
             side: graphs::Side::new(),
             run_shape: None,
             prefill: PrefillContract::P1,
             p2_side_on: p2_shared_side_on(),
             p2_kda_chunked: true,
+            sp_chunks: 0,
             slices: crate::families::glm::profile_slices::SliceProfiler::from_env()?,
             cfg,
             dev,
@@ -836,6 +844,7 @@ impl GlmModel {
         self.kv_tab.release(slot);
         self.mtp_begin(slot);
         self.p2_seg[slot] = None;
+        self.dflash_prompt_end(slot, None);
         Ok(())
     }
 
@@ -844,6 +853,7 @@ impl GlmModel {
         self.pending.remove(&slot);
         self.kv_tab.release(slot);
         self.p2_seg[slot] = None;
+        self.dflash_prompt_end(slot, None);
     }
 
     /// Under P2, the first position of `slot`'s open prefill segment (`None`: the next prompt chunk starts one). The backend cuts a P2
@@ -1093,6 +1103,7 @@ impl GlmModel {
             splice,
             mtp,
             dflash,
+            tap_relay,
             run_shape,
             side,
             graphs,
@@ -1105,6 +1116,7 @@ impl GlmModel {
             prefill,
             p2_side_on,
             p2_kda_chunked,
+            sp_chunks,
             ..
         } = self;
         let gmut = graphs.mutant;
@@ -1138,8 +1150,6 @@ impl GlmModel {
         if *oracle_rounding {
             params.round = kda::Round::TowardZero;
         }
-        let x = s.streams.ptr() as *mut f32;
-        let (post, comb, part) = (s.mhc.post.ptr() as *mut f32, s.mhc.comb.ptr() as *mut f32, s.mhc.part.ptr() as *mut f32);
         let layer_of = |l: usize| -> &LayerDevice { &dev.layers[l] };
         let site_of = |sit: Site| {
             let l = layer_of(sit.layer);
@@ -1161,6 +1171,40 @@ impl GlmModel {
         if p2 && side.is_some() {
             return Err(ModelError::Config("a P2 prefill chunk runs on one stream (the layer branches are a window's)".into()));
         }
+        // The sequence-parallel residual (`contract::p2_sp_on`, on by default; a fact of the Hello through the P2 exchange id): a large P2
+        // prompt chunk on a rank of two with the KDA head split keeps only this rank's rows (`tp::RowSplit`) of the mHC streams. The
+        // embedding, every site's finalize and apply, the router and the head's mean run on them; the fp16 hidden rows are swapped with the
+        // peer's where a layer reads every row (a mixer, the routed experts, the head), never before a dense MLP; the mixers', the dense
+        // MLPs' and the experts' outputs are kept on this rank's rows alone (no output swap). Every one of these ops is row-independent,
+        // so each row is the same bits on whichever rank computes it. The drafter's taps of the peer's rows cross the link
+        // (`dflash::TapRelay`). Never with a capture, forced routing, an image splice or a snapshot inside the chunk.
+        let sp = if p2
+            && big
+            && !cap
+            && snap_cuts.is_empty()
+            && splice.is_empty()
+            && forced.is_none()
+            && (dflash.is_none() || tap_relay.is_some())
+            && mtp.as_ref().is_none_or(|m| m.mutant.is_none())
+            && super::contract::p2_sp_on()
+        {
+            tp.as_ref().filter(|t| t.split_bits() & tp::SPLIT_KDA != 0).and_then(|t| t.p2_row_split(rows))
+        } else {
+            None
+        };
+        // the rows of the mHC streams this rank keeps (every row without `sp`), and the mHC buffers at its first one
+        let (r0, mrows) = sp.map_or((0, rows), |sp| (sp.lo, sp.rows()));
+        *sp_chunks += u64::from(sp.is_some());
+        let x = unsafe { (s.streams.ptr() as *mut f32).add(r0 * mhc::ROW) };
+        let (post, comb, part) = unsafe {
+            (
+                (s.mhc.post.ptr() as *mut f32).add(r0 * mhc::STREAMS),
+                (s.mhc.comb.ptr() as *mut f32).add(r0 * mhc::STREAMS * mhc::STREAMS),
+                (s.mhc.part.ptr() as *mut f32).add(r0 * mhc::PART_FLOATS_PER_ROW),
+            )
+        };
+        let hidden_at = unsafe { (s.hidden.ptr() as *mut u8).add(r0 * cfg.hidden * 2) as *mut c_void };
+        let mixer_out_at = unsafe { (s.mixer_out.ptr() as *const u8).add(r0 * cfg.hidden * 4) as *const c_void };
         // under P2 a MoE layer's shared expert runs on the first side stream beside the router and the routed experts, joined right before the
         // P2 combine (its output's one reader): only what overlaps in time changes, never a bit (its own scratch, `hidden` read-only, its
         // output written by it alone). Opt-in (`REXL3_GLM_P2_SHARED_SIDE=1`, `set_p2_shared_side`): not faster on node 4 (MEASURED).
@@ -1183,14 +1227,31 @@ impl GlmModel {
         };
         // the KDA layers' prefill descriptor, uploaded by the first one and kept for the forward
         let mut kda_desc: Option<DevBuf> = None;
+        // under `sp`: a gather of the peer's hidden rows is in flight on the exchange stream (`GlmTp::sp_gather_begin`); the first op that
+        // reads the peer's rows (or exchanges anything) joins it first
+        let mut gather_pending = false;
+        macro_rules! join_gather {
+            () => {
+                if gather_pending {
+                    tp.as_mut().expect("sp is a rank's").sp_gather_join(st)?;
+                    gather_pending = false;
+                }
+            };
+        }
         if let Some(t) = &timer {
             t.record(0, st)?;
         }
         for (i, op) in plan.iter().enumerate() {
             last_ev = i;
+            // a gather in flight is joined before any op that does not read only this rank's rows
+            if !matches!(op, Op::Mixer { .. } | Op::MoeShared { .. } | Op::MoeRoute { .. }) {
+                join_gather!();
+            }
             match *op {
                 Op::Embed => {
-                    unsafe { mhc::embed_expand(dev.embed.ptr(), s.ids.ptr(), x, rows, cfg.vocab, st)? };
+                    // (under `sp` this rank's rows alone)
+                    let ids = unsafe { (s.ids.ptr() as *const i32).add(r0) as *const c_void };
+                    unsafe { mhc::embed_expand(dev.embed.ptr(), ids, x, mrows, cfg.vocab, st)? };
                     // an image's rows replace the embeddings of its placeholder tokens, in all four streams (the text attention is NoPE: nothing else
                     // about an image position differs from a text one). With no image in the chunk this launches nothing.
                     for op in splice.iter() {
@@ -1216,7 +1277,7 @@ impl GlmModel {
                     }
                 }
                 Op::FirstPartials(site) => unsafe {
-                    mhc::partials(x, site_of(site), part, rows, Tune::AUTO, st)?;
+                    mhc::partials(x, site_of(site), part, mrows, Tune::AUTO, st)?;
                 },
                 Op::Finalize(site) => {
                     let l = layer_of(site.layer);
@@ -1233,16 +1294,27 @@ impl GlmModel {
                             post,
                             comb,
                             None,
-                            s.hidden.ptr(),
+                            hidden_at,
                             Ty::F16,
-                            rows,
+                            mrows,
                             &MhcCfg::GLM53,
                             RMS_EPS,
                             st,
                         )?;
                     }
+                    // under `sp`, the peer's hidden rows swapped in where the next op reads every row (not a dense MLP: per row), on the
+                    // exchange stream while the main stream runs what reads only this rank's rows (the router, a KDA layer's own rows)
+                    if let Some(sp) = sp.filter(|_| !matches!(plan.get(i + 1), Some(Op::DenseFfn { .. }))) {
+                        tp.as_mut().expect("sp is a rank's").sp_gather_begin(&s.hidden, cfg.hidden * 2, sp, st)?;
+                        gather_pending = true;
+                    }
                 }
                 Op::Mixer { layer, kind } => {
+                    // a KDA layer on a split rank joins the gather inside itself, after its own rows' qkv
+                    let kda_join = std::mem::take(&mut gather_pending);
+                    if kda_join && kind != MixerKind::Kda {
+                        tp.as_mut().expect("sp is a rank's").sp_gather_join(st)?;
+                    }
                     last_sublayer_was_mixer = true;
                     cur_layer = layer;
                     let l = layer_of(layer);
@@ -1287,8 +1359,11 @@ impl GlmModel {
                                     kda_desc.as_ref().unwrap(),
                                     piece,
                                     st,
+                                    sp,
+                                    kda_join,
                                 )?;
                             } else if big {
+                                t.sp_gather_join(st)?;
                                 if kda_desc.is_none() {
                                     kda_desc = Some(kda::prefill_descriptor(b.seq_slot[0] as usize, rows)?);
                                 }
@@ -1299,6 +1374,7 @@ impl GlmModel {
                                 };
                                 t.kda_split_layer(ord, &w.o, *kda_dims, &params, &mut pools[ord], io, path, rows, st)?;
                             } else {
+                                t.sp_gather_join(st)?;
                                 let batch = kda::Batch { seq_start: &s.seq_start, slot: &s.seq_slot, n_seq: b.n_seq(), rows };
                                 let rec = if mode == Mode::Window { &mut recs[ord] } else { &mut s.kda_prefill_rec };
                                 let path = tp::KdaPath::Window { batch: &batch, rec, commit: mode == Mode::Prefill };
@@ -1770,7 +1846,8 @@ impl GlmModel {
                                     Ok(())
                                 },
                             )?;
-                            if let Some(sp) = split {
+                            // (under `sp` the rank's residual reads its own rows alone)
+                            if let Some(sp) = split.filter(|_| sp.is_none()) {
                                 tp.as_mut().expect("a row split is a rank's").swap_rows(&s.mixer_out, cfg.hidden * 4, sp, st)?;
                                 mark!("mla: the row split's output swap");
                             }
@@ -1790,14 +1867,16 @@ impl GlmModel {
                     };
                     if p2 {
                         let big_sc = s.pf.as_mut().and_then(|p| p.dense.as_mut());
-                        // a large chunk on a rank of two: this rank's rows, then the output rows swapped (`tp::RowSplit`)
-                        match tp.as_mut().filter(|_| big).and_then(|t| t.p2_row_split(rows).map(|sp| (t, sp))) {
-                            Some((t, sp)) => {
+                        // a large chunk on a rank of two: this rank's rows, then the output rows swapped (`tp::RowSplit`; not under `sp`)
+                        match tp.as_mut().filter(|_| big).and_then(|t| t.p2_row_split(rows).map(|rs| (t, rs))) {
+                            Some((t, rs)) => {
                                 let h = cfg.hidden;
-                                let x = s.hidden.subview(sp.lo * h * 2, sp.rows() * h * 2);
-                                let mut y = s.mixer_out.subview(sp.lo * h * 4, sp.rows() * h * 4);
-                                layers::gated(m, &x, sp.rows(), &mut y, s.dense.as_mut(), big_sc, st, path)?;
-                                t.swap_rows(&s.mixer_out, h * 4, sp, st)?;
+                                let x = s.hidden.subview(rs.lo * h * 2, rs.rows() * h * 2);
+                                let mut y = s.mixer_out.subview(rs.lo * h * 4, rs.rows() * h * 4);
+                                layers::gated(m, &x, rs.rows(), &mut y, s.dense.as_mut(), big_sc, st, path)?;
+                                if sp.is_none() {
+                                    t.swap_rows(&s.mixer_out, h * 4, rs, st)?;
+                                }
                             }
                             None => layers::gated(m, &s.hidden, rows, &mut s.mixer_out, s.dense.as_mut(), big_sc, st, path)?,
                         }
@@ -1894,7 +1973,24 @@ impl GlmModel {
                         FfnDevice::MoeSubbanks { layer: m, .. } => &m.router,
                         _ => return Err(ModelError::Config(format!("layer {layer} has no router"))),
                     };
-                    if moe_pf {
+                    if let Some(sp) = sp {
+                        // under `sp`: the router on this rank's rows (beside the hidden rows' gather), then the gather joined and the peer's
+                        // picks and weights swapped in (the routed experts read every row's)
+                        let pf = s.pf.as_mut().ok_or_else(|| ModelError::Config("no prefill scratch".into()))?;
+                        let (h, e, k) = (cfg.hidden, router.experts, router.topk);
+                        let xr = s.hidden.subview(sp.lo * h * 2, sp.rows() * h * 2);
+                        let mut lg = pf.moe.logits.subview(sp.lo * e * 2, sp.rows() * e * 2);
+                        let mut pk = pf.moe.pick.subview(sp.lo * k * 4, sp.rows() * k * 4);
+                        let mut wt = pf.moe.wts.subview(sp.lo * k * 2, sp.rows() * k * 2);
+                        router.logits(&xr, Dtype::F16, sp.rows(), &mut lg, st)?;
+                        router.select(sig, &lg, sp.rows(), &mut pk, &mut wt, st)?;
+                        let t = tp.as_mut().expect("sp is a rank's");
+                        t.sp_gather_join(st)?;
+                        gather_pending = false;
+                        t.swap_rows(&pf.moe.pick, k * 4, sp, st)?;
+                        t.swap_rows(&pf.moe.wts, k * 2, sp, st)?;
+                    } else if moe_pf {
+                        join_gather!();
                         let pf = s.pf.as_mut().ok_or_else(|| ModelError::Config("no prefill scratch".into()))?;
                         router.logits(&s.hidden, Dtype::F16, rows, &mut pf.moe.logits, st)?;
                         router.select(sig, &pf.moe.logits, rows, &mut pf.moe.pick, &mut pf.moe.wts, st)?;
@@ -1949,7 +2045,7 @@ impl GlmModel {
                             Some(t) => {
                                 let owed = std::mem::take(&mut shared_deferred).then_some(&**shared);
                                 let ex = tp::P2Routed::Subbanks(&m.experts);
-                                p2_rank_layer(t, ex, owed, with_shared, s, rows, st, path, &mut |_| Ok(()))?;
+                                p2_rank_layer(t, ex, owed, with_shared, s, rows, st, path, sp.is_some(), &mut |_| Ok(()))?;
                             }
                             // a mixed-width layer on one node: the pairs stage once per subbank, then the one combine
                             // (`glm_p2_moe::run_subbanks`); the layer's shared expert ran first (on the side stream, when it is on, joined
@@ -2088,7 +2184,8 @@ impl GlmModel {
                     if p2 {
                         let FfnDevice::Moe { shared, .. } = &layer_of(layer).ffn else { unreachable!() };
                         let owed = std::mem::take(&mut shared_deferred).then_some(&**shared);
-                        p2_rank_layer(t, tp::P2Routed::Bank(&m.experts), owed, with_shared, s, rows, st, path, &mut |_| Ok(()))?;
+                        let ex = tp::P2Routed::Bank(&m.experts);
+                        p2_rank_layer(t, ex, owed, with_shared, s, rows, st, path, sp.is_some(), &mut |_| Ok(()))?;
                         break 'p2arm;
                     }
                     let sh = with_shared.then_some(&s.moe_shared_out);
@@ -2202,26 +2299,24 @@ impl GlmModel {
                 }
                 Op::ApplyPartials { next } => {
                     unsafe {
-                        mhc::apply_partials(x, cu(&s.mixer_out), Ty::F32, post, comb, site_of(next), part, rows, Tune::AUTO, st)?;
+                        mhc::apply_partials(x, mixer_out_at, Ty::F32, post, comb, site_of(next), part, mrows, Tune::AUTO, st)?;
                     }
                     if cap {
                         capture_streams(capture.as_mut().unwrap(), &s.streams, st, rows, last_sublayer_was_mixer, cur_layer)?;
                     }
                     // the drafter's taps of a completed layer (its FFN's partials applied: the next site is the next layer's attention)
-                    if let (Some(d), SiteKind::Attn) = (dflash.as_mut(), next.kind) {
-                        d.tap(&s.streams, cur_layer, rows, st)?;
+                    if next.kind == SiteKind::Attn {
+                        dflash::tap_layer(dflash, tap_relay, tp, &s.streams, cur_layer, rows, sp, st)?;
                     }
                 }
                 Op::Apply => {
                     unsafe {
-                        mhc::apply(x, cu(&s.mixer_out), Ty::F32, post, comb, rows, st)?;
+                        mhc::apply(x, mixer_out_at, Ty::F32, post, comb, mrows, st)?;
                     }
                     if cap {
                         capture_streams(capture.as_mut().unwrap(), &s.streams, st, rows, last_sublayer_was_mixer, cur_layer)?;
                     }
-                    if let Some(d) = dflash.as_mut() {
-                        d.tap(&s.streams, cur_layer, rows, st)?;
-                    }
+                    dflash::tap_layer(dflash, tap_relay, tp, &s.streams, cur_layer, rows, sp, st)?;
                 }
                 Op::HeadMean => {
                     if cap {
@@ -2233,8 +2328,12 @@ impl GlmModel {
                         push_tail(&mut c.hc_head, &v[..rows * cfg.hidden], cfg.hidden, c.tail);
                     }
                     unsafe {
-                        mhc::mean(x, Some(dev.final_norm.ptr() as *const f32), s.hidden.ptr(), Ty::F16, rows, RMS_EPS, st)?
+                        mhc::mean(x, Some(dev.final_norm.ptr() as *const f32), hidden_at, Ty::F16, mrows, RMS_EPS, st)?
                     };
+                    // under `sp`, the peer's normed rows swapped in (the head and the NextN tap read them)
+                    if let Some(sp) = sp {
+                        tp.as_mut().expect("sp is a rank's").swap_rows(&s.hidden, cfg.hidden * 2, sp, st)?;
+                    }
                     if let Some(m) = mtp.as_ref() {
                         // the NextN drafter's tap: this forward's final-normed rows, before the head moves rows around in `hidden`
                         let h = cfg.hidden;
@@ -2374,20 +2473,22 @@ impl GlmModel {
         want: Option<usize>,
     ) -> Result<Option<Candidates>, ModelError> {
         let b = RowBatch::from_requests(&[gb_engine::RowRequest { slot, tokens: tokens.to_vec(), first_position: start as u64 }]);
+        let head = if want.is_some() { Head::LastRow } else { Head::None };
+        self.dflash_begin_chunk(slot, start, tokens.len());
+        let r = self.forward(&b, Mode::Prefill, head);
+        if let Err(e) = r {
+            // the next forward taps again
+            self.dflash_end_chunk();
+            return Err(e);
+        }
+        self.mtp_prefill_chunk(slot, start, tokens)?;
+        self.dflash_prefill_chunk(slot, start, tokens.len())?;
         match want {
             None => {
-                self.forward(&b, Mode::Prefill, Head::None)?;
-                self.mtp_prefill_chunk(slot, start, tokens)?;
-                self.dflash_prefill_chunk(slot, start, tokens.len())?;
                 self.stream.sync()?;
                 Ok(None)
             }
-            Some(count) => {
-                self.forward(&b, Mode::Prefill, Head::LastRow)?;
-                self.mtp_prefill_chunk(slot, start, tokens)?;
-                self.dflash_prefill_chunk(slot, start, tokens.len())?;
-                self.candidates_of(1, count).map(Some)
-            }
+            Some(count) => self.candidates_of(1, count).map(Some),
         }
     }
 

@@ -239,6 +239,8 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime> GlmTpBackend<R> {
             }
             self.digests.begin(slot);
         }
+        // rank 0's drafter absorbs only the rows that reach its ring after the prompt
+        self.leader.inner_mut().dflash_prompt_end(slot, Some(n));
         let at = done;
         let want = (end == n).then_some(candidates);
         let c = self.leader.prefill_chunk(&Self::chunk_batch(slot, at, &prompt[at..end]), want)?;
@@ -279,6 +281,7 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime> GlmTpBackend<R> {
             }
             self.digests.begin(slot);
         }
+        self.leader.inner_mut().dflash_prompt_end(slot, Some(n));
         // set on every slice, as the single node does
         self.images.set(slot, images);
         let c = match call {
@@ -521,7 +524,7 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime> Backend for GlmTpBackend<R
         self.prefill_piece(slot, start, tokens, start as usize + tokens.len(), candidates)
     }
 
-    fn prefill_piece(&mut self, slot: usize, start: u64, tokens: &[u32], _total: usize, candidates: usize) -> RowOutput {
+    fn prefill_piece(&mut self, slot: usize, start: u64, tokens: &[u32], total: usize, candidates: usize) -> RowOutput {
         if self.dead() {
             return nan_row(candidates);
         }
@@ -534,6 +537,7 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime> Backend for GlmTpBackend<R
                 }
                 self.digests.begin(slot);
             }
+            self.leader.inner_mut().dflash_prompt_end(slot, Some(total.max(start as usize + tokens.len())));
             let (mut pos, n) = (start as usize, tokens.len());
             let mut at = 0;
             let mut last = None;
@@ -2062,6 +2066,7 @@ pub(crate) mod tests {
             cache_slot_bytes: 0,
             cache_pages: 0,
             kv: "fp16".into(),
+            taps: "none".into(),
         };
         let g0 = gate("aaaa".into(), &mo, 512, facts.clone()).at(0, 2);
         assert!(BootGate::check(&g0, &gate("aaaa".into(), &mo, 512, facts.clone()).at(1, 2)).is_ok());
@@ -2163,6 +2168,7 @@ pub(crate) mod tests {
             cache_slot_bytes: 0,
             cache_pages: 0,
             kv: "fp16".into(),
+            taps: "none".into(),
         };
         let mut g = gate("p".into(), &mo, 512, facts).at(1, 2);
         // the build and the NCCL fingerprint depend on the box: pin them for the golden
@@ -2206,6 +2212,7 @@ pub(crate) mod tests {
             cache_slot_bytes: 0,
             cache_pages: 0,
             kv: "fp16".into(),
+            taps: "none".into(),
         };
         let enc = |f: GlmFacts| {
             let mut g = gate("p".into(), &mo, 512, f).at(1, 2);
@@ -2288,6 +2295,7 @@ pub(crate) mod tests {
             cache_slot_bytes: 0,
             cache_pages: 0,
             kv: "fp16".into(),
+            taps: "none".into(),
         };
         let enc = |f: GlmFacts| {
             let mut g = gate("p".into(), &mo, 512, f).at(1, 2);
@@ -2319,9 +2327,9 @@ pub(crate) mod tests {
         assert_eq!((d[1].1, d[1].2), ("10", "00"), "bit 4: {d:?}");
         let mut e = Enc::new();
         GlmCall::encode_facts(&facts, &mut e);
-        e.0[0] = 0x40;
+        e.0[0] = 0x80;
         let err = GlmCall::decode_facts(&mut Dec::new(&e.0)).unwrap_err().to_string();
-        assert!(err.contains("flags 0x40") && err.contains("bits 0 to 5 only"), "{err}");
+        assert!(err.contains("flags 0x80") && err.contains("bits 0 to 6 only"), "{err}");
         // an fp8 latent cache (`--kv-dtype fp8`): bit 5 and the format's name after every other fact (`fp8` as a u64 length and 3 bytes:
         // 11 bytes more), nothing else moves, the Hello round-trips, and a group whose ranks disagree is refused by name
         let fp8 = GlmFacts { kv: "fp8".into(), ..facts.clone() };
@@ -2340,6 +2348,17 @@ pub(crate) mod tests {
         assert!(e.contains("the latent cache format (--kv-dtype / REXL3_GLM_KV; pass the same to every rank)"), "{e}");
         assert!(e.contains("rank 0 has fp8, rank 1 has fp16"), "{e}");
         assert!(BootGate::check(&leader8, &gate("p".into(), &mo, 512, fp8).at(1, 2)).is_ok(), "two fp8 ranks agree");
+        // a drafting group (`--draft`): bit 6 and the tapped layers after every other fact (`5,14` as a u64 length and 4 bytes: 12 bytes
+        // more), nothing else moves, and ranks that tap other layers (or one without the drafter) are refused by name
+        let taps = facts.clone().with_taps(&[5, 14]);
+        let ont = enc(taps.clone());
+        assert_eq!(&ont[..2], format!("{:02x}", glen + 12), "12 bytes longer");
+        assert_eq!(&ont[at..at + 24], format!("{}{}", le(4), "352c3134"), "{ont}");
+        assert_eq!(&ont[at + 24..], &GOLDEN_HELLO[at..]);
+        let lt = gate("p".into(), &mo, 512, taps.clone()).at(0, 2);
+        let e = BootGate::check(&lt, &gate("p".into(), &mo, 512, facts.clone()).at(1, 2)).unwrap_err();
+        assert!(e.contains("the DFlash2 drafter's taps (--draft; pass the same to every rank)") && e.contains("5,14"), "{e}");
+        assert!(BootGate::check(&lt, &gate("p".into(), &mo, 512, taps).at(1, 2)).is_ok(), "two ranks on the same taps agree");
     }
 
     /// Captured 2026-10-14 (lane L2b): length 0x73, protocol 4, kind 1 (Hello), seq 0, `RXTP`, pack `p`, layers 45, slots 2, KV pages 16,

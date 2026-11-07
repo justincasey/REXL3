@@ -36,6 +36,28 @@ pub fn loads_here(o: &ServeOptions) -> bool {
     wanted(o) && o.tp.as_ref().is_none_or(|t| t.rank == 0)
 }
 
+/// The layers a group's DFlash2 drafter taps (its config's `target_layer_ids`; empty without [`wanted`]), read on every rank from its
+/// own options: a fact of the TP Hello (`GlmFacts::taps`), since under the sequence-parallel residual both ranks relay the taps
+/// (`model::dflash::TapRelay`).
+pub fn tap_layers(o: &ServeOptions) -> Result<Vec<usize>, ModelError> {
+    if !wanted(o) {
+        return Ok(Vec::new());
+    }
+    let dir = o.draft_dir.clone().expect("wanted() checked it");
+    Ok(read_draft_config(&dir)?.target_layer_ids)
+}
+
+/// Bytes a rank of a two-rank P2 group holds back for the tap relay's stage (`model::dflash::TapRelay`) at prompt chunks of `chunk`
+/// rows: on both ranks when the group drafts with DFlash2, 0 otherwise.
+pub fn relay_bytes(o: &ServeOptions, cfg: &GlmConfig, chunk: usize) -> u64 {
+    let two = o.tp.as_ref().is_some_and(|t| t.ranks == 2);
+    if wanted(o) && two && super::contract::current().p2_prefill(true) {
+        super::model::TapRelay::planned_bytes(chunk, cfg.hidden) as u64
+    } else {
+        0
+    }
+}
+
 /// The drafter's plan for a trunk of `cfg` with `slots` slots and prompt chunks of `chunk` rows, when this process loads one: its config
 /// read and checked (by name, before any weight is read) and its bytes.
 pub fn plan(o: &ServeOptions, cfg: &GlmConfig, slots: usize, chunk: usize) -> Result<Option<DflashPlan>, ModelError> {

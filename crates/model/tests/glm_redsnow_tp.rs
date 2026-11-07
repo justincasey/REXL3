@@ -728,3 +728,157 @@ fn a_ranks_nextn_layer_binds_as_subbanks_and_is_refused_by_name_where_it_would_r
     drop(m);
     eprintln!("MemAvailable min {:.1} GiB", gib(guard.finish()));
 }
+
+/// The DFlash2 drafter of `REXL3_DFLASH_DIR` attached to `m` tapping `taps` (layers of the prefix: the pack's own taps reach past it).
+fn attach_drafter(m: &mut GlmModel, dir: &Path, taps: &[usize]) {
+    use gb_model::draft::{Draft, BLOCK};
+    let dims = gb_model::shapes::read_draft_config(dir).unwrap().dims(gb_model::families::glm::alloc::TOKENIZER_VOCAB);
+    let pack = gb_model::pack::Pack::open(dir).unwrap();
+    let mut ctx = gb_model::loadctx::LoadCtx::from_env();
+    let (draft, _) = Draft::declare_bf16(&mut ctx, &pack, dims, m.cfg.vocab, SLOTS, m.chunk_rows(), BLOCK).unwrap();
+    ctx.finish().unwrap();
+    m.attach_dflash(draft, taps).unwrap();
+}
+
+/// FNV-1a 64 of a slice of u16.
+fn fnv16(v: &[u16]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for x in v {
+        fnv(&mut h, &x.to_le_bytes());
+    }
+    h
+}
+
+/// The first prompt of [`script`] in `chunk`-row chunks, the digest of its answer and, with a drafter, the digest of the drafter's tap
+/// rows after every chunk.
+fn prompt_taps(m: &mut GlmModel, chunk: usize) -> (u64, Vec<u64>) {
+    let p = Rng(0x9e37_79b9_7f4a_7c15).tokens(2300);
+    m.begin_slot(0).unwrap();
+    let (mut at, mut taps, mut answer) = (0, Vec::new(), 0);
+    while at < p.len() {
+        let end = (at + chunk).min(p.len());
+        let want = (end == p.len()).then_some(COUNT);
+        let c = m.prefill_chunk(0, at, &p[at..end], want).unwrap();
+        if m.has_dflash() {
+            taps.push(fnv16(&m.dflash_taps_host(end - at).unwrap()));
+        }
+        if let Some(c) = c {
+            answer = digest_call(m, &c, 1);
+        }
+        at = end;
+    }
+    m.end_slot(0);
+    (answer, taps)
+}
+
+/// The sequence-parallel residual of a P2 prompt chunk (`GlmModel::run`'s `sp`, `REXL3_GLM_P2_SP` on): two P2 ranks under the serving split
+/// `kda,lm,mla,sh` keep only their rows of the mHC streams in every chunk of two 128-row slabs or more (512-row chunks; 336-row chunks
+/// cut 256 / 80, the 2,300-token prompt's last 252 rows run unsplit). Both ranks' answers equal ONE P2 model's byte for byte. With a
+/// DFlash2 drafter (`REXL3_DFLASH_DIR`: on rank 0 and on the one model, tapping five layers of the prefix; both ranks relay), rank 0's
+/// tap rows after every chunk equal the one model's, and the one model's drafts after a long prompt are the same with and without the
+/// backend naming the prompt's end (the rows more than a ring before it neither tapped nor absorbed).
+#[test]
+#[ignore]
+fn p2_redsnow_sequence_parallel_two_ranks_equal_one_p2_model_and_relay_the_taps() {
+    use gb_model::families::glm::model::tp::split_from_vars;
+    let Some(dir) = redsnow_dir() else { return };
+    assert!(gb_model::families::glm::contract::p2_sp_on(), "REXL3_GLM_P2_SP is off: nothing to test");
+    let layers: usize = std::env::var("REXL3_REDSNOW_TP_LAYERS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    let draft_dir = std::env::var("REXL3_DFLASH_DIR").ok().map(PathBuf::from).filter(|p| p.join("config.json").exists());
+    let taps: Vec<usize> = [1, 3, 4, 5, 7].iter().map(|&l| l.min(layers - 1)).collect();
+    require_available(if layers <= 8 { 60 } else { 80 } * GIB);
+    let guard = Guard::start(20 * GIB);
+    let (mut a, _) = load(&dir, layers, None, |_| {});
+    a.set_prefill_contract(PrefillContract::P2).unwrap();
+    a.set_graphs(false);
+    if let Some(d) = &draft_dir {
+        attach_drafter(&mut a, d, &taps);
+    }
+    let reference = script(&mut a);
+    let ref_336 = script_chunk(&mut a, 336);
+    let ref_taps = prompt_taps(&mut a, CHUNK);
+    let ref_taps_336 = prompt_taps(&mut a, 336);
+    if draft_dir.is_some() {
+        // the drafts after a 4,000-token prompt: every row absorbed (no prompt end named) == only the rows that reach the ring
+        let p = Rng(0x51_7cc1_b727_220a).tokens(4000);
+        let mut picks = Vec::new();
+        for (slot, end) in [(0usize, None), (1, Some(p.len()))] {
+            a.begin_slot(slot).unwrap();
+            a.dflash_prompt_end(slot, end);
+            let mut at = 0;
+            let mut last = 0;
+            while at < p.len() {
+                let e = (at + CHUNK).min(p.len());
+                let want = (e == p.len()).then_some(COUNT);
+                if let Some(c) = a.prefill_chunk(slot, at, &p[at..e], want).unwrap() {
+                    last = c.ids[0] as u32;
+                }
+                at = e;
+            }
+            let mut toks = p.clone();
+            toks.push(last);
+            let s = gb_sampling::Sampling { temperature: 0.0, ..Default::default() };
+            let ask = gb_model::families::glm::model::DflashAsk { slot, tokens: &toks, sampling: &s, want: 7 };
+            picks.push(a.dflash_draft(&[ask]).unwrap().remove(0).tokens);
+        }
+        let skipped = a.dflash_mut().unwrap().skipped;
+        assert!(skipped >= 4000 - 2560, "the rows more than a ring before the prompt's end were absorbed ({skipped} skipped)");
+        assert_eq!(picks[0], picks[1], "the drafts differ when the prompt's end is named");
+        eprintln!("one P2 model: the drafts after 4,000 rows are {:?} with and without the prompt's end ({skipped} rows skipped)", picks[0]);
+        for s in 0..2 {
+            a.end_slot(s);
+        }
+    }
+    eprintln!("one P2 model: {} answering calls, {} tap digests", reference.len(), ref_taps.1.len());
+    drop(a);
+
+    let bits = split_from_vars(|_| Some("kda,lm,mla,sh".into())).unwrap();
+    let owns = [ExpertOwnership::range(E, 0, 2).unwrap(), ExpertOwnership::range(E, 1, 2).unwrap()];
+    let mut models = Vec::new();
+    for o in &owns {
+        let (mut m, _) = load(&dir, layers, Some(o), |_| {});
+        m.set_prefill_contract(PrefillContract::P2).unwrap();
+        models.push(m);
+    }
+    let mut b = models.pop().unwrap();
+    let mut a = models.pop().unwrap();
+    let mut comms = LoopbackGroup::with_timeout(2, Duration::from_secs(120)).into_iter();
+    a.enable_tp(Arc::new(comms.next().unwrap()), owns[0].clone()).unwrap();
+    b.enable_tp(Arc::new(comms.next().unwrap()), owns[1].clone()).unwrap();
+    a.enable_head_split(bits).unwrap();
+    b.enable_head_split(bits).unwrap();
+    if let Some(d) = &draft_dir {
+        attach_drafter(&mut a, d, &taps);
+        a.enable_tap_relay(&taps).unwrap();
+        b.enable_tap_relay(&taps).unwrap();
+    }
+    let t = std::time::Instant::now();
+    let run = |m: &mut GlmModel| (script(m), script_chunk(m, 336), prompt_taps(m, CHUNK), prompt_taps(m, 336));
+    let (r0, r1, a, b) = std::thread::scope(|sc| {
+        let h0 = sc.spawn(move || (run(&mut a), a));
+        let h1 = sc.spawn(move || (run(&mut b), b));
+        let (r0, a) = h0.join().expect("rank 0");
+        let (r1, b) = h1.join().expect("rank 1");
+        (r0, r1, a, b)
+    });
+    eprintln!("two P2 ranks (split kda,lm,mla,sh) ran the script in {:.1?}", t.elapsed());
+    assert!(a.sp_chunks() > 0 && a.sp_chunks() == b.sp_chunks(), "sp chunks {} / {}", a.sp_chunks(), b.sp_chunks());
+    assert_eq!((&r0.0, &r1.0), (&reference, &reference), "512-row chunks: the ranks' answers differ from the one P2 model's");
+    assert_eq!((&r0.1, &r1.1), (&ref_336, &ref_336), "336-row chunks: the ranks' answers differ from the one P2 model's");
+    assert_eq!((r0.2 .0, r1.2 .0, r0.3 .0, r1.3 .0), (ref_taps.0, ref_taps.0, ref_taps_336.0, ref_taps_336.0), "the prompt's answers");
+    assert_eq!((&r0.2 .1, &r0.3 .1), (&ref_taps.1, &ref_taps_336.1), "rank 0's tap rows differ from the one model's");
+    let (t0r, t1r) = (a.tp().unwrap(), b.tp().unwrap());
+    assert_eq!((t0r.exchanges, t0r.exchanged_bytes), (t1r.exchanges, t1r.exchanged_bytes), "the ranks exchanged alike");
+    eprintln!(
+        "P2 SEQUENCE-PARALLEL BYTE-IDENTICAL: {} + {} answering calls == the one P2 model, {} tap digests; {} sp chunks, {} exchanges of \
+         {:.1} MiB a rank",
+        reference.len(),
+        ref_336.len(),
+        ref_taps.1.len() + ref_taps_336.1.len(),
+        a.sp_chunks(),
+        t0r.exchanges,
+        t0r.exchanged_bytes as f64 / 1048576.0
+    );
+    drop((a, b));
+    eprintln!("MemAvailable min {:.1} GiB", gib(guard.finish()));
+}
