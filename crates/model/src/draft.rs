@@ -186,6 +186,52 @@ impl Lin {
     }
 }
 
+/// Linears that read one input: separate ones (an EXL3 pack's), or, for a bf16 pack, ONE 4-bit matrix of their rows stacked
+/// ([`load_group`]), which one launch runs, writing each part's output to its own buffer. Each part's rows are quantized exactly
+/// as they would be alone; only the K split (a function of the stacked shape) can differ, and a draft only proposes tokens.
+enum LinGroup {
+    Each(Vec<Lin>),
+    Stacked { w: Q4Weights, parts: Vec<usize> },
+}
+
+impl LinGroup {
+    /// Parts `from..` of the group over `m` rows of `x`: part `from + i` into `outs[i]`, bf16 `[m, part width]`.
+    fn forward(
+        &self,
+        x: &DevBuf,
+        from: usize,
+        outs: &mut [&mut DevBuf],
+        m: usize,
+        s: &mut LinScratch,
+        st: &Stream,
+    ) -> Result<(), ModelError> {
+        match self {
+            LinGroup::Each(v) => {
+                for (l, y) in v[from..].iter().zip(outs.iter_mut()) {
+                    l.forward(x, y, m, s, st)?;
+                }
+            }
+            LinGroup::Stacked { w, parts } => {
+                let col0 = parts[..from].iter().sum();
+                let mut segs: Vec<(&mut DevBuf, usize)> = outs.iter_mut().map(|y| &mut **y).zip(parts[from..].iter().copied()).collect();
+                w.forward_cols(x, &mut s.gs, col0, &mut segs, m, st)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn push<'a>(&'a self, v: &mut Vec<(String, &'a DevBuf)>, names: &[String]) {
+        match self {
+            LinGroup::Each(ls) => {
+                for (l, n) in ls.iter().zip(names) {
+                    l.push(v, n.clone());
+                }
+            }
+            LinGroup::Stacked { w, .. } => v.push((format!("{}.q4", names.join("+")), &w.buf)),
+        }
+    }
+}
+
 struct ConvPair {
     /// f16 `[2, 2, hidden]`
     base: DevBuf,
@@ -196,14 +242,13 @@ struct ConvPair {
 struct DraftLayer {
     input_norm: DevBuf,
     post_norm: DevBuf,
-    q: Lin,
-    k: Lin,
-    v: Lin,
+    /// q, k and v
+    qkv: LinGroup,
     o: Lin,
     q_norm: DevBuf,
     k_norm: DevBuf,
-    gate: Lin,
-    up: Lin,
+    /// gate and up
+    gu: LinGroup,
     down: Lin,
     attn_conv: ConvPair,
     mlp_conv: ConvPair,
@@ -402,6 +447,45 @@ fn load_q4<'p>(
     Ok(Lin::Q4(Q4Weights::from_buf(buf, n, k)?))
 }
 
+/// The linears `names` (each `[n, k]`, `parts` the n's) that read one input: an EXL3 pack's one by one, a bf16 pack's as one 4-bit
+/// matrix of their rows stacked in order ([`LinGroup::Stacked`]; every part but the last whole 64-row tiles).
+fn load_group<'p>(
+    ctx: &mut LoadCtx<'p>,
+    pack: &'p Pack,
+    format: Format,
+    names: &[String],
+    k: usize,
+    parts: &[usize],
+    bytes: &mut usize,
+) -> Result<LinGroup, ModelError> {
+    if format == Format::Exl3 {
+        let mut v = Vec::with_capacity(names.len());
+        for (name, &n) in names.iter().zip(parts) {
+            v.push(load_exl3(ctx, pack, name, k, n, bytes)?);
+        }
+        return Ok(LinGroup::Each(v));
+    }
+    let tensors: Vec<String> = names.iter().map(|n| format!("{n}.weight")).collect();
+    for (t, &n) in tensors.iter().zip(parts) {
+        pack.entry(t, "BF16", &[n, k])?;
+    }
+    if k % q4_linear::GROUP != 0 || parts[..parts.len() - 1].iter().any(|n| n % 64 != 0) {
+        return Err(ModelError::Config(format!("draft {names:?}: parts {parts:?} of {k} inputs cannot be stacked")));
+    }
+    let n: usize = parts.iter().sum();
+    let len = q4_linear::bytes(n, k);
+    let shapes: Vec<(String, usize)> = tensors.into_iter().zip(parts.iter().copied()).collect();
+    let buf = ctx.computed(len, move || {
+        let mut w = Vec::with_capacity(n * k);
+        for (t, rows) in &shapes {
+            w.extend_from_slice(&pack.bf16(t, &[*rows, k])?);
+        }
+        Ok(q4_linear::quantize_bf16(&w, n, k))
+    })?;
+    *bytes += len;
+    Ok(LinGroup::Stacked { w: Q4Weights::from_buf(buf, n, k)?, parts: parts.to_vec() })
+}
+
 fn f32_dev<'p>(ctx: &mut LoadCtx<'p>, pack: &'p Pack, name: &str, shape: &[usize]) -> Result<DevBuf, ModelError> {
     ctx.f32_from_bf16(pack, name, shape, false)
 }
@@ -480,11 +564,11 @@ impl Draft {
             let p = format!("layers.{i}");
             v.push((format!("{p}.input_norm"), &l.input_norm));
             v.push((format!("{p}.post_norm"), &l.post_norm));
-            for (n, w) in
-                [("q", &l.q), ("k", &l.k), ("v", &l.v), ("o", &l.o), ("gate", &l.gate), ("up", &l.up), ("down", &l.down)]
-            {
-                w.push(&mut v, format!("{p}.{n}"));
-            }
+            let names = |ns: &[&str]| ns.iter().map(|n| format!("{p}.{n}")).collect::<Vec<_>>();
+            l.qkv.push(&mut v, &names(&["q", "k", "v"]));
+            l.o.push(&mut v, format!("{p}.o"));
+            l.gu.push(&mut v, &names(&["gate", "up"]));
+            l.down.push(&mut v, format!("{p}.down"));
             v.push((format!("{p}.q_norm"), &l.q_norm));
             v.push((format!("{p}.k_norm"), &l.k_norm));
             for (n, c) in [("attn_conv", &l.attn_conv), ("mlp_conv", &l.mlp_conv)] {
@@ -631,14 +715,19 @@ impl Draft {
             layers.push(DraftLayer {
                 input_norm: f32_dev(ctx, pack, &format!("{p}input_layernorm.weight"), &[h])?,
                 post_norm: f32_dev(ctx, pack, &format!("{p}post_attention_layernorm.weight"), &[h])?,
-                q: lin(ctx, &format!("{p}self_attn.q_proj"), h, Q_HEADS * HEAD_DIM, &mut bytes)?,
-                k: lin(ctx, &format!("{p}self_attn.k_proj"), h, KV_HEADS * HEAD_DIM, &mut bytes)?,
-                v: lin(ctx, &format!("{p}self_attn.v_proj"), h, KV_HEADS * HEAD_DIM, &mut bytes)?,
+                qkv: load_group(
+                    ctx,
+                    pack,
+                    format,
+                    &[format!("{p}self_attn.q_proj"), format!("{p}self_attn.k_proj"), format!("{p}self_attn.v_proj")],
+                    h,
+                    &[Q_HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM],
+                    &mut bytes,
+                )?,
                 o: lin(ctx, &format!("{p}self_attn.o_proj"), Q_HEADS * HEAD_DIM, h, &mut bytes)?,
                 q_norm: f32_dev(ctx, pack, &format!("{p}self_attn.q_norm.weight"), &[HEAD_DIM])?,
                 k_norm: f32_dev(ctx, pack, &format!("{p}self_attn.k_norm.weight"), &[HEAD_DIM])?,
-                gate: lin(ctx, &format!("{p}mlp.gate_proj"), h, f, &mut bytes)?,
-                up: lin(ctx, &format!("{p}mlp.up_proj"), h, f, &mut bytes)?,
+                gu: load_group(ctx, pack, format, &[format!("{p}mlp.gate_proj"), format!("{p}mlp.up_proj")], h, &[f, f], &mut bytes)?,
                 down: lin(ctx, &format!("{p}mlp.down_proj"), f, h, &mut bytes)?,
                 attn_conv: conv_pair(ctx, pack, &dims, &p, "attention_conv", &mut bytes)?,
                 mlp_conv: conv_pair(ctx, pack, &dims, &p, "mlp_conv", &mut bytes)?,
@@ -903,8 +992,7 @@ impl Draft {
             glue::rmsnorm(cp(ctx), cp(hidden_norm), mp(ctx), n, h, dims.eps, stream)?;
         }
         for (l, layer) in layers.iter().enumerate() {
-            layer.k.forward(ctx, kproj, n, lin, stream)?;
-            layer.v.forward(ctx, vproj, n, lin, stream)?;
+            layer.qkv.forward(ctx, 1, &mut [&mut *kproj, &mut *vproj], n, lin, stream)?;
             cache.write_ctx(l, kproj, vproj, &layer.k_norm, ctx_pos, ctx_slot, n, dims.eps, dims.rope_theta, stream)?;
         }
         Ok(())
@@ -1250,9 +1338,7 @@ impl Draft {
                 glue::small_linear_f16w(cp(h), cp(&layer.attn_conv.proj), mp(dynv), rows, hd, dw, stream)?;
             }
             dflash2::dynconv(h, dynv, &layer.attn_conv.base, 0, n, block, hd, CONV_GROUP, None, y, stream)?;
-            layer.q.forward(y, qb, rows, lin, stream)?;
-            layer.k.forward(y, kb, rows, lin, stream)?;
-            layer.v.forward(y, vb, rows, lin, stream)?;
+            layer.qkv.forward(y, 0, &mut [&mut *qb, &mut *kb, &mut *vb], rows, lin, stream)?;
             unsafe {
                 glue::attn_prep(
                     &prep,
@@ -1295,8 +1381,7 @@ impl Draft {
                 glue::small_linear_f16w(cp(h), cp(&layer.mlp_conv.proj), mp(dynv), rows, hd, dw, stream)?;
             }
             dflash2::dynconv(h, dynv, &layer.mlp_conv.base, 0, n, block, hd, CONV_GROUP, None, y, stream)?;
-            layer.gate.forward(y, g, rows, lin, stream)?;
-            layer.up.forward(y, u, rows, lin, stream)?;
+            layer.gu.forward(y, 0, &mut [&mut *g, &mut *u], rows, lin, stream)?;
             unsafe {
                 glue::swiglu(cp(g), cp(u), mp(sw), rows * dims.intermediate, stream)?;
             }
