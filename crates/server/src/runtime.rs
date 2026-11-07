@@ -758,7 +758,18 @@ fn run(engine: &mut dyn ServeEngine, rx: &Receiver<Cmd>, lp: &mut Loop, m: &Metr
                 None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
             };
             match got {
-                Ok(c) => cmds.push(c),
+                Ok(c) => {
+                    // a request that wakes the idle engine waits the engine's gather window for the ones sent with it (filled together)
+                    let gather = if matches!(c, Cmd::Submit { .. }) { engine.gather_window() } else { Duration::ZERO };
+                    cmds.push(c);
+                    let until = Instant::now() + gather;
+                    while !gather.is_zero() && Instant::now() < until {
+                        match rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                            Ok(c) => cmds.push(c),
+                            Err(_) => break,
+                        }
+                    }
+                }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return Exit::Stopped, // every sender is gone
             }

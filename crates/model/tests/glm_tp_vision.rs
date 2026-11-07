@@ -197,6 +197,10 @@ impl PrefixRuntime for Probe {
     }
 }
 
+// every runtime of a GLM backend says whether it runs prompt forwards of several prompts or in parts (`GlmTpBackend` is bound on it):
+// this file's backends prefill one prompt a call, whole, as the single node it is compared with
+impl gb_model::families::glm::tp_part::PartRuntime for Probe {}
+
 /// A deterministic synthetic RGB image: gradients, a checkerboard and a disc, so the tower sees structure, not noise.
 fn synth(width: usize, height: usize, seed: u32) -> gb_vision::Rgb {
     let mut data = Vec::with_capacity(width * height * 3);

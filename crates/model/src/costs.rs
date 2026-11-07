@@ -238,6 +238,20 @@ fn parse_prefill_batching(value: Option<&str>) -> Result<bool, ModelError> {
     }
 }
 
+/// `REXL3_PREFILL_GATHER_MS`: how long a request that wakes an idle engine waits for the requests sent with it, so their prompts are
+/// filled together (`Engine::with_gather_window`); unset: `default_ms` (the family's), `0`: none. Never a bit.
+pub fn prefill_gather_from_env(default_ms: u64) -> Result<std::time::Duration, ModelError> {
+    parse_prefill_gather(std::env::var("REXL3_PREFILL_GATHER_MS").ok().as_deref(), default_ms)
+}
+
+fn parse_prefill_gather(value: Option<&str>, default_ms: u64) -> Result<std::time::Duration, ModelError> {
+    let ms = match value.map(str::trim) {
+        None | Some("") => default_ms,
+        Some(s) => s.parse::<u64>().map_err(|_| ModelError::Config(format!("REXL3_PREFILL_GATHER_MS={s:?}: expected milliseconds")))?,
+    };
+    Ok(std::time::Duration::from_millis(ms))
+}
+
 /// `REXL3_SPEC_LEARN`: `1`/`true`/`on` lets the budget learn its priors from the traffic; unset, `0`, `false` or `off` keeps the
 /// measured tables.
 pub fn spec_learn_from_env() -> Result<bool, ModelError> {
@@ -377,6 +391,16 @@ mod tests {
             assert!(!parse_prefill_batching(off).unwrap(), "{off:?}");
         }
         assert!(parse_prefill_batching(Some("maybe")).is_err());
+    }
+
+    #[test]
+    fn the_prefill_gather_is_the_familys_unless_set_in_milliseconds() {
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(parse_prefill_gather(None, 15).unwrap(), ms(15));
+        assert_eq!(parse_prefill_gather(Some(" "), 15).unwrap(), ms(15));
+        assert_eq!(parse_prefill_gather(Some("0"), 15).unwrap(), ms(0));
+        assert_eq!(parse_prefill_gather(Some("40"), 15).unwrap(), ms(40));
+        assert!(parse_prefill_gather(Some("soon"), 15).is_err());
     }
 
     #[test]

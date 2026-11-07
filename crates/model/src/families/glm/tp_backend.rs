@@ -28,14 +28,15 @@ use super::prefix;
 use super::spec::{SpecConfig, SpecRuntime};
 use super::tp::{self, GlmCall, PrefixRuntime, Taken};
 use super::tp_mtp::GlmMtpRuntime;
+use super::tp_part::{self, PartRuntime, PrefillPart, TO_END};
 use super::tp_vision::{self, ChunkCall, ImageRuntime, SlotImages, TpVision};
 use crate::error::ModelError;
 use crate::forward::Candidates;
 use crate::lockstep::{self, TpLeader};
 use crate::rows::RowBatch;
 use gb_engine::{
-    Backend, BackendError, CacheBudget, Captured, CutStep, ImageSpan, PrefillStep, PrefixCaps, PrefixHandle, ProposeRequest,
-    RowOutput, RowRequest,
+    Backend, BackendError, CacheBudget, Captured, CutStep, ImageSpan, PrefillJob, PrefillStep, PrefixCaps, PrefixHandle,
+    ProposeRequest, RowOutput, RowRequest,
 };
 use std::collections::BTreeMap;
 
@@ -50,7 +51,7 @@ fn row_of(c: &Candidates, r: usize, n: usize) -> RowOutput {
 }
 
 /// Rank 0's backend of a GLM group.
-pub struct GlmTpBackend<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime> {
+pub struct GlmTpBackend<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> {
     pub leader: TpLeader<R>,
     /// Rows of one prefill slice (the model's chunk: the gate's `prefill_rows`).
     chunk: usize,
@@ -86,11 +87,48 @@ pub struct GlmTpBackend<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime> {
     /// Snapshots taken at a slice end whose drafter book was not sound (`SnapMeta::mtp_ok` false): a warm turn from one of them would not
     /// draft. 0 is the expected count (the book is built chunk by chunk up to the slice's end).
     snaps_without_drafts: u64,
+    /// The slices of several waiting prompts go through ONE forward (`tp_part`, P1 and P2): every rank runs them.
+    batches: bool,
+    /// The rows a forward may have while a prompt forward is paused (every rank's stash: `tp_part::PART_ROOM`; 0: no parts).
+    part_room: usize,
+    /// While a sequence decodes, a slice longer than the room runs in parts of about this many milliseconds (`tp_part::PART_MS_ENV`; 0:
+    /// whole slices, the adaptive small slice instead).
+    part_ms: f64,
+    /// While a sequence decodes, the most rows the fresh short slices of one forward have (`tp_part::BATCH_ROWS_ENV`).
+    batch_rows: usize,
+    /// A call ran the fresh short slices while another job waited (the slice in parts, a long slice, an image): the next call runs that
+    /// one ([`GlmTpBackend::plan_call`]).
+    other_owed: bool,
+    /// The layers of the forward (a part's bound is a layer).
+    layers: usize,
+    /// Measured over modelled time of the parts run so far, smoothed ([`GlmTpBackend::part_layers`]).
+    part_scale: f64,
+    /// The prompt slice running in parts, while one is.
+    inflight: Option<Inflight>,
 }
 
-impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime> GlmTpBackend<R> {
+/// A prompt slice running in parts: its slot, prompt length and rows `done..end`, the candidates its prompt asks for, the next layer.
+#[derive(Clone, Copy, Debug)]
+struct Inflight {
+    slot: usize,
+    n: usize,
+    done: usize,
+    end: usize,
+    candidates: usize,
+    next: usize,
+}
+
+/// Modelled milliseconds of one layer of a P2 prompt forward of `rows` rows on a two-rank group (the measured 4,096-row chunk of 2.8 s
+/// over 45 layers, and the weight reads' floor of a small one); the measured parts scale it ([`GlmTpBackend::part_layers`]).
+fn layer_ms(rows: usize) -> f64 {
+    6.0 + 0.014 * rows as f64
+}
+
+impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> GlmTpBackend<R> {
     /// Rank 0's backend over `leader`, with prefill slices of `chunk` rows, for a model of `slots` slots.
     pub fn new(leader: TpLeader<R>, chunk: usize, slots: usize) -> Self {
+        let (batches, part_room, layers) =
+            (leader.inner().prefill_batches(), leader.inner().prefill_part_rows(), leader.inner().prefill_layers());
         Self {
             leader,
             chunk: chunk.max(1),
@@ -108,7 +146,40 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime> GlmTpBackend<R> {
             snaps: BTreeMap::new(),
             book: lockstep::SnapshotBook::default(),
             snaps_without_drafts: 0,
+            batches,
+            part_room,
+            part_ms: 0.0,
+            batch_rows: chunk.max(1),
+            other_owed: false,
+            layers,
+            part_scale: 1.0,
+            inflight: None,
         }
+    }
+
+    /// While a sequence decodes, run a slice longer than the room (`tp_part::PART_ROOM`) in parts of about `ms` milliseconds (`tp_part`;
+    /// 0: whole slices). Only when every rank holds the stash (`PartRuntime::prefill_part_rows`); a slice then has the chunk's rows
+    /// whether or not a sequence decodes.
+    pub fn with_parts(mut self, ms: f64) -> Self {
+        self.part_ms = if self.part_room > 0 && self.layers > 1 { ms.max(0.0) } else { 0.0 };
+        self
+    }
+
+    /// While a sequence decodes, put at most `rows` rows of fresh short slices through one forward (`tp_part::BATCH_ROWS_ENV`; with
+    /// nothing decoding, the chunk's).
+    pub fn with_batch_rows(mut self, rows: usize) -> Self {
+        self.batch_rows = rows.min(self.chunk);
+        self
+    }
+
+    fn parts_on(&self) -> bool {
+        self.part_ms > 0.0
+    }
+
+    /// Whether the slices of several prompts go through one forward (the runtime's `PartRuntime::prefill_batches`): the engine then
+    /// serves every waiting prompt a step (`tp_boot`).
+    pub fn batches(&self) -> bool {
+        self.batches
     }
 
     /// Enable the prefix cache on every rank (as `GlmBackend::with_prefix_cache`): forwards `EnableSnapshots` of `budget.snapshot_slots`,
@@ -151,9 +222,11 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime> GlmTpBackend<R> {
         self
     }
 
-    /// Rows of the next slice: the small size while a sequence is decoding, the chunk otherwise, under the engine's deadline limit.
+    /// Rows of the next slice: the small size while a sequence is decoding (unless long slices run in parts), the chunk otherwise; at most
+    /// the room of a paused part while one is; under the engine's deadline limit.
     pub fn slice_rows(&self) -> usize {
-        let base = if self.decode_waiting { self.small } else { self.chunk };
+        let base = if self.decode_waiting && !self.parts_on() { self.small } else { self.chunk };
+        let base = if self.inflight.is_some() { base.min(self.part_room) } else { base };
         // under P2 a slice ends on its segment's 16-row KDA grid unless it ends the prompt (`prefix::slice_rows_for`)
         prefix::slice_rows_for(self.contract, base.min(self.deadline_rows.unwrap_or(usize::MAX)).max(1))
     }
@@ -170,8 +243,12 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime> GlmTpBackend<R> {
         self.images.allows(slot, first_position, rows)
     }
 
-    /// Give `slot`'s state back on every rank and forget its image spans and its drafting state (as `GlmBackend::drop_slot`).
+    /// Give `slot`'s state back on every rank and forget its image spans, its drafting state and its slice in flight (as
+    /// `GlmBackend::drop_slot`; every rank's model forgets a paused forward of the slot as it ends it).
     fn drop_slot(&mut self, slot: usize) {
+        if self.inflight.is_some_and(|f| f.slot == slot) {
+            self.inflight = None;
+        }
         self.leader.end_slot(slot);
         self.images.clear(slot);
         if let Some(s) = self.spec.as_mut() {
@@ -232,6 +309,22 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime> GlmTpBackend<R> {
             return Err(ModelError::Request(format!("a slice from {done} of a prompt of {n} tokens")));
         }
         let end = self.slice_end(done, n, cuts)?;
+        self.open_slice(slot, done, n)?;
+        let at = done;
+        let want = (end == n).then_some(candidates);
+        let t = std::time::Instant::now();
+        let c = self.leader.prefill_chunk(&Self::chunk_batch(slot, at, &prompt[at..end]), want)?;
+        super::spec::cost_log(format_args!("P {} 1 {} {:.4}", end - at, self.layers, t.elapsed().as_secs_f64() * 1e3));
+        let row = c.map(|c| row_of(&c, 0, candidates));
+        if let Some(r) = &row {
+            self.digests.row(slot, n - 1, prompt[n - 1], r);
+        }
+        Ok(PrefillStep { done: end, row })
+    }
+
+    /// Before a slice of `slot`'s prompt of `n` tokens from `done`: a prompt's first slice begins the slot on every rank (and its drafting
+    /// state and digests here); rank 0's drafter absorbs only the rows that reach its ring after the prompt.
+    fn open_slice(&mut self, slot: usize, done: usize, n: usize) -> Result<(), ModelError> {
         if done == 0 {
             self.leader.begin_slot(slot)?;
             if let Some(s) = self.spec.as_mut() {
@@ -239,16 +332,144 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime> GlmTpBackend<R> {
             }
             self.digests.begin(slot);
         }
-        // rank 0's drafter absorbs only the rows that reach its ring after the prompt
         self.leader.inner_mut().dflash_prompt_end(slot, Some(n));
-        let at = done;
-        let want = (end == n).then_some(candidates);
-        let c = self.leader.prefill_chunk(&Self::chunk_batch(slot, at, &prompt[at..end]), want)?;
-        let row = c.map(|c| row_of(&c, 0, candidates));
+        Ok(())
+    }
+
+    /// Layers of the next part of a forward of `rows` rows, `left` layers still to run: about [`GlmTpBackend::part_ms`] of them by the
+    /// modelled layer time scaled by the parts measured so far, at least one, and all that are left when the rest would be a sliver.
+    fn part_layers(&self, rows: usize, left: usize) -> usize {
+        let k = ((self.part_ms / (layer_ms(rows) * self.part_scale)).floor() as usize).clamp(1, left);
+        if left - k < k.div_ceil(2) {
+            left
+        } else {
+            k
+        }
+    }
+
+    /// A part of `layers` layers of a forward of `rows` rows took `ms`: the model's scale follows (smoothed, bounded).
+    fn part_took(&mut self, rows: usize, layers: usize, ms: f64) {
+        super::spec::cost_log(format_args!("P {rows} 1 {layers} {ms:.4}"));
+        let ratio = ms / (layer_ms(rows) * layers as f64);
+        if ratio.is_finite() && ratio > 0.0 {
+            self.part_scale = (0.7 * self.part_scale + 0.3 * ratio).clamp(0.25, 4.0);
+        }
+    }
+
+    /// Whether the slice `done..end` of a text prompt runs in parts: parts are on, a sequence decodes, none runs in parts now, and the
+    /// slice has more rows than may run between two parts of another (a shorter one runs whole, alone or with others: `plan_call`).
+    fn wants_parts(&self, done: usize, end: usize) -> bool {
+        self.parts_on() && self.decode_waiting && self.inflight.is_none() && end - done > self.part_room
+    }
+
+    /// The first part of the slice `done..end` of `slot`'s prompt (`tp_part`): the forward begins, its first layers run, it pauses.
+    fn begin_part(&mut self, slot: usize, prompt: &[u32], done: usize, end: usize, candidates: usize) -> Result<PrefillStep, ModelError> {
+        let n = prompt.len();
+        self.open_slice(slot, done, n)?;
+        let k = self.part_layers(end - done, self.layers);
+        let until = if k >= self.layers { TO_END } else { k as u32 };
+        let want = (end == n).then_some(candidates as u32);
+        let t = std::time::Instant::now();
+        let c = tp_part::forward_part(
+            &mut self.leader,
+            PrefillPart { begin: Some(Self::chunk_batch(slot, done, &prompt[done..end])), want, until },
+        )?;
+        self.part_took(end - done, k, t.elapsed().as_secs_f64() * 1e3);
+        if until == TO_END {
+            return Ok(self.slice_done(slot, prompt, end, candidates, c));
+        }
+        self.inflight = Some(Inflight { slot, n, done, end, candidates, next: k });
+        Ok(PrefillStep { done, row: None })
+    }
+
+    /// The next part of the slice in flight: about a part's layers while a sequence decodes, the rest otherwise. Its last part ends the
+    /// slice (`done` moves to its end, and the candidates come when it ends the prompt).
+    fn next_part(&mut self, prompt: &[u32]) -> Result<PrefillStep, ModelError> {
+        let f = self.inflight.expect("a slice in flight");
+        let left = self.layers - f.next;
+        let k = if self.decode_waiting { self.part_layers(f.end - f.done, left) } else { left };
+        let until = if f.next + k >= self.layers { TO_END } else { (f.next + k) as u32 };
+        let want = (f.end == f.n).then_some(f.candidates as u32);
+        let t = std::time::Instant::now();
+        let c = tp_part::forward_part(&mut self.leader, PrefillPart { begin: None, want, until })?;
+        self.part_took(f.end - f.done, k, t.elapsed().as_secs_f64() * 1e3);
+        if until == TO_END {
+            self.inflight = None;
+            return Ok(self.slice_done(f.slot, prompt, f.end, f.candidates, c));
+        }
+        self.inflight = Some(Inflight { next: f.next + k, ..f });
+        Ok(PrefillStep { done: f.done, row: None })
+    }
+
+    /// A slice of `slot`'s prompt that ended at `end`: its row when it ended the prompt.
+    fn slice_done(&mut self, slot: usize, prompt: &[u32], end: usize, candidates: usize, c: Option<Candidates>) -> PrefillStep {
+        let n = prompt.len();
+        let row = c.filter(|_| end == n).map(|c| row_of(&c, 0, candidates));
         if let Some(r) = &row {
             self.digests.row(slot, n - 1, prompt[n - 1], r);
         }
-        Ok(PrefillStep { done: end, row })
+        PrefillStep { done: end, row }
+    }
+
+    /// The slices of several text prompts in ONE forward (`tp_part`; each `(job, end)`: the job's slice is `done..end`): each prompt's
+    /// rows the bits of its own slice alone, its row when its slice ends its prompt.
+    fn batch_slices(&mut self, jobs: &[(&PrefillJob<'_>, usize)]) -> Result<Vec<PrefillStep>, ModelError> {
+        let mut reqs = Vec::with_capacity(jobs.len());
+        for &(j, end) in jobs {
+            self.open_slice(j.slot, j.done, j.prompt.len())?;
+            reqs.push(RowRequest { slot: j.slot, tokens: j.prompt[j.done..end].to_vec(), first_position: j.done as u64 });
+        }
+        let want = jobs.iter().filter(|(j, end)| *end == j.prompt.len()).map(|(j, _)| j.candidates as u32).max();
+        let b = RowBatch::from_requests(&reqs);
+        let t = std::time::Instant::now();
+        let rows = b.rows;
+        let c = tp_part::forward_part(&mut self.leader, PrefillPart { begin: Some(b), want, until: TO_END })?;
+        super::spec::cost_log(format_args!("P {rows} {} {} {:.4}", jobs.len(), self.layers, t.elapsed().as_secs_f64() * 1e3));
+        Ok(jobs
+            .iter()
+            .enumerate()
+            .map(|(i, &(j, end))| {
+                let n = j.prompt.len();
+                let row = c.as_ref().filter(|_| end == n).map(|c| row_of(c, i, j.candidates));
+                if let Some(r) = &row {
+                    self.digests.row(j.slot, n - 1, j.prompt[n - 1], r);
+                }
+                PrefillStep { done: end, row }
+            })
+            .collect())
+    }
+
+    /// The jobs of one `prefill_slices` call (in the engine's order): the fresh short text slices that go through one forward together,
+    /// as many as fit its rows (each `(job, end)`; a slice that fits alone but not with these waits for the next call), and the first job
+    /// that goes alone: the slice in parts, a slice that runs in parts (`wants_parts`) or would not fit even alone, one with images. The
+    /// forward's rows: a paused part's room while one is paused (and then only prompts that end in it, as `slice_at` runs meanwhile),
+    /// the batch rows while a sequence decodes, the chunk otherwise.
+    fn plan_call(&self, jobs: &[PrefillJob<'_>]) -> (Vec<(usize, usize)>, Option<usize>) {
+        let paused = self.inflight.is_some();
+        let room = if paused {
+            self.part_room
+        } else if self.decode_waiting {
+            self.batch_rows
+        } else {
+            self.chunk
+        };
+        let (mut group, mut other, mut rows) = (Vec::new(), None, 0usize);
+        for (i, j) in jobs.iter().enumerate() {
+            let n = j.prompt.len();
+            let fresh = j.images.is_empty() && j.done < n && !self.inflight.is_some_and(|f| f.slot == j.slot);
+            let end = if fresh { self.slice_end(j.done, n, &[]).ok() } else { None };
+            match end.filter(|&end| end - j.done <= room && !self.wants_parts(j.done, end) && (!paused || end == n)) {
+                Some(end) if rows + (end - j.done) <= room => {
+                    rows += end - j.done;
+                    group.push((i, end));
+                }
+                Some(_) => {}
+                None => {
+                    other.get_or_insert(i);
+                }
+            }
+        }
+        (group, other)
     }
 
     /// One prefill slice of a prompt with images (as `GlmBackend::prefill_slice_at` for a model that takes no cut inside a chunk), ended
@@ -274,14 +495,7 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime> GlmTpBackend<R> {
         let planned = self.slice_end(done, n, cuts)?;
         // the rows are read off the device before anything of the slot is touched: a failure here forwards nothing
         let (call, end) = v.chunk_call(slot, prompt, images, done, planned, candidates)?;
-        if done == 0 {
-            self.leader.begin_slot(slot)?;
-            if let Some(s) = self.spec.as_mut() {
-                s.begin(slot);
-            }
-            self.digests.begin(slot);
-        }
-        self.leader.inner_mut().dflash_prompt_end(slot, Some(n));
+        self.open_slice(slot, done, n)?;
         // set on every slice, as the single node does
         self.images.set(slot, images);
         let c = match call {
@@ -297,7 +511,9 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime> GlmTpBackend<R> {
 
     /// One prefill slice of `prompt` from `done`, with a snapshot of the slot's state when the slice ends at one of `cuts` (as
     /// `GlmBackend::prefill_slice_at` for a model that takes no cut inside a chunk). With no cuts this is exactly the slice
-    /// `prefill_slice` has always run.
+    /// `prefill_slice` has always run, except that while a sequence decodes a long text slice runs in parts (`tp_part`: each call one
+    /// part, `done` unchanged until the last), and while one runs in parts another prompt's slice runs only when it fits the paused
+    /// forward's room (otherwise nothing runs: `done` unchanged).
     fn slice_at(
         &mut self,
         slot: usize,
@@ -310,6 +526,30 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime> GlmTpBackend<R> {
         let n = prompt.len();
         if self.dead() {
             return CutStep { step: PrefillStep { done: n, row: Some(nan_row(candidates)) }, captured: Vec::new() };
+        }
+        let text = images.is_empty() && cuts.is_empty() && done < n;
+        let part = match self.inflight {
+            Some(f) if f.slot == slot => Some(None),
+            Some(_) if !(text && n - done <= self.part_room) => {
+                return CutStep { step: PrefillStep { done, row: None }, captured: Vec::new() };
+            }
+            Some(_) => None,
+            None if text => self.slice_end(done, n, &[]).ok().filter(|&end| self.wants_parts(done, end)).map(Some),
+            None => None,
+        };
+        if let Some(begin) = part {
+            let r = match begin {
+                None => self.next_part(prompt),
+                Some(end) => self.begin_part(slot, prompt, done, end, candidates),
+            };
+            return match r {
+                Ok(step) => CutStep { step, captured: Vec::new() },
+                Err(e) => {
+                    self.record(&format!("prefill of slot {slot}"), &e);
+                    self.drop_slot(slot);
+                    CutStep { step: PrefillStep { done: n, row: Some(nan_row(candidates)) }, captured: Vec::new() }
+                }
+            };
         }
         // the snapshots this slice took, handed to the engine if it does not fail and given back (on every rank) if it does
         let mut captured: Vec<Captured> = Vec::new();
@@ -473,7 +713,7 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime> GlmTpBackend<R> {
 
 /// Rank 0's window graph counters when its backend ends (the follower prints its own as it exits: `tp_glm_graphs`), so a two-node leg
 /// records whether the graphs ran on both ranks.
-impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime> Drop for GlmTpBackend<R> {
+impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> Drop for GlmTpBackend<R> {
     fn drop(&mut self) {
         if let Some(g) = self.leader.inner().graph_counters() {
             eprintln!(
@@ -489,7 +729,7 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime> Drop for GlmTpBackend<R> {
     }
 }
 
-impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime> Backend for GlmTpBackend<R> {
+impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> Backend for GlmTpBackend<R> {
     fn set_prefill_row_limit(&mut self, rows: Option<usize>) -> bool {
         self.deadline_rows = rows;
         true
@@ -497,6 +737,51 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime> Backend for GlmTpBackend<R
 
     fn set_decode_waiting(&mut self, waiting: bool) {
         self.decode_waiting = waiting;
+    }
+
+    /// The slice running in parts (`tp_part`), and the rows another prompt's slice may have meanwhile (the ranks' stash).
+    fn prefill_in_flight(&self) -> Option<(usize, usize)> {
+        self.inflight.map(|f| (f.slot, self.part_room))
+    }
+
+    /// The fresh short text slices of several waiting prompts go through ONE forward (`tp_part`, P1 and P2: each prompt's rows the bits of
+    /// its own slice alone; [`GlmTpBackend::plan_call`] picks them). A call runs ONE forward: that group, or the first job that goes alone
+    /// (the slice in parts, a long slice, one with images), the two taking turns while both wait; every job it does not run is not served
+    /// (`done` unchanged and no row: the engine asks again at its next step, after a decode round). So the decoding streams wait for one
+    /// forward a step, and the prompts of a group get their first tokens together.
+    fn prefill_slices(&mut self, jobs: &[PrefillJob<'_>]) -> Vec<PrefillStep> {
+        if !self.batches || self.dead() || jobs.len() < 2 {
+            return jobs.iter().map(|j| self.prefill_slice(j.slot, j.prompt, j.images, j.done, j.candidates)).collect();
+        }
+        let (group, other) = self.plan_call(jobs);
+        let mut out: Vec<PrefillStep> = jobs.iter().map(|j| PrefillStep { done: j.done, row: None }).collect();
+        let alone = match (other, &group[..]) {
+            (Some(i), _) if group.is_empty() || self.other_owed => Some(i),
+            (_, &[(i, _)]) => Some(i),
+            _ => None,
+        };
+        self.other_owed = other.is_some() && alone != other;
+        if let Some(i) = alone {
+            let j = &jobs[i];
+            out[i] = self.prefill_slice(j.slot, j.prompt, j.images, j.done, j.candidates);
+            return out;
+        }
+        let batch: Vec<(&PrefillJob<'_>, usize)> = group.iter().map(|&(i, end)| (&jobs[i], end)).collect();
+        match self.batch_slices(&batch) {
+            Ok(steps) => {
+                for (&(i, _), s) in group.iter().zip(steps) {
+                    out[i] = s;
+                }
+            }
+            Err(e) => {
+                self.record(&format!("prefill of {} prompts in one forward", group.len()), &e);
+                for &(i, _) in &group {
+                    self.drop_slot(jobs[i].slot);
+                    out[i] = PrefillStep { done: jobs[i].prompt.len(), row: Some(nan_row(jobs[i].candidates)) };
+                }
+            }
+        }
+        out
     }
 
     /// Rank 0's own graph cache (`/metrics`); a follower prints its own (`tp_follower_stats`, `tp_glm_graphs`).
@@ -801,6 +1086,10 @@ pub(crate) mod tests {
         pub(crate) chain: Vec<u64>,
         pub(crate) snap_chain: BTreeMap<u32, u64>,
         pub(crate) faults: Arc<RecFaults>,
+        /// Prompt forwards of several prompts and in parts (`tp_part`): `(room rows, layers)`, `None`: the runtime runs neither.
+        pub(crate) parts: Option<(usize, usize)>,
+        /// The paused prompt forward and its `want`.
+        pub(crate) paused: Option<(RowBatch, Option<u32>)>,
     }
 
     impl Rec {
@@ -821,6 +1110,8 @@ pub(crate) mod tests {
                 chain: vec![0; 4],
                 snap_chain: BTreeMap::new(),
                 faults: Arc::default(),
+                parts: None,
+                paused: None,
             }
         }
 
@@ -864,16 +1155,73 @@ pub(crate) mod tests {
     }
 
     fn cands(b: &RowBatch, rows: usize, count: usize) -> Candidates {
+        cands_of_rows(b, &(b.rows - rows..b.rows).collect::<Vec<_>>(), count)
+    }
+
+    /// The mock's candidates of rows `src` of `b`: a pure function of each row's token and position.
+    fn cands_of_rows(b: &RowBatch, src: &[usize], count: usize) -> Candidates {
         let mut ids = Vec::new();
         let mut vals = Vec::new();
-        for r in 0..rows {
-            let src = b.rows - rows + r;
+        for &r in src {
             for k in 0..count {
-                ids.push((b.ids[src] * 31 + b.positions[src] * 7 + k as i32) % 1000);
-                vals.push(-(k as f32) - b.positions[src] as f32 * 0.5);
+                ids.push((b.ids[r] * 31 + b.positions[r] * 7 + k as i32) % 1000);
+                vals.push(-(k as f32) - b.positions[r] as f32 * 0.5);
             }
         }
-        Candidates { rows, count, ids, vals }
+        Candidates { rows: src.len(), count, ids, vals }
+    }
+
+    /// [`cands`] of the last row of each sequence of `b`, in sequence order (the model's head of a forward of several prompts).
+    fn seq_cands(b: &RowBatch, count: usize) -> Candidates {
+        cands_of_rows(b, &(0..b.n_seq()).map(|i| b.seq_rows(i).end - 1).collect::<Vec<_>>(), count)
+    }
+
+    /// As `GlmModel::prefill_rows` / `prefill_resume`: a forward of one or several prompts, paused before `until` when that is short of
+    /// the layers; its prompts' rows join their slots (books, pages, segments, chains) when it ends.
+    impl crate::families::glm::tp_part::PartRuntime for Rec {
+        fn prefill_batches(&self) -> bool {
+            self.parts.is_some()
+        }
+        fn prefill_part_rows(&self) -> usize {
+            self.parts.map_or(0, |p| p.0)
+        }
+        fn prefill_layers(&self) -> usize {
+            self.parts.map_or(0, |p| p.1)
+        }
+        fn prefill_part(&mut self, call: &PrefillPart) -> Result<Option<Candidates>, ModelError> {
+            let (room, layers) = self.parts.ok_or_else(|| ModelError::NotBuilt("parts".into()))?;
+            call.check(4)?;
+            let ends = call.until == TO_END || call.until as usize >= layers;
+            let (b, want) = match &call.begin {
+                Some(b) => {
+                    let seqs: Vec<String> =
+                        (0..b.n_seq()).map(|i| format!("{}@{}+{}", b.seq_slot[i], b.positions[b.seq_rows(i).start], b.seq_rows(i).len())).collect();
+                    self.log.lock().unwrap().push(format!("part [{}] {:?} until={}", seqs.join(" "), call.want, call.until));
+                    if self.paused.is_some() && (!ends || b.rows > room) {
+                        return Err(ModelError::Request("a forward too big for the paused one's room".into()));
+                    }
+                    (b.clone(), call.want)
+                }
+                None => {
+                    self.log.lock().unwrap().push(format!("resume until={}", call.until));
+                    self.paused.take().ok_or_else(|| ModelError::Request("nothing paused".into()))?
+                }
+            };
+            if !ends {
+                self.paused = Some((b, want));
+                return Ok(None);
+            }
+            for i in 0..b.n_seq() {
+                let r = b.seq_rows(i);
+                let (slot, start) = (b.seq_slot[i] as usize, b.positions[r.start] as usize);
+                let tokens: Vec<u32> = b.ids[r].iter().map(|&t| t as u32).collect();
+                let _ = self.books[slot].prefill_chunk(start, tokens.len());
+                self.cover(slot, start + tokens.len());
+                self.anchor[slot].get_or_insert(start);
+                self.eat(slot, start, &tokens);
+            }
+            Ok(want.map(|w| seq_cands(&b, w as usize)))
+        }
     }
 
     impl LockstepRuntime for Rec {
@@ -1242,6 +1590,181 @@ pub(crate) mod tests {
         let starts: Vec<String> =
             a.iter().filter(|x| x.starts_with("prefill")).map(|x| x.split(' ').take(3).collect::<Vec<_>>().join(" ")).collect();
         assert_eq!(starts, ["prefill 1 0", "prefill 1 32", "prefill 1 64", "prefill 1 96"], "32 + 32 + 32 + 4 rows");
+    }
+
+    /// A P2 leader backend over a follower thread, both recording, whose runtimes run forwards of several prompts and in parts (`room`
+    /// rows meanwhile, `layers` layers), with parts of `part_ms` while a sequence decodes.
+    fn parts_group(
+        chunk: usize,
+        room: usize,
+        layers: usize,
+        part_ms: f64,
+    ) -> (GlmTpBackend<Rec>, Log, Log, std::thread::JoinHandle<FollowerExit>) {
+        let (a, b) = Link::<GlmCall>::pair(Duration::from_secs(30)).unwrap();
+        let (l0, l1): (Log, Log) = (Arc::default(), Arc::default());
+        let f = Rec { parts: Some((room, layers)), ..Rec::new(l1.clone()) };
+        let h = std::thread::spawn(move || run_follower(f, b, FollowerConfig::new(t())).unwrap());
+        let leader = TpLeader::lead(Rec { parts: Some((room, layers)), ..Rec::new(l0.clone()) }, a, t());
+        let be = GlmTpBackend::new(leader, chunk, 4).with_contract(super::super::contract::PrefillContract::P2).with_parts(part_ms);
+        (be, l0, l1, h)
+    }
+
+    /// Each prompt's row alone (slot = its index): the P2 backend over a runtime that runs neither batches nor parts, slice by slice.
+    fn solo_rows(chunk: usize, prompts: &[Vec<u32>], candidates: usize) -> Vec<RowOutput> {
+        let (be, _l0, _l1, h) = group(chunk, false);
+        let mut be = be.with_contract(super::super::contract::PrefillContract::P2);
+        let rows = prompts
+            .iter()
+            .enumerate()
+            .map(|(slot, p)| {
+                let mut done = 0;
+                loop {
+                    let s = be.prefill_slice(slot, p, &[], done, candidates);
+                    done = s.done;
+                    if let Some(r) = s.row {
+                        return r;
+                    }
+                }
+            })
+            .collect();
+        drop(be);
+        h.join().unwrap();
+        rows
+    }
+
+    /// `tp_part`: the slices of several waiting prompts go through ONE `PrefillPart` call (every rank runs it), as many as fit the chunk;
+    /// the one that does not fit waits (not served: `done` unchanged) and is served alone by the next call; each prompt's row is the row
+    /// it gets alone.
+    #[test]
+    fn the_slices_of_several_waiting_prompts_share_one_forward_and_each_row_is_its_solo_row() {
+        let prompts: Vec<Vec<u32>> = vec![(1..20).collect(), (30..33).collect(), (50..90).collect(), (100..130).collect()];
+        let (mut be, l0, l1, h) = parts_group(64, 32, 6, 300.0);
+        assert!(be.batches());
+        let jobs: Vec<PrefillJob<'_>> =
+            prompts.iter().enumerate().map(|(slot, p)| PrefillJob { slot, prompt: p, images: &[], done: 0, candidates: 3 }).collect();
+        let mut steps = be.prefill_slices(&jobs);
+        assert!(steps[3].done == 0 && steps[3].row.is_none(), "the prompt that does not fit with the others waits");
+        steps[3] = be.prefill_slices(&jobs[3..]).remove(0);
+        assert!(be.take_error().is_none());
+        drop(be);
+        assert!(matches!(h.join().unwrap(), FollowerExit::Shutdown(_)));
+        let (a, b) = (l0.lock().unwrap().clone(), l1.lock().unwrap().clone());
+        assert_eq!(a, b, "the follower runs rank 0's forwards");
+        assert_eq!(
+            a,
+            [
+                "begin 0",
+                "begin 1",
+                "begin 2",
+                "part [0@0+19 1@0+3 2@0+40] Some(3) until=4294967295",
+                "begin 3",
+                "prefill 3 0 [100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129] Some(3)",
+            ],
+            "19 + 3 + 40 rows fit the 64-row chunk; the 30 more do not"
+        );
+        let solo = solo_rows(64, &prompts, 3);
+        for (i, (s, r)) in steps.iter().zip(&solo).enumerate() {
+            assert_eq!(s.done, prompts[i].len());
+            assert_eq!(s.row.as_ref(), Some(r), "prompt {i}");
+        }
+    }
+
+    /// `tp_part`: while a sequence decodes a call runs ONE forward: the fresh short prompts together (at most the batch rows), or the
+    /// first job that goes alone (here a long slice, run in parts), the two taking turns while both wait; a short prompt that arrives
+    /// while the long one is paused runs whole between two parts (its turn), and the parts go on. Every job a call does not run is not
+    /// served. The follower runs rank 0's calls, and every row is the one its prompt gets alone.
+    #[test]
+    fn while_a_sequence_decodes_a_call_runs_one_forward_and_short_prompts_and_a_long_slice_take_turns() {
+        let prompts: Vec<Vec<u32>> = vec![(1..11).collect(), (20..32).collect(), (100..300).collect(), (400..408).collect()];
+        let (be, l0, l1, h) = parts_group(256, 32, 6, 1e-3);
+        let mut be = be.with_batch_rows(64);
+        be.set_decode_waiting(true);
+        let job = |slot: usize| PrefillJob { slot, prompt: &prompts[slot], images: &[], done: 0, candidates: 2 };
+        let mut rows: Vec<Option<RowOutput>> = vec![None; prompts.len()];
+        // the two short prompts together; the long one waits
+        let s = be.prefill_slices(&[job(0), job(1), job(2)]);
+        assert!(s[0].row.is_some() && s[1].row.is_some() && s[2].done == 0 && s[2].row.is_none());
+        (rows[0], rows[1]) = (s[0].row.clone(), s[1].row.clone());
+        // its turn: the long slice's first part; the short prompt that arrived waits
+        let s = be.prefill_slices(&[job(3), job(2)]);
+        assert!(s[0].done == 0 && s[0].row.is_none() && s[1].done == 0 && s[1].row.is_none());
+        assert_eq!(be.prefill_in_flight(), Some((2, 32)));
+        // the short prompt's turn, whole while the long one is paused
+        let s = be.prefill_slices(&[job(3), job(2)]);
+        assert!(s[0].done == 8 && s[1].done == 0 && s[1].row.is_none());
+        rows[3] = s[0].row.clone();
+        let s = be.prefill_slices(&[job(2)]);
+        assert!(s[0].done == 0 && s[0].row.is_none());
+        be.set_decode_waiting(false);
+        let s = be.prefill_slices(&[job(2)]);
+        assert_eq!(s[0].done, 200);
+        rows[2] = s[0].row.clone();
+        assert!(be.take_error().is_none());
+        drop(be);
+        assert!(matches!(h.join().unwrap(), FollowerExit::Shutdown(_)));
+        let (a, b) = (l0.lock().unwrap().clone(), l1.lock().unwrap().clone());
+        assert_eq!(a, b, "the follower runs rank 0's calls");
+        assert_eq!(
+            a,
+            [
+                "begin 0",
+                "begin 1",
+                "part [0@0+10 1@0+12] Some(2) until=4294967295",
+                "begin 2",
+                "part [2@0+200] Some(2) until=1",
+                "begin 3",
+                "prefill 3 0 [400, 401, 402, 403, 404, 405, 406, 407] Some(2)",
+                "resume until=2",
+                "resume until=4294967295",
+            ]
+        );
+        let solo = solo_rows(256, &prompts, 2);
+        for (i, (r, s)) in rows.iter().zip(&solo).enumerate() {
+            assert_eq!(r.as_ref(), Some(s), "prompt {i}");
+        }
+    }
+
+    /// `tp_part`: while a sequence decodes, a long slice runs in parts (each call one, `done` unchanged and no row until the last; the
+    /// backend names it in flight); a prompt that fits the room runs whole between two parts, one that does not is not run at all; when
+    /// nothing decodes any more the rest runs in one part. The follower runs rank 0's calls, and the row is the one the prompt gets alone.
+    #[test]
+    fn a_long_slice_runs_in_parts_while_a_sequence_decodes_and_a_short_prompt_runs_between_two() {
+        let long: Vec<u32> = (0..200).collect();
+        let short: Vec<u32> = (500..510).collect();
+        let other: Vec<u32> = (700..800).collect();
+        let (mut be, l0, l1, h) = parts_group(256, 32, 6, 1e-3);
+        be.set_decode_waiting(true);
+        let s = be.prefill_slice(0, &long, &[], 0, 2);
+        assert!(s.done == 0 && s.row.is_none());
+        assert_eq!(be.prefill_in_flight(), Some((0, 32)));
+        let s = be.prefill_slice(1, &short, &[], 0, 2);
+        assert!(s.done == short.len() && s.row.is_some(), "a prompt that fits the room runs whole meanwhile");
+        let s = be.prefill_slice(2, &other, &[], 0, 2);
+        assert!(s.done == 0 && s.row.is_none(), "one that does not fit is not run");
+        let s = be.prefill_slice(0, &long, &[], 0, 2);
+        assert!(s.done == 0 && s.row.is_none());
+        be.set_decode_waiting(false);
+        let s = be.prefill_slice(0, &long, &[], 0, 2);
+        assert_eq!(s.done, long.len());
+        assert_eq!(be.prefill_in_flight(), None);
+        let row = s.row.expect("the last part ends the prompt");
+        assert!(be.take_error().is_none());
+        drop(be);
+        assert!(matches!(h.join().unwrap(), FollowerExit::Shutdown(_)));
+        let (a, b) = (l0.lock().unwrap().clone(), l1.lock().unwrap().clone());
+        assert_eq!(a, b, "the follower runs rank 0's parts");
+        assert_eq!(
+            a,
+            [
+                "begin 0",
+                "part [0@0+200] Some(2) until=1",
+                "begin 1",
+                "prefill 1 0 [500, 501, 502, 503, 504, 505, 506, 507, 508, 509] Some(2)",
+                "resume until=2",
+                "resume until=4294967295",
+            ]
+        );
+        assert_eq!(row, solo_rows(256, &[long], 2)[0]);
     }
 
     /// Lane E: the adaptive slice. With no sequence decoding a prompt goes in the big chunk; while one is, in the small one; the follower

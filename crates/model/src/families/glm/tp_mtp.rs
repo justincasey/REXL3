@@ -253,9 +253,10 @@ pub fn apply<R: GlmMtpRuntime + ?Sized>(r: &mut R, call: GlmCall) -> Result<Call
             r.mtp_disable_slot(slot as usize);
             Ok(CallReply::NONE)
         }
-        // an image chunk is `tp_vision`'s (`tp::apply_family` routes it there): a runtime that reaches here applies no image
-        GlmCall::PrefillImage(_) => {
-            Err(ModelError::Request("prefill_image reached the draft calls' dispatch (use tp::apply_family)".into()))
+        // an image chunk is `tp_vision`'s and a prompt forward's part `tp_part`'s (`tp::apply_family` routes them there): a runtime that
+        // reaches here applies neither
+        GlmCall::PrefillImage(_) | GlmCall::PrefillPart(_) => {
+            Err(ModelError::Request("a prefill call reached the draft calls' dispatch (use tp::apply_family)".into()))
         }
         // the prefix cache's calls key their handles by the call's sequence number (`tp::apply_prefix`): a runtime that reaches here keeps none
         GlmCall::EnableSnapshots { .. } | GlmCall::Snapshot { .. } | GlmCall::Restore { .. } | GlmCall::Release { .. } => {
