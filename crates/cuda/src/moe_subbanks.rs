@@ -43,6 +43,159 @@ const INVALID: CudaError = CudaError(1);
 /// A split-width subbank (gate and up of different widths) on the batched path: no kernel takes it.
 pub const SPLIT_PREFILL: CudaError = CudaError(-1101);
 
+#[allow(non_snake_case)]
+mod ffi_multi {
+    use core::ffi::c_void;
+    crate::launchers! {
+        pub fn gb_moe_rot_in_multi(
+            x: *const c_void,
+            x_dtype: i32,
+            pick: *const c_void,
+            suh0: *const c_void,
+            suh1: *const c_void,
+            out0: *mut c_void,
+            out1: *mut c_void,
+            rows: i32,
+            topk: i32,
+            k: i32,
+            e: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn gb_moe_gemv_multi(
+            x0: *const c_void,
+            x1: *const c_void,
+            tp0: *const c_void,
+            tp1: *const c_void,
+            bits0: *const c_void,
+            bits1: *const c_void,
+            uids: *const c_void,
+            ucount: *const c_void,
+            mcount: *const c_void,
+            members: *const c_void,
+            z: *mut c_void,
+            mats: i32,
+            k: i32,
+            n: i32,
+            p: i32,
+            widths: i32,
+            codebook: i32,
+            sk: i32,
+            wk: i32,
+            umax: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn gb_moe_gateup_epilogue_multi(
+            z: *const c_void,
+            pick: *const c_void,
+            tab: *const c_void,
+            xd: *mut c_void,
+            rows: i32,
+            topk: i32,
+            n: i32,
+            sk: i32,
+            e: i32,
+            limit: f32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn gb_moe_down_pairs_multi(
+            z: *const c_void,
+            pick: *const c_void,
+            svh: *const c_void,
+            y_pairs: *mut c_void,
+            rows: i32,
+            topk: i32,
+            d: i32,
+            sk: i32,
+            e: i32,
+            stream: *mut c_void,
+        ) -> i32;
+    }
+}
+
+/// A rank's experts of every subbank as one set of per-expert tables indexed by GLOBAL id, so the decode pairs stage runs each of its
+/// seven stages as ONE launch over every subbank (the picks stay global ids; each block finds its expert's width, trellis and scales in
+/// the tables). A block's arithmetic is the one-bank launch's: the plans are the shape's alone and every block runs the same
+/// `gemv_block` at its expert's width (`csrc/moe_experts.cu`), so each pair's `y` is the per-subbank chain's bit for bit.
+struct MultiTables {
+    /// i32 `[E]`: `g` where this rank holds expert `g`, `-1` elsewhere (the remap's table).
+    owned_ids: DevBuf,
+    /// u64 `[E]` each: the trellis addresses of gate, up and down.
+    tp: [DevBuf; 3],
+    /// i32 `[E]` each: the widths of gate, up and down.
+    bits: [DevBuf; 3],
+    /// u64 `[E]` each: the suh rows of gate and up.
+    suh: [DevBuf; 2],
+    /// u64 `[3][E]`: the svh_g, svh_u and suh_d rows (the gate/up epilogue's).
+    epi: DevBuf,
+    /// u64 `[E]`: the svh_down rows.
+    svh_d: DevBuf,
+    /// The widths present (bit `b - 1` for `b` bits) among gate and up, and among down.
+    widths_gu: i32,
+    widths_d: i32,
+    codebook: i32,
+    plan_gu: (usize, usize),
+    plan_d: (usize, usize),
+}
+
+impl MultiTables {
+    /// The tables of `banks` (disjoint, covering the rank's experts), or `None` when they cannot share launches: different codebooks or
+    /// plans (a test's override).
+    fn of(dims: MoeDims, banks: &[MoeExperts]) -> Result<Option<Self>, CudaError> {
+        let first = &banks[0];
+        if banks.iter().any(|b| b.codebook != first.codebook || b.plan_gu != first.plan_gu || b.plan_d != first.plan_d) {
+            return Ok(None);
+        }
+        let (e, h, i) = (dims.experts, dims.hidden as u64, dims.inter as u64);
+        let mut owned_ids = vec![-1i32; e];
+        let mut tp = [vec![0u64; e], vec![0u64; e], vec![0u64; e]];
+        let mut bits = [vec![0i32; e], vec![0i32; e], vec![0i32; e]];
+        let mut suh = [vec![0u64; e], vec![0u64; e]];
+        let mut epi = vec![0u64; 3 * e];
+        let mut svh_d = vec![0u64; e];
+        let (mut widths_gu, mut widths_d) = (0i32, 0i32);
+        for b in banks {
+            let o = b.own.as_ref().ok_or(INVALID)?;
+            let el = o.own.local();
+            let mut ptrs = [vec![0u64; el], vec![0u64; el], vec![0u64; el]];
+            for (dst, src) in ptrs.iter_mut().zip([&b.gate_ptrs, &b.up_ptrs, &b.down_ptrs]) {
+                src.download(dst)?;
+            }
+            let widths = [b.bits_gu, b.bits_u, b.bits_d];
+            widths_gu |= (1 << (widths[0] - 1)) | (1 << (widths[1] - 1));
+            widths_d |= 1 << (widths[2] - 1);
+            for (l, &g) in o.own.owned().iter().enumerate() {
+                let (g, l64) = (g as usize, l as u64);
+                owned_ids[g] = g as i32;
+                for m in 0..3 {
+                    tp[m][g] = ptrs[m][l];
+                    bits[m][g] = widths[m] as i32;
+                }
+                suh[0][g] = b.suh_g.ptr() as u64 + l64 * h * 2;
+                suh[1][g] = b.suh_u.ptr() as u64 + l64 * h * 2;
+                epi[g] = b.svh_g.ptr() as u64 + l64 * i * 2;
+                epi[e + g] = b.svh_u.ptr() as u64 + l64 * i * 2;
+                epi[2 * e + g] = b.suh_d.ptr() as u64 + l64 * i * 2;
+                svh_d[g] = b.svh_d.ptr() as u64 + l64 * h * 2;
+            }
+        }
+        let up = |v: &[u64]| DevBuf::from_slice(v);
+        let upi = |v: &[i32]| DevBuf::from_slice(v);
+        Ok(Some(Self {
+            owned_ids: upi(&owned_ids)?,
+            tp: [up(&tp[0])?, up(&tp[1])?, up(&tp[2])?],
+            bits: [upi(&bits[0])?, upi(&bits[1])?, upi(&bits[2])?],
+            suh: [up(&suh[0])?, up(&suh[1])?],
+            epi: up(&epi)?,
+            svh_d: up(&svh_d)?,
+            widths_gu,
+            widths_d,
+            codebook: codebook_code(first.codebook),
+            plan_gu: first.plan_gu,
+            plan_d: first.plan_d,
+        }))
+    }
+}
+
 fn check(rc: i32) -> Result<(), CudaError> {
     CudaError::check(rc)
 }
@@ -598,6 +751,8 @@ pub struct MoeSubbanks {
     pub dims: MoeDims,
     own: ExpertOwnership,
     banks: Vec<MoeExperts>,
+    /// The banks' experts as one set of tables (`None`: the banks differ in codebook or plan, and each runs its own chain).
+    multi: Option<MultiTables>,
 }
 
 impl MoeSubbanks {
@@ -631,7 +786,8 @@ impl MoeSubbanks {
                 return Err(INVALID);
             }
         }
-        Ok(Self { dims, own, banks })
+        let multi = MultiTables::of(dims, &banks)?;
+        Ok(Self { dims, own, banks, multi })
     }
 
     /// From every expert's loaded groups (global id order; only the owned ones are read): partitions `own` by key and uploads each
@@ -702,13 +858,25 @@ impl MoeSubbanks {
         self.banks.iter().map(|b| b.expert_bytes * b.experts_local()).sum()
     }
 
-    /// Launches one decode call makes (pairs stage of every subbank, then one combine).
-    pub fn decode_launches(&self) -> usize {
-        self.banks.iter().map(|b| if b.fused_gate_up() { 7 } else { 8 }).sum::<usize>() + 1
+    /// The tables of one launch a stage, when every bank still runs the codebook and plans they were built for (a test may override a
+    /// bank's plan after construction).
+    fn multi(&self) -> Option<&MultiTables> {
+        self.multi.as_ref().filter(|m| {
+            self.banks.iter().all(|b| codebook_code(b.codebook) == m.codebook && b.plan_gu == m.plan_gu && b.plan_d == m.plan_d)
+        })
     }
 
-    /// The decode pairs stage of this rank (1..=`s.max_rows` rows): every subbank in order, the first one writing the `-0.0` filler.
-    /// `s.y_pairs` then holds, per pair, the `y` of the subbank that holds its pick, or `-0.0`. Clobbers `s.xg`.
+    /// Launches one decode call makes (the pairs stage: seven over every subbank at once, or each subbank's chain; then one combine).
+    pub fn decode_launches(&self) -> usize {
+        match self.multi() {
+            Some(_) => 7 + 1,
+            None => self.banks.iter().map(|b| if b.fused_gate_up() { 7 } else { 8 }).sum::<usize>() + 1,
+        }
+    }
+
+    /// The decode pairs stage of this rank (1..=`s.max_rows` rows). `s.y_pairs` then holds, per pair, the `y` of the subbank that holds
+    /// its pick, or `-0.0` when this rank holds none. Clobbers `s.xg`. Every stage runs as one launch over all the subbanks
+    /// ([`MultiTables`]); banks that cannot share launches run in order, the first one writing the `-0.0` filler.
     pub fn run_pairs(
         &self,
         x: &DevBuf,
@@ -718,10 +886,136 @@ impl MoeSubbanks {
         os: &mut OwnScratch,
         st: &Stream,
     ) -> Result<(), CudaError> {
+        if let Some(m) = self.multi() {
+            return self.multi_pairs(m, x, x_dtype, rows, s, os, st);
+        }
         for (i, b) in self.banks.iter().enumerate() {
             b.subbank_pairs(x, x_dtype, rows, s, os, i == 0, st)?;
         }
         Ok(())
+    }
+
+    /// [`MoeSubbanks::run_pairs`] as seven launches over every subbank: the remap to global ids of this rank (and the `-0.0` filler), the
+    /// grouping over global ids, then rot_in, the gate/up GEMV, its epilogue, the down GEMV and the down epilogue, each finding a pair's
+    /// expert in `m`. Each pair's arithmetic is its subbank chain's.
+    #[allow(clippy::too_many_arguments)]
+    fn multi_pairs(
+        &self,
+        m: &MultiTables,
+        x: &DevBuf,
+        x_dtype: Dtype,
+        rows: usize,
+        s: &mut MoeScratch,
+        os: &mut OwnScratch,
+        st: &Stream,
+    ) -> Result<(), CudaError> {
+        let d = self.dims;
+        let p = rows * d.topk;
+        if rows == 0
+            || rows > s.max_rows
+            || rows > os.max_rows
+            || os.dims.experts != d.experts
+            || os.dims.topk != d.topk
+            || !s.fits_plans(&d, (m.plan_gu, m.plan_d))
+            || s.xg.bytes() < rows * d.hidden * 4
+            || x.bytes() < rows * d.hidden * x_dtype.size()
+        {
+            return Err(INVALID);
+        }
+        let ((sk_gu, wk_gu), (sk_d, wk_d)) = (m.plan_gu, m.plan_d);
+        let e = d.experts as i32;
+        let umax = p.min(self.own.local()) as i32;
+        let (r, k, pi) = (rows as i32, d.topk as i32, p as i32);
+        let pl = os.pick_local.ptr();
+        unsafe {
+            check(ffi::gb_moe_own_remap(s.pick.ptr(), m.owned_ids.ptr(), pl, s.y_pairs.ptr(), pi, d.hidden as i32, e, st.raw()))?;
+            check(ffi::gb_moe_group(pl, s.uids.ptr(), s.ucount.ptr(), s.mcount.ptr(), s.members.ptr(), r, k, e, st.raw()))?;
+            check(ffi_multi::gb_moe_rot_in_multi(
+                x.ptr(),
+                x_dtype as i32,
+                pl,
+                m.suh[0].ptr(),
+                m.suh[1].ptr(),
+                s.xg.ptr(),
+                s.xu.ptr(),
+                r,
+                k,
+                d.hidden as i32,
+                e,
+                st.raw(),
+            ))?;
+            check(ffi_multi::gb_moe_gemv_multi(
+                s.xg.ptr(),
+                s.xu.ptr(),
+                m.tp[0].ptr(),
+                m.tp[1].ptr(),
+                m.bits[0].ptr(),
+                m.bits[1].ptr(),
+                s.uids.ptr(),
+                s.ucount.ptr(),
+                s.mcount.ptr(),
+                s.members.ptr(),
+                s.z.ptr(),
+                2,
+                d.hidden as i32,
+                d.inter as i32,
+                pi,
+                m.widths_gu,
+                m.codebook,
+                sk_gu as i32,
+                wk_gu as i32,
+                umax,
+                st.raw(),
+            ))?;
+            check(ffi_multi::gb_moe_gateup_epilogue_multi(
+                s.z.ptr(),
+                pl,
+                m.epi.ptr(),
+                s.xd.ptr(),
+                r,
+                k,
+                d.inter as i32,
+                sk_gu as i32,
+                e,
+                d.limit,
+                st.raw(),
+            ))?;
+            check(ffi_multi::gb_moe_gemv_multi(
+                s.xd.ptr(),
+                s.xd.ptr(),
+                m.tp[2].ptr(),
+                m.tp[2].ptr(),
+                m.bits[2].ptr(),
+                m.bits[2].ptr(),
+                s.uids.ptr(),
+                s.ucount.ptr(),
+                s.mcount.ptr(),
+                s.members.ptr(),
+                s.z.ptr(),
+                1,
+                d.inter as i32,
+                d.hidden as i32,
+                pi,
+                m.widths_d,
+                m.codebook,
+                sk_d as i32,
+                wk_d as i32,
+                umax,
+                st.raw(),
+            ))?;
+            check(ffi_multi::gb_moe_down_pairs_multi(
+                s.z.ptr(),
+                pl,
+                m.svh_d.ptr(),
+                s.y_pairs.ptr(),
+                r,
+                k,
+                d.hidden as i32,
+                sk_d as i32,
+                e,
+                st.raw(),
+            ))
+        }
     }
 
     /// The batched pairs stage of this rank (1..=`s.max_rows` rows), as [`MoeSubbanks::run_pairs`].
