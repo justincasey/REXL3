@@ -961,6 +961,32 @@ impl Stream {
             Err(CudaError(-1))
         }
     }
+    /// Queue a strided host-to-device copy (`cudaMemcpy2DAsync`): `height` rows of `width` bytes, row `r` from `src + r * src_pitch`
+    /// to `dst + r * dst_pitch`. One call for any row count (the loader's column cut of a trellis: thousands of rows a tensor). The
+    /// staging contract of [`Stream::memcpy_h2d_async`] applies.
+    ///
+    /// # Safety
+    /// `dst` must be a device address with `(height - 1) * dst_pitch + width` bytes behind it, `src` readable for
+    /// `(height - 1) * src_pitch + width` bytes, and both pitches at least `width`.
+    pub unsafe fn memcpy_h2d_2d_async(
+        &self,
+        dst: *mut c_void,
+        dst_pitch: usize,
+        src: *const u8,
+        src_pitch: usize,
+        width: usize,
+        height: usize,
+    ) -> Result<(), CudaError> {
+        #[cfg(not(gb_no_cuda))]
+        {
+            CudaError::check(ffi::cudaMemcpy2DAsync(dst, dst_pitch, src as *const c_void, src_pitch, width, height, H2D, self.0))
+        }
+        #[cfg(gb_no_cuda)]
+        {
+            let _ = (dst, dst_pitch, src, src_pitch, width, height, H2D);
+            Err(CudaError(-1))
+        }
+    }
     /// Queue a device-to-host copy of `bytes` bytes from the device address `src` to `dst`. `dst` must be
     /// pinned host memory (a [`Block::alloc_mapped_host`] block): pageable host memory is invalid for an async
     /// D2H copy. The caller records an event after the copies and waits on it (see the decode round's read-back
