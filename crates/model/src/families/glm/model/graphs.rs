@@ -472,7 +472,9 @@ impl GlmModel {
         match self.capture_window(plan, b, head, max_pos) {
             Ok(g) => {
                 self.graphs.stats.captures += 1;
-                self.graphs.stats.capture_ms += t.elapsed().as_secs_f64() * 1e3;
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                self.graphs.stats.capture_ms += ms;
+                crate::families::glm::spec::cost_log(format_args!("G {} {} {ms:.4}", key.rows, key.n_seq));
                 let r = g.launch(&self.stream);
                 self.graphs.slots.insert(key, Slot::Ready(g, tick));
                 r.map_err(ModelError::from)

@@ -375,23 +375,37 @@ pub const MTP_COST_TP_RESTRICTED: MtpCost = MtpCost {
     chain_per_stream: 0.43,
 };
 
-/// `REXL3_GLM_COST_LOG=<file>`: every verify window (`W rows ms`) and every draft call (`D streams rows depth ms`) the runtime
-/// observes is appended to the file (the measurement of the cost tables: `tools/glm_tp_cost_tables.sh`), and on a two-rank group every
-/// prompt forward or part of one rank 0 runs (`P rows prompts layers ms`, `tp_backend`). Unset: nothing is written.
+/// `REXL3_GLM_COST_LOG=<file>`: every verify window (`W rows ms streams predicted_ms`), every draft call (`D streams rows depth ms`; a
+/// DFlash2 call adds each stream's `slot:chain/kept/reach` with the chances the cut priced each depth with, `;`-separated), every
+/// round's commit (`C slot verified accepted`) and every window graph captured (`G rows sequences ms`) is appended to the file, and on a
+/// two-rank group every prompt forward or part of one rank 0 runs (`P rows prompts layers ms`, `tp_backend`). Each line ends with the
+/// milliseconds since the first line (when it was written: the gaps between rounds). Unset: nothing is written.
 pub const COST_LOG_ENV: &str = "REXL3_GLM_COST_LOG";
 
 pub(super) fn cost_log(line: std::fmt::Arguments<'_>) {
     use std::io::Write;
-    static LOG: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    static LOG: std::sync::OnceLock<Option<(std::sync::Mutex<std::fs::File>, Instant)>> = std::sync::OnceLock::new();
     let f = LOG.get_or_init(|| {
         let p = std::env::var(COST_LOG_ENV).ok().filter(|p| !p.trim().is_empty())?;
-        std::fs::OpenOptions::new().create(true).append(true).open(p.trim()).ok().map(std::sync::Mutex::new)
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p.trim())
+            .ok()
+            .map(|f| (std::sync::Mutex::new(f), Instant::now()))
     });
-    if let Some(m) = f {
+    if let Some((m, t0)) = f {
         if let Ok(mut f) = m.lock() {
-            let _ = writeln!(f, "{line}");
+            let _ = writeln!(f, "{line} {:.3}", t0.elapsed().as_secs_f64() * 1e3);
         }
     }
+}
+
+/// Whether [`cost_log`] writes (so a caller formats nothing it would drop).
+pub(super) fn cost_log_on() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var(COST_LOG_ENV).is_ok_and(|p| !p.trim().is_empty()));
+    *ON
 }
 
 // ---------------------------------------------------------------------------------------------------------------------- telemetry
@@ -814,7 +828,7 @@ impl SpecRuntime {
             let ms = t.elapsed().as_secs_f64() * 1e3;
             self.stats.mtp_ms += ms;
             self.stats.mtp_calls += 1;
-            cost_log(format_args!("D {} 0 {} {ms:.4}", asks.len(), cap));
+            let streams = asks.len();
             self.dflash_ms = self.dflash_ms * DFLASH_MS_DECAY + ms * (1.0 - DFLASH_MS_DECAY);
             // each stream's chance of reaching each depth, from its picks' margins
             let reach: Vec<Vec<f64>> = picked
@@ -834,6 +848,20 @@ impl SpecRuntime {
                 let cost = &self.cost;
                 allocate_chains(&reach, super::alloc::WINDOW_ROWS, self.dflash_ms, &|s, rows| cost.verify_ms_of(s, rows))
             };
+            if cost_log_on() {
+                // each stream: slot:chain/kept/the chances of reaching each depth (`reach`, what the cut priced)
+                let per: Vec<String> = asking
+                    .iter()
+                    .zip(&picked)
+                    .zip(&counts)
+                    .zip(&reach)
+                    .map(|(((&i, p), n), r)| {
+                        let r: Vec<String> = r.iter().map(|x| format!("{x:.3}")).collect();
+                        format!("{}:{}/{n}/{}", reqs[i].slot, p.tokens.len(), r.join(";"))
+                    })
+                    .collect();
+                cost_log(format_args!("D {streams} 0 {cap} {ms:.4} {}", per.join(",")));
+            }
             for ((&i, p), n) in asking.iter().zip(picked).zip(counts) {
                 let n = n.min(p.tokens.len());
                 out[i] = Some(p.tokens[..n].to_vec());
@@ -856,7 +884,7 @@ impl SpecRuntime {
 
     /// [`SpecRuntime::on_window`] of a window of `streams` sequences (the per-sequence cost of a two-rank group's table).
     pub fn on_window_of(&mut self, streams: usize, rows: usize, ms: f64) {
-        cost_log(format_args!("W {rows} {ms:.4} {streams}"));
+        cost_log(format_args!("W {rows} {ms:.4} {streams} {:.3}", self.cost.verify_ms_of(streams, rows)));
         self.stats.window_ms += ms;
         self.stats.windows += 1;
         self.stats.window_rows += rows as u64;
@@ -883,6 +911,7 @@ impl SpecRuntime {
         s.committed += accepted as u64 + 1;
         s.by_source[source.idx()] += 1;
         let accepted = accepted.min(verified);
+        cost_log(format_args!("C {slot} {verified} {accepted}"));
         self.stats.record(source, verified, accepted);
         if !margins.is_empty() {
             // a DFlash2 round: its margins teach the cut (the arbiter does not choose its depths)
