@@ -31,6 +31,11 @@
 //! a verify window, another slot's whole prompt and a window of two slots run between its parts, gives every call the bits of the run
 //! with the forward whole. Both on one model and on the two ranks of the serving split (`kda,lm,mla,sh`; under P2 the
 //! sequence-parallel residual), whose answers must equal the one model's.
+//!
+//! `p1_the_last_layers_tail_on_the_head_rows_equals_every_rows` (`ops::plan_forward_head_rows`): on a prefix whose last layer is KDA,
+//! the P1 prompt forwards run with that layer's tail on the head rows alone and with it on every row (`GlmModel::set_head_rows`) give
+//! every answer, every layer's state after every prompt chunk and the windows after byte for byte (chunked, several prompts in one
+//! forward, a forward paused at layer bounds), on one model and on the two ranks of the serving split.
 
 mod glm_support;
 
@@ -1262,4 +1267,121 @@ fn p2_a_forward_paused_with_windows_and_a_prompt_between_its_parts_equals_the_wh
 #[ignore]
 fn p1_a_forward_paused_with_windows_and_a_prompt_between_its_parts_equals_the_whole_forward() {
     a_forward_paused_equals_the_whole_forward(PrefillContract::P1);
+}
+
+/// Every layer's state of `slot` after its first `n` prompt rows, one digest a layer: a KDA layer's current state and conv history (its
+/// other buffer and the parity carry what earlier runs on the model left); an MLA layer's latent rows (through the slot's pages) and DSA
+/// pool rows.
+fn slot_state(m: &mut GlmModel, layers: usize, slot: usize, n: usize) -> Vec<u64> {
+    (0..layers)
+        .map(|l| {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            if l % 4 == 3 {
+                for x in m.latent_rows(l, slot, n).unwrap() {
+                    fnv(&mut h, &x.to_le_bytes());
+                }
+                for x in m.pool_rows(l, slot, n / gb_cuda::dsa::P).unwrap() {
+                    fnv(&mut h, &x.to_le_bytes());
+                }
+            } else {
+                let (state, conv) = m.kda_state(l, slot).unwrap();
+                for x in state {
+                    fnv(&mut h, &x.to_bits().to_le_bytes());
+                }
+                for x in conv {
+                    fnv(&mut h, &x.to_le_bytes());
+                }
+            }
+            h
+        })
+        .collect()
+}
+
+/// The head-rows test's calls: three prompts chunked (2,300 rows in 512-row chunks: the large path; 200 in 128-row chunks and 37 whole:
+/// the window-sized path) with every layer's state after every chunk, then [`script`] (its windows after), [`batch_script`]'s three
+/// prompts in one forward and [`pause_script`]'s slice whole and paused at three bounds. `(answers, states)`: the answering calls'
+/// digests in call order, the state digests.
+fn head_rows_script(m: &mut GlmModel, layers: usize) -> (Vec<u64>, Vec<u64>) {
+    let (mut answers, mut states) = (Vec::new(), Vec::new());
+    let mut r = Rng(0x3c6e_f372_fe94_f82b);
+    for (slot, n, chunk) in [(0usize, 2300usize, CHUNK), (1, 200, 128), (2, 37, 128)] {
+        let p = r.tokens(n);
+        m.begin_slot(slot).unwrap();
+        let mut at = 0;
+        while at < n {
+            let end = (at + chunk).min(n);
+            if let Some(c) = m.prefill_chunk(slot, at, &p[at..end], (end == n).then_some(COUNT)).unwrap() {
+                answers.push(digest_call(m, &c, 1));
+            }
+            states.extend(slot_state(m, layers, slot, end));
+            at = end;
+        }
+    }
+    m.flush().unwrap();
+    for s in 0..SLOTS {
+        m.end_slot(s);
+    }
+    answers.extend(script(m));
+    answers.extend(batch_script(m, true, false).0);
+    answers.extend(pause_script(m, &[], false).0);
+    answers.extend(pause_script(m, &[1, layers / 2, layers - 1], false).0);
+    (answers, states)
+}
+
+/// The last layer's tail on the head rows alone (`ops::plan_forward_head_rows`, on by default) against every row: a prefix whose last
+/// layer is KDA (`REXL3_REDSNOW_TP_LAYERS`, one fewer when it ends on an MLA layer), [`head_rows_script`] with it and without it
+/// (`GlmModel::set_head_rows`) on one model and on the two ranks of the serving split (each rank against itself for the states, which
+/// hold its heads; every rank's answers against the one model's).
+#[test]
+#[ignore]
+fn p1_the_last_layers_tail_on_the_head_rows_equals_every_rows() {
+    let Some(dir) = redsnow_dir() else { return };
+    let (layers, _, _) = prefix_setup();
+    let layers = if layers % 4 == 0 { layers - 1 } else { layers };
+    assert!(layers >= 4, "parts need a few layers");
+    require_available(if layers <= 8 { 60 } else { 80 } * GIB);
+    let guard = Guard::start(20 * GIB);
+    let mut a = one_model(PrefillContract::P1, &dir, layers, None, &[], PART_ROOM);
+    a.set_head_rows(false);
+    let every = head_rows_script(&mut a, layers);
+    assert_eq!(a.head_rows_runs(), 0, "the head rows' tail is off");
+    a.set_head_rows(true);
+    let head = head_rows_script(&mut a, layers);
+    assert!(a.head_rows_runs() > 0, "the head rows' tail ran");
+    // (the control: the script again without it, after both, equals its first run)
+    a.set_head_rows(false);
+    assert_eq!(head_rows_script(&mut a, layers), every, "one model: the script without the head rows' tail twice");
+    let first_diff = |x: &[u64], y: &[u64]| x.iter().zip(y).position(|(p, q)| p != q).map(|i| (i / layers, i % layers));
+    assert_eq!(head.0, every.0, "one model: an answer differs with the last layer's tail on the head rows");
+    assert_eq!(
+        first_diff(&head.1, &every.1),
+        None,
+        "one model: a layer's state differs with the last layer's tail on the head rows (chunk, layer)"
+    );
+    eprintln!(
+        "one model ({layers} layers): {} answering calls and {} layer states equal with the tail on the head rows ({} forwards) and on every row",
+        every.0.len(),
+        every.1.len(),
+        a.head_rows_runs()
+    );
+    drop(a);
+
+    let (a, b) = two_ranks(PrefillContract::P1, &dir, layers, None, &[], PART_ROOM);
+    let (h0, h1, a, b) = on_ranks(a, b, |m| head_rows_script(m, layers));
+    let (e0, e1, a, b) = on_ranks(a, b, |m| {
+        m.set_head_rows(false);
+        head_rows_script(m, layers)
+    });
+    assert!(a.head_rows_runs() > 0 && a.head_rows_runs() == b.head_rows_runs(), "both ranks ran the head rows' tail alike");
+    assert_eq!((&h0.0, &h1.0), (&every.0, &every.0), "two ranks with the tail on the head rows: an answer differs from the one model's");
+    assert_eq!((&e0.0, &e1.0), (&every.0, &every.0), "two ranks with the tail on every row: an answer differs from the one model's");
+    assert_eq!((&h0.1, &h1.1), (&e0.1, &e1.1), "two ranks: a layer's state differs with the last layer's tail on the head rows");
+    eprintln!(
+        "HEAD ROWS' TAIL BYTE-IDENTICAL (P1, {layers} layers): {} answering calls and {} layer states, one model and two ranks ({} forwards a rank)",
+        every.0.len(),
+        every.1.len(),
+        a.head_rows_runs()
+    );
+    drop((a, b));
+    eprintln!("MemAvailable min {:.1} GiB", gib(guard.finish()));
 }

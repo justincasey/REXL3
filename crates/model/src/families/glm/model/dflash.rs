@@ -242,6 +242,7 @@ impl GlmModel {
         let st = DflashState::new(draft, tap_layers, self.layers, rows)?;
         let bytes = st.tap_bytes();
         self.dflash = Some(st);
+        self.keep_tapped_rows(tap_layers);
         Ok(bytes)
     }
 

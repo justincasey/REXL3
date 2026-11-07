@@ -786,12 +786,13 @@ impl GlmTp {
     /// One KDA layer on this rank's heads (32 of 64): the rank's qkv strips, the KDA core at 32 heads on the rank's pool, then the
     /// replicated `o_proj` of the 64 heads: on the window path by S2 partials (the rank's 4 of the 8 K splits swapped, 64 KiB a row), on the
     /// big path by the gathered core output (`out` `[rows, 8192]`, the peer's 4,096 columns swapped in) through the full layer. Every output
-    /// is the single node's bit for bit.
+    /// is the single node's bit for bit. Without `o` (the last layer of a forward whose tail runs on the head rows alone) the core output
+    /// stays where the core wrote it: `out` on the window path, the rank's own half-width rows on the big path ([`GlmTp::kda_core_row`]).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn kda_split_layer(
         &mut self,
         ord: usize,
-        o: &Exl3Weights,
+        o: Option<&Exl3Weights>,
         dims: kda::Dims,
         params: &kda::Params,
         pool: &mut kda::Pool,
@@ -826,6 +827,7 @@ impl GlmTp {
                 if commit {
                     kda::commit(st, dims, &kr.w.view(), params, pool, batch, rec, kws, None, true)?;
                 }
+                let Some(o) = o else { return Ok(()) };
                 let x = out.subview(0, rows * c * 2);
                 self.split_o(o, &x, rows, mixer_out, ws, st)
             }
@@ -860,11 +862,20 @@ impl GlmTp {
                         )?;
                     }
                 }
+                let Some(o) = o else { return Ok(()) };
                 self.gather_cols_f16(&own, out, rows, c, st)?;
                 o.forward_big(out, mixer_out, rows, Dtype::F16, Dtype::F32, ws, st)?;
                 Ok(())
             }
         }
+    }
+
+    /// Copy `bytes` at `src_off` of this rank's own half-width KDA core rows (the big path's, [`GlmTp::kda_split_layer`] without `o`)
+    /// into `dst` at `dst_off`.
+    pub(super) fn kda_core_row(&self, dst: &mut DevBuf, dst_off: usize, src_off: usize, bytes: usize, st: &Stream) -> Result<(), ModelError> {
+        let sp = self.split.as_ref().ok_or_else(|| ModelError::Config("no head split".into()))?;
+        dst.copy_range_from(dst_off, &sp.own, src_off, bytes, st)?;
+        Ok(())
     }
 }
 
