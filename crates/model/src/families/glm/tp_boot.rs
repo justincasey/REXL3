@@ -840,6 +840,8 @@ pub fn build_leader(
             if p.relay_bytes > 0 {
                 rank.m.enable_tap_relay(&p.taps)?;
             }
+            // the taps on every rank: a tap of the last layer keeps every row's tail (both ranks skip the same exchanges)
+            rank.m.keep_tapped_rows(&p.taps);
             // after the drafter: the stash of a paused prompt forward keeps its tap rows too
             super::tp_part::enable(&mut rank.m)?;
             rank.m.set_graph_capture_first(super::model::graphs::capture_at_first_or(CAPTURE_FIRST));
@@ -1020,6 +1022,7 @@ pub fn follow(ctx: &BuildCtx<'_>) -> Result<(), ModelError> {
             if p.relay_bytes > 0 {
                 rank.m.enable_tap_relay(&p.taps)?;
             }
+            rank.m.keep_tapped_rows(&p.taps);
             super::tp_part::enable(&mut rank.m)?;
             rank.m.set_graph_capture_first(super::model::graphs::capture_at_first_or(CAPTURE_FIRST));
             Ok(rank)

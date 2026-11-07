@@ -15,6 +15,9 @@
 //! per layer l:  Finalize(attn l)  Mixer(l)  ApplyPartials(ffn l)  Finalize(ffn l)  [DenseFfn | MoeShared MoeRoute MoeExperts]  ApplyPartials(attn l+1) | Apply
 //! HeadMean, LmHead
 //! ```
+//!
+//! A prompt forward whose last layer is KDA may run that layer's tail on the head's rows alone ([`plan_forward_head_rows`]): everything
+//! after its recurrence feeds only the head.
 
 use super::config::GlmConfig;
 use crate::family::{Ffn, Mixer};
@@ -66,6 +69,13 @@ pub enum Op {
     HeadMean,
     /// The `lm_head` on the head rows.
     LmHead,
+    /// The last layer's KDA mixer up to its core output ([`plan_forward_head_rows`]): the qkv projection, the recurrence over every row
+    /// and its state commit; the core output stays for [`Op::MixerOut`].
+    MixerCore { layer: usize },
+    /// Each sequence's last row (the head's) gathered to the front: every later op runs on those rows alone.
+    HeadRows,
+    /// The `o_proj` of [`Op::MixerCore`]'s output, on the head rows.
+    MixerOut { layer: usize },
 }
 
 /// The kinds of layer `l`, from the config's recipe.
@@ -91,6 +101,28 @@ pub fn plan_forward_tap(cfg: &GlmConfig, layers: usize) -> Vec<Op> {
     let mut ops = build(cfg, layers, true, None);
     assert_eq!(ops.pop(), Some(Op::LmHead));
     ops
+}
+
+/// [`plan_forward`] of a prompt forward whose last layer is KDA, with that layer's tail on the head rows alone. The recurrence (and its
+/// state commit) runs on every row ([`Op::MixerCore`]); everything after it (the `o_proj`, the FFN site, the MoE block, the last apply)
+/// feeds only the head, which reads each sequence's last row. With a head that tail runs after [`Op::HeadRows`] on those rows; without
+/// one it does not run. `None` when the last layer is not KDA. The forward's other readers of the tail's rows (a drafter's tap of the
+/// last layer, the NextN tap, a capture) are the caller's to rule out.
+pub fn plan_forward_head_rows(cfg: &GlmConfig, layers: usize, head: bool) -> Option<Vec<Op>> {
+    let n = layers.min(cfg.layers.len());
+    if n == 0 || mixer_kind(cfg, n - 1) != MixerKind::Kda {
+        return None;
+    }
+    let layer = n - 1;
+    let mut ops = build(cfg, layers, head, None);
+    let at = ops.iter().position(|o| *o == Op::Mixer { layer, kind: MixerKind::Kda })?;
+    if head {
+        ops.splice(at..=at, [Op::MixerCore { layer }, Op::HeadRows, Op::MixerOut { layer }]);
+    } else {
+        ops.truncate(at);
+        ops.push(Op::MixerCore { layer });
+    }
+    Some(ops)
 }
 
 /// A deliberate bug in the schedule, so the tests can show that the validator ([`check_plan`]) catches each one. Production passes none.
@@ -395,6 +427,43 @@ mod tests {
     fn the_vocabulary_mutant_leaves_the_schedule_alone() {
         let c = real();
         assert_eq!(plan_forward_mutated(&c, 45, true, Mutant::UnmaskedVocab), plan_forward(&c, 45, true));
+    }
+
+    #[test]
+    fn the_head_rows_plan_is_the_plain_plan_with_the_last_kda_layer_cut_at_its_recurrence() {
+        let c = real();
+        for n in 1..=45 {
+            let last_kda = mixer_kind(&c, n - 1) == MixerKind::Kda;
+            for head in [false, true] {
+                let full = plan_forward(&c, n, head);
+                let Some(ops) = plan_forward_head_rows(&c, n, head) else {
+                    assert!(!last_kda, "{n} layers: the last layer is KDA");
+                    continue;
+                };
+                assert!(last_kda, "{n} layers: the last layer is MLA");
+                let at = full.iter().position(|o| *o == Op::Mixer { layer: n - 1, kind: MixerKind::Kda }).unwrap();
+                // everything before the last mixer is the plain plan's
+                assert_eq!(ops[..at], full[..at], "{n} layers, head {head}");
+                if head {
+                    // the mixer cut in two around the gather, the rest (FFN site, block, apply, head) the plain plan's on the head rows
+                    assert_eq!(ops[at..at + 3], [Op::MixerCore { layer: n - 1 }, Op::HeadRows, Op::MixerOut { layer: n - 1 }]);
+                    assert_eq!(ops[at + 3..], full[at + 1..], "{n} layers");
+                    let joined: Vec<Op> = ops
+                        .iter()
+                        .filter(|o| !matches!(o, Op::HeadRows | Op::MixerOut { .. }))
+                        .map(|o| match *o {
+                            Op::MixerCore { layer } => Op::Mixer { layer, kind: MixerKind::Kda },
+                            o => o,
+                        })
+                        .collect();
+                    check_plan(&c, n, true, &joined).unwrap_or_else(|e| panic!("{n} layers: {e}"));
+                } else {
+                    // no head: the forward ends at the last recurrence
+                    assert_eq!(ops[at..], [Op::MixerCore { layer: n - 1 }], "{n} layers");
+                }
+            }
+        }
+        assert!(plan_forward_head_rows(&c, 45, true).is_some(), "layer 44 is KDA");
     }
 
     #[test]

@@ -145,7 +145,7 @@ impl GlmModel {
             }
         };
         let end = if whole { f.plan.len() } else { layer_op(&f.plan, until) };
-        if let Err(e) = self.run(&f.plan[..end], b, Mode::Prefill, head, f.max_pos) {
+        if let Err(e) = self.run_plan(&f.plan[..end], b, Mode::Prefill, head, f.max_pos) {
             self.dflash_end_chunk();
             return Err(e);
         }
@@ -172,7 +172,7 @@ impl GlmModel {
         self.ensure_pages(&p.b, true)?;
         self.dflash_set_skip_taps(p.skip_taps);
         let end = if until >= self.layers { p.plan.len() } else { layer_op(&p.plan, until).max(p.next) };
-        if let Err(e) = self.run(&p.plan[p.next..end], &p.b, Mode::Prefill, p.head, p.max_pos) {
+        if let Err(e) = self.run_plan(&p.plan[p.next..end], &p.b, Mode::Prefill, p.head, p.max_pos) {
             self.dflash_end_chunk();
             return Err(e);
         }

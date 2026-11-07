@@ -215,6 +215,11 @@ fn p2_shared_side_on() -> bool {
     *ON.get_or_init(|| matches!(std::env::var("REXL3_GLM_P2_SHARED_SIDE").as_deref(), Ok("1" | "on" | "true" | "yes")))
 }
 
+/// `REXL3_GLM_HEAD_ROWS` (`0`/`off` turns it off; on by default): a P1 prompt forward whose last layer is KDA runs that layer's tail on
+/// the head rows alone ([`ops::plan_forward_head_rows`]). Never a bit: a P1 row's bits do not depend on the rows beside it.
+static HEAD_ROWS_ON: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| !matches!(std::env::var("REXL3_GLM_HEAD_ROWS").as_deref(), Ok("0" | "off" | "false" | "no")));
+
 /// The rows of one piece of a P2 prompt chunk's chunked KDA recurrence over this scratch (`kda::p2_piece_rows`; 512 when the scratch holds
 /// it). `REXL3_GLM_P2_KDA_PIECE` (a multiple of 16, at most the scratch's rows) overrides it for the benches: never a bit, pieces end on
 /// chunk boundaries.
@@ -272,6 +277,9 @@ pub fn op_class(op: &Op) -> &'static str {
         Op::Finalize(_) => "mhc finalize",
         Op::ApplyPartials { .. } | Op::Apply => "mhc apply+partials",
         Op::Mixer { kind: MixerKind::Kda, .. } => "kda layer (qkv, kda, o_proj)",
+        Op::MixerCore { .. } => "kda layer (qkv, kda), head rows' tail after it",
+        Op::HeadRows => "head rows gather",
+        Op::MixerOut { .. } => "kda o_proj (head rows)",
         Op::Mixer { kind: MixerKind::MlaDsa, .. } => "mla+dsa layer",
         Op::DenseFfn { .. } => "dense mlp",
         Op::MoeShared { .. } => "moe shared expert",
@@ -390,6 +398,13 @@ pub struct GlmModel {
     p2_kda_chunked: bool,
     /// Prompt chunks this model ran under the sequence-parallel residual (`run`'s `sp`; the tests' audit).
     sp_chunks: u64,
+    /// A P1 prompt forward whose last layer is KDA runs that layer's tail on the head rows alone (`REXL3_GLM_HEAD_ROWS`, on by default;
+    /// [`GlmModel::set_head_rows`]; see [`GlmModel::head_rows_tail`]).
+    head_rows_on: bool,
+    /// The group's drafter taps the last trunk layer ([`GlmModel::keep_tapped_rows`]): every row's tail then runs.
+    last_tapped: bool,
+    /// Prompt forwards that ran the last layer's tail on the head rows alone (the tests' audit).
+    head_rows_runs: u64,
     /// A prompt forward paused at a layer boundary (`prefill_rows` with a layer bound, `part.rs`) and the stash of the rows another
     /// forward may overwrite while it waits (`enable_prefill_parts`; `None`: parts are off).
     paused: Option<part::Paused>,
@@ -604,6 +619,9 @@ impl GlmModel {
             p2_side_on: p2_shared_side_on(),
             p2_kda_chunked: true,
             sp_chunks: 0,
+            head_rows_on: *HEAD_ROWS_ON,
+            last_tapped: false,
+            head_rows_runs: 0,
             paused: None,
             stash: None,
             slices: crate::families::glm::profile_slices::SliceProfiler::from_env()?,
@@ -723,6 +741,40 @@ impl GlmModel {
     #[doc(hidden)]
     pub fn set_p2_kda_chunked(&mut self, on: bool) {
         self.p2_kda_chunked = on;
+    }
+
+    /// Run a P1 prompt forward's last-layer tail on the head rows alone (true) or on every row (false); the bits are the same either way.
+    /// Every rank of a group sets the same.
+    pub fn set_head_rows(&mut self, on: bool) {
+        self.head_rows_on = on;
+    }
+
+    /// The trunk layers the group's drafter taps (on every rank of a group: a fact of the Hello, though rank 0 alone drafts). A tap of the
+    /// last layer reads every row's streams after its tail, so that tail then runs on every row.
+    pub fn keep_tapped_rows(&mut self, taps: &[usize]) {
+        self.last_tapped |= self.layers > 0 && taps.contains(&(self.layers.min(self.cfg.layers.len()) - 1));
+    }
+
+    /// Prompt forwards that ran the last layer's tail on the head rows alone (the tests' audit).
+    pub fn head_rows_runs(&self) -> u64 {
+        self.head_rows_runs
+    }
+
+    /// Whether this prompt forward runs its last layer's tail on the head rows alone ([`ops::plan_forward_head_rows`]): a P1 prompt
+    /// forward whose head is each sequence's last row (or none) and whose rows after the last recurrence nothing else reads (no NextN
+    /// drafter, which taps every row's final norm; no drafter's tap of the last layer; no capture or forced routing; no snapshot inside
+    /// the chunk). Every input is a fact both ranks of a group share, so they skip the same exchanges.
+    fn head_rows_tail(&self, b: &RowBatch, mode: Mode, head: Head) -> bool {
+        self.head_rows_on
+            && mode == Mode::Prefill
+            && head != Head::AllRows
+            && !self.prefill.p2_prefill(true)
+            && self.mtp.is_none()
+            && !self.last_tapped
+            && self.capture.is_none()
+            && self.forced.is_none()
+            && self.snap_cuts.is_empty()
+            && b.n_seq() <= alloc::MAX_ROWS
     }
 
     /// The prefill contract the model's prompt chunks run (`contract.rs`).
@@ -1071,7 +1123,7 @@ impl GlmModel {
         if self.graph_eligible(mode, head) {
             self.run_window(&f.plan, b, head, f.max_pos)?;
         } else {
-            self.run(&f.plan, b, mode, head, f.max_pos)?;
+            self.run_plan(&f.plan, b, mode, head, f.max_pos)?;
         }
         self.forward_end(b, mode, &f.segs);
         Ok(())
@@ -1119,6 +1171,9 @@ impl GlmModel {
         let plan = match self.mutant {
             _ if replay => Vec::new(),
             Some(m) => ops::plan_forward_mutated(&self.cfg, self.layers, head != Head::None, m),
+            // the last layer's tail on the head rows alone (a P1 prompt forward whose last layer is KDA, nothing else reading those rows)
+            None if self.head_rows_tail(b, mode, head) => ops::plan_forward_head_rows(&self.cfg, self.layers, head != Head::None)
+                .unwrap_or_else(|| ops::plan_forward(&self.cfg, self.layers, head != Head::None)),
             // the drafter taps the head's mean and norm for every row, with or without logits
             None if head == Head::None && self.mtp.is_some() => ops::plan_forward_tap(&self.cfg, self.layers),
             None => ops::plan_forward(&self.cfg, self.layers, head != Head::None),
@@ -1140,6 +1195,52 @@ impl GlmModel {
             let r = b.seq_rows(i);
             self.p2_seg[slot] = Some((anchor, b.positions[r.start] as usize + r.len()));
         }
+    }
+
+    /// Run `plan` (a forward's schedule, or a part of a prompt forward's) over `b`. A schedule with the last layer's tail on the head rows
+    /// ([`ops::plan_forward_head_rows`]) runs to its [`Op::HeadRows`] on every row, gathers the head rows ([`GlmModel::gather_head_rows`])
+    /// and runs the rest on them alone.
+    fn run_plan(&mut self, plan: &[Op], b: &RowBatch, mode: Mode, head: Head, max_pos: usize) -> Result<(), ModelError> {
+        self.head_rows_runs += u64::from(plan.iter().any(|o| matches!(o, Op::MixerCore { .. })));
+        let Some(k) = plan.iter().position(|o| *o == Op::HeadRows) else {
+            return self.run(plan, b, mode, head, max_pos);
+        };
+        self.run(&plan[..k], b, mode, head, max_pos)?;
+        let rows = self.gather_head_rows(b)?;
+        self.run(&plan[k + 1..], &rows, mode, head, max_pos)
+    }
+
+    /// [`Op::HeadRows`], after the last KDA layer's recurrence ([`Op::MixerCore`]): each sequence's last row moved to row `i` (sequence
+    /// order; row `i`'s source is at or past it, so no move reads a row an earlier one wrote) in everything the tail reads: the streams,
+    /// the mixing of the layer's attention site (`post`, `comb`) and the core output (into `kda_out`, from a split rank's own half-width
+    /// rows on the large path, `GlmTp::kda_split_layer`). Returns the batch of those rows alone, each its own sequence.
+    fn gather_head_rows(&mut self, b: &RowBatch) -> Result<RowBatch, ModelError> {
+        let core = self.kda_dims.v_dim() * 2;
+        let GlmModel { s, tp, stream: st, .. } = self;
+        let split_big =
+            b.rows > alloc::MAX_ROWS && tp.as_ref().is_some_and(|t| t.split_bits() & tp::SPLIT_KDA != 0);
+        let (xr, pr, cr) = (mhc::ROW * 4, mhc::STREAMS * 4, mhc::STREAMS * mhc::STREAMS * 4);
+        let mut reqs = Vec::with_capacity(b.n_seq());
+        for i in 0..b.n_seq() {
+            let last = b.seq_rows(i).end - 1;
+            if last != i {
+                s.streams.copy_within(i * xr, last * xr, xr, st)?;
+                s.mhc.post.copy_within(i * pr, last * pr, pr, st)?;
+                s.mhc.comb.copy_within(i * cr, last * cr, cr, st)?;
+                if !split_big {
+                    s.kda_out.copy_within(i * core, last * core, core, st)?;
+                }
+            }
+            if split_big {
+                tp.as_ref().expect("a split rank").kda_core_row(&mut s.kda_out, i * core, last * core, core, st)?;
+            }
+            reqs.push(gb_engine::RowRequest {
+                slot: b.seq_slot[i] as usize,
+                tokens: vec![b.ids[last] as u32],
+                first_position: b.positions[last] as u64,
+            });
+        }
+        Ok(RowBatch::from_requests(&reqs))
     }
 
     #[allow(clippy::too_many_lines, unused_assignments)]
@@ -1313,7 +1414,7 @@ impl GlmModel {
         for (i, op) in plan.iter().enumerate() {
             last_ev = i;
             // a gather in flight is joined before any op that does not read only this rank's rows
-            if !matches!(op, Op::Mixer { .. } | Op::MoeShared { .. } | Op::MoeRoute { .. }) {
+            if !matches!(op, Op::Mixer { .. } | Op::MixerCore { .. } | Op::MoeShared { .. } | Op::MoeRoute { .. }) {
                 join_gather!();
             }
             match *op {
@@ -1378,7 +1479,16 @@ impl GlmModel {
                         gather_pending = true;
                     }
                 }
-                Op::Mixer { layer, kind } => {
+                o @ (Op::Mixer { .. } | Op::MixerCore { .. }) => {
+                    // `core`: the last KDA layer of a forward whose tail runs on the head rows alone stops at its core output (no o_proj)
+                    let (layer, kind, core) = match o {
+                        Op::Mixer { layer, kind } => (layer, kind, false),
+                        Op::MixerCore { layer } => (layer, MixerKind::Kda, true),
+                        _ => unreachable!(),
+                    };
+                    if core && p2 {
+                        return Err(ModelError::Config("a P2 prompt forward runs its last layer on every row".into()));
+                    }
                     // a KDA layer on a split rank joins the gather inside itself, after its own rows' qkv
                     let kda_join = std::mem::take(&mut gather_pending);
                     if kda_join && kind != MixerKind::Kda {
@@ -1439,13 +1549,13 @@ impl GlmModel {
                                 }
                                 let segs = kda_segs(b, &kda_descs);
                                 let path = tp::KdaPath::Prefill { segs: &segs, rec: &mut s.kda_prefill_rec };
-                                t.kda_split_layer(ord, &w.o, *kda_dims, &params, &mut pools[ord], io, path, rows, st)?;
+                                t.kda_split_layer(ord, (!core).then_some(&w.o), *kda_dims, &params, &mut pools[ord], io, path, rows, st)?;
                             } else {
                                 t.sp_gather_join(st)?;
                                 let batch = kda::Batch { seq_start: &s.seq_start, slot: &s.seq_slot, n_seq: b.n_seq(), rows };
                                 let rec = if mode == Mode::Window { &mut recs[ord] } else { &mut s.kda_prefill_rec };
                                 let path = tp::KdaPath::Window { batch: &batch, rec, commit: mode == Mode::Prefill };
-                                t.kda_split_layer(ord, &w.o, *kda_dims, &params, &mut pools[ord], io, path, rows, st)?;
+                                t.kda_split_layer(ord, (!core).then_some(&w.o), *kda_dims, &params, &mut pools[ord], io, path, rows, st)?;
                             }
                             mark!("kda: a rank's heads (qkv strips, core, split o_proj)");
                         }
@@ -1599,8 +1709,10 @@ impl GlmModel {
                                 }
                             }
                             mark!("kda: prefill (projections, prep, state, norm, commit)");
-                            layers::lin(&w.o, &s.kda_out, &mut s.mixer_out, rows, Dtype::F16, Dtype::F32, &mut s.ws, st, path)?;
-                            mark!("kda: o_proj");
+                            if !core {
+                                layers::lin(&w.o, &s.kda_out, &mut s.mixer_out, rows, Dtype::F16, Dtype::F32, &mut s.ws, st, path)?;
+                                mark!("kda: o_proj");
+                            }
                         }
                         (MixerDevice::Kda(w), MixerKind::Kda) => {
                             let ord = kda_ord[layer];
@@ -1625,8 +1737,10 @@ impl GlmModel {
                                 true,
                             )?;
                             mark!("kda: window (projections, prep, state, norm)");
-                            layers::lin(&w.o, &s.kda_out, &mut s.mixer_out, rows, Dtype::F16, Dtype::F32, &mut s.ws, st, path)?;
-                            mark!("kda: o_proj");
+                            if !core {
+                                layers::lin(&w.o, &s.kda_out, &mut s.mixer_out, rows, Dtype::F16, Dtype::F32, &mut s.ws, st, path)?;
+                                mark!("kda: o_proj");
+                            }
                             if mode == Mode::Prefill {
                                 // every row of a prompt chunk is accepted: flip the buffer the window wrote and shift the conv history
                                 kda::commit(
@@ -1933,6 +2047,24 @@ impl GlmModel {
                         }
                     }
                 }
+                Op::MixerOut { layer } => {
+                    // the o_proj of the last KDA layer's core output on the head rows (`gather_head_rows` put them first in `kda_out`): a
+                    // split rank's by K-split partials, as a window's
+                    last_sublayer_was_mixer = true;
+                    cur_layer = layer;
+                    let MixerDevice::Kda(w) = &layer_of(layer).mixer else {
+                        return Err(ModelError::Config(format!("layer {layer} has no KDA mixer")));
+                    };
+                    match tp.as_mut().filter(|t| t.split_bits() & tp::SPLIT_KDA != 0) {
+                        Some(t) => {
+                            let x = s.kda_out.subview(0, rows * kda_dims.v_dim() * 2);
+                            t.split_o(&w.o, &x, rows, &mut s.mixer_out, &mut s.ws, st)?;
+                        }
+                        None => layers::lin(&w.o, &s.kda_out, &mut s.mixer_out, rows, Dtype::F16, Dtype::F32, &mut s.ws, st, path)?,
+                    }
+                    mark!("kda: o_proj of the head rows");
+                }
+                Op::HeadRows => return Err(ModelError::Config("the head rows' gather runs between two runs (`run_plan`)".into())),
                 Op::DenseFfn { layer } => {
                     last_sublayer_was_mixer = false;
                     cur_layer = layer;
@@ -2499,7 +2631,8 @@ impl GlmModel {
             for &(name, a, b) in &marks {
                 *p.sub.entry(name).or_insert(0.0) += t.ms(a, b)? as f64;
             }
-            p.forwards += 1;
+            // (the head rows' tail is the rest of the forward its first run counted)
+            p.forwards += usize::from(!matches!(plan.first(), Some(Op::MixerOut { .. })));
         }
         Ok(())
     }
