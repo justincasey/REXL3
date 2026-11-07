@@ -14,6 +14,27 @@ use gb_sched::{KvLayout, MemoryError, MemoryModel, MemoryProfile, StepShape, Vis
 /// at 128 rows) are far under it, so it stays the reserve; the planner takes the larger of the two.
 pub const ACTIVATION_RESERVE: u64 = 5 << 30;
 
+/// The blanket this process plans with: [`ACTIVATION_RESERVE`] unless `REXL3_GLM_ACTIVATION_RESERVE_GIB` names another (fractions
+/// allowed). The planner still takes the larger of it and the modelled buffers, so a smaller blanket never under-prices the scratch;
+/// what it frees is the unmodelled margin, which goes to the KV pool. Memory only: no kernel and no output byte changes. A value that
+/// does not parse, or one under 1 GiB, is refused loudly (a typo must not become "no margin").
+pub fn activation_reserve_bytes() -> u64 {
+    *RESERVE
+}
+
+static RESERVE: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+    let Ok(v) = std::env::var("REXL3_GLM_ACTIVATION_RESERVE_GIB") else {
+        return ACTIVATION_RESERVE;
+    };
+    match v.trim().parse::<f64>() {
+        Ok(g) if g.is_finite() && g >= 1.0 => {
+            eprintln!("rexl3 event=glm_activation_reserve source=REXL3_GLM_ACTIVATION_RESERVE_GIB reserve_gib={g:.2}");
+            (g * (1u64 << 30) as f64) as u64
+        }
+        _ => panic!("REXL3_GLM_ACTIVATION_RESERVE_GIB={v:?}: expected a number of GiB >= 1"),
+    }
+});
+
 /// The memory model of a GLM pack, ready to be evaluated at any serving settings.
 pub struct GlmMemorySource(pub GlmConfig);
 
@@ -85,7 +106,7 @@ impl MemoryModel for GlmMemory<'_> {
             .map_or(0, |v| v.iter().map(|i| i.bytes).sum())
     }
     fn activation_reserve(&self) -> u64 {
-        ACTIVATION_RESERVE
+        activation_reserve_bytes()
     }
     /// The NextN head's per-slot state when it drafts: its DSA raw-row ring (the 12th layer's, 128 KiB) and the store of pending tapped hidden
     /// rows (`alloc::MTP_TAP_CAP` fp16 rows of 4,096). Its latent cache and pooled keys are per token and charged through the KV layout
