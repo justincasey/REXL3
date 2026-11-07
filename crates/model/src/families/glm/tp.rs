@@ -63,6 +63,13 @@ pub enum GlmCall {
     MtpDraft { asks: Vec<tp_mtp::AskWire>, keyed: Vec<Option<gb_sampling::Sampling>> },
     /// `GlmModel::mtp_disable_slot(slot)`.
     MtpDisable { slot: u32 },
+    /// `GlmModel::dflash_run(reqs)`: a round of the DFlash2 drafter split over the group (`dflash::share_of`), with rank 0's requests
+    /// (`GlmModel::dflash_reqs`: each sequence's anchor, position, drafts wanted, restricted-head coverage and sampler). Both ranks meet in
+    /// the round's swaps. Acked with `tp_mtp::picks_digest` of the picks, which both ranks hold alike.
+    DflashDraft { reqs: Vec<super::model::DflashReq> },
+    /// `GlmModel::dflash_prompt_end(slot, end, cut)` on a split drafter's follower (rank 0's word, so both halves absorb the same rows and
+    /// keep the same snapshot windows).
+    DflashPromptEnd { slot: u32, end: Option<u32>, cut: Option<u32> },
     /// A prefill chunk with the f32 feature rows of the images inside it (rank 0's tower made them; every rank splices these bytes, and
     /// the NextN drafter's prefill of the chunk reads the same rows: `docs/GLM_TP.md` 11).
     PrefillImage(PrefillImage),
@@ -161,6 +168,10 @@ pub struct GlmFacts {
     /// follower's rows to rank 0 (`model::dflash::TapRelay`), so the ranks must agree on them. Flagged by bit 6 of the first byte and
     /// appended last only when set (a Hello of a group without a drafter keeps its bytes).
     pub taps: String,
+    /// The DFlash2 drafter split over the group (`dflash::split_fact`: `off`, or `on:` and a digest of the draft pack's config): both ranks
+    /// load a half and run every round together, so both must split, and split the same pack. Flagged by bit 7 of the first byte and
+    /// appended last only when on (a Hello without the split keeps its bytes).
+    pub draft_split: String,
 }
 
 impl GlmFacts {
@@ -188,6 +199,7 @@ impl GlmFacts {
             cache_pages: 0,
             kv: gb_cuda::mla::configured_kv().unwrap_or_default().name().into(),
             taps: "none".into(),
+            draft_split: "off".into(),
         }
     }
 
@@ -264,6 +276,12 @@ impl GlmFacts {
         };
         self
     }
+
+    /// These facts with the DFlash2 drafter's split (`dflash::split_fact`).
+    pub fn with_draft_split(mut self, fact: String) -> GlmFacts {
+        self.draft_split = fact;
+        self
+    }
 }
 
 /// FNV-1a 64 of the expert width split of `experts` experts over `ranks` ranks (every rank every expert, at its share of the width):
@@ -315,6 +333,8 @@ impl FamilyCall for GlmCall {
         match self {
             GlmCall::MtpDraft { .. } => tp_mtp::K_MTP_DRAFT,
             GlmCall::MtpDisable { .. } => tp_mtp::K_MTP_DISABLE,
+            GlmCall::DflashDraft { .. } => tp_mtp::K_DFLASH_DRAFT,
+            GlmCall::DflashPromptEnd { .. } => tp_mtp::K_DFLASH_PROMPT_END,
             GlmCall::PrefillImage(_) => K_PREFILL_IMAGE,
             GlmCall::PrefillPart(_) => K_PREFILL_PART,
             GlmCall::EnableSnapshots { .. } => K_ENABLE_SNAPSHOTS,
@@ -327,6 +347,8 @@ impl FamilyCall for GlmCall {
         match self {
             GlmCall::MtpDraft { .. } => "mtp_draft",
             GlmCall::MtpDisable { .. } => "mtp_disable_slot",
+            GlmCall::DflashDraft { .. } => "dflash_draft",
+            GlmCall::DflashPromptEnd { .. } => "dflash_prompt_end",
             GlmCall::PrefillImage(_) => "prefill_image",
             GlmCall::PrefillPart(_) => "prefill_part",
             GlmCall::EnableSnapshots { .. } => "enable_snapshots",
@@ -339,6 +361,12 @@ impl FamilyCall for GlmCall {
         match self {
             GlmCall::MtpDraft { asks, keyed } => tp_mtp::encode_draft(e, asks, keyed),
             GlmCall::MtpDisable { slot } => e.u32(*slot),
+            GlmCall::DflashDraft { reqs } => tp_mtp::encode_dflash(e, reqs),
+            GlmCall::DflashPromptEnd { slot, end, cut } => {
+                e.u32(*slot);
+                e.opt_u32(*end);
+                e.opt_u32(*cut);
+            }
             GlmCall::PrefillImage(p) => p.encode(e),
             GlmCall::PrefillPart(p) => p.encode(e),
             GlmCall::EnableSnapshots { slots } => e.u32(*slots),
@@ -358,6 +386,12 @@ impl FamilyCall for GlmCall {
         Ok(match kind {
             tp_mtp::K_MTP_DRAFT => Some(tp_mtp::decode_draft(d)?),
             tp_mtp::K_MTP_DISABLE => Some(GlmCall::MtpDisable { slot: d.u32("glm disable slot")? }),
+            tp_mtp::K_DFLASH_DRAFT => Some(tp_mtp::decode_dflash(d)?),
+            tp_mtp::K_DFLASH_PROMPT_END => Some(GlmCall::DflashPromptEnd {
+                slot: d.u32("glm dflash prompt slot")?,
+                end: d.opt_u32("glm dflash prompt end")?,
+                cut: d.opt_u32("glm dflash prompt cut")?,
+            }),
             K_PREFILL_IMAGE => Some(GlmCall::PrefillImage(PrefillImage::decode(d)?)),
             K_PREFILL_PART => Some(GlmCall::PrefillPart(PrefillPart::decode(d)?)),
             K_ENABLE_SNAPSHOTS => Some(GlmCall::EnableSnapshots { slots: d.u32("glm snapshot slots")? }),
@@ -378,14 +412,15 @@ impl FamilyCall for GlmCall {
     fn encode_facts(f: &GlmFacts, e: &mut Enc) {
         // the first byte (MAIN's layout): bit 0 graphs (the byte the earlier builds wrote as a boolean), bit 1 the adaptive slice (lane E),
         // bit 2 the NextN draft calls' graphs (lane T), only with graphs on, bit 3 a head split (lane E), bit 4 the prefix cache's arena,
-        // bit 5 a latent cache that is not fp16, bit 6 the DFlash2 drafter's taps
+        // bit 5 a latent cache that is not fp16, bit 6 the DFlash2 drafter's taps, bit 7 the drafter's split
         e.u8(u8::from(f.graphs)
             | (u8::from(f.prefill_small != 0) << 1)
             | (u8::from(f.graphs && f.draft_graphs) << 2)
             | (u8::from(f.split != 0) << 3)
             | (u8::from(f.cache_on_wire()) << 4)
             | (u8::from(f.kv != "fp16") << 5)
-            | (u8::from(f.taps != "none") << 6));
+            | (u8::from(f.taps != "none") << 6)
+            | (u8::from(f.draft_split != "off") << 7));
         e.bool(f.mtp);
         if f.mtp {
             e.u32(f.mtp_depth);
@@ -423,14 +458,18 @@ impl FamilyCall for GlmCall {
         if f.taps != "none" {
             e.str(&f.taps);
         }
+        // the drafter's split last, only with bit 7
+        if f.draft_split != "off" {
+            e.str(&f.draft_split);
+        }
     }
 
     fn decode_facts(d: &mut Dec<'_>) -> Result<GlmFacts, WireError> {
         let flags = d.u8("glm graphs and adaptive slice")?;
-        if flags > 127 || (flags & 4 != 0 && flags & 1 == 0) {
+        if flags & 4 != 0 && flags & 1 == 0 {
             return Err(WireError::Invalid(format!(
-                "glm graphs, adaptive slice, draft graphs, head split, prefix cache, latent cache format and drafter taps: flags \
-                 {flags:#04x} (bits 0 to 6 only, bit 2 only with bit 0)"
+                "glm graphs, adaptive slice, draft graphs, head split, prefix cache, latent cache format, drafter taps and drafter split: \
+                 flags {flags:#04x} (bit 2 only with bit 0)"
             )));
         }
         let (graphs, adaptive, draft_graphs, split) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0, flags & 8 != 0);
@@ -457,6 +496,7 @@ impl FamilyCall for GlmCall {
             cache_pages: 0,
             kv: "fp16".into(),
             taps: "none".into(),
+            draft_split: "off".into(),
         };
         if graphs {
             f.overlap = d.u8("glm graph branches")?;
@@ -480,6 +520,9 @@ impl FamilyCall for GlmCall {
         }
         if flags & 64 != 0 {
             f.taps = d.str("glm drafter taps")?;
+        }
+        if flags & 128 != 0 {
+            f.draft_split = d.str("glm drafter split")?;
         }
         Ok(f)
     }
@@ -528,6 +571,12 @@ impl FamilyCall for GlmCall {
             fact_differs("the prefill contract (REXL3_GLM_PREFILL_CONTRACT)", &a.prefill, &b.prefill, who),
             fact_differs("the latent cache format (--kv-dtype / REXL3_GLM_KV; pass the same to every rank)", &a.kv, &b.kv, who),
             fact_differs("the DFlash2 drafter's taps (--draft; pass the same to every rank)", &a.taps, &b.taps, who),
+            fact_differs(
+                "the DFlash2 drafter's split (REXL3_GLM_DRAFT_SPLIT and --draft; pass the same to every rank)",
+                &a.draft_split,
+                &b.draft_split,
+                who,
+            ),
             // the prefix cache's arena (Nemotron's protocol 4): rank 0 forwards `EnableSnapshots` of its slots and every follower builds
             // exactly that pool, so the request and a slot's bytes must be equal and a follower's plan must hold at least rank 0's slots
             // and pages (each named, never the generic "KV pages" refusal the cache's pages would otherwise show up as)
@@ -902,6 +951,21 @@ impl GlmMtpRuntime for GlmRank {
             return Err(ModelError::Request(format!("a draft ask for slot {} of a model of {} slots", a.slot, self.m.slots)));
         }
         self.m.dflash_draft(asks)
+    }
+    fn dflash_split(&self) -> bool {
+        self.m.dflash_split()
+    }
+    fn dflash_reqs(&self, asks: &[super::model::DflashAsk<'_>]) -> Result<Vec<super::model::DflashReq>, ModelError> {
+        self.m.dflash_reqs(asks)
+    }
+    fn dflash_run(&mut self, reqs: &[super::model::DflashReq]) -> Result<Vec<crate::draft::Picked>, ModelError> {
+        if let Some(r) = reqs.iter().find(|r| r.slot >= self.m.slots) {
+            return Err(ModelError::Request(format!("a draft request for slot {} of a model of {} slots", r.slot, self.m.slots)));
+        }
+        let t = self.m.slices.enter(Kind::Draft, reqs.len(), None);
+        let r = self.m.dflash_run(reqs);
+        self.m.slices.leave(t, r.is_ok());
+        r
     }
     fn dflash_prompt_end(&mut self, slot: usize, end: Option<usize>, cut: Option<usize>) {
         if slot < self.m.slots {

@@ -374,6 +374,18 @@ impl GlmTp {
         let t = self.comm.topology();
         (t.rank, t.ranks)
     }
+
+    /// Whether this rank's collectives may be captured into a CUDA graph (`TpComm::capturable`): a split drafter's rounds hold them.
+    pub(super) fn capturable(&self) -> bool {
+        self.comm.capturable()
+    }
+}
+
+/// The split DFlash2 drafter's exchange (`draft::DraftPeer`): the group's byte swap, counted with the rank's other exchanges.
+impl crate::draft::DraftPeer for GlmTp {
+    fn swap(&mut self, send: &DevBuf, send_off: usize, recv: &mut DevBuf, recv_off: usize, bytes: usize, st: &Stream) -> Result<(), ModelError> {
+        GlmTp::swap(self, send, send_off, recv, recv_off, bytes, st)
+    }
 }
 
 /// How a bank holds the routed experts, for a refusal.

@@ -354,8 +354,9 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> GlmTpBackend
     }
 
     /// Before a slice of `slot`'s prompt of `n` tokens from `done` with `cuts` still to take: a prompt's first slice begins the slot on every
-    /// rank (and its drafting state and digests here); rank 0's drafter absorbs only the rows that reach its ring after the prompt, and the
-    /// window before the next cut (its snapshot keeps the drafter's context: `GlmModel::dflash_prompt_end`).
+    /// rank (and its drafting state and digests here); the drafter (rank 0's, or both halves of a split one: `tp_mtp::dflash_prompt_end`)
+    /// absorbs only the rows that reach its ring after the prompt, and the window before the next cut (its snapshot keeps the drafter's
+    /// context: `GlmModel::dflash_prompt_end`).
     fn open_slice(&mut self, slot: usize, done: usize, n: usize, cuts: &[usize]) -> Result<(), ModelError> {
         if done == 0 {
             self.leader.begin_slot(slot)?;
@@ -365,7 +366,7 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> GlmTpBackend
             self.digests.begin(slot);
         }
         let cut = cuts.iter().copied().find(|&c| c > done);
-        self.leader.inner_mut().dflash_prompt_end(slot, Some(n), cut);
+        super::tp_mtp::dflash_prompt_end(&mut self.leader, slot, Some(n), cut);
         Ok(())
     }
 
@@ -904,7 +905,7 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> Backend for 
                 }
                 self.digests.begin(slot);
             }
-            self.leader.inner_mut().dflash_prompt_end(slot, Some(total.max(start as usize + tokens.len())), None);
+            super::tp_mtp::dflash_prompt_end(&mut self.leader, slot, Some(total.max(start as usize + tokens.len())), None);
             let (mut pos, n) = (start as usize, tokens.len());
             let mut at = 0;
             let mut last = None;
@@ -2998,6 +2999,7 @@ pub(crate) mod tests {
             cache_pages: 0,
             kv: "fp16".into(),
             taps: "none".into(),
+            draft_split: "off".into(),
         };
         let g0 = gate("aaaa".into(), &mo, 512, facts.clone()).at(0, 2);
         assert!(BootGate::check(&g0, &gate("aaaa".into(), &mo, 512, facts.clone()).at(1, 2)).is_ok());
@@ -3100,6 +3102,7 @@ pub(crate) mod tests {
             cache_pages: 0,
             kv: "fp16".into(),
             taps: "none".into(),
+            draft_split: "off".into(),
         };
         let mut g = gate("p".into(), &mo, 512, facts).at(1, 2);
         // the build and the NCCL fingerprint depend on the box: pin them for the golden
@@ -3144,6 +3147,7 @@ pub(crate) mod tests {
             cache_pages: 0,
             kv: "fp16".into(),
             taps: "none".into(),
+            draft_split: "off".into(),
         };
         let enc = |f: GlmFacts| {
             let mut g = gate("p".into(), &mo, 512, f).at(1, 2);
@@ -3227,6 +3231,7 @@ pub(crate) mod tests {
             cache_pages: 0,
             kv: "fp16".into(),
             taps: "none".into(),
+            draft_split: "off".into(),
         };
         let enc = |f: GlmFacts| {
             let mut g = gate("p".into(), &mo, 512, f).at(1, 2);
@@ -3258,9 +3263,9 @@ pub(crate) mod tests {
         assert_eq!((d[1].1, d[1].2), ("10", "00"), "bit 4: {d:?}");
         let mut e = Enc::new();
         GlmCall::encode_facts(&facts, &mut e);
-        e.0[0] = 0x80;
+        e.0[0] = 0x04;
         let err = GlmCall::decode_facts(&mut Dec::new(&e.0)).unwrap_err().to_string();
-        assert!(err.contains("flags 0x80") && err.contains("bits 0 to 6 only"), "{err}");
+        assert!(err.contains("flags 0x04") && err.contains("bit 2 only with bit 0"), "{err}");
         // an fp8 latent cache (`--kv-dtype fp8`): bit 5 and the format's name after every other fact (`fp8` as a u64 length and 3 bytes:
         // 11 bytes more), nothing else moves, the Hello round-trips, and a group whose ranks disagree is refused by name
         let fp8 = GlmFacts { kv: "fp8".into(), ..facts.clone() };
@@ -3289,7 +3294,26 @@ pub(crate) mod tests {
         let lt = gate("p".into(), &mo, 512, taps.clone()).at(0, 2);
         let e = BootGate::check(&lt, &gate("p".into(), &mo, 512, facts.clone()).at(1, 2)).unwrap_err();
         assert!(e.contains("the DFlash2 drafter's taps (--draft; pass the same to every rank)") && e.contains("5,14"), "{e}");
-        assert!(BootGate::check(&lt, &gate("p".into(), &mo, 512, taps).at(1, 2)).is_ok(), "two ranks on the same taps agree");
+        assert!(BootGate::check(&lt, &gate("p".into(), &mo, 512, taps.clone()).at(1, 2)).is_ok(), "two ranks on the same taps agree");
+        // a split drafter (`REXL3_GLM_DRAFT_SPLIT`, on by default): bit 7 and the split's fact after the taps (`on:ab` as a u64 length and
+        // 5 bytes: 13 bytes more), nothing else moves, and a rank that does not split (or splits another pack) is refused by name
+        let split = taps.clone().with_draft_split("on:ab".into());
+        let ons = enc(split.clone());
+        assert_eq!(&ons[..2], format!("{:02x}", glen + 12 + 13), "25 bytes longer");
+        assert_eq!(&ons[at..at + 24 + 26], format!("{}{}{}{}", le(4), "352c3134", le(5), "6f6e3a6162"), "{ons}");
+        assert_eq!(&ons[at + 50..], &GOLDEN_HELLO[at..]);
+        let d: Vec<(usize, &str, &str)> = (0..at / 2)
+            .filter(|&i| ons[2 * i..2 * i + 2] != GOLDEN_HELLO[2 * i..2 * i + 2])
+            .map(|i| (i, &ons[2 * i..2 * i + 2], &GOLDEN_HELLO[2 * i..2 * i + 2]))
+            .collect();
+        assert_eq!(d.len(), 2, "the length and the first fact byte: {d:?}");
+        assert_eq!((d[1].1, d[1].2), ("c0", "00"), "bits 6 and 7: {d:?}");
+        let ls = gate("p".into(), &mo, 512, split.clone()).at(0, 2);
+        for other in [taps.clone(), taps.clone().with_draft_split("on:cd".into())] {
+            let e = BootGate::check(&ls, &gate("p".into(), &mo, 512, other).at(1, 2)).unwrap_err();
+            assert!(e.contains("the DFlash2 drafter's split (REXL3_GLM_DRAFT_SPLIT and --draft; pass the same to every rank)"), "{e}");
+        }
+        assert!(BootGate::check(&ls, &gate("p".into(), &mo, 512, split).at(1, 2)).is_ok(), "two ranks on the same split agree");
     }
 
     /// Captured 2026-10-14 (lane L2b): length 0x73, protocol 4, kind 1 (Hello), seq 0, `RXTP`, pack `p`, layers 45, slots 2, KV pages 16,

@@ -2138,7 +2138,7 @@ impl Model {
                     DraftReq { anchor: tokens[tokens.len() - 1], slot, p: tokens.len() - 1, sampling, want, coverage }
                 })
                 .collect();
-            let t = d.propose_batch_scored(&w.embed, &w.lm_head, cfg.vocab, &dr, stream)?;
+            let t = d.propose_batch_scored(&w.embed, &w.lm_head, cfg.vocab, &dr, None, stream)?;
             for (&i, picked) in group.iter().zip(t) {
                 out[i] = Some(picked);
             }
