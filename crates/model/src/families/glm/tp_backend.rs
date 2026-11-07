@@ -2061,6 +2061,7 @@ pub(crate) mod tests {
             cache_slots: 0,
             cache_slot_bytes: 0,
             cache_pages: 0,
+            kv: "fp16".into(),
         };
         let g0 = gate("aaaa".into(), &mo, 512, facts.clone()).at(0, 2);
         assert!(BootGate::check(&g0, &gate("aaaa".into(), &mo, 512, facts.clone()).at(1, 2)).is_ok());
@@ -2161,6 +2162,7 @@ pub(crate) mod tests {
             cache_slots: 0,
             cache_slot_bytes: 0,
             cache_pages: 0,
+            kv: "fp16".into(),
         };
         let mut g = gate("p".into(), &mo, 512, facts).at(1, 2);
         // the build and the NCCL fingerprint depend on the box: pin them for the golden
@@ -2203,6 +2205,7 @@ pub(crate) mod tests {
             cache_slots: 0,
             cache_slot_bytes: 0,
             cache_pages: 0,
+            kv: "fp16".into(),
         };
         let enc = |f: GlmFacts| {
             let mut g = gate("p".into(), &mo, 512, f).at(1, 2);
@@ -2284,6 +2287,7 @@ pub(crate) mod tests {
             cache_slots: 0,
             cache_slot_bytes: 0,
             cache_pages: 0,
+            kv: "fp16".into(),
         };
         let enc = |f: GlmFacts| {
             let mut g = gate("p".into(), &mo, 512, f).at(1, 2);
@@ -2315,9 +2319,27 @@ pub(crate) mod tests {
         assert_eq!((d[1].1, d[1].2), ("10", "00"), "bit 4: {d:?}");
         let mut e = Enc::new();
         GlmCall::encode_facts(&facts, &mut e);
-        e.0[0] = 0x20;
+        e.0[0] = 0x40;
         let err = GlmCall::decode_facts(&mut Dec::new(&e.0)).unwrap_err().to_string();
-        assert!(err.contains("flags 0x20") && err.contains("bits 0 to 4 only"), "{err}");
+        assert!(err.contains("flags 0x40") && err.contains("bits 0 to 5 only"), "{err}");
+        // an fp8 latent cache (`--kv-dtype fp8`): bit 5 and the format's name after every other fact (`fp8` as a u64 length and 3 bytes:
+        // 11 bytes more), nothing else moves, the Hello round-trips, and a group whose ranks disagree is refused by name
+        let fp8 = GlmFacts { kv: "fp8".into(), ..facts.clone() };
+        let on8 = enc(fp8.clone());
+        assert_eq!(&on8[..2], format!("{:02x}", glen + 11), "11 bytes longer");
+        assert_eq!(&on8[at..at + 22], format!("{}{}", le(3), "667038"), "{on8}");
+        assert_eq!(&on8[at + 22..], &GOLDEN_HELLO[at..]);
+        let d: Vec<(usize, &str, &str)> = (0..at / 2)
+            .filter(|&i| on8[2 * i..2 * i + 2] != GOLDEN_HELLO[2 * i..2 * i + 2])
+            .map(|i| (i, &on8[2 * i..2 * i + 2], &GOLDEN_HELLO[2 * i..2 * i + 2]))
+            .collect();
+        assert_eq!(d.len(), 2, "the length and the first fact byte: {d:?}");
+        assert_eq!((d[1].1, d[1].2), ("20", "00"), "bit 5: {d:?}");
+        let leader8 = gate("p".into(), &mo, 512, fp8.clone()).at(0, 2);
+        let e = BootGate::check(&leader8, &gate("p".into(), &mo, 512, facts.clone()).at(1, 2)).unwrap_err();
+        assert!(e.contains("the latent cache format (--kv-dtype / REXL3_GLM_KV; pass the same to every rank)"), "{e}");
+        assert!(e.contains("rank 0 has fp8, rank 1 has fp16"), "{e}");
+        assert!(BootGate::check(&leader8, &gate("p".into(), &mo, 512, fp8).at(1, 2)).is_ok(), "two fp8 ranks agree");
     }
 
     /// Captured 2026-10-14 (lane L2b): length 0x73, protocol 4, kind 1 (Hello), seq 0, `RXTP`, pack `p`, layers 45, slots 2, KV pages 16,

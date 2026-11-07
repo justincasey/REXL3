@@ -178,15 +178,25 @@ pub fn snapshot_bytes(cfg: &GlmConfig, mtp: bool) -> Result<u64, String> {
 /// shape of state is another namespace, so entries are never shared across them (the index is empty at every boot anyway). The NextN layer is in
 /// it: a snapshot with the drafter's state is not one without it. The prefill chunk is NOT: rows are chunk-grid invariant (under either contract).
 /// The prefill contract IS (`contract::PrefillContract::arith_tag`): P1 adds nothing (its text is the one it always was: one arithmetic for
-/// prompt and decoded rows), P2 is another arithmetic for prompt rows and so another namespace.
+/// prompt and decoded rows), P2 is another arithmetic for prompt rows and so another namespace. The latent cache's format IS (`--kv-dtype`):
+/// fp16 keeps the text it always had (`kv=f16`), fp8 pages are another namespace.
 pub fn namespace_of(target_fingerprint: &str, mtp: bool) -> u64 {
-    namespace_with(target_fingerprint, mtp, super::contract::current())
+    namespace_with(target_fingerprint, mtp, super::contract::current(), gb_cuda::mla::configured_kv().unwrap_or_default())
 }
 
-/// [`namespace_of`] under a given prefill contract (pure, for the tests).
-pub fn namespace_with(target_fingerprint: &str, mtp: bool, contract: super::contract::PrefillContract) -> u64 {
+/// [`namespace_of`] under a given prefill contract and latent cache format (pure, for the tests).
+pub fn namespace_with(
+    target_fingerprint: &str,
+    mtp: bool,
+    contract: super::contract::PrefillContract,
+    kv: gb_cuda::mla::LatentKv,
+) -> u64 {
+    let kv = match kv {
+        gb_cuda::mla::LatentKv::Plain => "f16",
+        gb_cuda::mla::LatentKv::Fp8 => "fp8-e4m3-token-f32(v1)+f16",
+    };
     let text = format!(
-        "rexl3-glm-prefix-cache-v1|{target_fingerprint}|mtp={}|page={}|ring={RING_LEN}|tail={MAX_TAIL_ROWS}|kv=f16|state=f32+bf16|arith=one{}",
+        "rexl3-glm-prefix-cache-v1|{target_fingerprint}|mtp={}|page={}|ring={RING_LEN}|tail={MAX_TAIL_ROWS}|kv={kv}|state=f32+bf16|arith=one{}",
         if mtp { "nextn" } else { "none" },
         alloc::PAGE_TOKENS,
         contract.arith_tag(),
@@ -324,6 +334,13 @@ mod tests {
         assert_eq!(a, namespace_of("pack-a", true), "a function of its inputs");
         assert_ne!(a, namespace_of("pack-b", true), "another pack");
         assert_ne!(a, namespace_of("pack-a", false), "a snapshot with the drafter's state is not one without it");
+        use crate::families::glm::contract::PrefillContract;
+        use gb_cuda::mla::LatentKv;
+        assert_ne!(
+            namespace_with("pack-a", true, PrefillContract::P2, LatentKv::Plain),
+            namespace_with("pack-a", true, PrefillContract::P2, LatentKv::Fp8),
+            "fp8 latent pages are not fp16 pages"
+        );
     }
 
     #[test]
@@ -338,14 +355,16 @@ mod tests {
             );
             text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))
         };
+        use gb_cuda::mla::LatentKv::Plain;
         for (fp, mtp) in [("pack-a", true), ("pack-a", false), ("glm-prefix-engine-test", true)] {
-            assert_eq!(namespace_with(fp, mtp, PrefillContract::P1), before(fp, mtp), "P1's namespace moved: {fp} {mtp}");
-            assert_ne!(namespace_with(fp, mtp, PrefillContract::P2), before(fp, mtp), "P2 shares P1's namespace: {fp} {mtp}");
+            assert_eq!(namespace_with(fp, mtp, PrefillContract::P1, Plain), before(fp, mtp), "P1's namespace moved: {fp} {mtp}");
+            assert_ne!(namespace_with(fp, mtp, PrefillContract::P2, Plain), before(fp, mtp), "P2 shares P1's namespace: {fp} {mtp}");
         }
         // a process's namespace is its contract's: the default (P2 since the owner's decision of 2026-10-19) is another namespace than the one
         // before the contract existed, and `REXL3_GLM_PREFILL_CONTRACT=p1` is exactly that one
         let cur = crate::families::glm::contract::current();
-        assert_eq!(namespace_of("pack-a", true), namespace_with("pack-a", true, cur), "a process is on its contract's namespace");
+        let kv = gb_cuda::mla::configured_kv().unwrap_or_default();
+        assert_eq!(namespace_of("pack-a", true), namespace_with("pack-a", true, cur, kv), "a process is on its contract's namespace");
         if cur == PrefillContract::P1 {
             assert_eq!(namespace_of("pack-a", true), before("pack-a", true), "a P1 process is on the namespace it always had");
         } else {

@@ -34,6 +34,9 @@ impl BuildInfo {
     /// `_glmpfp1` last (`families::glm::contract::fingerprint_suffix`); a default P2 process has
     /// no such field.
     ///
+    /// A process whose GLM latent cache is fp8 (`--kv-dtype fp8`, `REXL3_GLM_KV`, which changes output bits) carries `_glmkv8` after
+    /// that; an fp16 GLM process has no such field.
+    ///
     /// A process serving DeepSeek-V4.1 whose cache is the q4 plane (`--kv-dtype q4`, `REXL3_DSV41_KV`)
     /// carries `kvq4` (fused with the Nemotron KV suffix when both apply); an f16 DSV4.1 process has
     /// no such field.
@@ -56,6 +59,9 @@ impl BuildInfo {
         if let Some(g) = gb_model::families::glm::contract::fingerprint_suffix() {
             s.push('_');
             s.push_str(&g);
+        }
+        if gb_cuda::mla::configured_kv() == Ok(gb_cuda::mla::LatentKv::Fp8) {
+            s.push_str("_glmkv8");
         }
         s
     }

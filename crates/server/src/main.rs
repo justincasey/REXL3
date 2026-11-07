@@ -278,23 +278,28 @@ fn parse_from(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--reasoning-unverified" => a.reasoning_unverified = true,
             "--no-vision" => a.vision = false,
             // the KV cache's element type (Nemotron): fp16 (default) or int8 (a power-of-two scale per token and kv head, opt-in for
-            // long-context decode, docs/NEMOTRON_KV_INT8.md). fp8 was evaluated and rejected: a named error. Carried to the model as
-            // REXL3_KV_DTYPE, set here before anything is built; every TP rank must pass the same value (compared at the rendezvous)
-            // Two families take this flag and each parses only its own spellings, so the value picks the family:
-            // `q4` is DeepSeek-V4.1's cache (`REXL3_DSV41_KV`), `int8` is Nemotron's (`REXL3_KV_DTYPE`), and `fp16`
-            // is both. An unknown value, and `fp8`, are still errors.
+            // long-context decode, docs/NEMOTRON_KV_INT8.md). Carried to the model as REXL3_KV_DTYPE, set here before anything is built;
+            // every TP rank must pass the same value (compared at the rendezvous).
+            // Three families take this flag and each parses only its own spellings, so the value picks the family:
+            // `q4` is DeepSeek-V4.1's cache (`REXL3_DSV41_KV`), `int8` is Nemotron's (`REXL3_KV_DTYPE`), `fp8` is GLM's latent
+            // cache (`REXL3_GLM_KV`, E4M3 with an fp32 scale per token, gb_cuda::mla::kv8), and `fp16` is all three. An unknown
+            // value is an error.
             "--kv-dtype" => {
                 let v = val("--kv-dtype")?;
                 let dsv41 = gb_cuda::dsv4_kvq4::KvFmt::parse(&v).ok();
                 let nemotron = gb_cuda::nemotron_attn::KvDtype::parse(&v);
-                match (dsv41, nemotron) {
-                    (None, Err(e)) => return Err(format!("--kv-dtype: {e}")),
-                    (dsv41, nemotron) => {
+                let glm = gb_cuda::mla::LatentKv::parse(&v).ok();
+                match (dsv41, nemotron, glm) {
+                    (None, Err(e), None) => return Err(format!("--kv-dtype: {e} (GLM: fp16 or fp8)")),
+                    (dsv41, nemotron, glm) => {
                         if let Some(f) = dsv41 {
                             std::env::set_var(gb_cuda::dsv4_kvq4::KV_FMT_ENV, f.name());
                         }
                         if let Ok(d) = nemotron {
                             std::env::set_var(gb_cuda::nemotron_attn::KV_DTYPE_ENV, d.name());
+                        }
+                        if let Some(g) = glm {
+                            std::env::set_var(gb_cuda::mla::KV_ENV, g.name());
                         }
                     }
                 }
@@ -813,7 +818,7 @@ async fn serve_main() {
             if !e.is_empty() {
                 eprintln!("error: {e}");
             }
-            eprintln!("usage: rexl3-serve --model DIR [--draft DIR] [--port 8889] [--host 127.0.0.1] [--max-model-len N] [--served-model-name NAME] [--backend mock|cuda] [--slots N (default 8; fewer when the box holds fewer, unless the flag is given)] [--spec auto|mtp|copy|none] [--no-drafts] [--default-max-tokens N (0 = whole window)] [--default-thinking off|template (default off: a request that names neither enable_thinking nor reasoning_effort does not think; template: the chat template's own default)] [--default-reasoning-effort LEVEL (a request that names no effort and does not turn thinking off gets this level; a request that names an effort or sets enable_thinking false keeps its own)] [--reasoning-unverified (offer declared reasoning controls the template check refuses)] [--kv-tokens N] [--kv-headroom-tokens N (0)] [--prefill-chunk N] [--window-rows N (up to 128)] [--no-vision] [--kv-dtype fp16|int8|q4 (Nemotron: fp16, the default and the qualified one, or int8; DeepSeek-V4.1: fp16 or q4, a 4-bit compressed plane and indexer keys, see crates/cuda/src/dsv4_kvq4.rs; int8 experimental: not qualified for v0.1.0 (the 1M NIAH, task-level recall and two-node exactness-at-depth checks are pending))] [--max-image-tokens N] [--no-video] [--max-video-frames N (32)] [--max-video-tokens N (4096)] [--video-pruning-rate Q (0 = off)] [--video-evs-strict] [--chat-format ID] [--allow-unvalidated-pack] [--intervention DIR] [--verify-pack] [--no-spec-tree] [--prefix-cache on|off] [--prefix-cache-mib N] [--tp-ranks N (2 or more) --tp-rank 0..N-1 --tp-peer HOST:PORT (rank 0's rendezvous address, the same on every rank; REXL3_TP_RANKS, REXL3_TP_RANK, REXL3_TP_PEER) [--tp-connect-timeout SECS (default 900)] [--tp-ready-timeout SECS (default 1800)] [--tp-peer-timeout SECS (default 15)]] [--queue-depth N] [--queue-timeout SECS] [--request-timeout SECS (default 1800)] [--write-stall SECS (default 30)] [--heartbeat-stale-secs SECS (default 60)] [--loading-budget SECS (default 1800)] [--prefill-budget SECS (default 1800)] [--header-read-timeout SECS (default 30)] [--shutdown-grace SECS] [--unready-after N] [--exit-after N] [--mock SPEC (test only)]");
+            eprintln!("usage: rexl3-serve --model DIR [--draft DIR] [--port 8889] [--host 127.0.0.1] [--max-model-len N] [--served-model-name NAME] [--backend mock|cuda] [--slots N (default 8; fewer when the box holds fewer, unless the flag is given)] [--spec auto|mtp|copy|none] [--no-drafts] [--default-max-tokens N (0 = whole window)] [--default-thinking off|template (default off: a request that names neither enable_thinking nor reasoning_effort does not think; template: the chat template's own default)] [--default-reasoning-effort LEVEL (a request that names no effort and does not turn thinking off gets this level; a request that names an effort or sets enable_thinking false keeps its own)] [--reasoning-unverified (offer declared reasoning controls the template check refuses)] [--kv-tokens N] [--kv-headroom-tokens N (0)] [--prefill-chunk N] [--window-rows N (up to 128)] [--no-vision] [--kv-dtype fp16|int8|q4|fp8 (Nemotron: fp16, the default and the qualified one, or int8; DeepSeek-V4.1: fp16 or q4, a 4-bit compressed plane and indexer keys, see crates/cuda/src/dsv4_kvq4.rs; GLM: fp16 or fp8, an E4M3 latent with an fp32 scale per token, see crates/cuda/csrc/mla_kv8.cuh; int8 experimental: not qualified for v0.1.0 (the 1M NIAH, task-level recall and two-node exactness-at-depth checks are pending))] [--max-image-tokens N] [--no-video] [--max-video-frames N (32)] [--max-video-tokens N (4096)] [--video-pruning-rate Q (0 = off)] [--video-evs-strict] [--chat-format ID] [--allow-unvalidated-pack] [--intervention DIR] [--verify-pack] [--no-spec-tree] [--prefix-cache on|off] [--prefix-cache-mib N] [--tp-ranks N (2 or more) --tp-rank 0..N-1 --tp-peer HOST:PORT (rank 0's rendezvous address, the same on every rank; REXL3_TP_RANKS, REXL3_TP_RANK, REXL3_TP_PEER) [--tp-connect-timeout SECS (default 900)] [--tp-ready-timeout SECS (default 1800)] [--tp-peer-timeout SECS (default 15)]] [--queue-depth N] [--queue-timeout SECS] [--request-timeout SECS (default 1800)] [--write-stall SECS (default 30)] [--heartbeat-stale-secs SECS (default 60)] [--loading-budget SECS (default 1800)] [--prefill-budget SECS (default 1800)] [--header-read-timeout SECS (default 30)] [--shutdown-grace SECS] [--unready-after N] [--exit-after N] [--mock SPEC (test only)]");
             eprintln!("       Resource defaults: --max-body-mib 64 --max-total-request-mib 128 --max-json-nodes 300000 --max-json-depth 128 --max-rendered-prompt-mib (16 bytes per --max-model-len token, at least 1; 4 for 262144) --preparation-concurrency 2 --preparation-queue 64 --processing-reserve-mib (2048, or the price of one prompt at the rendered cap, 448 bytes a byte, when that is more); --model-alias NAME (repeatable). TLS/auth belongs at the loopback proxy, not a secret argv flag.");
             eprintln!("image flags: --image-urls off|on (default off; security review required); --image-url-max-bytes N (10485760 max); --image-url-connect-timeout SEC (10); --image-url-total-timeout SEC (30); --image-preparation-bytes N (2147483648); --image-retained-bytes N (134217728); --image-preparation-workers N (2); --image-preparation-backlog N (64); --image-preparation-wait SEC (300); --image-preparation-deadline SEC (1800)");
             eprintln!("       rexl3-serve --version");
