@@ -465,8 +465,9 @@ impl PrefillScratch {
         Ok(())
     }
 
+    /// Whether a bank of `d` runs in this scratch: the same layer shape, or a width share's bank (`d.inter` below the scratch's).
     pub(crate) fn fits(&self, d: &MoeDims) -> bool {
-        self.dims.hidden == d.hidden && self.dims.inter == d.inter && self.dims.experts == d.experts && self.dims.topk == d.topk
+        self.dims.hidden == d.hidden && self.dims.inter >= d.inter && self.dims.experts == d.experts && self.dims.topk == d.topk
     }
 }
 

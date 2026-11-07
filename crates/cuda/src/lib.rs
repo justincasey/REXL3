@@ -91,6 +91,7 @@ pub mod moe;
 pub mod moe_owned;
 pub mod moe_prefill;
 pub mod moe_subbanks;
+pub mod moe_width;
 pub mod mtpk;
 pub mod nccl;
 pub mod nemotron_attn;
