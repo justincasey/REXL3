@@ -233,6 +233,17 @@ mod gpu {
                 base: *const i32,
                 stream: *mut c_void,
             ) -> i32;
+            pub fn gb_dflash_merge_topk(
+                ia: *const c_void,
+                va: *const c_void,
+                ib: *const c_void,
+                vb: *const c_void,
+                io: *mut c_void,
+                vo: *mut c_void,
+                rows: i32,
+                k: i32,
+                stream: *mut c_void,
+            ) -> i32;
         }
     }
 
@@ -649,6 +660,38 @@ mod gpu {
         }
         let rc = unsafe {
             ffi::gb_dflash_remap_ids(ids.ptr(), count as i32, ranges.len() as i32, cum.as_ptr(), base.as_ptr(), stream.raw())
+        };
+        CudaError::check(rc)
+    }
+
+    /// The top-k of a draft head split over two ranks: `ids`/`vals` (i32 / f32 `[rows, k]`) hold this rank's top `k` of its columns
+    /// (token ids), `peer_ids`/`peer_vals` the other rank's; each row becomes the `k` largest of the `2k` by (value DESC, id ASC), the
+    /// full head's top-k order, in place. Both ranks get the same lists (the halves' ids are disjoint). `k <= 16`.
+    pub fn merge_topk(
+        ids: &mut DevBuf,
+        vals: &mut DevBuf,
+        peer_ids: &DevBuf,
+        peer_vals: &DevBuf,
+        rows: usize,
+        k: usize,
+        stream: &Stream,
+    ) -> Result<(), CudaError> {
+        assert!((1..=16).contains(&k), "1 to 16 candidates a row");
+        for (b, what) in [(&*ids, "merge ids"), (&*vals, "merge vals"), (peer_ids, "merge peer ids"), (peer_vals, "merge peer vals")] {
+            need(b, rows * k * 4, what);
+        }
+        let rc = unsafe {
+            ffi::gb_dflash_merge_topk(
+                ids.ptr(),
+                vals.ptr(),
+                peer_ids.ptr(),
+                peer_vals.ptr(),
+                ids.ptr(),
+                vals.ptr(),
+                rows as i32,
+                k as i32,
+                stream.raw(),
+            )
         };
         CudaError::check(rc)
     }

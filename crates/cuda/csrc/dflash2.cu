@@ -638,6 +638,58 @@ GB_EXPORT int gb_dflash_remap_ids(void* ids, int count, int n_ranges, const int*
     return GB_CHECK_LAUNCH();
 }
 
+// The top-k of a split draft head: each rank of a two-rank group has the top k (ids, values) of its own columns; per row, the k largest of
+// the 2k candidates by (value DESC, id ASC), the full head's top-k order (glue topk). The halves' ids are disjoint, so the result does not
+// depend on which list is `a`: both ranks get the same lists from (own, peer). One warp a row, lane j holding candidate j (2k <= 32).
+namespace {
+__device__ __forceinline__ uint64_t merge_key(float v, int id) {
+    const uint32_t u = v == 0.f ? 0u : __float_as_uint(v);                            // -0 ties with +0, as in the head's top-k
+    const uint32_t o = (v != v) ? 0u : (u & 0x80000000u) ? ~u : (u | 0x80000000u);   // NaN lowest, as the head's top-k reports it
+    return ((uint64_t)o << 32) | (uint64_t)(0xFFFFFFFFu - (uint32_t)id);
+}
+
+__global__ void merge_topk_kernel(const int* ia, const float* va, const int* __restrict__ ib, const float* __restrict__ vb, int* io, float* vo,
+                                  int rows, int k) {
+    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= rows) return;
+    int id = -1;
+    float v = 0.f;
+    if (lane < k) {
+        id = ia[(size_t)row * k + lane];
+        v = va[(size_t)row * k + lane];
+    } else if (lane < 2 * k) {
+        id = ib[(size_t)row * k + lane - k];
+        v = vb[(size_t)row * k + lane - k];
+    }
+    uint64_t key = lane < 2 * k ? merge_key(v, id) : 0ull;
+    __syncwarp();                                  // every input read before the first write (io / vo may alias ia / va)
+    for (int j = 0; j < k; ++j) {
+        uint64_t best = key;
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) {
+            const uint64_t o = ((uint64_t)__shfl_xor_sync(0xffffffffu, (uint32_t)(best >> 32), m) << 32) |
+                               (uint64_t)__shfl_xor_sync(0xffffffffu, (uint32_t)best, m);
+            best = o > best ? o : best;
+        }
+        if (key == best && lane < 2 * k) {          // the one holder (keys are distinct: disjoint ids)
+            io[(size_t)row * k + j] = id;
+            vo[(size_t)row * k + j] = v;
+            key = 0ull;
+        }
+    }
+}
+}  // namespace
+
+// ids / vals: i32 / f32 [rows, k] each (a: this rank's, b: the peer's); the merged top-k into io / vo (may be a's buffers). k <= 16.
+GB_EXPORT int gb_dflash_merge_topk(const void* ia, const void* va, const void* ib, const void* vb, void* io, void* vo, int rows, int k,
+                                   void* stream) {
+    if (rows <= 0) return 0;
+    if (k < 1 || k > 16 || !ia || !va || !ib || !vb || !io || !vo) return (int)cudaErrorInvalidValue;
+    merge_topk_kernel<<<(rows + 3) / 4, 128, 0, gb_stream(stream)>>>((const int*)ia, (const float*)va, (const int*)ib, (const float*)vb,
+                                                                      (int*)io, (float*)vo, rows, k);
+    return GB_CHECK_LAUNCH();
+}
+
 GB_EXPORT int gb_dflash_selector_walk(const void* anchor, const void* topk_ids, const void* topk_vals, const void* gate, int gate_is_f32,
                                       const void* pred_codebook, const void* succ_codebook, int n_seq, int rows, int k, int rank,
                                       void* out_tokens, void* conf, void* stream) {
