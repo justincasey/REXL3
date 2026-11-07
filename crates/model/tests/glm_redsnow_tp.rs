@@ -817,7 +817,7 @@ fn p2_redsnow_sequence_parallel_two_ranks_equal_one_p2_model_and_relay_the_taps(
         let mut picks = Vec::new();
         for (slot, end) in [(0usize, None), (1, Some(p.len()))] {
             a.begin_slot(slot).unwrap();
-            a.dflash_prompt_end(slot, end);
+            a.dflash_prompt_end(slot, end, None);
             let mut at = 0;
             let mut last = 0;
             while at < p.len() {

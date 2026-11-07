@@ -12,15 +12,15 @@
 //! each sequence only. A rejected row's position is written again by the window that next covers it. When the backend has named the
 //! prompt's end ([`GlmModel::dflash_prompt_end`]), the rows of a chunk more than a ring behind it are neither tapped nor absorbed: the
 //! prompt's later rows would overwrite their ring entries before any draft reads the ring (a row's entry is its own row's alone, so the
-//! ring after the prompt holds the same bits).
+//! ring after the prompt holds the same bits). The window before the prompt's next snapshot cut (named with the end) is always absorbed.
 //!
 //! **Drafting** runs the draft's block for each asking sequence at the position of its pending token and returns the selector's chain
 //! with each pick's score and margin (`draft::Picked`). It reads the trunk's embedding and `lm_head` and writes only the draft's own ring
 //! and scratch: the trunk's state and every committed token are untouched, so drafted == serial whatever it proposes. On a
 //! tensor-parallel group it runs on rank 0 alone (the draft is dense, the head replicated): nothing is forwarded to a follower.
 //!
-//! **Prefix cache.** A restored prefix does not bring its draft context back: the ring keeps whatever the slot held at those
-//! positions, so drafts after a restore are weaker until 2,048 new positions have been absorbed. Exactness is unaffected.
+//! **Prefix cache.** A snapshot keeps the drafter's context window (`model/snapshot.rs`: the ring rows of the last 2,048 positions before
+//! the cut, `Draft::save_window`) and a restore puts it back, so drafts after a hit are those of a cold prefill of the same tokens.
 //!
 //! **Tensor parallel, sequence-parallel residual.** Under the sequence-parallel residual of a P2 prompt chunk (`GlmModel::run`'s `sp`)
 //! each rank holds only its own rows of the streams. Both ranks of a group whose rank 0 drafts then hold a [`TapRelay`] (the taps are a
@@ -149,9 +149,10 @@ pub struct DflashState {
     /// Per trunk layer: its column block in a tap row, or `None` when it is not tapped.
     pub(super) tap_of: Vec<Option<usize>>,
     rows: usize,
-    /// Per slot: the end of the prompt being prefilled, when the backend named it (`GlmModel::dflash_prompt_end`; `None` after
-    /// `begin_slot`).
+    /// Per slot: the end of the prompt being prefilled and its next snapshot cut, when the backend named them
+    /// (`GlmModel::dflash_prompt_end`; `None` after `begin_slot`).
     prompt_end: Vec<Option<usize>>,
+    next_cut: Vec<Option<usize>>,
     /// The prompt chunk in flight absorbs none of its rows (all of them more than a ring before its prompt's end): `tap` writes nothing.
     skip_taps: bool,
     /// Positions absorbed, prompt positions skipped (more than a ring before their prompt's end) and draft rounds run (the boot and the
@@ -192,6 +193,7 @@ impl DflashState {
             rows,
             draft,
             prompt_end: Vec::new(),
+            next_cut: Vec::new(),
             skip_taps: false,
             absorbed: 0,
             skipped: 0,
@@ -223,14 +225,16 @@ impl DflashState {
         Ok(())
     }
 
-    /// The first position of `slot`'s prompt whose row reaches the ring after the prompt: `end - cap` when the backend named the prompt's
-    /// end, 0 otherwise (every row is absorbed).
+    /// The first position of `slot`'s prompt whose row reaches the ring after the prompt or the window of its next snapshot cut: `end -
+    /// cap` when the backend named the prompt's end, at most `cut - window` when it named a cut; 0 otherwise (every row is absorbed).
     fn keep_from(&self, slot: usize) -> usize {
-        self.prompt_end
-            .get(slot)
-            .copied()
-            .flatten()
-            .map_or(0, |end| end.saturating_sub(gb_cuda::dflash2::DraftCtxLayout::DEFAULT_CAP))
+        use gb_cuda::dflash2::DraftCtxLayout;
+        let end = self.prompt_end.get(slot).copied().flatten().map(|end| end.saturating_sub(DraftCtxLayout::DEFAULT_CAP));
+        let cut = self.next_cut.get(slot).copied().flatten().map(|c| c.saturating_sub(DraftCtxLayout::WINDOW));
+        match (end, cut) {
+            (Some(e), Some(c)) => e.min(c),
+            (e, _) => e.unwrap_or(0),
+        }
     }
 }
 
@@ -266,14 +270,22 @@ impl GlmModel {
         Ok(added)
     }
 
-    /// The backend's word that `slot`'s prompt being prefilled ends at position `end` (`None`: unknown, every row is absorbed). Set before
-    /// each prompt slice; `begin_slot` forgets it. The rows more than a ring before `end` are neither tapped nor absorbed (see the module).
-    pub fn dflash_prompt_end(&mut self, slot: usize, end: Option<usize>) {
+    /// The backend's word that `slot`'s prompt being prefilled ends at position `end` and takes its next snapshot at `cut` (`None`: unknown,
+    /// every row is absorbed; no cut). Set before each prompt slice; `begin_slot` forgets both. The rows more than a ring before `end` are
+    /// neither tapped nor absorbed (see the module), except the window before `cut`, which the snapshot keeps.
+    pub fn dflash_prompt_end(&mut self, slot: usize, end: Option<usize>, cut: Option<usize>) {
         let Some(d) = self.dflash.as_mut() else { return };
         if d.prompt_end.len() <= slot {
             d.prompt_end.resize(slot + 1, None);
+            d.next_cut.resize(slot + 1, None);
         }
         d.prompt_end[slot] = end;
+        d.next_cut[slot] = cut;
+    }
+
+    /// The first position of `slot` whose drafter context row was absorbed by the prompt being prefilled (0 without a drafter).
+    pub(super) fn dflash_kept_from(&self, slot: usize) -> usize {
+        self.dflash.as_ref().map_or(0, |d| d.keep_from(slot))
     }
 
     /// Before the forward of the prompt rows of `b` (each sequence's consecutive rows of its prompt): whether any of its rows will be
