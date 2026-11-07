@@ -226,6 +226,12 @@ pub trait Backend {
     fn prefill_in_flight(&self) -> Option<(usize, usize)> {
         None
     }
+    /// A prompt's forward is paused mid-way and goes on right after the next decode round, its first token waiting for that round alone
+    /// (GLM's tensor-parallel rank 0: a short prompt's forward in parts of its own). The engine then makes the round as short as it can:
+    /// no drafts, one row a sequence. Drafts never change what is emitted, so only when tokens arrive moves, never a bit. The default: no.
+    fn prefill_waits_round(&self) -> bool {
+        false
+    }
     /// A proven cold-call bound, when available (CPU mock); native families require observed work, not a guessed rate.
     fn cold_step_budget(&self) -> Option<std::time::Duration> {
         None
@@ -1994,12 +2000,14 @@ impl<B: Backend> Engine<B> {
         if self.verifies_trees() {
             return self.decode_round_trees();
         }
+        // a prompt's forward paused mid-way waits for this round only: the round drafts nothing (`Backend::prefill_waits_round`)
+        let lean = self.backend.prefill_waits_round();
         let maxes: Vec<usize> = self
             .active
             .iter()
             .map(|s| {
                 let left = s.req.max_new - s.generated();
-                if !self.cfg.drafting || !s.draft {
+                if lean || !self.cfg.drafting || !s.draft {
                     0
                 } else {
                     let m = self.cfg.max_drafts.min(left.saturating_sub(1));
