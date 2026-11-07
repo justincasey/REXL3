@@ -158,6 +158,12 @@ pub struct Exl3Linear {
     /// `Some` when only some of the group's 128-column strips are placed (lane E, a TP rank's KDA `qkv_proj` heads: [`StripCut`]); `None`
     /// (every group of a single node, and of a rank without the KDA head split) places the whole group.
     pub cut: Option<StripCut>,
+    /// `Some((k0, k1))` when only the input rows `[k0, k1)` of the group are placed (an expert's `down_proj` under the expert WIDTH
+    /// split, `FfnConfig::width`): whole 16-row k tiles, so the trellis rows are one contiguous run of the stored trellis. `k` stays the
+    /// stored group's; `trellis.bytes` and `suh.bytes` are the PLACED bytes, `trellis.src` / `suh.src` the stored parts' first bytes
+    /// (the plan reads from `src + k0 / 16 * row` and `src + 2 k0`, as [`StripCut`] does for columns); `svh` is whole. `None` for every
+    /// other group.
+    pub rows: Option<(usize, usize)>,
 }
 
 /// The 128-column strips of an EXL3 group that a rank places and loads (lane E, GLM Phase 2: "the rank stores only its own qkv strips").
@@ -386,14 +392,20 @@ pub struct ExpertBank {
     pub bits_down: Bits,
     pub codebook: Codebook,
     pub hidden: usize,
+    /// The layer's expert width (the whole `moe_intermediate`, also under a [`ExpertBank::width`] share).
     pub inter: usize,
     pub experts: Vec<ExpertWeights>,
     /// The first subbank's layout (a uniform single-node bank: THE layout).
     pub layout: ExpertLayout,
     /// The owned experts by key, in key order (one for a uniform layer).
     pub subbanks: Vec<ExpertSubbank>,
-    /// The experts this rank holds (`ExpertOwnership::all` on a single node).
+    /// The experts this rank holds (`ExpertOwnership::all` on a single node and under a width share).
     pub own: gb_cuda::moe::ExpertOwnership,
+    /// `Some` under the expert WIDTH split: every expert is placed with only the share's intermediate columns
+    /// `share.cols(inter) = [c0, c1)` (gate/up: a one-range [`StripCut`] of strips `[c0/128, c1/128)`; down: [`Exl3Linear::rows`]
+    /// `(c0, c1)`), so each subbank's layout is `gb_cuda::moe::SubbankRegion::stacked(key, n, hidden, c1 - c0, ..)` and the device binds
+    /// it with `MoeExperts::from_region_width`. `None`: whole experts.
+    pub width: Option<gb_cuda::moe::WidthShare>,
 }
 
 /// A MoE layer: fp16 router `[experts, hidden]`, fp32 selection bias `[experts]`, the routed experts and the shared expert.
@@ -625,9 +637,9 @@ impl MlaWeights {
 }
 
 impl ExpertBank {
-    /// Whether this is today's single bank: one subbank holding every expert.
+    /// Whether this is today's single bank: one subbank holding every expert, whole (a width share is never one).
     pub fn is_single(&self) -> bool {
-        self.subbanks.len() == 1 && self.own.is_all()
+        self.subbanks.len() == 1 && self.own.is_all() && self.width.is_none()
     }
 
     fn visit<'a>(&'a self, f: Visit<'a, '_>) {

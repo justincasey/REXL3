@@ -798,6 +798,7 @@ fn every_codebook_marker_is_a_check_the_plan_owes() {
         dst_bytes: bytes,
         region: 0,
         dst: offset,
+        pitch: None,
     };
     let far = super::plan::LoadPlan {
         files: vec!["f".into()],
@@ -893,7 +894,110 @@ fn the_single_node_plan_is_unchanged_by_subbanks() {
     assert_eq!(plan_digest(plan()), 0x8f6c_6195_12f3_b20e, "items {}", plan().items.len());
     let all = GlmWeights::map_owned(&inventory(), &config(), &gb_cuda::moe::ExpertOwnership::all(288)).unwrap();
     assert_eq!(plan_digest(&all.load_plan().unwrap()), 0x8f6c_6195_12f3_b20e);
-    assert!(weights().banks().all(|b| b.is_single()));
+    assert!(weights().banks().all(|b| b.is_single() && b.width.is_none()));
+    assert!(plan().items.iter().all(|i| i.pitch.is_none()), "no strided item without a width share");
+}
+
+/// The expert WIDTH split (`GlmConfig::with_expert_width`, `gb_cuda::moe_width`): rank r of 2 maps every expert of every bank (the NextN
+/// layer's too) at the intermediate columns `[1024 r, 1024 (r + 1))`. Per subbank the layout is `SubbankRegion::stacked` at width 1024;
+/// gate/up read their column half as ONE strided item a projection, down its row half as one contiguous item; the two ranks read every
+/// stored trellis byte exactly once, the scale halves once and the model-width scales on both; every other item and every marker is
+/// the single node's. Ownership other than `all` is refused.
+fn check_width_split(inv: &PackInventory, cfg: &GlmConfig) {
+    use gb_cuda::moe::{ExpertOwnership, SubbankRegion, WidthShare};
+    use std::collections::BTreeMap;
+    let whole = GlmWeights::map(inv, cfg).unwrap().load_plan().unwrap();
+    let routed = |i: &super::plan::LoadItem| i.name.contains(".mlp.experts.");
+    let by_name: BTreeMap<&str, &super::plan::LoadItem> =
+        whole.items.iter().filter(|i| routed(i)).map(|i| (i.name.as_str(), i)).collect();
+    // per stored part: the copied bytes of both ranks, and the source ranges they read
+    let mut copied: BTreeMap<String, u64> = BTreeMap::new();
+    let mut reads: BTreeMap<String, Vec<(u64, u64)>> = BTreeMap::new();
+    for r in 0..2 {
+        let wcfg = cfg.with_expert_width(r, 2).unwrap();
+        let share = WidthShare::new(r, 2).unwrap();
+        assert_eq!(wcfg.ffn.width, Some(share));
+        let own = ExpertOwnership::range(288, r, 2).unwrap();
+        let e = GlmWeights::map_owned(inv, &wcfg, &own).expect_err("a width share takes every expert");
+        assert!(e.problems.iter().all(|p| matches!(p, Problem::NonUniform { what, .. } if what.contains("width share"))), "{e:?}");
+        let w = GlmWeights::map_owned(inv, &wcfg, &ExpertOwnership::all(288)).unwrap();
+        let p = w.load_plan().unwrap(); // validated, strided items included
+        assert!(w.banks().count() > 0);
+        for b in w.banks() {
+            assert_eq!(b.width, Some(share), "layer {}", b.layer);
+            assert!(!b.is_single() && b.own.is_all() && b.inter == 2048);
+            for (x, ex) in b.experts.iter().enumerate() {
+                for g in [&ex.gate_proj, &ex.up_proj, &ex.down_proj] {
+                    assert!(g.trellis.dst != Dst::NONE && g.suh.dst != Dst::NONE && g.svh.dst != Dst::NONE, "layer {} expert {x}", b.layer);
+                }
+                assert_eq!(ex.gate_proj.cut, Some(StripCut { ranges: vec![(8 * r, 8 * r + 8)] }));
+                assert_eq!((ex.down_proj.rows, ex.down_proj.cut.is_none()), (Some((1024 * r, 1024 * (r + 1))), true));
+            }
+            let mut cursor = 0usize;
+            for sb in &b.subbanks {
+                let (lay, end) = SubbankRegion::stacked(sb.key, sb.ids.len(), 4096, 1024, cursor, ALIGN as usize);
+                for (a, l) in [(&lay.gate, &sb.layout.gate), (&lay.up, &sb.layout.up), (&lay.down, &sb.layout.down)] {
+                    assert_eq!(
+                        (a.trellis as u64, a.trellis_stride as u64, a.suh as u64, a.svh as u64),
+                        (l.trellis, l.trellis_stride, l.suh, l.svh),
+                        "layer {} {:?}",
+                        b.layer,
+                        sb.key
+                    );
+                }
+                cursor = end;
+            }
+            assert_eq!(b.subbanks.iter().map(|s| s.ids.len()).sum::<usize>(), 288);
+            assert_eq!(align_up(cursor as u64), w.regions[b.region as usize].bytes, "layer {}", b.layer);
+        }
+        // every non-routed item and every marker is the single node's
+        let non_routed = |p: &super::plan::LoadPlan| p.items.iter().filter(|i| !routed(i)).cloned().collect::<Vec<_>>();
+        assert_eq!(non_routed(&p), non_routed(&whole), "rank {r}");
+        assert_eq!(p.markers, whole.markers, "rank {r}");
+        // routed: one item a stored part (9 an expert); every read inside the stored part; a strided item is a gate/up trellis half
+        assert_eq!(p.items.iter().filter(|i| routed(i)).count(), by_name.len(), "rank {r}");
+        for it in p.items.iter().filter(|i| routed(i)) {
+            let st = by_name[it.name.as_str()];
+            assert!(it.offset >= st.offset && it.offset + it.bytes <= st.offset + st.bytes, "{} reads outside its part", it.name);
+            let gate_up = it.name.contains(".gate_proj.") || it.name.contains(".up_proj.");
+            assert_eq!(it.pitch.is_some(), gate_up && it.part == ItemPart::Trellis, "{}", it.name);
+            if let Some(pt) = it.pitch {
+                assert_eq!((pt.src_pitch, it.dst_bytes * 2), (pt.width * 2, st.bytes), "{}", it.name);
+                let rows = it.dst_bytes / pt.width;
+                // the half's tiles of every k-tile row, one row's bytes into each source row
+                assert_eq!(it.offset, st.offset + r as u64 * pt.width, "{}", it.name);
+                for k in 0..rows {
+                    reads.entry(it.name.clone()).or_default().push((it.offset + k * pt.src_pitch, pt.width));
+                }
+            } else {
+                reads.entry(it.name.clone()).or_default().push((it.offset, it.bytes));
+            }
+            *copied.entry(it.name.clone()).or_default() += it.copied_bytes();
+        }
+    }
+    // both ranks: every trellis byte exactly once, the halves' scales once, the model-width scales (gate/up suh, down svh) twice
+    for (name, st) in &by_name {
+        let twice = name.ends_with(".down_proj.svh")
+            || (name.ends_with(".suh") && (name.contains(".gate_proj.") || name.contains(".up_proj.")));
+        assert_eq!(copied[*name], if twice { 2 * st.bytes } else { st.bytes }, "{name}");
+        if !twice {
+            let mut v = reads[*name].clone();
+            v.sort();
+            let mut at = st.offset;
+            for (o, n) in v {
+                assert_eq!(o, at, "{name}: a gap or an overlap");
+                at += n;
+            }
+            assert_eq!(at, st.offset + st.bytes, "{name}");
+        }
+    }
+}
+
+#[test]
+fn a_width_share_places_every_expert_at_its_columns() {
+    check_width_split(&inventory(), &config());
+    let (inv, cfg) = sc410().text_side();
+    check_width_split(&inv, &cfg);
 }
 
 // ------------------------------------------------------------------------------------- every pinned pack: 2.25bpw and sc_4.10bpw

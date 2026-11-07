@@ -65,7 +65,7 @@ pub enum ItemPart {
 }
 
 /// One copy: `bytes` at `offset` of shard `file`, through `xform`, to `dst` bytes into `region` (where it takes `dst_bytes`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LoadItem {
     /// The checkpoint tensor name (`<prefix>.trellis` for a group's parts).
     pub name: String,
@@ -73,14 +73,60 @@ pub struct LoadItem {
     pub category: Category,
     pub file: u16,
     pub offset: u64,
-    /// Bytes read from the shard.
+    /// Bytes read from the shard (of a strided item: its whole source span, gaps included, so sorting, overlap and extents see the
+    /// range the read covers).
     pub bytes: u64,
     /// What the executor does to them (`Xform::None` for every EXL3 part and nearly every plain tensor).
     pub xform: Xform,
-    /// Bytes the item occupies in its region (`bytes`, unless `xform` changes the size).
+    /// Bytes the item occupies in its region (`bytes`, unless `xform` changes the size or the item is strided).
     pub dst_bytes: u64,
     pub region: RegionId,
     pub dst: u64,
+    /// `Some` for a strided item: the source span is rows of `width` bytes `src_pitch` apart (`bytes = (rows - 1) * src_pitch +
+    /// width`), copied densely (`dst_bytes = rows * width`), unchanged (`xform` is `None`). One such item carries a one-range
+    /// [`super::weights::StripCut`] of a trellis (a width share's gate/up columns: every k-tile row's kept tiles) where per-row items
+    /// would be `k / 16` of them.
+    pub pitch: Option<Pitch>,
+}
+
+/// The row shape of a strided [`LoadItem`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pitch {
+    pub width: u64,
+    pub src_pitch: u64,
+}
+
+impl LoadItem {
+    /// Bytes the item copies (its rows, for a strided item; else the bytes it reads).
+    pub fn copied_bytes(&self) -> u64 {
+        if self.pitch.is_some() {
+            self.dst_bytes
+        } else {
+            self.bytes
+        }
+    }
+}
+
+/// The derived form, with `pitch` shown only when it is `Some`: a plan without strided items prints (and so digests, `layout_tests`)
+/// exactly as before strided items existed.
+impl std::fmt::Debug for LoadItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("LoadItem");
+        d.field("name", &self.name)
+            .field("part", &self.part)
+            .field("category", &self.category)
+            .field("file", &self.file)
+            .field("offset", &self.offset)
+            .field("bytes", &self.bytes)
+            .field("xform", &self.xform)
+            .field("dst_bytes", &self.dst_bytes)
+            .field("region", &self.region)
+            .field("dst", &self.dst);
+        if let Some(p) = &self.pitch {
+            d.field("pitch", p);
+        }
+        d.finish()
+    }
 }
 
 /// The 4-byte codebook marker of an EXL3 group (`mul1`: `0x83DCD12D`, `mcg`: `0xCBAC1FED`, little-endian). It is not uploaded; it says which
@@ -166,7 +212,41 @@ impl GlmWeights {
                 dst_bytes: t.dst_bytes,
                 region: t.dst.region,
                 dst: t.dst.offset,
+                pitch: None,
             }),
+            Leaf::Exl3(g) if g.cut.as_ref().is_some_and(|c| c.ranges.len() == 1) => {
+                // one range of strips (a width share's gate/up columns): the trellis as ONE strided item (every k-tile row's kept tiles,
+                // dense on the device as `select_strips_planned` lays them out), `suh` whole, `svh` the range's columns
+                let (lo, hi) = g.cut.as_ref().unwrap().ranges[0];
+                let bits = g.bits.twice() as u64 / 2;
+                let strip = 256 * bits; // one 128-column strip of one k-tile row
+                let (rows, width, src_pitch) = ((g.k / 16) as u64, (hi - lo) as u64 * strip, (g.n / 128) as u64 * strip);
+                if gb_cuda::exl3_split::cut_strips(g.n, &[(lo, hi)]).is_none() || g.k % 16 != 0 || g.trellis.bytes != rows * width {
+                    bad.push(format!("`{}`: strips [{lo}, {hi}) are not a cut of {} x {}", g.prefix, g.k, g.n));
+                    return;
+                }
+                let item = |part, suffix: &str, p: &super::weights::Exl3Part, src: u64, bytes: u64, dst_bytes: u64, pitch| LoadItem {
+                    name: format!("{}.{suffix}", g.prefix),
+                    part,
+                    category: g.category,
+                    file: p.src.file,
+                    offset: p.src.offset + src,
+                    bytes,
+                    xform: Xform::None,
+                    dst_bytes,
+                    region: p.dst.region,
+                    dst: p.dst.offset,
+                    pitch,
+                };
+                let (span, pitch) = ((rows - 1) * src_pitch + width, Some(Pitch { width, src_pitch }));
+                items.push(item(ItemPart::Trellis, "trellis", &g.trellis, lo as u64 * strip, span, rows * width, pitch));
+                items.push(item(ItemPart::Suh, "suh", &g.suh, 0, g.suh.bytes, g.suh.bytes, None));
+                items.push(item(ItemPart::Svh, "svh", &g.svh, lo as u64 * 256, g.svh.bytes, g.svh.bytes, None));
+                if let Some((src, bytes)) = g.marker {
+                    skipped.add(g.category, bytes);
+                    markers.push(marker_of(g, src));
+                }
+            }
             Leaf::Exl3(g) if g.cut.is_some() => {
                 // a rank's strips of the group (`StripCut`): the trellis as one run per k-tile row and range, `svh` one per range, `suh` whole,
                 // laid out as `select_strips_planned` lays out its device copy (the codebook marker is checked as for any group)
@@ -190,6 +270,7 @@ impl GlmWeights {
                     dst_bytes: bytes as u64,
                     region: p.dst.region,
                     dst: p.dst.offset + dst as u64,
+                    pitch: None,
                 };
                 items.extend(tr.into_iter().map(|r| run(ItemPart::Trellis, "trellis", &g.trellis, r)));
                 items.push(run(ItemPart::Suh, "suh", &g.suh, (0, 0, g.suh.bytes as usize)));
@@ -200,20 +281,29 @@ impl GlmWeights {
                 }
             }
             Leaf::Exl3(g) => {
-                for (part, suffix, p) in
-                    [(ItemPart::Trellis, "trellis", &g.trellis), (ItemPart::Suh, "suh", &g.suh), (ItemPart::Svh, "svh", &g.svh)]
-                {
+                // a row cut (a width share's down rows, `Exl3Linear::rows`): the trellis k-tile rows and `suh` entries `[k0, k1)` are
+                // contiguous in the stored parts, `svh` whole; a whole group reads every part from its first byte
+                let (tr_src, suh_src) = match g.rows {
+                    Some((k0, _)) => ((k0 / 16) as u64 * g.n as u64 * (g.bits.twice() as u64 / 2) * 2, k0 as u64 * 2),
+                    None => (0, 0),
+                };
+                for (part, suffix, p, at) in [
+                    (ItemPart::Trellis, "trellis", &g.trellis, tr_src),
+                    (ItemPart::Suh, "suh", &g.suh, suh_src),
+                    (ItemPart::Svh, "svh", &g.svh, 0),
+                ] {
                     items.push(LoadItem {
                         name: format!("{}.{suffix}", g.prefix),
                         part,
                         category: g.category,
                         file: p.src.file,
-                        offset: p.src.offset,
+                        offset: p.src.offset + at,
                         bytes: p.bytes,
                         xform: Xform::None,
                         dst_bytes: p.bytes,
                         region: p.dst.region,
                         dst: p.dst.offset,
+                        pitch: None,
                     });
                 }
                 if let Some((src, bytes)) = g.marker {
@@ -260,7 +350,7 @@ impl LoadPlan {
     pub fn totals(&self) -> PlanTotals {
         let mut uploaded = Bytes::default();
         for i in &self.items {
-            uploaded.add(i.category, i.bytes);
+            uploaded.add(i.category, i.copied_bytes());
         }
         PlanTotals {
             items: self.items.len(),
@@ -405,7 +495,17 @@ impl LoadPlan {
             if i.dst % ALIGN != 0 {
                 return Err(format!("{} is placed at {} in {}, not aligned to {ALIGN}", i.name, i.dst, r.kind));
             }
-            if i.xform.dst_bytes(i.bytes) != i.dst_bytes {
+            if let Some(p) = i.pitch {
+                // a strided item: whole rows of `width` bytes, `src_pitch` apart, copied densely and unchanged
+                let rows_ok = p.width > 0 && p.src_pitch >= p.width && i.bytes >= p.width && (i.bytes - p.width) % p.src_pitch == 0;
+                if !rows_ok || i.xform != Xform::None || i.dst_bytes != ((i.bytes - p.width) / p.src_pitch + 1) * p.width {
+                    return Err(format!(
+                        "{} reads a {}-byte span in rows of {} bytes {} apart through {:?} and says it takes {} on the device, which \
+                         is not its rows copied unchanged",
+                        i.name, i.bytes, p.width, p.src_pitch, i.xform, i.dst_bytes
+                    ));
+                }
+            } else if i.xform.dst_bytes(i.bytes) != i.dst_bytes {
                 return Err(format!(
                     "{} reads {} bytes through {:?} and says it takes {} on the device, which that conversion cannot make",
                     i.name, i.bytes, i.xform, i.dst_bytes

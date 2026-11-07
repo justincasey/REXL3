@@ -246,12 +246,16 @@ pub fn run_as(dir: &Path, plan: &LoadPlan, regions: &Regions, o: &Options, compo
     for it in &plan.items {
         let dst = regions.view(it.region, it.dst, it.dst_bytes)?;
         let fid = files[it.file as usize];
-        match it.xform {
-            Xform::None => {
+        match (it.xform, it.pitch) {
+            (Xform::None, Some(p)) => {
+                // a column cut of a trellis (a width share's gate/up): the rows of its source span, densely (`validate` checked the shape)
+                loader.copy_file_strided(&dst, fid, it.offset, it.bytes as usize, p.width as usize, p.src_pitch as usize)?;
+            }
+            (Xform::None, None) => {
                 // the scales are copied as stored: fp16 -> f64 -> fp16 is the identity on every value a pack holds
                 loader.copy_file(&dst, fid, it.offset, it.bytes as usize, CopyXform::None)?;
             }
-            x => {
+            (x, _) => {
                 let path = dir.join(&plan.files[it.file as usize]);
                 let (off, len, name) = (it.offset, it.bytes as usize, it.name.clone());
                 loader.copy_compute(&dst, it.dst_bytes as usize, move || {

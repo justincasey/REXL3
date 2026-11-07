@@ -309,6 +309,16 @@ impl GlmFamily {
         let inv = PackInventory::from_checkpoint(&ck).map_err(GlmPackError::Inventory)?;
         GlmPack::from_inventory_owned(&inv, config, own)
     }
+
+    /// [`GlmFamily::map_pack`] for rank `rank` of `ranks` under the expert width split: every routed expert at the rank's columns
+    /// (`GlmConfig::with_expert_width`; the pack's config is the rank's): boot it with `load::boot_mapped`.
+    pub fn map_pack_width(dir: &Path, rank: usize, ranks: usize) -> Result<GlmPack, GlmPackError> {
+        let config = GlmConfig::from_dir(dir).map_err(GlmPackError::Config)?.with_expert_width(rank, ranks).map_err(GlmPackError::Config)?;
+        let ck = gb_exl3::checkpoint::scan(dir, false).map_err(|e| GlmPackError::Pack(PackError::Io(e.to_string())))?;
+        let inv = PackInventory::from_checkpoint(&ck).map_err(GlmPackError::Inventory)?;
+        let all = gb_cuda::moe::ExpertOwnership::all(config.ffn.routed_experts);
+        GlmPack::from_inventory_owned(&inv, config, &all)
+    }
 }
 
 // ----------------------------------------------------------------------------------------------------------- the plan report

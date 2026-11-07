@@ -221,6 +221,7 @@ impl<'a> Binder<'a> {
             marker: None,
             category,
             cut: None,
+            rows: None,
         };
         let Some((key, g)) = self.inv.groups.get_key_value(prefix) else {
             self.problems.push(Problem::Missing { name: prefix.to_string(), group: true });
@@ -291,6 +292,39 @@ impl<'a> Binder<'a> {
         out.suh.dst = self.place(region, out.suh.bytes);
         out.svh.dst = self.place(region, out.svh.bytes);
         out
+    }
+
+    /// Cut a claimed routed expert projection to the columns `[c0, c1)` of the expert width (whole 128-column blocks) for a width share
+    /// ([`ExpertBank::width`]): `down` false is gate/up (`k` = hidden, `n` = the width: output columns, a one-range [`StripCut`], `svh`
+    /// cut, `suh` whole), `down` true is down (`k` = the width, `n` = hidden: input rows, [`Exl3Linear::rows`], `suh` cut, `svh` whole).
+    /// The placed byte sizes become the cut's (nothing is placed here: the bank lays its experts out); the stored layout is checked
+    /// first, so a cut reads exactly the bytes the kernels expect.
+    fn width_cut(&mut self, g: &mut Exl3Linear, down: bool, (c0, c1): (usize, usize)) {
+        let bits = (g.bits.twice() / 2) as u64;
+        let (k, n) = (g.k as u64, g.n as u64);
+        let row = n * bits * 2; // one k-tile row: n / 16 tiles of 16 x bits int16
+        let width = if down { k } else { n };
+        if g.bits.twice() % 2 != 0 || g.trellis.bytes != k / 16 * row || g.suh.bytes != k * 2 || g.svh.bytes != n * 2 || c1 as u64 > width
+        {
+            self.problems.push(Problem::Unsupported {
+                prefix: g.prefix.clone(),
+                why: format!(
+                    "a width share [{c0}, {c1}) needs whole bits and the stored layout ({} trellis bytes for {k} x {n})",
+                    g.trellis.bytes
+                ),
+            });
+            return;
+        }
+        let kept = (c1 - c0) as u64;
+        if down {
+            g.trellis.bytes = kept / 16 * row;
+            g.suh.bytes = kept * 2;
+            g.rows = Some((c0, c1));
+        } else {
+            g.trellis.bytes = k / 16 * kept * bits * 2;
+            g.svh.bytes = kept * 2;
+            g.cut = Some(StripCut { ranges: vec![(c0 / 128, c1 / 128)] });
+        }
     }
 
     fn mhc_set(&mut self, l: &str, which: &str, streams: usize, region: RegionId, cat: Category) -> HcWeights {
@@ -419,6 +453,7 @@ impl<'a> Binder<'a> {
             layout: ExpertLayout { gate: ProjLayout::default(), up: ProjLayout::default(), down: ProjLayout::default() },
             subbanks: vec![],
             own: self.own.clone(),
+            width: self.cfg.ffn.width,
         };
         if self.problems.len() != before {
             // some group is missing or malformed: those problems are the report, the subbanks of what is left are not meaningful
@@ -448,6 +483,27 @@ impl<'a> Binder<'a> {
         }
         if self.problems.len() != before {
             return ExpertBank { experts, ..unplaced };
+        }
+        // a width share places every expert at its columns: the cut sizes are the placed sizes from here on (uniformity, layout)
+        if let Some(share) = self.cfg.ffn.width {
+            let Some(cols) = share.cols(mi).filter(|_| self.own.is_all()) else {
+                self.problems.push(Problem::NonUniform {
+                    layer,
+                    what: format!(
+                        "the expert width share {share:?} needs every expert owned ({} of {n}) and a width ({mi}) of equal 128-column shares",
+                        self.own.local()
+                    ),
+                });
+                return ExpertBank { experts, ..unplaced };
+            };
+            for x in experts.iter_mut() {
+                self.width_cut(&mut x.gate_proj, false, cols);
+                self.width_cut(&mut x.up_proj, false, cols);
+                self.width_cut(&mut x.down_proj, true, cols);
+            }
+            if self.problems.len() != before {
+                return ExpertBank { experts, ..unplaced };
+            }
         }
         let parts = subbank_partition(&keys, &self.own).expect("the ownership is for this layer's expert count");
         // within a subbank every member has the first member's byte sizes (the strides are constants)

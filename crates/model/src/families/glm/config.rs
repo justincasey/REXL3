@@ -103,6 +103,10 @@ pub struct FfnConfig {
     pub shared_experts: usize,
     pub routed_scaling_factor: f64,
     pub swiglu_limit: f64,
+    /// A tensor-parallel rank of the expert WIDTH split ([`GlmConfig::with_expert_width`], `gb_cuda::moe_width`): it holds the columns
+    /// `width.cols(moe_intermediate)` of every routed expert (gate/up output columns, down input rows). `None`: whole experts (one
+    /// node, or a rank of the whole-expert range split).
+    pub width: Option<gb_cuda::moe::WidthShare>,
 }
 
 /// The vision tower, from `vision_config`, plus the special tokens that delimit media in the prompt.
@@ -522,6 +526,7 @@ impl GlmConfig {
             shared_experts: usize_at(t, tp, "n_shared_experts")?,
             routed_scaling_factor: f64_at(t, tp, "routed_scaling_factor")?,
             swiglu_limit: f64_at(t, tp, "swiglu_limit")?,
+            width: None,
         };
         if ffn.experts_per_token > ffn.routed_experts {
             return Err("config.json: `text_config.num_experts_per_tok` exceeds `n_routed_experts`".into());
@@ -793,6 +798,20 @@ impl GlmConfig {
         Ok(c)
     }
 
+    /// This configuration for rank `rank` of `ranks` under the expert WIDTH split (`gb_cuda::moe_width`): every routed expert's
+    /// intermediate columns `[rank * I / ranks, (rank + 1) * I / ranks)`. Refused unless the width cuts into equal whole 128-column
+    /// blocks.
+    pub fn with_expert_width(&self, rank: usize, ranks: usize) -> Result<GlmConfig, String> {
+        let i = self.ffn.moe_intermediate;
+        let share = gb_cuda::moe::WidthShare::new(rank, ranks)
+            .ok()
+            .filter(|s| s.cols(i).is_some() && self.ffn.width.is_none())
+            .ok_or_else(|| format!("the expert width split takes rank {rank} of {ranks} ranks and an expert width ({i}) that cuts into equal 128-column blocks, once"))?;
+        let mut c = self.clone();
+        c.ffn.width = Some(share);
+        Ok(c)
+    }
+
     /// The KV layout of the MLA layers: per token a latent of `kv_lora_rank` fp16 values and, on a layer with its own indexer, the pooled
     /// key plane of `index_head_dim` values per `kpool` tokens. A shared-indexer layer caches the latent only. With pooling there is NO
     /// per-token indexer plane: the raw `[LayerNorm(k) | gate]` rows the pools are built from live in a ring of `ring_len` rows per slot
@@ -919,7 +938,8 @@ mod tests {
                 experts_per_token: 8,
                 shared_experts: 1,
                 routed_scaling_factor: 2.5,
-                swiglu_limit: 10.0
+                swiglu_limit: 10.0,
+                width: None,
             }
         );
         assert_eq!(c.eos, vec![154820, 154827, 154829]);
