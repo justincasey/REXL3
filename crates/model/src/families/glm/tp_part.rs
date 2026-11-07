@@ -25,6 +25,19 @@ pub const PART_ROOM: usize = 512;
 /// bit.
 pub const PART_MS_ENV: &str = "REXL3_GLM_PREFILL_PART_MS";
 
+/// `REXL3_GLM_PREFILL_BATCH_ROWS`: while a sequence decodes, rank 0 puts at most this many rows of fresh short prompts (each at most
+/// [`PART_ROOM`] rows) through one forward, which the decoding streams wait for whole (default 2,048; with nothing decoding, the chunk's
+/// rows). Rank 0's alone; never a bit.
+pub const BATCH_ROWS_ENV: &str = "REXL3_GLM_PREFILL_BATCH_ROWS";
+
+/// The batch rows of [`BATCH_ROWS_ENV`], refused by name when malformed.
+pub fn batch_rows_from_env() -> Result<usize, ModelError> {
+    match std::env::var(BATCH_ROWS_ENV).ok().as_deref().map(str::trim) {
+        None | Some("") => Ok(2048),
+        Some(s) => s.parse::<usize>().map_err(|_| ModelError::Config(format!("{BATCH_ROWS_ENV}={s:?}: expected rows"))),
+    }
+}
+
 /// The part target of [`PART_MS_ENV`] (0: parts off), refused by name when malformed.
 pub fn part_ms_from_env() -> Result<f64, ModelError> {
     parse_part_ms(std::env::var(PART_MS_ENV).ok().as_deref())
