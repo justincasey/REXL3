@@ -1091,6 +1091,9 @@ impl gb_model::families::glm::tp::PrefixRuntime for StaleRank {
     fn prefix_state_digest(&mut self, slot: usize, len: usize) -> Result<u64, gb_model::error::ModelError> {
         self.r.prefix_state_digest(slot, len)
     }
+    fn kv_pages(&self) -> (usize, Vec<usize>) {
+        self.r.kv_pages()
+    }
     fn snapshot_handles(&mut self) -> &mut gb_model::families::glm::tp::SnapHandles {
         self.r.snapshot_handles()
     }

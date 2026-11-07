@@ -752,6 +752,9 @@ pub trait PrefixRuntime: LockstepRuntime<Call = GlmCall> {
     fn seal_snapshot(&mut self, snap: u32, pages: &[u32]) -> Result<u64, ModelError>;
     /// `GlmModel::prefix_state_digest`: the content digest of `slot`'s live state as a prefix of `len` tokens.
     fn prefix_state_digest(&mut self, slot: usize, len: usize) -> Result<u64, ModelError>;
+    /// The KV pool's free pages and the pages each slot's table holds (`KvTables`): a cache that keeps idle pool pages reads rank 0's,
+    /// which are every rank's (the calls allocate and release pages in one order on every rank).
+    fn kv_pages(&self) -> (usize, Vec<usize>);
     /// A follower's handles ([`apply_prefix`]).
     fn snapshot_handles(&mut self) -> &mut SnapHandles;
 }
@@ -852,6 +855,9 @@ impl PrefixRuntime for GlmRank {
     fn prefix_state_digest(&mut self, slot: usize, len: usize) -> Result<u64, ModelError> {
         self.m.prefix_state_digest(slot, len)
     }
+    fn kv_pages(&self) -> (usize, Vec<usize>) {
+        (self.m.kv_free_pages(), (0..self.m.slots).map(|s| self.m.kv_slot_pages(s)).collect())
+    }
     fn snapshot_handles(&mut self) -> &mut SnapHandles {
         &mut self.snaps
     }
@@ -897,9 +903,9 @@ impl GlmMtpRuntime for GlmRank {
         }
         self.m.dflash_draft(asks)
     }
-    fn dflash_prompt_end(&mut self, slot: usize, end: Option<usize>) {
+    fn dflash_prompt_end(&mut self, slot: usize, end: Option<usize>, cut: Option<usize>) {
         if slot < self.m.slots {
-            self.m.dflash_prompt_end(slot, end);
+            self.m.dflash_prompt_end(slot, end, cut);
         }
     }
 }
