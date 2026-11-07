@@ -78,6 +78,19 @@ mod ffi {
             un: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn gb_moe_router_logits_v4(
+            x: *const c_void,
+            x_dtype: i32,
+            gate: *const c_void,
+            logits: *mut c_void,
+            rows: i32,
+            k: i32,
+            e: i32,
+            rb: i32,
+            eb: i32,
+            warps: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn gb_moe_router_select(
             logits: *const c_void,
             sig: *const c_void,
@@ -520,6 +533,41 @@ impl MoeRouter {
                 eb as i32,
                 warps as i32,
                 un as i32,
+                st.raw(),
+            ))
+        }
+    }
+
+    /// The prefill tiling with 16-byte loads (`router_logits_v4_kernel`: rows 2/4/8 and experts 2/4/8 an 8-lane group, warps a block
+    /// 2/4/8), for fp16 `x`, a hidden size that is a multiple of 64 and 16-byte aligned buffers (`Err` otherwise): the same bits as every
+    /// other blocking (tested), only the speed differs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn logits_blocked_v4(
+        &self,
+        x: &DevBuf,
+        x_dtype: Dtype,
+        rows: usize,
+        logits: &mut DevBuf,
+        rb: usize,
+        eb: usize,
+        warps: usize,
+        st: &Stream,
+    ) -> Result<(), CudaError> {
+        if rows == 0 || x.bytes() < rows * self.hidden * x_dtype.size() || logits.bytes() < rows * self.experts * 2 {
+            return Err(INVALID);
+        }
+        unsafe {
+            check(ffi::gb_moe_router_logits_v4(
+                x.ptr(),
+                x_dtype as i32,
+                self.gate.ptr(),
+                logits.ptr(),
+                rows as i32,
+                self.hidden as i32,
+                self.experts as i32,
+                rb as i32,
+                eb as i32,
+                warps as i32,
                 st.raw(),
             ))
         }

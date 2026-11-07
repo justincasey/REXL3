@@ -783,6 +783,59 @@ fn bench_router_big() {
     }
 }
 
+/// The 16-byte prefill tiling (`router_logits_v4_kernel`) against the launcher's default at the GLM prefill shapes, in microseconds, L2
+/// warm: the router (4096 -> 288), the DSA indexer's plain-fp16 `wq_b` (1536 -> 4096; here its first 512 columns, the most a router
+/// holds), its `wk` / `compress_gate` (4096 -> 128) and `weights_proj` (4096 -> 32), at a row-split chunk's 2,048 rows and a whole
+/// chunk's 4,096. Every shape's bits are the default's.
+#[test]
+#[ignore]
+fn bench_router_v4() {
+    gpu!();
+    let st = Stream::new().unwrap();
+    let mut r = Rng(37);
+    let t = EventTimer::new(2).unwrap();
+    for (k, n) in [(4096usize, 288usize), (1536, 512), (4096, 128), (4096, 32)] {
+        let w = rand_f16(&mut r, n * k, 0.03);
+        let gemv = MoeRouter::new(&w, &vec![0.0f32; n], k, 8, 1.0).unwrap();
+        for rows in [2048usize, 4096] {
+            let x = up(&rand_f16(&mut r, rows * k, 1.0));
+            let mut want = DevBuf::zeroed(rows * n * 2).unwrap();
+            let mut got = DevBuf::zeroed(rows * n * 2).unwrap();
+            let time = |f: &mut dyn FnMut()| {
+                f();
+                t.record(0, &st).unwrap();
+                for _ in 0..5 {
+                    f();
+                }
+                t.record(1, &st).unwrap();
+                t.ms(0, 1).unwrap() as f64 * 1e3 / 5.0
+            };
+            let def = time(&mut || gemv.logits(&x, Dtype::F16, rows, &mut want, &st).unwrap());
+            let eb = time(&mut || gemv.logits_blocked_eb(&x, Dtype::F16, rows, &mut got, 4, 4, 4, 1, &st).unwrap());
+            let want: Vec<u16> = sync_dl(&want, &st);
+            let mut line = Vec::new();
+            let mut best = (f64::MAX, (0, 0, 0));
+            for (rb, eb4) in [(2usize, 2usize), (2, 4), (2, 8), (4, 2), (4, 4), (4, 8), (8, 2), (8, 4)] {
+                for warps in [2usize, 4, 8] {
+                    let us = time(&mut || gemv.logits_blocked_v4(&x, Dtype::F16, rows, &mut got, rb, eb4, warps, &st).unwrap());
+                    assert!(sync_dl::<u16>(&got, &st) == want, "{k}x{n} rows {rows}: v4 rb {rb} eb {eb4} warps {warps} changes the bits");
+                    if us < best.0 {
+                        best = (us, (rb, eb4, warps));
+                    }
+                    line.push(format!("r{rb}e{eb4}w{warps} {us:.0}"));
+                }
+            }
+            let tf = 2.0 * (rows * n * k) as f64 / (best.0 * 1e-6) / 1e12;
+            println!(
+                "ROUTERV4 {k}x{n} R={rows}: default {def:.0} us, eb 4/4/4/1 {eb:.0} us, v4 best {:.0} us at {:?} ({tf:.1} TFLOP/s) | {}",
+                best.0,
+                best.1,
+                line.join(" ")
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------------------------------------
 // Qwen Flash-Next grouped prefill (REXL3_FLASH_NEXT_GROUPED_MOE_PREFILL): the constructor from the per-expert
 // Exl3Weights the Qwen loader keeps (MoeExperts::from_exl3), the route representation (u32 ids -> i32 picks, f32
