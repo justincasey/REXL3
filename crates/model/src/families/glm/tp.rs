@@ -119,7 +119,8 @@ pub struct GlmFacts {
     pub window_rows: u32,
     /// The draft head's vocabulary (`REXL3_MTP_VOCAB`, effective; `none` without the NextN layer).
     pub mtp_vocab: String,
-    /// The digest of the expert ownership table (owner rank of every global expert; [`ownership_digest`]).
+    /// The digest of the expert ownership table (owner rank of every global expert; [`ownership_digest`]), or of the width split
+    /// ([`width_digest`]: every rank holds every expert at its share of the width).
     pub ownership: u64,
     /// The collective policy (`REXL3_TP_COLLECTIVE`, `tp_comm::collective_fingerprint`): ring on one rank and one-shot on another wait
     /// for collectives the other never issues.
@@ -233,6 +234,23 @@ impl GlmFacts {
         self.split = split;
         self
     }
+
+    /// These facts for a rank of the expert width split (`tp_boot::ExpertSplit::Width`): the ownership fact is the split's digest.
+    pub fn with_width_split(mut self, experts: usize, ranks: usize) -> GlmFacts {
+        self.ownership = width_digest(experts, ranks);
+        self
+    }
+}
+
+/// FNV-1a 64 of the expert width split of `experts` experts over `ranks` ranks (every rank every expert, at its share of the width):
+/// never a range table's digest.
+pub fn width_digest(experts: usize, ranks: usize) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut eat = |b: u8| h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
+    for b in b"glm-width-v1".iter().copied().chain((experts as u64).to_le_bytes()).chain((ranks as u64).to_le_bytes()) {
+        eat(b);
+    }
+    h
 }
 
 /// The owner rank of every global expert under [`ExpertOwnership::range`] at `ranks` ranks.

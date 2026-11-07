@@ -102,15 +102,58 @@ pub fn abort_group_comm() {
     }
 }
 
-/// The flags byte rank 0 appends to the NCCL unique id, checked by every follower before it acknowledges: the expert rule
-/// (`1` = `ExpertOwnership::range`, the only one built). A rank that would own other experts never joins.
-const FLAG_RANGE: u8 = 1;
+/// `REXL3_GLM_TP_EXPERTS`: how the ranks of a sharded group hold the routed experts. `width` (unset: the default) gives every rank every
+/// expert at its half of the intermediate width (`gb_cuda::moe_width`: gate/up columns, down K rows; equal bytes a rank and token, the
+/// single node's decode bits); `range` keeps whole experts by `ExpertOwnership::range` (0..144 | 144..288), the layout before it, for an
+/// A/B. Rank 0 sends its rule in the flags byte of the bootstrap, and a follower with another refuses to join.
+pub const EXPERTS_ENV: &str = "REXL3_GLM_TP_EXPERTS";
 
-/// The communicator (`NcclTp`), bootstrapped over the rendezvous: rank 0 offers the unique id and the flags byte, every follower checks it
-/// before it acknowledges, nobody joins a communicator another rank refused. An empty offer (`REXL3_TP_COMM=none`): no communicator.
+/// The rule of [`EXPERTS_ENV`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpertSplit {
+    /// Whole experts, `ExpertOwnership::range`.
+    Range,
+    /// Every expert at the rank's share of its width.
+    Width,
+}
+
+impl ExpertSplit {
+    /// The rule of this process (refused by name when malformed).
+    pub fn from_env() -> Result<Self, ModelError> {
+        match std::env::var(EXPERTS_ENV).as_deref() {
+            Err(_) | Ok("width") => Ok(Self::Width),
+            Ok("range") => Ok(Self::Range),
+            Ok(v) => Err(ModelError::Config(format!(
+                "{EXPERTS_ENV}={v}: `width` (every expert's intermediate columns split between the ranks, the default) or `range` \
+                 (whole experts by id range)"
+            ))),
+        }
+    }
+
+    /// The flags byte rank 0 appends to the NCCL unique id (`1` = range, `2` = width).
+    fn flag(self) -> u8 {
+        match self {
+            Self::Range => 1,
+            Self::Width => 2,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Range => "range",
+            Self::Width => "width",
+        }
+    }
+}
+
+/// The communicator (`NcclTp`), bootstrapped over the rendezvous: rank 0 offers the unique id and the flags byte (its [`ExpertSplit`]),
+/// every follower checks it before it acknowledges, nobody joins a communicator another rank refused. An empty offer
+/// (`REXL3_TP_COMM=none`): no communicator.
 pub fn make_comm(topo: TpTopology, rv: &mut Rendezvous<'_, GlmCall>) -> Result<Option<Arc<dyn TpComm>>, ModelError> {
     default_nccl_channels();
     let n = NcclUniqueId::BYTES;
+    let split = ExpertSplit::from_env()?;
+    let flag = split.flag();
     let offer = if topo.rank == 0 {
         if !sharded() {
             Some(Vec::new())
@@ -119,7 +162,7 @@ pub fn make_comm(topo: TpTopology, rv: &mut Rendezvous<'_, GlmCall>) -> Result<O
                 ModelError::Config(format!("ncclGetUniqueId: {e} (is libnccl on LD_LIBRARY_PATH / REXL3_NCCL_LIB?)"))
             })?;
             let mut b = id.as_bytes().to_vec();
-            b.push(FLAG_RANGE);
+            b.push(flag);
             Some(b)
         }
     } else {
@@ -136,8 +179,15 @@ pub fn make_comm(topo: TpTopology, rv: &mut Rendezvous<'_, GlmCall>) -> Result<O
         if !sharded() {
             return Err("rank 0 runs with a communicator and this rank without (REXL3_TP_COMM=none)".into());
         }
-        if b.len() != n + 1 || b[n] != FLAG_RANGE {
-            return Err(format!("the communicator's bootstrap is {} bytes with flags {:?}, expected {} with {FLAG_RANGE} (the ranks run different builds)", b.len(), b.get(n), n + 1));
+        if b.len() != n + 1 {
+            return Err(format!("the communicator's bootstrap is {} bytes, expected {} (the ranks run different builds)", b.len(), n + 1));
+        }
+        if b[n] != flag {
+            return Err(format!(
+                "rank 0 holds the routed experts by rule {} and this rank by {flag} ({}: {EXPERTS_ENV}; 1 = range, 2 = width)",
+                b[n],
+                split.name()
+            ));
         }
         Ok(())
     };
@@ -156,9 +206,10 @@ pub fn make_comm(topo: TpTopology, rv: &mut Rendezvous<'_, GlmCall>) -> Result<O
         ModelError::Config(format!("rank {}: ncclCommInitRank failed: {e} (library {})", topo.rank, NcclComm::library_path()))
     })?;
     eprintln!(
-        "rexl3 event=tp_comm family=glm rank={} ranks={} status=nccl experts=range init_s={:.2} env=\"{}\"",
+        "rexl3 event=tp_comm family=glm rank={} ranks={} status=nccl experts={} init_s={:.2} env=\"{}\"",
         topo.rank,
         topo.ranks,
+        split.name(),
         t0.elapsed().as_secs_f64(),
         gb_cuda::nccl::nccl_environment().join(" ")
     );
@@ -378,7 +429,8 @@ pub fn plan_rank(o: &ServeOptions) -> Result<RankPlan, ModelError> {
     Ok(RankPlan { fingerprint, ..plan_from(o, cfg, ck, free_now, scan_s, own)? })
 }
 
-/// This rank's share of the routed experts: `ExpertOwnership::range` of its place in the group when the group has a communicator, `None`
+/// This rank's share of the routed experts when the group has a communicator: `ExpertOwnership::range` of its place, or every expert
+/// under the width split ([`ExpertSplit::Width`]: the rank holds them all at its share of the width, [`rank_expert_width`]); `None`
 /// otherwise (`REXL3_TP_COMM=none`: every rank holds every expert).
 pub fn rank_ownership(o: &ServeOptions, cfg: &GlmConfig) -> Result<Option<ExpertOwnership>, ModelError> {
     let Some(t) = o.tp.as_ref().filter(|t| t.is_group()) else { return Ok(None) };
@@ -386,9 +438,19 @@ pub fn rank_ownership(o: &ServeOptions, cfg: &GlmConfig) -> Result<Option<Expert
         return Ok(None);
     }
     let experts = alloc::moe_dims(cfg).experts;
+    if ExpertSplit::from_env()? == ExpertSplit::Width {
+        return Ok(Some(ExpertOwnership::all(experts)));
+    }
     ExpertOwnership::range(experts, t.rank, t.ranks)
         .map(Some)
         .map_err(|e| ModelError::Config(format!("expert ownership of rank {} of {}: {e}", t.rank, t.ranks)))
+}
+
+/// The place `(rank, ranks)` of a rank of a sharded group under the expert width split ([`EXPERTS_ENV`] `width`, the default): it maps,
+/// plans and loads its columns of every routed expert (`GlmConfig::with_expert_width`). `None` otherwise.
+pub fn rank_expert_width(o: &ServeOptions) -> Result<Option<(usize, usize)>, ModelError> {
+    let Some(t) = o.tp.as_ref().filter(|t| t.is_group()) else { return Ok(None) };
+    Ok((sharded() && ExpertSplit::from_env()? == ExpertSplit::Width).then_some((t.rank, t.ranks)))
 }
 
 /// Bytes of the device regions a rank allocates for `pack` (mapped for its share): the global region and every trunk layer's trunk and
@@ -417,7 +479,8 @@ pub fn rank_kda_split(o: &ServeOptions) -> Result<Option<(usize, usize)>, ModelE
     Ok((sharded() && bits & super::model::tp::SPLIT_KDA != 0).then_some((t.rank, t.ranks)))
 }
 
-/// [`plan_rank`] at a given free figure (before the load): the planner's half, pure (the CPU check of the cluster file's flags).
+/// [`plan_rank`] at a given free figure (before the load): the planner's half, pure (the CPU check of the cluster file's flags). A rank of
+/// the expert width split ([`rank_expert_width`]) plans with its share in the configuration (`own` is then every expert).
 pub fn plan_from(
     o: &ServeOptions,
     cfg: GlmConfig,
@@ -426,6 +489,10 @@ pub fn plan_from(
     scan_s: f64,
     own: Option<ExpertOwnership>,
 ) -> Result<RankPlan, ModelError> {
+    let cfg = match rank_expert_width(o)? {
+        Some((rank, ranks)) => cfg.with_expert_width(rank, ranks).map_err(ModelError::Config)?,
+        None => cfg,
+    };
     plan_from_split(o, cfg, ck, free_now, scan_s, own, rank_kda_split(o)?)
 }
 
@@ -445,6 +512,9 @@ pub fn plan_from_split(
         Some((rank, ranks)) => cfg.with_kda_rank(rank, ranks).map_err(ModelError::Config)?,
         None => cfg,
     };
+    if cfg.ffn.width.is_some() && !own.as_ref().is_some_and(|o| o.is_all()) {
+        return Err(ModelError::Config("a rank of the expert width split maps every expert (at its share of the width)".into()));
+    }
     let mtp = mtp_wanted(o, &cfg);
     let mem_opts = memory::engine_options(&memory_options(o, mtp));
     let profile = memory::memory_profile(&cfg, &mem_opts).map_err(|e| ModelError::Config(e.to_string()))?;
@@ -580,8 +650,12 @@ pub fn load_rank_with(
         let topo = comm.topology();
         let experts = alloc::moe_dims(cfg).experts;
         let own = own.cloned().ok_or_else(|| ModelError::Config("a rank with a communicator has no expert share".into()))?;
-        let want = ExpertOwnership::range(experts, topo.rank, topo.ranks)
-            .map_err(|e| ModelError::Config(format!("expert ownership of rank {} of {}: {e}", topo.rank, topo.ranks)))?;
+        // whole experts: the range of the rank's place; the width split: every expert, at the share `cfg` names (`enable_tp` checks it)
+        let want = match cfg.ffn.width {
+            Some(_) => ExpertOwnership::all(experts),
+            None => ExpertOwnership::range(experts, topo.rank, topo.ranks)
+                .map_err(|e| ModelError::Config(format!("expert ownership of rank {} of {}: {e}", topo.rank, topo.ranks)))?,
+        };
         if own != want {
             return Err(ModelError::Config(format!(
                 "this rank was mapped for {} experts, but rank {} of {} owns {}",
@@ -591,13 +665,22 @@ pub fn load_rank_with(
                 want.local()
             )));
         }
-        eprintln!(
-            "rexl3 event=tp_glm_ownership rank={} ranks={} experts={}..={} of {experts}",
-            topo.rank,
-            topo.ranks,
-            own.owned().first().copied().unwrap_or(0),
-            own.owned().last().copied().unwrap_or(0)
-        );
+        match cfg.ffn.width.and_then(|w| w.cols(cfg.ffn.moe_intermediate)) {
+            Some((c0, c1)) => eprintln!(
+                "rexl3 event=tp_glm_ownership rank={} ranks={} split=width experts=0..={} of {experts} columns={c0}..{c1} of {}",
+                topo.rank,
+                topo.ranks,
+                experts - 1,
+                cfg.ffn.moe_intermediate
+            ),
+            None => eprintln!(
+                "rexl3 event=tp_glm_ownership rank={} ranks={} split=range experts={}..={} of {experts}",
+                topo.rank,
+                topo.ranks,
+                own.owned().first().copied().unwrap_or(0),
+                own.owned().last().copied().unwrap_or(0)
+            ),
+        }
         m.enable_tp(comm, own)?;
         // lane E Phase 2: the replicated weights this rank splits with its peer (`REXL3_GLM_TP_SPLIT`, a fact of the Hello)
         m.enable_head_split(super::model::tp::split_from_env().map_err(ModelError::Config)?)?;
@@ -665,6 +748,7 @@ pub fn adaptive_small(chunk: usize) -> Result<usize, ModelError> {
 /// slice by [`gate_of`].
 pub fn facts_of(cfg: &GlmConfig, ranks: usize, mtp: bool) -> Result<GlmFacts, ModelError> {
     let f = GlmFacts::local(alloc::moe_dims(cfg).experts, ranks);
+    let f = if cfg.ffn.width.is_some() { f.with_width_split(alloc::moe_dims(cfg).experts, ranks) } else { f };
     let f =
         if mtp { f.with_mtp(alloc::MTP_MAX_DEPTH, super::tp_mtp::mtp_vocab_fact(true, vocab_setting()?, cfg.vocab)) } else { f };
     // the graph settings of a sharded rank (its communicator is NCCL's, capturable); a replicated group (`REXL3_TP_COMM=none`) runs no
