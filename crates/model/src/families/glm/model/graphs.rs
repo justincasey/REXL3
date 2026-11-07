@@ -33,8 +33,11 @@ use gb_cuda::{dsa, Stream};
 use std::collections::HashMap;
 use std::time::Instant;
 
-/// Instantiated graphs kept at once.
-pub const GRAPH_LIMIT: usize = 96;
+/// Instantiated graphs kept at once. An instantiated window graph holds about 9 KB of driver memory per launch (two thirds of it host memory,
+/// measured on GB10 with CUDA 13.0, whatever the kernels): 12 to 20 MiB for a window's 1,200 to 1,650 launches, held until the graph is evicted
+/// and outside every plan. 96 graphs held up to 1.6 GiB; the bench's 5,067 windows touch 80 shapes, 55 of them more than once, and at 32 graphs
+/// they cost 24 more captures of about 7 ms each (0.2 s over the whole run) for about 1 GiB less memory.
+pub const GRAPH_LIMIT: usize = 32;
 /// Instantiated graphs of NextN draft calls kept at once (their own cache beside the windows').
 pub const DRAFT_GRAPH_LIMIT: usize = 32;
 
