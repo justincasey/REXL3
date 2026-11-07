@@ -11,7 +11,9 @@
 //! One MLA layer's cache is a [`LatentCache`]: a single buffer `T [n_blocks][256 tokens][512]` holding the **normalised**
 //! 512-wide latent `c_kv` of every token (T = fp16 or bf16, one T per call chain). There is no rope key (`qk_rope_head_dim`
 //! is 0) and the same vector is both K and V of all 64 heads. That is 1 KiB per token per layer, 11 KiB per token over the
-//! 11 MLA layers (the MTP layer 45 keeps its own cache the same way).
+//! 11 MLA layers (the MTP layer 45 keeps its own cache the same way). With `--kv-dtype fp8` ([`LatentKv::Fp8`]) a page holds the
+//! 512 E4M3 values and one fp32 scale of each token instead (516 bytes a token and layer), quantised once by [`latent_write`] and
+//! dequantised exactly into the same T tiles by every attention kernel ([`kv8`]).
 //!
 //! A device block table `i32 [slots][max_blocks]` ([`BlockTable`], shared with the GQA cache) maps `(slot, position / 256)`
 //! to a block id, and `RowIndex` gives each row of a call its `(slot, absolute position)`. **A layer's other planes share
@@ -92,26 +94,218 @@ fn check_dtype(d: Dtype) -> i32 {
     d as i32
 }
 
-/// One layer's paged latent cache `T [n_blocks][256][512]`.
+/// The latent cache's format (`--kv-dtype`, [`KV_ENV`]): the call chain's T (fp16 for GLM, the default: every golden was made with
+/// it), or the fp8 page of `csrc/mla_kv8.cuh` ([`kv8`]): per token 512 E4M3 values and one fp32 scale `amax / 448`, 516 bytes against
+/// 1,024. The kernels dequantise an fp8 page exactly into the T tiles they stage, so on any cache the fp8 path's output is the T
+/// path's on the dequantised values ([`kv8::dequantise`]), bit for bit; every reader (decode, verify, prefill, a restored prefix)
+/// reads the same quantised bytes, so drafted == serial, concurrent == solo and prefix-restored == uncached hold under fp8 too.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum LatentKv {
+    /// `T [n_blocks][256][512]`.
+    #[default]
+    Plain,
+    /// E4M3 `[n_blocks][256][512]` then fp32 scales `[n_blocks][256]`, page by page.
+    Fp8,
+}
+
+impl LatentKv {
+    /// Bytes of one block (256 tokens) of latents of activation type `dtype`.
+    pub fn block_bytes(self, dtype: Dtype) -> usize {
+        match self {
+            LatentKv::Plain => BLOCK_TOKENS * LATENT_DIM * dtype.size(),
+            LatentKv::Fp8 => kv8::PAGE_BYTES,
+        }
+    }
+    /// Bytes one token costs in one layer.
+    pub fn token_bytes(self, dtype: Dtype) -> usize {
+        self.block_bytes(dtype) / BLOCK_TOKENS
+    }
+    /// The flag's spelling (`fp16`, `fp8`).
+    pub const fn name(self) -> &'static str {
+        match self {
+            LatentKv::Plain => "fp16",
+            LatentKv::Fp8 => "fp8",
+        }
+    }
+    /// Parses `fp16` (`f16`, `half`) or `fp8` (`e4m3`, `fp8_e4m3`, `fp8e4m3`). A typo is an error, never a silent fp16.
+    pub fn parse(v: &str) -> Result<Self, String> {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "fp16" | "f16" | "half" => Ok(LatentKv::Plain),
+            "fp8" | "e4m3" | "fp8_e4m3" | "fp8e4m3" => Ok(LatentKv::Fp8),
+            other => Err(format!("{other:?}: expected fp16 or fp8")),
+        }
+    }
+    /// The kernels' `kv` argument.
+    pub(crate) const fn id(self) -> i32 {
+        match self {
+            LatentKv::Plain => 0,
+            LatentKv::Fp8 => 1,
+        }
+    }
+}
+
+/// The environment variable that selects GLM's latent cache format for the process (`fp16`, the default, or `fp8`); the server's
+/// `--kv-dtype fp8` sets it. Every TP rank must run with the same value (the ranks compare it at the Hello).
+pub const KV_ENV: &str = "REXL3_GLM_KV";
+
+/// The format this process is configured for ([`KV_ENV`]; unset or empty: fp16). An unrecognised value is an error, so a typo never
+/// silently serves the other format.
+pub fn configured_kv() -> Result<LatentKv, String> {
+    match std::env::var(KV_ENV) {
+        Err(_) => Ok(LatentKv::Plain),
+        Ok(v) if v.trim().is_empty() => Ok(LatentKv::Plain),
+        Ok(v) => LatentKv::parse(&v).map_err(|e| format!("{KV_ENV}={v:?}: {e}")),
+    }
+}
+
+/// The CPU mirror of `csrc/mla_kv8.cuh`: the fp8 page's addressing, the quantiser of the latent write and the dequantiser of the
+/// attention kernels' staging, bit for bit (`crates/cuda/tests/mla_kv8.rs` holds the device to it).
+pub mod kv8 {
+    use super::{BLOCK_TOKENS, LATENT_DIM};
+    use crate::exl3_linear::Dtype;
+
+    /// Byte offset of the scales in a page: the values `[256][512]` come first.
+    pub const SCALE_OFF: usize = BLOCK_TOKENS * LATENT_DIM;
+    /// Bytes of one page: 131,072 of values and 1,024 of scales.
+    pub const PAGE_BYTES: usize = SCALE_OFF + BLOCK_TOKENS * 4;
+    /// The largest finite E4M3 magnitude.
+    pub const E4M3_MAX: f32 = 448.0;
+
+    /// The E4M3 (FN: bias 7, no infinities, `0x7F`/`0xFF` NaN) code of `x`, round to nearest even, saturating at +-448: what
+    /// `__nv_cvt_float2_to_fp8x2(.., __NV_SATFINITE, __NV_E4M3)` gives.
+    pub fn e4m3_rne(x: f32) -> u8 {
+        let sign = if x.is_sign_negative() { 0x80u8 } else { 0 };
+        if x.is_nan() {
+            return 0x7F;
+        }
+        let a = x.abs();
+        if a >= E4M3_MAX {
+            return sign | 0x7E;
+        }
+        // below 2^-6 the codes are the multiples of 2^-9 (subnormals; 8 * 2^-9 is the smallest normal 0x08): a * 512 is exact
+        if a < 1.0 / 64.0 {
+            return sign | (a * 512.0).round_ties_even() as u8;
+        }
+        let bits = a.to_bits();
+        let e = ((bits >> 23) & 0xFF) as i32 - 127;
+        let mut man = ((bits >> 20) & 0x7) as i32;
+        let rem = bits & 0x000F_FFFF;
+        if rem > 0x8_0000 || (rem == 0x8_0000 && man & 1 == 1) {
+            man += 1;
+        }
+        let mut exp = e + 7;
+        if man == 8 {
+            man = 0;
+            exp += 1;
+        }
+        if exp > 15 || (exp == 15 && man > 6) {
+            return sign | 0x7E;
+        }
+        sign | ((exp as u8) << 3) | man as u8
+    }
+
+    /// One latent row (`LATENT_DIM` values as f32, read from T) quantised: its E4M3 bytes and its scale `amax / 448`. A row whose
+    /// scale is 0 (all zeros) is zero bytes.
+    pub fn quantise_row(row: &[f32]) -> (Vec<u8>, f32) {
+        assert_eq!(row.len(), LATENT_DIM);
+        let amax = row.iter().fold(0.0f32, |m, &v| if v.abs() > m { v.abs() } else { m });
+        let s = amax / E4M3_MAX;
+        if !(s > 0.0) {
+            return (vec![0u8; LATENT_DIM], s);
+        }
+        (row.iter().map(|&v| e4m3_rne(v / s)).collect(), s)
+    }
+
+    /// The T bits (fp16 or bf16) a kernel stages for E4M3 byte `b` at scale `s`: `round_T(f32(b) * s)`.
+    pub fn dequantise(b: u8, s: f32, dtype: Dtype) -> u16 {
+        let v = crate::fp8_linear::e4m3_to_f32(b) * s;
+        match dtype {
+            Dtype::F16 => gb_exl3::f16::f64_to_f16(v as f64),
+            Dtype::BF16 => crate::num::f32_to_bf16(v),
+            Dtype::F32 => panic!("the latent cache holds 16-bit values"),
+        }
+    }
+
+    /// T bits of a 16-bit value as f32.
+    pub fn to_f32(v: u16, dtype: Dtype) -> f32 {
+        match dtype {
+            Dtype::F16 => gb_exl3::f16::f16_to_f64(v) as f32,
+            Dtype::BF16 => crate::num::bf16_to_f32(v),
+            Dtype::F32 => panic!("the latent cache holds 16-bit values"),
+        }
+    }
+
+    /// A row of T bits as the kernels read it back after a write: quantised, then dequantised.
+    pub fn round_trip(row: &[u16], dtype: Dtype) -> Vec<u16> {
+        let f: Vec<f32> = row.iter().map(|&v| to_f32(v, dtype)).collect();
+        let (q, s) = quantise_row(&f);
+        q.iter().map(|&b| dequantise(b, s, dtype)).collect()
+    }
+
+    /// The row of token `tok` of page `page` from a host copy of a whole fp8 cache, dequantised to T bits.
+    pub fn read_row(cache: &[u8], page: usize, tok: usize, dtype: Dtype) -> Vec<u16> {
+        let base = page * PAGE_BYTES;
+        let s = f32::from_le_bytes(cache[base + SCALE_OFF + tok * 4..][..4].try_into().unwrap());
+        cache[base + tok * LATENT_DIM..][..LATENT_DIM].iter().map(|&b| dequantise(b, s, dtype)).collect()
+    }
+}
+
+/// One layer's paged latent cache: `T [n_blocks][256][512]`, or the fp8 page ([`LatentKv::Fp8`]).
 #[derive(Debug)]
 pub struct LatentCache {
     pub lat: DevBuf,
     pub n_blocks: usize,
+    /// The activation type: what the kernels stage and attend in (the values themselves with [`LatentKv::Plain`]).
     pub dtype: Dtype,
+    pub kv: LatentKv,
 }
 
 impl LatentCache {
     /// Bytes of one block of latents.
-    pub fn block_bytes(dtype: Dtype) -> usize {
-        BLOCK_TOKENS * LATENT_DIM * dtype.size()
+    pub fn block_bytes(dtype: Dtype, kv: LatentKv) -> usize {
+        kv.block_bytes(dtype)
     }
     /// Allocates an (uninitialised) cache of `n_blocks` pages.
-    pub fn new(n_blocks: usize, dtype: Dtype) -> Result<Self, CudaError> {
+    pub fn new(n_blocks: usize, dtype: Dtype, kv: LatentKv) -> Result<Self, CudaError> {
         check_dtype(dtype);
-        Ok(Self { lat: DevBuf::alloc(n_blocks * Self::block_bytes(dtype))?, n_blocks, dtype })
+        Ok(Self { lat: DevBuf::alloc(n_blocks * kv.block_bytes(dtype))?, n_blocks, dtype, kv })
     }
     pub fn capacity_tokens(&self) -> usize {
         self.n_blocks * BLOCK_TOKENS
+    }
+    /// Bytes of one block of this cache.
+    pub fn page_bytes(&self) -> usize {
+        self.kv.block_bytes(self.dtype)
+    }
+    /// The byte ranges `(offset, len)` of rows `0..rows` of page `page` (rows < 256): the values, then for fp8 the scales. A page copy
+    /// or a digest of a partial page covers exactly these.
+    pub fn row_ranges(&self, page: usize, rows: usize) -> Vec<(usize, usize)> {
+        let base = page * self.page_bytes();
+        match self.kv {
+            LatentKv::Plain => vec![(base, rows * LATENT_DIM * self.dtype.size())],
+            LatentKv::Fp8 => vec![(base, rows * LATENT_DIM), (base + kv8::SCALE_OFF, rows * 4)],
+        }
+    }
+    /// Rows `0..n` of the sequence whose pages are `blocks`, as the kernels read them: T bits `[n][512]` (dequantised for fp8). A
+    /// debug and test path: copies the whole cache to the host. Synchronous.
+    pub fn read_rows(&self, blocks: &[u32], n: usize) -> Result<Vec<u16>, CudaError> {
+        let mut out = Vec::with_capacity(n * LATENT_DIM);
+        match self.kv {
+            LatentKv::Plain => {
+                let all: Vec<u16> = self.lat.to_vec()?;
+                for p in 0..n {
+                    let at = plane_offset(blocks[p / BLOCK_TOKENS] as usize, p % BLOCK_TOKENS, BLOCK_TOKENS, LATENT_DIM);
+                    out.extend_from_slice(&all[at..at + LATENT_DIM]);
+                }
+            }
+            LatentKv::Fp8 => {
+                let all: Vec<u8> = self.lat.to_vec()?;
+                for p in 0..n {
+                    out.extend(kv8::read_row(&all, blocks[p / BLOCK_TOKENS] as usize, p % BLOCK_TOKENS, self.dtype));
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -189,6 +383,7 @@ pub fn attend_workspace_bytes(rows: usize, max_context: usize) -> usize {
 mod ffi {
     use core::ffi::c_void;
     crate::launchers! {
+        #[allow(clippy::too_many_arguments)]
         pub fn gb_mla_latent_write(
             lat: *const c_void,
             row_slot: *const i32,
@@ -197,6 +392,8 @@ mod ffi {
             max_blocks: i32,
             cache: *mut c_void,
             rows: i32,
+            dtype: i32,
+            kv: i32,
             stream: *mut c_void,
         ) -> i32;
         #[allow(clippy::too_many_arguments)]
@@ -234,6 +431,7 @@ mod ffi {
             workspace: *mut c_void,
             workspace_bytes: usize,
             dtype: i32,
+            kv: i32,
             nh: i32,
             stream: *mut c_void,
         ) -> i32;
@@ -254,6 +452,7 @@ mod ffi {
             workspace: *mut c_void,
             workspace_bytes: usize,
             dtype: i32,
+            kv: i32,
             nh: i32,
             stream: *mut c_void,
         ) -> i32;
@@ -291,6 +490,7 @@ mod ffi {
             workspace: *mut c_void,
             workspace_bytes: usize,
             dtype: i32,
+            kv: i32,
             variant: i32,
             stream: *mut c_void,
         ) -> i32;
@@ -310,13 +510,15 @@ mod ffi {
             workspace: *mut c_void,
             workspace_bytes: usize,
             dtype: i32,
+            kv: i32,
             stream: *mut c_void,
         ) -> i32;
     }
 }
 
-/// Writes row `r`'s normalised latent (`lat`: `T [rows][512]`) into the cache at `(row_slot[r], row_pos[r])`. A negative
-/// position skips the row. Rows must target distinct positions.
+/// Writes row `r`'s normalised latent (`lat`: `T [rows][512]`) into the cache at `(row_slot[r], row_pos[r])`: the values, or for an
+/// fp8 cache their E4M3 bytes and the row's scale ([`kv8::quantise_row`]). A negative position skips the row. Rows must target distinct
+/// positions.
 pub fn latent_write(
     lat: &DevBuf,
     rows: &RowIndex,
@@ -336,6 +538,8 @@ pub fn latent_write(
             table.max_blocks as i32,
             cache.lat.ptr(),
             n_rows as i32,
+            check_dtype(cache.dtype),
+            cache.kv.id(),
             stream.raw(),
         )
     };
@@ -463,6 +667,7 @@ fn attend_impl(
             workspace.ptr(),
             workspace.bytes(),
             dt,
+            cache.kv.id(),
             variant,
             stream.raw(),
         )
@@ -534,6 +739,7 @@ pub fn attend_sparse(
             workspace.ptr(),
             workspace.bytes(),
             dt,
+            cache.kv.id(),
             stream.raw(),
         )
     };
@@ -731,6 +937,7 @@ pub fn attend_below_heads(
             workspace.ptr(),
             workspace.bytes(),
             dt,
+            cache.kv.id(),
             nh as i32,
             stream.raw(),
         )
@@ -776,6 +983,7 @@ pub fn attend_sparse_heads(
             workspace.ptr(),
             workspace.bytes(),
             dt,
+            cache.kv.id(),
             nh as i32,
             stream.raw(),
         )

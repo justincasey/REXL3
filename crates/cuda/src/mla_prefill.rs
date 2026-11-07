@@ -17,6 +17,7 @@ use crate::rt::{CudaError, DevBuf, Stream};
 mod ffi {
     use core::ffi::c_void;
     crate::launchers! {
+        #[allow(clippy::too_many_arguments)]
         pub fn gb_mla_attend_pf(
             q_lat: *const c_void,
             cache: *const c_void,
@@ -31,6 +32,7 @@ mod ffi {
             out: *mut c_void,
             rows: i32,
             dtype: i32,
+            kv: i32,
             stream: *mut c_void,
         ) -> i32;
     }
@@ -73,6 +75,7 @@ pub fn attend_pf(
             o_lat.ptr(),
             n_rows as i32,
             cache.dtype as i32,
+            cache.kv.id(),
             stream.raw(),
         )
     };

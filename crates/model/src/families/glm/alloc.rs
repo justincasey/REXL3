@@ -9,8 +9,9 @@
 //!   the conv history and the parity word: `kda::Dims::slot_bytes`, 34 layers), and the DSA raw-row rings (`ring_len x 512 B` per MLA layer: the
 //!   indexer's `[LayerNorm(k) | gate]` rows of the last `ring_len` tokens of the slot, which is all the pool update ever reads back: the per-token
 //!   plane the oracle keeps is 512 B per token and layer and is NOT built);
-//! * **per KV page** (256 tokens): the MLA latent (`256 x 512` fp16 per MLA layer) and the DSA pool plane (`64 x 128` fp16 per MLA layer, one
-//!   entry per 4 tokens): 11,968 B per token over the 11 MLA layers;
+//! * **per KV page** (256 tokens): the MLA latent (`256 x 512` fp16 per MLA layer; with `--kv-dtype fp8` `256 x 512` E4M3 and 256 fp32
+//!   scales) and the DSA pool plane (`64 x 128` fp16 per MLA layer, one entry per 4 tokens): 11,968 B per token over the 11 MLA layers
+//!   (6,380 B with fp8);
 //! * **per window row**: the KDA window record of every layer (`kda::Dims::record_bytes_per_row`: the raw bf16 qkv row, the fp32 decay and beta;
 //!   the conv shift reads the same raw rows, so there is no second copy), held until the window's commit;
 //! * **scratch**: every activation and workspace buffer of one forward call, sized for `max_rows` rows (the kernels take at most 128 per call).
@@ -239,7 +240,10 @@ impl AllocPlan {
             .map(|i| Item { name: i.name, bytes: i.bytes * p.slots as u64 })
             .collect();
         items.extend([
-            Item { name: "mla_latent", bytes: n_mla_state * p.kv_blocks as u64 * LatentCache::block_bytes(Dtype::F16) as u64 },
+            Item {
+                name: "mla_latent",
+                bytes: n_mla_state * p.kv_blocks as u64 * LatentCache::block_bytes(Dtype::F16, cfg.latent_kv) as u64,
+            },
             Item { name: "dsa_pools", bytes: n_mla_state * dsa::Planes::pool_bytes(p.kv_blocks) as u64 },
             Item { name: "kda_window_records", bytes: n_kda * p.window_rows as u64 * d.record_bytes_per_row() as u64 },
         ]);

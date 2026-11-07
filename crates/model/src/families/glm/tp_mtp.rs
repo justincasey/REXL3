@@ -625,6 +625,7 @@ mod tests {
             cache_slots: 0,
             cache_slot_bytes: 0,
             cache_pages: 0,
+            kv: "fp16".into(),
         }
     }
 

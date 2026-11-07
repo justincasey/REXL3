@@ -344,11 +344,12 @@ pub fn build_engine(o: &ServeOptions) -> Result<GlmEngine, ModelError> {
     }
     boot::fact("slots", slots.to_string());
     eprintln!(
-        "rexl3 event=kv_plan free_gib={:.1} kv_pages={} kv_tokens={} slots={}",
+        "rexl3 event=kv_plan free_gib={:.1} kv_pages={} kv_tokens={} slots={} kv={}",
         gib(free),
         plan.kv_blocks,
         plan.kv_tokens,
-        slots
+        slots,
+        cfg.latent_kv.name()
     );
     boot::fact("kv_pages", plan.kv_blocks.to_string());
     boot::fact("kv_tokens", plan.kv_tokens.to_string());

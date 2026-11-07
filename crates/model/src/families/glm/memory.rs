@@ -168,6 +168,19 @@ mod tests {
         let with_mtp = memory_profile(&c, &MemoryOptions { mtp: true, ..opts() }).unwrap();
         assert_eq!(with_mtp.kv_bytes_per_token(), 12 * 1088);
         assert_eq!(with_mtp.kv_page_bytes(), 12 * 278_528);
+        // an fp8 latent (`--kv-dtype fp8`): 512 E4M3 bytes and one fp32 scale a token and layer, the pool plane unchanged: 516 + 64 B, so a
+        // fixed budget holds 11,968 / 6,380 = 1.876x the tokens; the page is the device's (`kv8::PAGE_BYTES` + the pools)
+        let c8 = GlmConfig { latent_kv: gb_cuda::mla::LatentKv::Fp8, ..real() };
+        let p8 = memory_profile(&c8, &opts()).unwrap();
+        assert_eq!(p8.kv_bytes_per_token(), 11 * (516 + 64));
+        assert_eq!(p8.kv_bytes_per_token(), 6_380);
+        assert_eq!(p8.kv_page_bytes(), 11 * (gb_cuda::mla::kv8::PAGE_BYTES as u64 + 16_384));
+        let a8 = super::super::alloc::AllocPlan::new(
+            &c8,
+            &super::super::alloc::AllocParams { slots: 1, kv_blocks: 7, max_context: 4096, max_rows: 128, window_rows: 64, mtp: false },
+        )
+        .unwrap();
+        assert_eq!(a8.get("mla_latent") + a8.get("dsa_pools"), 7 * p8.kv_page_bytes(), "the plan's pages are the profile's");
     }
 
     #[test]

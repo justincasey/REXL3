@@ -413,7 +413,7 @@ impl GlmModel {
         let mut latent = Vec::new();
         let mut planes = Vec::new();
         for _ in &mla_layers {
-            latent.push(LatentCache::new(o.kv_blocks, Dtype::F16)?);
+            latent.push(LatentCache::new(o.kv_blocks, Dtype::F16, cfg.latent_kv)?);
             planes.push(dsa::Planes::new(o.kv_blocks, o.slots, RING_LEN)?);
         }
         let moe_dims = alloc::moe_dims(&cfg);
@@ -2451,18 +2451,12 @@ impl GlmModel {
         Ok((self.pools[ord].read_both(slot)?, par[slot] & 1, self.pools[ord].read_conv(slot)?))
     }
 
-    /// The MLA latent rows `0..n` of MLA layer `l` for `slot` (fp16 bits, `[n][512]`), through the slot's page table (a debug path).
+    /// The MLA latent rows `0..n` of MLA layer `l` for `slot` (fp16 bits, `[n][512]`, dequantised from an fp8 cache: what the attention
+    /// kernels read), through the slot's page table (a debug path).
     pub fn latent_rows(&mut self, l: usize, slot: usize, n: usize) -> Result<Vec<u16>, ModelError> {
         self.stream.sync()?;
         let ord = self.mla_ord[l];
-        let all: Vec<u16> = self.latent[ord].lat.to_vec()?;
-        let blocks = self.kv_tab.blocks_of(slot);
-        let mut out = Vec::with_capacity(n * mla::LATENT_DIM);
-        for p in 0..n {
-            let at = (blocks[p / BLOCK_TOKENS] as usize * BLOCK_TOKENS + p % BLOCK_TOKENS) * mla::LATENT_DIM;
-            out.extend_from_slice(&all[at..at + mla::LATENT_DIM]);
-        }
-        Ok(out)
+        Ok(self.latent[ord].read_rows(self.kv_tab.blocks_of(slot), n)?)
     }
 
     /// The DSA pool rows of pools `0..n_pools` of MLA layer `l` for `slot` (fp16 bits, `[n_pools][128]`).

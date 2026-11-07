@@ -761,11 +761,12 @@ pub fn build_leader(
     // the prefix cache (`docs/GLM_TP.md` 4.2): rank 0's engine decides hits; every rank snapshots and restores its own state between
     // chunks. `with_prefix_cache` forwards `EnableSnapshots` (each rank allocates its own pool, rank 0's arena checked on every follower)
     eprintln!(
-        "rexl3 event=kv_plan free_gib={:.1} kv_pages={} kv_tokens={} slots={}",
+        "rexl3 event=kv_plan free_gib={:.1} kv_pages={} kv_tokens={} slots={} kv={}",
         gib(p.free_after_weights),
         p.kv_admitted.0,
         p.kv_admitted.1,
-        p.mo.slots
+        p.mo.slots,
+        p.cfg.latent_kv.name()
     );
     if p.cache.enabled() {
         eprintln!(
