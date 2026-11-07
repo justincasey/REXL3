@@ -20,9 +20,11 @@ pub const TO_END: u32 = u32::MAX;
 /// short prompts (and windows) run meanwhile up to these rows.
 pub const PART_ROOM: usize = 512;
 
-/// `REXL3_GLM_PREFILL_PART_MS`: while a sequence decodes, rank 0 runs a long prompt slice in parts of about this many milliseconds, a
-/// decode round between two (default 300; `0`/`off`: every slice whole). Rank 0's alone (its parts are calls every rank runs); never a
-/// bit.
+/// `REXL3_GLM_PREFILL_PART_MS`: while a sequence decodes, rank 0 runs a long prompt slice in parts of about this many milliseconds (at
+/// least a layer), a decode round between two (default 100; `0`/`off`: every slice whole). Rank 0's alone (its parts are calls every rank
+/// runs); never a bit. Smaller parts give the decoding streams more of the device and a long prompt less (MEASURED on pair B, the bench's
+/// mixed and trace phases: 300 ms -> trace mean 40.5 s, a 32K prompt beside 4 chats 39.5 s; 150 ms -> 33.1 s, 50.0 s; 100 ms -> 27.9 s,
+/// 53.6 s; 80 ms -> 28.5 s, 55.0 s).
 pub const PART_MS_ENV: &str = "REXL3_GLM_PREFILL_PART_MS";
 
 /// `REXL3_GLM_PREFILL_BATCH_ROWS`: while a sequence decodes, rank 0 puts at most this many rows of fresh short prompts (each at most
@@ -45,7 +47,7 @@ pub fn part_ms_from_env() -> Result<f64, ModelError> {
 
 fn parse_part_ms(v: Option<&str>) -> Result<f64, ModelError> {
     match v.map(str::trim) {
-        None | Some("") => Ok(300.0),
+        None | Some("") => Ok(100.0),
         Some("off") => Ok(0.0),
         Some(s) => s
             .parse::<f64>()

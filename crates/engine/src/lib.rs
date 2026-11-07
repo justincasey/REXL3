@@ -873,6 +873,8 @@ pub struct Engine<B: Backend> {
     prefill_policy: PrefillPolicy,
     /// Whether a burst's slices go to the backend as ONE `prefill_slices` call (default) or one `prefill_slice` call each.
     prefill_batching: bool,
+    /// How long the serving loop waits, when a request wakes the idle engine, for the ones sent with it ([`ServeEngine::gather_window`]).
+    gather: std::time::Duration,
     slice_deadline: Option<std::time::Instant>,
     max_step_time: std::time::Duration,
     /// Sequences that failed while the others went on (prefill, a row that could not be sampled, a backend error that served
@@ -950,6 +952,7 @@ impl<B: Backend> Engine<B> {
             scores: Vec::new(),
             prefill_policy: PrefillPolicy::default(),
             prefill_batching: true,
+            gather: std::time::Duration::ZERO,
             slice_deadline: None,
             max_step_time: std::time::Duration::ZERO,
             failed: Vec::new(),
@@ -1044,6 +1047,14 @@ impl<B: Backend> Engine<B> {
     /// one. Off is the behaviour before batching; replies are the same either way.
     pub fn with_prefill_batching(mut self, on: bool) -> Self {
         self.prefill_batching = on;
+        self
+    }
+
+    /// When a request arrives at the idle engine, the serving loop waits `d` for the ones sent with it before the first step, so prompts
+    /// sent together are filled together (a backend that puts several prompts through one forward: `Backend::prefill_slices`); a request
+    /// alone starts `d` later. Zero (the default): the first step starts at once. Moves when slices run, never a bit.
+    pub fn with_gather_window(mut self, d: std::time::Duration) -> Self {
+        self.gather = d;
         self
     }
 
@@ -1679,14 +1690,16 @@ impl<B: Backend> Engine<B> {
         // one decode round for the running sequences, then one prefill slice for the next queued prompt in turn: a long prompt
         // delays the others by one slice a round instead of stalling them for its whole prefill, and a short prompt behind it
         // gets its slice at the next turn
-        let more = if self.active.is_empty() { false } else { self.decode_round()? };
+        let decoded = !self.active.is_empty();
+        let more = if decoded { self.decode_round()? } else { false };
         // `Serial` runs one slice; `Burst` several while a burst of prompts waits, each to the prompt `pick_next_prefill` puts in front,
         // and the backend gets them in one call when it can put short prompts through one forward
         if urgent && !self.work_fits() {
             return Ok(more);
         }
         let slices = if urgent { 1 } else { self.prefill_slices() };
-        self.backend.set_decode_waiting(!self.active.is_empty());
+        // a round that ended its last sequences counts too: their last tokens leave when the step ends, after its prefill
+        self.backend.set_decode_waiting(decoded || !self.active.is_empty());
         if matches!(self.prefill_policy, PrefillPolicy::Burst { .. }) {
             // every prompt waiting at the start of the step is passed over by it unless it is served (a pick resets its count): the guard
             // counts steps, not the slices of one step, which are served together
@@ -2513,6 +2526,11 @@ pub trait ServeEngine {
         }
     }
     fn busy(&self) -> bool;
+    /// How long the serving loop waits, when a request arrives at this idle engine, for the requests sent with it before the first step
+    /// (`Engine::with_gather_window`). The default: none.
+    fn gather_window(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
     fn step(&mut self) -> Result<bool, StepError>;
     fn cancel(&mut self, id: u64) -> bool;
     fn abort_all(&mut self) -> usize;
@@ -2602,6 +2620,9 @@ impl<B: Backend> ServeEngine for Engine<B> {
     }
     fn busy(&self) -> bool {
         Engine::busy(self)
+    }
+    fn gather_window(&self) -> std::time::Duration {
+        self.gather
     }
     fn step(&mut self) -> Result<bool, StepError> {
         Engine::step(self)

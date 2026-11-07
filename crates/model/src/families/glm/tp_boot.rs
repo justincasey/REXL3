@@ -732,6 +732,15 @@ pub fn vocab_setting() -> Result<Option<(usize, f32)>, ModelError> {
 /// (512, `alloc::DEFAULT_PREFILL_CHUNK`); `0` / `off`: one size (the chunk). A number is taken as `--prefill-chunk` takes one.
 pub const ADAPTIVE_ENV: &str = "REXL3_GLM_ADAPTIVE_PREFILL";
 
+/// The gather window of a P2 group's engine (`REXL3_PREFILL_GATHER_MS` overrides): a request that wakes the idle engine waits this many
+/// milliseconds for the requests sent with it, whose prompts then share the first forward.
+pub const PREFILL_GATHER_MS: u64 = 15;
+
+/// A serving group's ranks capture a window shape at its first sighting (`REXL3_GLM_GRAPH_AT=1`: at its second, the model's default):
+/// on a fresh server the windows of a new concurrency then never run eagerly (MEASURED on pair B, C = 8 from a fresh boot: 93.0 ->
+/// 95.1 tok/s; the capture is ~8 ms a shape, under a second for a whole sweep).
+pub const CAPTURE_FIRST: bool = true;
+
 /// The adaptive slice's small rows for a rank whose chunk is `chunk` (`0`: one size), refused by name when malformed.
 pub fn adaptive_small(chunk: usize) -> Result<usize, ModelError> {
     let small = match std::env::var(ADAPTIVE_ENV).as_deref() {
@@ -769,7 +778,7 @@ pub fn facts_of(cfg: &GlmConfig, ranks: usize, mtp: bool) -> Result<GlmFacts, Mo
     // lane E Phase 2: the replicated weights this rank splits with its peer (`REXL3_GLM_TP_SPLIT`, two ranks)
     // (a replicated group, `REXL3_TP_COMM=none`, runs no collective and splits nothing: its fact says so)
     let split = if ranks == 2 && sharded() { super::model::tp::split_from_env().map_err(ModelError::Config)? } else { 0 };
-    Ok(f.with_graphs(graphs, super::model::graphs::overlap_parts(), super::model::graphs::capture_at_first())
+    Ok(f.with_graphs(graphs, super::model::graphs::overlap_parts(), super::model::graphs::capture_at_first_or(CAPTURE_FIRST))
         .with_draft_graphs(draft)
         .with_split(split))
 }
@@ -833,6 +842,7 @@ pub fn build_leader(
             }
             // after the drafter: the stash of a paused prompt forward keeps its tap rows too
             super::tp_part::enable(&mut rank.m)?;
+            rank.m.set_graph_capture_first(super::model::graphs::capture_at_first_or(CAPTURE_FIRST));
             tower = tp_vision::load_leader_tower(o, &p.pack)?;
             Ok(rank)
         },
@@ -904,12 +914,18 @@ pub fn build_leader(
     let batches = backend.batches();
     let engine = engine_over_budget(backend, p.admission, o.drafting, own_budget);
     // under P2 the backend puts the slices of several waiting prompts through one forward: every waiting prompt gets a slice a step
-    // (the fewest rows left first), so prompts that arrive together are filled together (`REXL3_PREFILL_BURST` overrides)
+    // (the fewest rows left first), so prompts that arrive together are filled together (`REXL3_PREFILL_BURST` overrides), and a request
+    // that wakes the idle engine waits a few milliseconds for the ones sent with it (`REXL3_PREFILL_GATHER_MS`)
     let engine = if batches {
         let policy = crate::costs::prefill_policy_from_env(PrefillPolicy::Burst { div: 1, cap: p.mo.slots.max(1) })?;
         let batching = crate::costs::prefill_batching_from_env()?;
-        eprintln!("rexl3 event=prefill_policy policy={} batching={batching}", format!("{policy:?}").to_lowercase());
-        engine.with_prefill_policy(policy).with_prefill_batching(batching)
+        let gather = crate::costs::prefill_gather_from_env(PREFILL_GATHER_MS)?;
+        eprintln!(
+            "rexl3 event=prefill_policy policy={} batching={batching} gather_ms={}",
+            format!("{policy:?}").to_lowercase(),
+            gather.as_millis()
+        );
+        engine.with_prefill_policy(policy).with_prefill_batching(batching).with_gather_window(gather)
     } else {
         engine
     };
@@ -1005,6 +1021,7 @@ pub fn follow(ctx: &BuildCtx<'_>) -> Result<(), ModelError> {
                 rank.m.enable_tap_relay(&p.taps)?;
             }
             super::tp_part::enable(&mut rank.m)?;
+            rank.m.set_graph_capture_first(super::model::graphs::capture_at_first_or(CAPTURE_FIRST));
             Ok(rank)
         },
     )?;

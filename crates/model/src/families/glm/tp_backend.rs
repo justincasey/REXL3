@@ -312,7 +312,9 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> GlmTpBackend
         self.open_slice(slot, done, n)?;
         let at = done;
         let want = (end == n).then_some(candidates);
+        let t = std::time::Instant::now();
         let c = self.leader.prefill_chunk(&Self::chunk_batch(slot, at, &prompt[at..end]), want)?;
+        super::spec::cost_log(format_args!("P {} 1 {} {:.4}", end - at, self.layers, t.elapsed().as_secs_f64() * 1e3));
         let row = c.map(|c| row_of(&c, 0, candidates));
         if let Some(r) = &row {
             self.digests.row(slot, n - 1, prompt[n - 1], r);
@@ -347,6 +349,7 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> GlmTpBackend
 
     /// A part of `layers` layers of a forward of `rows` rows took `ms`: the model's scale follows (smoothed, bounded).
     fn part_took(&mut self, rows: usize, layers: usize, ms: f64) {
+        super::spec::cost_log(format_args!("P {rows} 1 {layers} {ms:.4}"));
         let ratio = ms / (layer_ms(rows) * layers as f64);
         if ratio.is_finite() && ratio > 0.0 {
             self.part_scale = (0.7 * self.part_scale + 0.3 * ratio).clamp(0.25, 4.0);
@@ -417,10 +420,11 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> GlmTpBackend
             reqs.push(RowRequest { slot: j.slot, tokens: j.prompt[j.done..end].to_vec(), first_position: j.done as u64 });
         }
         let want = jobs.iter().filter(|(j, end)| *end == j.prompt.len()).map(|(j, _)| j.candidates as u32).max();
-        let c = tp_part::forward_part(
-            &mut self.leader,
-            PrefillPart { begin: Some(RowBatch::from_requests(&reqs)), want, until: TO_END },
-        )?;
+        let b = RowBatch::from_requests(&reqs);
+        let t = std::time::Instant::now();
+        let rows = b.rows;
+        let c = tp_part::forward_part(&mut self.leader, PrefillPart { begin: Some(b), want, until: TO_END })?;
+        super::spec::cost_log(format_args!("P {rows} {} {} {:.4}", jobs.len(), self.layers, t.elapsed().as_secs_f64() * 1e3));
         Ok(jobs
             .iter()
             .enumerate()

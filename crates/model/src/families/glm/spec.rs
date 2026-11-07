@@ -376,10 +376,11 @@ pub const MTP_COST_TP_RESTRICTED: MtpCost = MtpCost {
 };
 
 /// `REXL3_GLM_COST_LOG=<file>`: every verify window (`W rows ms`) and every draft call (`D streams rows depth ms`) the runtime
-/// observes is appended to the file (the measurement of the cost tables: `tools/glm_tp_cost_tables.sh`). Unset: nothing is written.
+/// observes is appended to the file (the measurement of the cost tables: `tools/glm_tp_cost_tables.sh`), and on a two-rank group every
+/// prompt forward or part of one rank 0 runs (`P rows prompts layers ms`, `tp_backend`). Unset: nothing is written.
 pub const COST_LOG_ENV: &str = "REXL3_GLM_COST_LOG";
 
-fn cost_log(line: std::fmt::Arguments<'_>) {
+pub(super) fn cost_log(line: std::fmt::Arguments<'_>) {
     use std::io::Write;
     static LOG: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
     let f = LOG.get_or_init(|| {
