@@ -1,6 +1,7 @@
 //! An idle engine's gather window (`Engine::with_gather_window`) holds only while other requests are still arriving
-//! (`Observability::arriving`): a request that wakes the idle engine alone starts at once; one that wakes it while another is in the HTTP
-//! layer waits for that one's submit, and no longer; a request refused before it submits ends the wait too. Timing only, never a token.
+//! (`Observability::arriving`), plus a few milliseconds of grace after the last one seen (`runtime::GATHER_GRACE`): a request that wakes
+//! the idle engine alone starts at once (after the grace); one that wakes it while another is in the HTTP layer waits for that one's
+//! submit, and no longer; a request refused before it submits ends the wait too. Timing only, never a token.
 mod common;
 
 use common::*;
