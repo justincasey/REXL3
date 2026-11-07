@@ -420,10 +420,11 @@ pub const MTP_COST_TP_RESTRICTED: MtpCost = MtpCost {
 };
 
 /// `REXL3_GLM_COST_LOG=<file>`: every verify window (`W rows ms streams predicted_ms`), every draft call (`D streams rows depth ms`; a
-/// DFlash2 call adds each stream's `slot:chain/kept/reach` with the chances the cut priced each depth with, `;`-separated), every
-/// round's commit (`C slot verified accepted`) and every window graph captured (`G rows sequences ms`) is appended to the file, and on a
-/// two-rank group every prompt forward or part of one rank 0 runs (`P rows prompts layers ms`, `tp_backend`). Each line ends with the
-/// milliseconds since the first line (when it was written: the gaps between rounds). Unset: nothing is written.
+/// DFlash2 call adds each stream's `slot:chain/kept/reach/margins`: the chances the cut priced each depth with and each pick's selector
+/// margin, `;`-separated), every round's commit (`C slot verified accepted`) and every window graph captured (`G rows sequences ms`) is
+/// appended to the file, and on a two-rank group every prompt forward or part of one rank 0 runs (`P rows prompts layers ms`,
+/// `tp_backend`). Each line ends with the milliseconds since the first line (when it was written: the gaps between rounds). Unset:
+/// nothing is written.
 pub const COST_LOG_ENV: &str = "REXL3_GLM_COST_LOG";
 
 pub(super) fn cost_log(line: std::fmt::Arguments<'_>) {
@@ -897,7 +898,7 @@ impl SpecRuntime {
                 allocate_chains(&reach, super::alloc::WINDOW_ROWS, self.dflash_ms, &|s, rows| cost.verify_ms_of(s, rows))
             };
             if cost_log_on() {
-                // each stream: slot:chain/kept/the chances of reaching each depth (`reach`, what the cut priced)
+                // each stream: slot:chain/kept/the chances of reaching each depth (`reach`, what the cut priced)/each pick's margin
                 let per: Vec<String> = asking
                     .iter()
                     .zip(&picked)
@@ -905,7 +906,8 @@ impl SpecRuntime {
                     .zip(&reach)
                     .map(|(((&i, p), n), r)| {
                         let r: Vec<String> = r.iter().map(|x| format!("{x:.3}")).collect();
-                        format!("{}:{}/{n}/{}", reqs[i].slot, p.tokens.len(), r.join(";"))
+                        let mg: Vec<String> = p.margin.iter().map(|x| format!("{x:.2}")).collect();
+                        format!("{}:{}/{n}/{}/{}", reqs[i].slot, p.tokens.len(), r.join(";"), mg.join(";"))
                     })
                     .collect();
                 cost_log(format_args!("D {streams} 0 {cap} {ms:.4} {}", per.join(",")));
