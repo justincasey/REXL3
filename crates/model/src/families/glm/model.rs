@@ -514,7 +514,13 @@ impl GlmModel {
             mixer_out: zv(cr * h * 4)?,
             kda_qkv: zv(cr * 3 * ch * 4)?,
             kda_out: zv(cr * ch * 2)?,
-            kda_ws: kda::Workspace::alloc(dims, alloc::kda_prefill_rows(r, cr))?,
+            kda_ws: {
+                let mut ws = kda::Workspace::alloc(dims, alloc::kda_prefill_rows(r, cr))?;
+                if alloc::kda_pipe_rows(r, cr) > 0 {
+                    ws.add_pipe()?;
+                }
+                ws
+            },
             kda_prefill_rec: kda::Record::alloc(dims, alloc::kda_prefill_rows(r, cr))?,
             // views: a row-split rank cuts its rows out of them (`layers::mla_dsa_mixer`)
             q_a: zv(cr * m.q_lora_rank * 2)?,
@@ -657,6 +663,7 @@ impl GlmModel {
             ("kda_window_records", self.recs.iter().map(rec).sum()),
             ("kda_prefill_record", rec(&s.kda_prefill_rec)),
             ("kda_workspace", kda::Workspace::bytes_per_row(self.kda_dims) as u64 * s.kda_ws.rows as u64),
+            ("kda_pipe", if s.kda_ws.pipelined() { kda::Workspace::pipe_bytes_per_row(self.kda_dims) as u64 * s.kda_ws.rows as u64 } else { 0 }),
             ("row_arrays", sum(&[&s.ids, &s.rowidx.slot, &s.rowidx.pos, &s.seq_start, &s.seq_slot, &s.keep])),
             ("streams", s.streams.bytes() as u64),
             ("mhc_work", sum(&[&s.mhc.part, &s.mhc.post, &s.mhc.comb])),
@@ -1439,6 +1446,8 @@ impl GlmModel {
         };
         // the KDA layers' prefill descriptors, one per sequence of the forward, uploaded by the first one and kept for the forward
         let mut kda_descs: Vec<DevBuf> = Vec::new();
+        // a site whose finalize already ran with the apply-partials before it (`mhc::apply_partials_finalize`, an op pair of a large chunk)
+        let mut finalized = None;
         // under `sp`: a gather of the peer's hidden rows is in flight on the exchange stream (`GlmTp::sp_gather_begin`); the first op that
         // reads the peer's rows (or exchanges anything) joins it first
         let mut gather_pending = false;
@@ -1492,27 +1501,29 @@ impl GlmModel {
                     mhc::partials(x, site_of(site), part, mrows, Tune::AUTO, st)?;
                 },
                 Op::Finalize(site) => {
-                    let l = layer_of(site.layer);
-                    let norm = match site.kind {
-                        SiteKind::Attn => &l.input_norm,
-                        SiteKind::Ffn => &l.post_norm,
-                    };
-                    unsafe {
-                        mhc::finalize(
-                            x,
-                            part,
-                            site_of(site),
-                            Some(norm.ptr() as *const f32),
-                            post,
-                            comb,
-                            None,
-                            hidden_at,
-                            Ty::F16,
-                            mrows,
-                            &MhcCfg::GLM53,
-                            RMS_EPS,
-                            st,
-                        )?;
+                    if finalized.take() != Some(site) {
+                        let l = layer_of(site.layer);
+                        let norm = match site.kind {
+                            SiteKind::Attn => &l.input_norm,
+                            SiteKind::Ffn => &l.post_norm,
+                        };
+                        unsafe {
+                            mhc::finalize(
+                                x,
+                                part,
+                                site_of(site),
+                                Some(norm.ptr() as *const f32),
+                                post,
+                                comb,
+                                None,
+                                hidden_at,
+                                Ty::F16,
+                                mrows,
+                                &MhcCfg::GLM53,
+                                RMS_EPS,
+                                st,
+                            )?;
+                        }
                     }
                     // under `sp`, the peer's hidden rows swapped in where the next op reads every row (not a dense MLP: per row), on the
                     // exchange stream while the main stream runs what reads only this rank's rows (the router, a KDA layer's own rows)
@@ -1605,7 +1616,7 @@ impl GlmModel {
                         // A forward of several prompts runs each one's recurrence on its own rows and slot
                         (MixerDevice::Kda(w), MixerKind::Kda) if p2 && *p2_kda_chunked => {
                             let ord = kda_ord[layer];
-                            layers::lin(&w.qkv, &s.hidden, &mut s.kda_qkv, rows, Dtype::F16, Dtype::F32, &mut s.ws, st, path)?;
+                            layers::lin(&w.qkv, &s.hidden, &mut s.kda_qkv, rows, Dtype::F16, Dtype::BF16, &mut s.ws, st, path)?;
                             mark!("kda: qkv_proj");
                             let slot = b.seq_slot[0] as usize;
                             let piece = p2_kda_piece(&s.kda_prefill_rec, &s.kda_ws);
@@ -1616,7 +1627,7 @@ impl GlmModel {
                                 let (h, ch) = (cfg.hidden, cfg.kda.heads * cfg.kda.head_dim);
                                 for g in kda_segs(b, &kda_descs) {
                                     let hv = s.hidden.subview(g.row0 * h * 2, g.rows * h * 2);
-                                    let qv = s.kda_qkv.subview(g.row0 * 3 * ch * 4, g.rows * 3 * ch * 4);
+                                    let qv = s.kda_qkv.subview(g.row0 * 3 * ch * 2, g.rows * 3 * ch * 2);
                                     let mut ov = s.kda_out.subview(g.row0 * ch * 2, g.rows * ch * 2);
                                     kda::prefill_chunked(
                                         st,
@@ -1626,7 +1637,7 @@ impl GlmModel {
                                         &hv,
                                         Dtype::F16,
                                         &qv,
-                                        Dtype::F32,
+                                        Dtype::BF16,
                                         &mut pools[ord],
                                         g.slot,
                                         g.rows,
@@ -1645,7 +1656,7 @@ impl GlmModel {
                                     let len = end - from;
                                     let desc = kda::prefill_descriptor_pieces(slot, len, piece)?;
                                     let hv = s.hidden.subview(from * h * 2, len * h * 2);
-                                    let qv = s.kda_qkv.subview(from * 3 * ch * 4, len * 3 * ch * 4);
+                                    let qv = s.kda_qkv.subview(from * 3 * ch * 2, len * 3 * ch * 2);
                                     let mut ov = s.kda_out.subview(from * ch * 2, len * ch * 2);
                                     kda::prefill_chunked(
                                         st,
@@ -1655,7 +1666,7 @@ impl GlmModel {
                                         &hv,
                                         Dtype::F16,
                                         &qv,
-                                        Dtype::F32,
+                                        Dtype::BF16,
                                         &mut pools[ord],
                                         slot,
                                         len,
@@ -2582,8 +2593,38 @@ impl GlmModel {
                     }
                 }
                 Op::ApplyPartials { next } => {
-                    unsafe {
-                        mhc::apply_partials(x, mixer_out_at, Ty::F32, post, comb, site_of(next), part, mrows, Tune::AUTO, st)?;
+                    // a large chunk's apply-partials and the next site's finalize right after it run in slabs of rows, each slab's
+                    // finalize re-reading its streams from the L2 (row-independent kernels, per-row scratch: the same bits as the two ops)
+                    if !cap && mrows > mhc::SLAB_ROWS && plan.get(i + 1) == Some(&Op::Finalize(next)) {
+                        let l = layer_of(next.layer);
+                        let norm = match next.kind {
+                            SiteKind::Attn => &l.input_norm,
+                            SiteKind::Ffn => &l.post_norm,
+                        };
+                        unsafe {
+                            mhc::apply_partials_finalize(
+                                x,
+                                mixer_out_at,
+                                Ty::F32,
+                                post,
+                                comb,
+                                site_of(next),
+                                part,
+                                Some(norm.ptr() as *const f32),
+                                hidden_at,
+                                Ty::F16,
+                                mrows,
+                                mhc::SLAB_ROWS,
+                                &MhcCfg::GLM53,
+                                RMS_EPS,
+                                st,
+                            )?;
+                        }
+                        finalized = Some(next);
+                    } else {
+                        unsafe {
+                            mhc::apply_partials(x, mixer_out_at, Ty::F32, post, comb, site_of(next), part, mrows, Tune::AUTO, st)?;
+                        }
                     }
                     if cap {
                         capture_streams(capture.as_mut().unwrap(), &s.streams, st, rows, last_sublayer_was_mixer, cur_layer)?;

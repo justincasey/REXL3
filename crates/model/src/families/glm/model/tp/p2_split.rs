@@ -42,7 +42,8 @@ impl GlmTp {
         Ok(())
     }
 
-    /// One KDA layer of a P2 prompt forward on this rank's heads (see the module): the qkv strips through the P2 GEMM over every row, the
+    /// One KDA layer of a P2 prompt forward on this rank's heads (see the module): the qkv strips through the P2 GEMM over every row (bf16
+    /// rows: the record's raw rows, `kda::prefill_chunked`), the
     /// chunked recurrence of each sequence of `segs` on its own slot of the rank's pool (pieces of `piece` rows, each segment's `desc` from
     /// `kda::prefill_descriptor_pieces`), the gathered core output (`io.out` `[rows, 64 * 128]`) and the full P2 o_proj into
     /// `io.mixer_out`; with `sp`, the gather and the o_proj of this rank's rows `[sp.lo, sp.hi)` alone (the other rows of `io.mixer_out` are
@@ -81,8 +82,8 @@ impl GlmTp {
                 let mut strips = |t: &Self, lo: usize, m: usize| -> Result<(), ModelError> {
                     let w = &t.kda_rank(ord).ok_or_else(no_rank)?.qkv.w;
                     let x = hidden.subview(lo * k * 2, m * k * 2);
-                    let mut y = qkv.subview(lo * n * 4, m * n * 4);
-                    gb_cuda::glm_p2::linear(w, &x, &mut y, m, Dtype::F16, Dtype::F32, ws, st)?;
+                    let mut y = qkv.subview(lo * n * 2, m * n * 2);
+                    gb_cuda::glm_p2::linear(w, &x, &mut y, m, Dtype::F16, Dtype::BF16, ws, st)?;
                     Ok(())
                 };
                 strips(self, sp.lo, sp.rows())?;
@@ -92,7 +93,7 @@ impl GlmTp {
             None => {
                 self.sp_gather_join(st)?;
                 let kr = self.kda_rank(ord).ok_or_else(no_rank)?;
-                gb_cuda::glm_p2::linear(&kr.qkv.w, hidden, qkv, rows, Dtype::F16, Dtype::F32, ws, st)?;
+                gb_cuda::glm_p2::linear(&kr.qkv.w, hidden, qkv, rows, Dtype::F16, Dtype::BF16, ws, st)?;
             }
         }
         {
@@ -100,7 +101,7 @@ impl GlmTp {
             let (h, cd) = (dims.hidden, dims.conv_dim());
             for g in segs {
                 let x = hidden.subview(g.row0 * h * 2, g.rows * h * 2);
-                let q = qkv.subview(g.row0 * cd * 4, g.rows * cd * 4);
+                let q = qkv.subview(g.row0 * cd * 2, g.rows * cd * 2);
                 let mut y = own.subview(g.row0 * c * 2, g.rows * c * 2);
                 kda::prefill_chunked(
                     st,
@@ -110,7 +111,7 @@ impl GlmTp {
                     &x,
                     Dtype::F16,
                     &q,
-                    Dtype::F32,
+                    Dtype::BF16,
                     pool,
                     g.slot,
                     g.rows,

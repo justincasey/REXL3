@@ -1010,14 +1010,15 @@ fn halving_reduction_is_the_butterfly_tree() {
     }
 }
 
-/// project() alone: every output row of an r-row launch equals the same row computed alone, for the row counts around both kernel
-/// configurations (one output per block up to 8 rows, four above) and the 128-row maximum; and the three input dtypes agree.
+/// project() alone: every output row of an r-row launch equals the same row computed alone, for the row counts around every kernel
+/// configuration (proj_in one output per block up to 8 rows, four above, the tiled schedule from 64 rows; proj_out one thread an output
+/// below 64 rows, tiled from 64) up to a 600-row launch; and the three input dtypes agree.
 #[test]
 fn projections_are_row_invariant_and_dtype_agnostic() {
     need_gpu!();
     let mut rng = Rng(24);
     let ctx = Ctx::new(HostW::random(&mut rng));
-    let total = 128;
+    let total = 600;
     let inp = Inp::random(&mut rng, total);
     let project_rows = |x: &DevBuf, dt: Dtype, rows: usize| -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let mut rec = Record::alloc(dims(), rows).unwrap();
@@ -1032,7 +1033,7 @@ fn projections_are_row_invariant_and_dtype_agnostic() {
     };
     let xs = DevBuf::from_slice(&inp.x).unwrap();
     let all = project_rows(&xs, Dtype::F16, total);
-    for rows in [1usize, 2, 7, 8, 9, 15, 16, 17, 40, 64, 127] {
+    for rows in [1usize, 2, 7, 8, 9, 15, 16, 17, 40, 63, 64, 65, 127, 200, 513] {
         let part = DevBuf::from_slice(&inp.x[..rows * HID]).unwrap();
         let got = project_rows(&part, Dtype::F16, rows);
         assert_f32_bits_eq(&format!("rows={rows} g"), &got.0, &all.0[..rows * VD]);
@@ -1040,7 +1041,7 @@ fn projections_are_row_invariant_and_dtype_agnostic() {
         assert_f32_bits_eq(&format!("rows={rows} z"), &got.2, &all.2[..rows * VD]);
     }
     // each row alone (the 1-row configuration) equals its place in the 128-row launch
-    for r in [0usize, 1, 7, 8, 63, 64, 127] {
+    for r in [0usize, 1, 7, 8, 63, 64, 127, 599] {
         let one = project_rows(&DevBuf::from_slice(&inp.x[r * HID..(r + 1) * HID]).unwrap(), Dtype::F16, 1);
         assert_f32_bits_eq(&format!("row {r} alone g"), &one.0, &all.0[r * VD..(r + 1) * VD]);
         assert_f32_bits_eq(&format!("row {r} alone z"), &one.2, &all.2[r * VD..(r + 1) * VD]);
@@ -1211,6 +1212,88 @@ fn prefill_equals_serial_decode_and_is_chunk_invariant() {
     a.commit(&ctx, &mut cont, None, true);
     b.commit(&ctx, &mut ser, None, true);
     assert_slot_eq("state after decode after prefill", &snap(&cont, 1), &snap(&ser, 1));
+}
+
+/// One [`prefill_chunked`] call of `inp` in pieces of `piece` rows: qkv as given (f32) or rounded to bf16 first (the GEMM's bf16 output),
+/// on a serial or a pipelined workspace.
+fn run_chunked(ctx: &Ctx, inp: &Inp, slot: usize, pool: &mut Pool, piece: usize, bf16_rows: bool, pipe: bool) -> Vec<u16> {
+    let rows = inp.rows();
+    let x = DevBuf::from_slice(&inp.x).unwrap();
+    let (qkv, qd) = if bf16_rows {
+        (DevBuf::from_slice(&bf16s(&inp.qkv)).unwrap(), Dtype::BF16)
+    } else {
+        (DevBuf::from_slice(&inp.qkv).unwrap(), Dtype::F32)
+    };
+    let mut rec = Record::alloc(dims(), piece).unwrap();
+    let mut ws = Workspace::alloc(dims(), piece).unwrap();
+    if pipe {
+        ws.add_pipe().unwrap();
+    }
+    let mut out = DevBuf::zeroed(rows * VD * 2).unwrap();
+    let desc = prefill_descriptor_pieces(slot, rows, piece).unwrap();
+    let w = ctx.dw.view();
+    prefill_chunked(&ctx.st, dims(), &w, &ctx.p, &x, Dtype::F16, &qkv, qd, pool, slot, rows, &mut rec, &mut ws, &mut out, &desc, piece)
+        .unwrap();
+    ctx.st.sync().unwrap();
+    out.to_vec::<u16>().unwrap()
+}
+
+/// The P2 prefill piece by piece through the public kernels (project, prep, the chunked recurrence, norm, commit), each on its own: what
+/// [`prefill_chunked`] computed before its fusions, the reference its bits are held to.
+fn run_chunked_reference(ctx: &Ctx, inp: &Inp, slot: usize, pool: &mut Pool, piece: usize) -> Vec<u16> {
+    let rows = inp.rows();
+    let mut rec = Record::alloc(dims(), piece).unwrap();
+    let mut ws = Workspace::alloc(dims(), piece).unwrap();
+    let w = ctx.dw.view();
+    let mut out = Vec::new();
+    for r0 in (0..rows).step_by(piece) {
+        let part = inp.slice(r0, (r0 + piece).min(rows));
+        let len = part.rows();
+        let (x, qkv) = (DevBuf::from_slice(&part.x).unwrap(), DevBuf::from_slice(&part.qkv).unwrap());
+        let batch = BatchBuf::new(&[len], &[slot]).unwrap();
+        let mut o = DevBuf::zeroed(len * VD * 2).unwrap();
+        project(&ctx.st, dims(), &w, &ctx.p, &x, Dtype::F16, len, &mut rec, &mut ws).unwrap();
+        prep(&ctx.st, dims(), &w, &qkv, Dtype::F32, pool, &batch.view(), &mut rec, &mut ws).unwrap();
+        window_chunked(&ctx.st, dims(), &ctx.p, pool, slot, len, &rec, &mut ws).unwrap();
+        norm(&ctx.st, dims(), &w, &ctx.p, len, &ws, &mut o).unwrap();
+        commit(&ctx.st, dims(), &w, &ctx.p, pool, &batch.view(), &rec, &mut ws, None, true).unwrap();
+        ctx.st.sync().unwrap();
+        out.extend(o.to_vec::<u16>().unwrap());
+    }
+    out
+}
+
+/// The P2 prefill (the decay alone from proj_out, the output gate with the norm in one pass; on f32 or bf16 qkv rows, bf16 rows needing no
+/// record copy and shifting the conv history off the rows themselves; serial or pipelined: each piece's projections, prep and conv shift on
+/// the side stream beside the previous piece's recurrence) gives the bits of the public kernels run one by one: output, state, conv
+/// history and parity, in one call and across calls cut on a chunk boundary.
+#[test]
+fn chunked_prefill_on_bf16_rows_and_pipelined_keeps_the_bits() {
+    need_gpu!();
+    let mut rng = Rng(77);
+    let ctx = Ctx::new(HostW::random(&mut rng));
+    let total = 1000;
+    let inp = Inp::random(&mut rng, total);
+    let start = Slot::random(&mut rng);
+    for piece in [256usize, 512] {
+        let mut base = pool_with(&[(1, &start)], 2);
+        let want = run_chunked_reference(&ctx, &inp, 1, &mut base, piece);
+        let (want_slot, want_par) = (snap(&base, 1), base.read_parity().unwrap());
+        for (bf, pipe) in [(false, false), (true, false), (true, true), (false, true)] {
+            let what = format!("piece {piece}, bf16 rows {bf}, pipelined {pipe}");
+            let mut pool = pool_with(&[(1, &start)], 2);
+            let got = run_chunked(&ctx, &inp, 1, &mut pool, piece, bf, pipe);
+            assert_bits_eq(&format!("out, {what}"), &got, &want);
+            assert_slot_eq(&format!("state, {what}"), &snap(&pool, 1), &want_slot);
+            assert_eq!(pool.read_parity().unwrap(), want_par, "parity, {what}");
+        }
+        // pipelined calls of 304 and 696 rows (the second starts on a chunk boundary): the one call's bits
+        let mut pool = pool_with(&[(1, &start)], 2);
+        let mut got = run_chunked(&ctx, &inp.slice(0, 304), 1, &mut pool, piece, true, true);
+        got.extend(run_chunked(&ctx, &inp.slice(304, total), 1, &mut pool, piece, true, true));
+        assert_bits_eq(&format!("out of two pipelined calls, piece {piece}"), &got, &want);
+        assert_slot_eq(&format!("state after two pipelined calls, piece {piece}"), &snap(&pool, 1), &want_slot);
+    }
 }
 
 // ------------------------------------------------------------------------------------------------ rounding decision
@@ -1710,7 +1793,7 @@ fn bench_projections_cold() {
     let mut rng = Rng(73);
     let sets: Vec<Ctx> = (0..8).map(|_| Ctx::new(HostW::random(&mut rng))).collect();
     let st = &sets[0].st;
-    for rows in [1usize, 2, 8, 9, 32, 128] {
+    for rows in [1usize, 2, 8, 9, 32, 128, 512] {
         let inp = Inp::random(&mut rng, rows);
         let x = DevBuf::from_slice(&inp.x).unwrap();
         let mut rec = Record::alloc(dims(), rows).unwrap();
