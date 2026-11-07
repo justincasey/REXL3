@@ -69,9 +69,11 @@ pub const P2_KDA: &str = gb_cuda::kda::P2_ARITH_ID;
 pub const P2_MLA: &str = gb_cuda::glm_p2_mla::ARITH_ID;
 
 /// The form of P2's tensor-parallel exchange (Lane P step (c), `model/tp/p2.rs`): each rank's part of the routed sum swapped as one fp32
-/// row a prompt row, the parts added in rank order. A fact of the TP Hello under P2 (in [`prefill_fingerprint`]), so ranks on another form
-/// are refused by name. Bump it with any change to what crosses or how it is summed.
-pub const P2_EXCHANGE: &str = "part-swap-v1";
+/// row a prompt row, the parts added in rank order; v2: a chunk of two slabs or more is row-split (the peer's rows of the part go, the
+/// shared expert, the parts' sum, the dense MLP and the MLA layers' per-row tail run on the rank's rows, their output rows swapped). A fact of
+/// the TP Hello under P2 (in [`prefill_fingerprint`]), so ranks on another form are refused by name. Bump it with any change to what crosses
+/// or how it is summed.
+pub const P2_EXCHANGE: &str = "part-swap-v2";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PrefillContract {

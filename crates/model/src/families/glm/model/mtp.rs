@@ -753,7 +753,7 @@ impl GlmModel {
             Ok(())
         };
         let hook: Option<layers::AfterAppend<'_>> = if cuts_here.is_empty() { None } else { Some(&mut ring_hook) };
-        layers::mla_dsa_mixer(&ctx, a, latent, planes, s, Some(&rowidx[step]), rows, max_pos, hook, &mut |_| Ok(()))?;
+        layers::mla_dsa_mixer(&ctx, a, latent, planes, s, Some(&rowidx[step]), rows, max_pos, None, hook, &mut |_| Ok(()))?;
         mark(2)?;
 
         // x += attention output, norm for the feed-forward block (one pass), the shared expert, the router and the routed experts
@@ -803,8 +803,8 @@ impl GlmModel {
                         MtpMoe::Single(wm) => super::tp::P2Routed::Bank(&wm.experts),
                         MtpMoe::Subbanks(wm) => super::tp::P2Routed::Subbanks(&wm.experts),
                     };
-                    t.p2_begin(ex, &s.hidden, rows, &mut pf.moe, &mut s.moe, st, &mut |_| Ok(()))?;
-                    t.p2_finish(&ex.dims(), &pf.moe, shared, &mut s.mixer_out, st)?;
+                    t.p2_begin(ex, &s.hidden, rows, &mut pf.moe, &mut s.moe, None, st, &mut |_| Ok(()))?;
+                    t.p2_finish(&ex.dims(), &pf.moe, shared, &mut s.mixer_out, None, st)?;
                 }
             }
         } else {

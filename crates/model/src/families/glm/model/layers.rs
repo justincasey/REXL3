@@ -128,6 +128,11 @@ fn slab_index(ri: &RowIndex, a: usize, n: usize) -> RowIndex {
 /// each step (profiling). Above [`MAX_ROWS`] rows (`big`) the projections run over all the rows, the attention in slabs. `after_append`, for a large
 /// chunk only: called after each slab's `dsa::append` with the slab's first row, its rows and the layer's planes (the prefix cache copies the ring tail
 /// of a snapshot taken inside the chunk there: the ring holds the last 256 raw rows, a slab is at most 128).
+///
+/// `own` (a large P2 chunk on a row-split rank of two, `tp::RowSplit`: slab-aligned rows `[lo, hi)`): the latent, the indexer's keys and every
+/// slab's `dsa::append` run over all the rows (the layer's state), the per-row rest (q_a, q_b, the indexer's query and weights, the selection,
+/// the attention and o_proj) over this rank's rows only; `s.mixer_out` then holds this rank's rows, which the caller swaps with the peer's. Every
+/// op is row-independent, so each row's bits are the full call's.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn mla_dsa_mixer(
     c: &MlaCtx<'_>,
@@ -138,6 +143,7 @@ pub(super) fn mla_dsa_mixer(
     ri: Option<&RowIndex>,
     rows: usize,
     max_pos: usize,
+    own: Option<(usize, usize)>,
     mut after_append: Option<AfterAppend<'_>>,
     mark: &mut dyn FnMut(&'static str) -> Result<(), ModelError>,
 ) -> Result<(), ModelError> {
@@ -148,9 +154,28 @@ pub(super) fn mla_dsa_mixer(
     };
     let ix = &w.indexer;
     let h = cfg.hidden;
-    lin(&w.q_a, &s.hidden, &mut s.q_a, rows, Dtype::F16, Dtype::F16, &mut s.ws, st, path)?;
-    glm_glue::rmsnorm_f16(&s.q_a, &w.q_a_norm, &mut s.q_resid, rows, cfg.mla.q_lora_rank, RMS_EPS, st)?;
-    lin(&w.q_b, &s.q_resid, &mut s.q, rows, Dtype::F16, Dtype::F16, &mut s.ws, st, path)?;
+    let (lo, hi) = own.unwrap_or((0, rows));
+    assert!(
+        own.is_none() || (big && lo < hi && hi <= rows && lo % MAX_ROWS == 0 && (hi == rows || hi % MAX_ROWS == 0)),
+        "a row split of an MLA layer is slab-aligned rows of a large chunk"
+    );
+    let n_own = hi - lo;
+    // rows [lo, hi) of a scratch buffer of `width` elements of `es` bytes a row
+    let part = |b: &DevBuf, width: usize, es: usize| b.subview(lo * width * es, n_own * width * es);
+    let (qa_w, qd) = (cfg.mla.q_lora_rank, cfg.mla.heads * cfg.mla.qk_head_dim());
+    if own.is_some() {
+        let x = part(&s.hidden, h, 2);
+        let mut qa = part(&s.q_a, qa_w, 2);
+        lin(&w.q_a, &x, &mut qa, n_own, Dtype::F16, Dtype::F16, &mut s.ws, st, path)?;
+        let mut qr = part(&s.q_resid, qa_w, 2);
+        glm_glue::rmsnorm_f16(&qa, &w.q_a_norm, &mut qr, n_own, qa_w, RMS_EPS, st)?;
+        let mut q = part(&s.q, qd, 2);
+        lin(&w.q_b, &qr, &mut q, n_own, Dtype::F16, Dtype::F16, &mut s.ws, st, path)?;
+    } else {
+        lin(&w.q_a, &s.hidden, &mut s.q_a, rows, Dtype::F16, Dtype::F16, &mut s.ws, st, path)?;
+        glm_glue::rmsnorm_f16(&s.q_a, &w.q_a_norm, &mut s.q_resid, rows, cfg.mla.q_lora_rank, RMS_EPS, st)?;
+        lin(&w.q_b, &s.q_resid, &mut s.q, rows, Dtype::F16, Dtype::F16, &mut s.ws, st, path)?;
+    }
     lin(&w.kv_a, &s.hidden, &mut s.kv_a, rows, Dtype::F16, Dtype::F16, &mut s.ws, st, path)?;
     glm_glue::rmsnorm_f16(&s.kv_a, &w.kv_a_norm, &mut s.ckv, rows, cfg.mla.kv_lora_rank, RMS_EPS, st)?;
     mark("mla: q_a, q_b, kv_a and their norms")?;
@@ -191,10 +216,19 @@ pub(super) fn mla_dsa_mixer(
         return Ok(());
     }
 
-    // a large chunk: the indexer's two remaining projections over all the rows (only when some slab selects), then the slabs in order
+    // a large chunk: the indexer's two remaining projections over the rows that select (only when some slab selects), then the slabs in
+    // order (every slab's append, this rank's slabs' selection and attention)
     if any_sparse {
-        moe::linear_f16(&s.hidden, Dtype::F16, &ix.weights_proj, &mut s.wproj, rows, h, cfg.indexer.heads, st)?;
-        ix.wq_b.forward(&s.q_resid, &mut s.iq, rows, &mut s.ws, st, true)?;
+        if own.is_some() {
+            let (x, qr) = (part(&s.hidden, h, 2), part(&s.q_resid, qa_w, 2));
+            let mut wp = part(&s.wproj, cfg.indexer.heads, 2);
+            let mut iq = part(&s.iq, cfg.indexer.heads * cfg.indexer.head_dim, 2);
+            moe::linear_f16(&x, Dtype::F16, &ix.weights_proj, &mut wp, n_own, h, cfg.indexer.heads, st)?;
+            ix.wq_b.forward(&qr, &mut iq, n_own, &mut s.ws, st, true)?;
+        } else {
+            moe::linear_f16(&s.hidden, Dtype::F16, &ix.weights_proj, &mut s.wproj, rows, h, cfg.indexer.heads, st)?;
+            ix.wq_b.forward(&s.q_resid, &mut s.iq, rows, &mut s.ws, st, true)?;
+        }
         mark("mla: indexer weights_proj and wq_b")?;
     }
     let (qd, ihd, ihs) = (cfg.mla.heads * cfg.mla.qk_head_dim(), cfg.indexer.head_dim, cfg.indexer.heads);
@@ -210,6 +244,10 @@ pub(super) fn mla_dsa_mixer(
             h(a, n, &*planes)?;
         }
         mark("mla: dsa append (slabs)")?;
+        if a < lo || a >= hi {
+            a += n;
+            continue;
+        }
         if dsa::is_sparse(slab_max) {
             let n_pools_max = (slab_max + 1) / dsa::P;
             let iq = s.iq.subview(a * ihs * ihd * 2, n * ihs * ihd * 2);
@@ -228,7 +266,13 @@ pub(super) fn mla_dsa_mixer(
         mark("mla: attention (slabs)")?;
         a += n;
     }
-    lin(&w.o, &s.mla_out, &mut s.mixer_out, rows, Dtype::F16, Dtype::F32, &mut s.ws, st, path)?;
+    if own.is_some() {
+        let x = part(&s.mla_out, ovd, 2);
+        let mut y = part(&s.mixer_out, h, 4);
+        lin(&w.o, &x, &mut y, n_own, Dtype::F16, Dtype::F32, &mut s.ws, st, path)?;
+    } else {
+        lin(&w.o, &s.mla_out, &mut s.mixer_out, rows, Dtype::F16, Dtype::F32, &mut s.ws, st, path)?;
+    }
     mark("mla: o_proj")?;
     Ok(())
 }

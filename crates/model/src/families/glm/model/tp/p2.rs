@@ -13,6 +13,13 @@
 //! subbank (`glm_p2_moe::pairs_subbanks_rank`; a split gate/up subbank through the decode pairs stage in windows of the decode scratch),
 //! into the one pair buffer, then the same `Own(r)` part, swap and `Parts` sum: each pair's bits are its row's and its expert's alone, so
 //! the rank's part is the one node's group-r part bit for bit.
+//!
+//! **Row split** ([`RowSplit`], a trunk MoE layer of a chunk of at least two 128-row slabs). Every P2 op is row-independent, so the
+//! replicated per-row work after the part need not be replicated: rank r sends the peer only the peer's rows of its part, computes the
+//! shared expert and the parts' sum on its OWN rows (`glm_p2_moe::combine_parts_rows`), and the ranks swap those output rows (byte
+//! copies). The same bytes cross as in the full swap (half a part each way, then half the output each way: 16 KiB a row in all), every
+//! output row is the operations of the full sum on the same values, so the bits are the one node's. The MLA layers of the chunk split
+//! their per-row tail the same way (`layers::mla_dsa_mixer`, [`GlmTp::swap_rows`]).
 
 use super::GlmTp;
 use crate::error::ModelError;
@@ -23,6 +30,32 @@ use gb_cuda::moe_prefill::PrefillScratch;
 use gb_cuda::moe_subbanks::MoeSubbanks;
 use gb_cuda::rt::Event;
 use gb_cuda::{CudaError, DevBuf, Stream};
+
+/// A prompt chunk's rows cut between the two ranks of a group: this rank's `[lo, hi)` and the peer's `[plo, phi)` (rank 0 takes the first
+/// half of the 128-row slabs, rank 1 the rest; both ranks derive the same cut from the rows).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::families::glm) struct RowSplit {
+    pub lo: usize,
+    pub hi: usize,
+    pub plo: usize,
+    pub phi: usize,
+}
+
+impl RowSplit {
+    /// The cut of `rows` rows for `rank` of two: `None` below two slabs of `slab` rows (one rank would get nothing).
+    pub(in crate::families::glm) fn of(rows: usize, slab: usize, rank: usize) -> Option<Self> {
+        if rows < 2 * slab || rank > 1 {
+            return None;
+        }
+        let m = (rows.div_ceil(slab).div_ceil(2) * slab).min(rows);
+        let ((lo, hi), (plo, phi)) = if rank == 0 { ((0, m), (m, rows)) } else { ((m, rows), (0, m)) };
+        Some(Self { lo, hi, plo, phi })
+    }
+
+    pub(in crate::families::glm) fn rows(&self) -> usize {
+        self.hi - self.lo
+    }
+}
 
 /// The routed experts of a P2 MoE layer on a rank: one bank (the whole bank, masked to the share, or the share bound as one subbank), or
 /// the share's several subbanks (a mixed-width layer).
@@ -102,10 +135,48 @@ impl GlmTp {
         self.p2.as_ref().map_or(0, |p| p.zero_copy_swaps)
     }
 
+    /// The row split of a P2 prompt chunk of `rows` rows on this rank (`None`: not a P2 rank of two, or under two 128-row slabs).
+    pub(in crate::families::glm::model) fn p2_row_split(&self, rows: usize) -> Option<RowSplit> {
+        let t = self.comm.topology();
+        if t.ranks != 2 || self.p2.is_none() {
+            return None;
+        }
+        RowSplit::of(rows, crate::families::glm::alloc::MAX_ROWS, t.rank)
+    }
+
+    /// The rows of a row-split buffer `buf` (`row_bytes` a row): this rank's rows `[lo, hi)` to the peer, the peer's `[plo, phi)` into
+    /// `buf` (byte copies on `st`, the prefill gather's sites).
+    pub(in crate::families::glm::model) fn swap_rows(
+        &mut self,
+        buf: &DevBuf,
+        row_bytes: usize,
+        sp: RowSplit,
+        st: &Stream,
+    ) -> Result<(), ModelError> {
+        let send = buf.subview(sp.lo * row_bytes, sp.rows() * row_bytes);
+        let mut recv = buf.subview(sp.plo * row_bytes, (sp.phi - sp.plo) * row_bytes);
+        let (sb, rb) = (send.bytes(), recv.bytes());
+        self.comm.swap_bytes_for(
+            crate::families::nemotron_h_omni::tp_roce::SiteUser::PrefillGather,
+            &send,
+            0,
+            sb,
+            &mut recv,
+            0,
+            rb,
+            st,
+        )?;
+        // the larger direction (the ranks of an uneven cut count alike)
+        self.exchanged_bytes += sb.max(rb) as u64;
+        self.exchanges += 1;
+        Ok(())
+    }
+
     /// The first half of a P2 MoE layer on this rank: the rank's pairs (`glm_p2_moe::pairs_rank` on the global picks in `s`, or
     /// `pairs_subbanks_rank` for a share of several subbanks, whose split gate/up subbank runs through the decode scratch `sd`), its part
-    /// (`Own(rank)`), and the swap of the parts queued on the exchange stream. The caller may queue replicated work on `st` (the shared
-    /// expert) before [`GlmTp::p2_finish`].
+    /// (`Own(rank)`), and the swap of the parts queued on the exchange stream (with `split`: only the peer's rows of this rank's part go,
+    /// only this rank's rows of the peer's come). The caller may queue replicated work on `st` (the shared expert; with `split` on this
+    /// rank's rows only) before [`GlmTp::p2_finish`].
     #[allow(clippy::too_many_arguments)]
     pub(in crate::families::glm::model) fn p2_begin(
         &mut self,
@@ -114,6 +185,7 @@ impl GlmTp {
         rows: usize,
         s: &mut PrefillScratch,
         sd: &mut MoeScratch,
+        split: Option<RowSplit>,
         st: &Stream,
         mark: &mut dyn FnMut(&'static str) -> Result<(), CudaError>,
     ) -> Result<(), ModelError> {
@@ -138,7 +210,11 @@ impl GlmTp {
         }
         // lane T: over REXL3's RoCE transport the part goes straight into the transport site's own half (the same combine, another
         // output buffer) and the swap only publishes it: no staging copy, no copy-out (the same bytes on the wire, so the same bits)
-        let zc = if t.ranks == 2 { self.comm.roce_tp().and_then(|rt| rt.zero_copy_swap(rows * p2.hidden * 4)) } else { None };
+        let zc = if t.ranks == 2 && split.is_none() {
+            self.comm.roce_tp().and_then(|rt| rt.zero_copy_swap(rows * p2.hidden * 4))
+        } else {
+            None
+        };
         if let Some(mut z) = zc {
             let r = t.rank;
             glm_p2_moe::combine_dims(CombineMode::Own(r), &s.y_pairs, &s.pick, &s.wts, None, None, &mut z.halves[r], rows, &d, st)?;
@@ -157,20 +233,26 @@ impl GlmTp {
             mark("combine")?;
             // the swap on its own stream, after the part
             gb_cuda::graph::fork(st, &p2.stream, &p2.ready)?;
-            let bytes = rows * p2.hidden * 4;
+            let rb = p2.hidden * 4;
+            let (soff, sbytes, roff, rbytes) = match split {
+                // the peer's rows of this part to the peer, this rank's rows of the peer's part from it
+                Some(sp) => (sp.plo * rb, (sp.phi - sp.plo) * rb, sp.lo * rb, sp.rows() * rb),
+                None => (0, rows * rb, 0, rows * rb),
+            };
             let [p0, p1] = &mut p2.parts;
             let (send, recv) = if r == 0 { (&*p0, p1) } else { (&*p1, p0) };
             // the part swap's own sites under REXL3's RoCE transport (lane T: never shared with another user of its size class)
             self.comm.swap_bytes_for(
                 crate::families::nemotron_h_omni::tp_roce::SiteUser::PartSwap,
                 send,
-                0,
-                bytes,
+                soff,
+                sbytes,
                 recv,
-                0,
-                bytes,
+                roff,
+                rbytes,
                 &p2.stream,
             )?;
+            let bytes = sbytes.max(rbytes);
             p2.done.record(&p2.stream)?;
             self.exchanged_bytes += bytes as u64;
             self.exchanges += 1;
@@ -181,12 +263,15 @@ impl GlmTp {
     }
 
     /// The second half: wait for the swap, then `out = (part_0 + part_1) + shared` (a group of one rank: the one-node combine of its pairs).
+    /// With `split` (the one `p2_begin` took): the sum on this rank's rows only (`shared` holds those rows), then the output rows swapped
+    /// with the peer's on the exchange stream, which `st` waits for.
     pub(in crate::families::glm::model) fn p2_finish(
         &mut self,
         d: &MoeDims,
         s: &PrefillScratch,
         shared: Option<&DevBuf>,
         out: &mut DevBuf,
+        split: Option<RowSplit>,
         st: &Stream,
     ) -> Result<(), ModelError> {
         let t = self.comm.topology();
@@ -195,16 +280,44 @@ impl GlmTp {
             .as_mut()
             .ok_or_else(|| ModelError::Config("a P2 MoE layer on a rank built without the P2 exchange".into()))?;
         let rows = p2.pending.take().ok_or_else(|| ModelError::Config("a P2 exchange finished before it began".into()))?;
-        if t.ranks == 2 {
-            gb_cuda::graph::wait(st, &p2.done)?;
-            let z = p2.zero_copy.take();
-            let parts = match &z {
-                Some(z) => (&z.halves[0], &z.halves[1]),
-                None => (&p2.parts[0], &p2.parts[1]),
-            };
-            glm_p2_moe::combine_dims(CombineMode::Parts, &s.y_pairs, &s.pick, &s.wts, shared, Some(parts), out, rows, d, st)?;
-        } else {
-            glm_p2_moe::combine_dims(CombineMode::Both, &s.y_pairs, &s.pick, &s.wts, shared, None, out, rows, d, st)?;
+        match split {
+            Some(sp) if t.ranks == 2 => {
+                gb_cuda::graph::wait(st, &p2.done)?;
+                let parts = (&p2.parts[0], &p2.parts[1]);
+                glm_p2_moe::combine_parts_rows(shared, parts, out, sp.lo, sp.rows(), d, st)?;
+                // the output rows on the exchange stream (its sites are the part swap's: one user, in order), then the main stream waits
+                gb_cuda::graph::fork(st, &p2.stream, &p2.ready)?;
+                let rb = d.hidden * 4;
+                let send = out.subview(sp.lo * rb, sp.rows() * rb);
+                let mut recv = out.subview(sp.plo * rb, (sp.phi - sp.plo) * rb);
+                let (sb, rcb) = (send.bytes(), recv.bytes());
+                self.comm.swap_bytes_for(
+                    crate::families::nemotron_h_omni::tp_roce::SiteUser::PartSwap,
+                    &send,
+                    0,
+                    sb,
+                    &mut recv,
+                    0,
+                    rcb,
+                    &p2.stream,
+                )?;
+                p2.done.record(&p2.stream)?;
+                gb_cuda::graph::wait(st, &p2.done)?;
+                self.exchanged_bytes += sb.max(rcb) as u64;
+                self.exchanges += 1;
+            }
+            _ if t.ranks == 2 => {
+                gb_cuda::graph::wait(st, &p2.done)?;
+                let z = p2.zero_copy.take();
+                let parts = match &z {
+                    Some(z) => (&z.halves[0], &z.halves[1]),
+                    None => (&p2.parts[0], &p2.parts[1]),
+                };
+                glm_p2_moe::combine_dims(CombineMode::Parts, &s.y_pairs, &s.pick, &s.wts, shared, Some(parts), out, rows, d, st)?;
+            }
+            _ => {
+                glm_p2_moe::combine_dims(CombineMode::Both, &s.y_pairs, &s.pick, &s.wts, shared, None, out, rows, d, st)?;
+            }
         }
         Ok(())
     }

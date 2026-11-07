@@ -633,3 +633,43 @@ pub fn combine_dims(
         ))
     }
 }
+
+/// [`CombineMode::Parts`] on rows `row0 .. row0 + rows` of `parts`, `shared` and `out` (each `[.., hidden]` fp32 from row 0): `out = (part_0
+/// + part_1) + shared` per element, exactly the full call's operations on those rows (a row-split TP rank sums only its own rows).
+#[allow(clippy::too_many_arguments)]
+pub fn combine_parts_rows(
+    shared: Option<&DevBuf>,
+    parts: (&DevBuf, &DevBuf),
+    out: &mut DevBuf,
+    row0: usize,
+    rows: usize,
+    d: &MoeDims,
+    st: &Stream,
+) -> Result<(), CudaError> {
+    let (rb, end) = (d.hidden * 4, (row0 + rows) * d.hidden * 4);
+    if rows == 0 || out.bytes() < end || parts.0.bytes() < end || parts.1.bytes() < end || shared.is_some_and(|b| b.bytes() < end) {
+        return Err(INVALID);
+    }
+    let off = row0 * rb;
+    let null = core::ptr::null();
+    // SAFETY: every buffer holds rows 0 .. row0 + rows (checked above); the Parts combine reads only the parts and the shared rows
+    unsafe {
+        check(ffi::gb_glm_p2m_combine(
+            2,
+            null,
+            null,
+            null,
+            shared.map_or(null, |b| b.ptr_at(off) as *const _),
+            parts.0.ptr_at(off) as *const _,
+            parts.1.ptr_at(off) as *const _,
+            out.ptr_at(off),
+            rows as i32,
+            d.topk as i32,
+            d.hidden as i32,
+            d.experts as i32,
+            group_split(d.experts) as i32,
+            0,
+            st.raw(),
+        ))
+    }
+}

@@ -471,6 +471,14 @@ fn the_two_group_combine_is_the_tp_split() {
     st.sync().unwrap();
     let split = out.to_vec::<f32>().unwrap();
     assert!(split.iter().zip(&whole.out).all(|(a, b)| a.to_bits() == b.to_bits()), "the TP split of the combine moved a bit");
+    // a row-split rank's sum: Parts on its own rows only (`combine_parts_rows`), the two ranges together == the full call
+    let mut rs = DevBuf::zeroed(rows * d.hidden * 4).unwrap();
+    for (r0, n) in [(0usize, 137usize), (137, rows - 137)] {
+        glm_p2_moe::combine_parts_rows(Some(&sh), (&parts[0], &parts[1]), &mut rs, r0, n, &d, &st).unwrap();
+    }
+    st.sync().unwrap();
+    let rsv = rs.to_vec::<f32>().unwrap();
+    assert!(rsv.iter().zip(&whole.out).all(|(a, b)| a.to_bits() == b.to_bits()), "the row-range Parts sum moved a bit");
     // the host's fmaf chains of the two groups, then (p0 + p1) + shared: the contract's order
     let gs = glm_p2_moe::group_split(d.experts);
     assert_eq!(gs, 144);

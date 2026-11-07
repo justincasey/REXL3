@@ -167,7 +167,8 @@ pub struct Profile {
 /// The profile's name of a routed-experts stage.
 /// One P2 MoE layer on a tensor-parallel rank (Lane P step (c), `model/tp/p2.rs`): the rank's pairs and part, the parts' swap queued, then
 /// the layer's shared expert when it is owed (`owed`: deferred by `MoeShared` to overlap the swap), then the parts' sum with the shared
-/// expert last into `mixer_out`.
+/// expert last into `mixer_out`. A chunk of two slabs or more is row-split (`tp::RowSplit`): the shared expert and the sum run on this
+/// rank's rows, the output rows are swapped with the peer's.
 #[allow(clippy::too_many_arguments)]
 fn p2_rank_layer(
     t: &mut tp::GlmTp,
@@ -180,14 +181,23 @@ fn p2_rank_layer(
     path: layers::LinPath,
     mark: &mut dyn FnMut(&'static str) -> Result<(), gb_cuda::CudaError>,
 ) -> Result<(), ModelError> {
+    let split = t.p2_row_split(rows);
     let pf = s.pf.as_mut().ok_or_else(|| ModelError::Config("P2 needs the prefill scratch (a chunk above 128 rows)".into()))?;
     let PfScratch { moe: moe_sc, shared: sh_sc, .. } = pf;
-    t.p2_begin(ex, &s.hidden, rows, moe_sc, &mut s.moe, st, mark)?;
+    t.p2_begin(ex, &s.hidden, rows, moe_sc, &mut s.moe, split, st, mark)?;
     if let Some(sh) = owed {
-        layers::gated(sh, &s.hidden, rows, &mut s.moe_shared_out, s.shared.as_mut(), Some(sh_sc), st, path)?;
+        match split {
+            Some(sp) => {
+                let h = sh.hidden;
+                let x = s.hidden.subview(sp.lo * h * 2, sp.rows() * h * 2);
+                let mut y = s.moe_shared_out.subview(sp.lo * h * 4, sp.rows() * h * 4);
+                layers::gated(sh, &x, sp.rows(), &mut y, s.shared.as_mut(), Some(sh_sc), st, path)?;
+            }
+            None => layers::gated(sh, &s.hidden, rows, &mut s.moe_shared_out, s.shared.as_mut(), Some(sh_sc), st, path)?,
+        }
     }
     let shared = with_shared.then_some(&s.moe_shared_out);
-    t.p2_finish(&ex.dims(), moe_sc, shared, &mut s.mixer_out, st)?;
+    t.p2_finish(&ex.dims(), moe_sc, shared, &mut s.mixer_out, split, st)?;
     Ok(())
 }
 
@@ -431,8 +441,9 @@ impl GlmModel {
             kda_out: zv(cr * ch * 2)?,
             kda_ws: kda::Workspace::alloc(dims, alloc::kda_prefill_rows(r, cr))?,
             kda_prefill_rec: kda::Record::alloc(dims, alloc::kda_prefill_rows(r, cr))?,
-            q_a: zeroed(cr * m.q_lora_rank * 2)?,
-            q_resid: zeroed(cr * m.q_lora_rank * 2)?,
+            // views: a row-split rank cuts its rows out of them (`layers::mla_dsa_mixer`)
+            q_a: zv(cr * m.q_lora_rank * 2)?,
+            q_resid: zv(cr * m.q_lora_rank * 2)?,
             q: zv(cr * m.heads * m.qk_head_dim() * 2)?,
             kv_a: zeroed(cr * m.kv_lora_rank * 2)?,
             ckv: zeroed(cr * m.kv_lora_rank * 2)?,
@@ -1692,6 +1703,9 @@ impl GlmModel {
                                 }
                                 Ok(())
                             };
+                            // a large P2 chunk on a rank of two: the per-row tail on this rank's rows, then the output rows swapped
+                            // (`tp::RowSplit`)
+                            let split = if big && p2 { tp.as_ref().and_then(|t| t.p2_row_split(rows)) } else { None };
                             layers::mla_dsa_mixer(
                                 &ctx,
                                 w,
@@ -1701,6 +1715,7 @@ impl GlmModel {
                                 None,
                                 rows,
                                 max_pos,
+                                split.map(|sp| (sp.lo, sp.hi)),
                                 if big && !cuts_here.is_empty() { Some(&mut ring_hook) } else { None },
                                 &mut |name| {
                                     if let Some(t) = &timer {
@@ -1712,6 +1727,10 @@ impl GlmModel {
                                     Ok(())
                                 },
                             )?;
+                            if let Some(sp) = split {
+                                tp.as_mut().expect("a row split is a rank's").swap_rows(&s.mixer_out, cfg.hidden * 4, sp, st)?;
+                                mark!("mla: the row split's output swap");
+                            }
                         }
                         _ => {
                             return Err(ModelError::Config(format!(
@@ -1728,7 +1747,17 @@ impl GlmModel {
                     };
                     if p2 {
                         let big_sc = s.pf.as_mut().and_then(|p| p.dense.as_mut());
-                        layers::gated(m, &s.hidden, rows, &mut s.mixer_out, s.dense.as_mut(), big_sc, st, path)?;
+                        // a large chunk on a rank of two: this rank's rows, then the output rows swapped (`tp::RowSplit`)
+                        match tp.as_mut().filter(|_| big).and_then(|t| t.p2_row_split(rows).map(|sp| (t, sp))) {
+                            Some((t, sp)) => {
+                                let h = cfg.hidden;
+                                let x = s.hidden.subview(sp.lo * h * 2, sp.rows() * h * 2);
+                                let mut y = s.mixer_out.subview(sp.lo * h * 4, sp.rows() * h * 4);
+                                layers::gated(m, &x, sp.rows(), &mut y, s.dense.as_mut(), big_sc, st, path)?;
+                                t.swap_rows(&s.mixer_out, h * 4, sp, st)?;
+                            }
+                            None => layers::gated(m, &s.hidden, rows, &mut s.mixer_out, s.dense.as_mut(), big_sc, st, path)?,
+                        }
                     } else if big {
                         let sc =
                             s.pf.as_mut()

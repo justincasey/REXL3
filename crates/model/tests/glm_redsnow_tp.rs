@@ -89,9 +89,14 @@ impl Rng {
 
 /// The call script (the one of `glm_tp.rs`): one digest per answering call, in call order.
 fn script(m: &mut GlmModel) -> Vec<u64> {
+    script_chunk(m, CHUNK)
+}
+
+/// [`script`] with the first prompt in chunks of `chunk` rows.
+fn script_chunk(m: &mut GlmModel, chunk: usize) -> Vec<u64> {
     let mut out = Vec::new();
     let mut r = Rng(0x9e37_79b9_7f4a_7c15);
-    let prompts = [(0usize, r.tokens(2300), CHUNK), (1, r.tokens(200), 128), (2, r.tokens(37), 128)];
+    let prompts = [(0usize, r.tokens(2300), chunk), (1, r.tokens(200), 128), (2, r.tokens(37), 128)];
     let mut pos = [0usize; SLOTS];
     let mut last = [0u32; SLOTS];
     for (slot, p, chunk) in &prompts {
@@ -364,6 +369,8 @@ fn p2_redsnow_prefix_two_ranks_equal_one_p2_model_byte_for_byte() {
     assert_eq!(ref_graphs, ref_eager, "one P2 model: graphs and eager differ on this prefix");
     let moved = ref_eager.iter().zip(&p1_ref).filter(|(x, y)| x != y).count();
     assert!(moved > 0, "P2 left every answer at P1's bits: the P2 path did not run");
+    // the first prompt in 336-row chunks as well: a row split of 3 slabs is uneven (256 / 80 rows), the last chunk's 284 rows 256 / 28
+    let ref_336 = script_chunk(&mut a, 336);
     eprintln!("one P2 model: {} answering calls, graphs == eager, {moved} differ from P1's (P2 ran)", ref_eager.len());
     drop(a);
 
@@ -380,16 +387,17 @@ fn p2_redsnow_prefix_two_ranks_equal_one_p2_model_byte_for_byte() {
     a.enable_tp(Arc::new(comms.next().unwrap()), owns[0].clone()).unwrap();
     b.enable_tp(Arc::new(comms.next().unwrap()), owns[1].clone()).unwrap();
     let t = std::time::Instant::now();
-    let (d0, d1, a, b) = std::thread::scope(|sc| {
-        let h0 = sc.spawn(move || (script(&mut a), a));
-        let h1 = sc.spawn(move || (script(&mut b), b));
-        let (d0, a) = h0.join().expect("rank 0");
-        let (d1, b) = h1.join().expect("rank 1");
-        (d0, d1, a, b)
+    let (d0, d1, e0, e1, a, b) = std::thread::scope(|sc| {
+        let h0 = sc.spawn(move || (script(&mut a), script_chunk(&mut a, 336), a));
+        let h1 = sc.spawn(move || (script(&mut b), script_chunk(&mut b, 336), b));
+        let (d0, e0, a) = h0.join().expect("rank 0");
+        let (d1, e1, b) = h1.join().expect("rank 1");
+        (d0, d1, e0, e1, a, b)
     });
-    eprintln!("two P2 ranks ran the script in {:.1?}", t.elapsed());
+    eprintln!("two P2 ranks ran the script twice in {:.1?}", t.elapsed());
     assert_eq!(d0, d1, "the two P2 ranks' answers differ");
     assert_eq!(d0, ref_eager, "the P2 group's answers differ from the one P2 model's");
+    assert_eq!((&e0, &e1), (&ref_336, &ref_336), "336-row chunks: the P2 group's answers differ from the one P2 model's");
     let (t0r, t1r) = (a.tp().unwrap(), b.tp().unwrap());
     assert!(t0r.p2_swaps() > 0 && t0r.p2_swaps() == t1r.p2_swaps(), "part swaps {} / {}", t0r.p2_swaps(), t1r.p2_swaps());
     assert_eq!((t0r.exchanges, t0r.exchanged_bytes), (t1r.exchanges, t1r.exchanged_bytes), "the ranks exchanged alike");
