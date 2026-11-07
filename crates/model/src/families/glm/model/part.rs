@@ -139,16 +139,17 @@ impl GlmModel {
     /// Prefill `b`: the consecutive prompt rows of one sequence or (under P2) several, each continuing its own prompt. With `until` at or
     /// past the model's layers the whole forward runs, its rows join the drafters' contexts, and with `want` the candidates of each
     /// sequence's LAST row come back, in sequence order (each sequence's slice must then end its prompt for them to be used). With a
-    /// smaller `until` (one sequence, parts enabled, fewer than [`PAUSE_DEPTH`] paused, and at most the stash's rows while one is) only
-    /// the layers before `until` run and the forward PAUSES there: `Ok(None)`, finished by [`GlmModel::prefill_resume`].
+    /// smaller `until` (parts enabled; with none paused, of any sequences; with one paused, of one sequence of at most the stash's rows;
+    /// never more than [`PAUSE_DEPTH`] paused) only the layers before `until` run and the forward PAUSES there: `Ok(None)`, finished by
+    /// [`GlmModel::prefill_resume`].
     pub fn prefill_rows(&mut self, b: &RowBatch, want: Option<usize>, until: usize) -> Result<Option<Candidates>, ModelError> {
         let whole = until >= self.layers;
         if !whole && self.stash.is_empty() {
             return Err(ModelError::Request("prompt forwards in parts are not enabled (enable_prefill_parts)".into()));
         }
-        if !whole && (b.n_seq() != 1 || self.paused.len() >= self.stash.len()) {
+        if !whole && (self.paused.len() >= self.stash.len() || (b.n_seq() != 1 && !self.paused.is_empty())) {
             return Err(ModelError::Request(format!(
-                "a prompt forward in parts is of one sequence, with fewer than {} others paused",
+                "a prompt forward in parts while another is paused is of one sequence, with fewer than {} paused",
                 self.stash.len()
             )));
         }

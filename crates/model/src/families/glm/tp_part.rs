@@ -34,6 +34,14 @@ pub const PART_MS_ENV: &str = "REXL3_GLM_PREFILL_PART_MS";
 /// prompt's forward is 500 ms, the largest gap between the decoding streams' tokens 623 ms whole). Rank 0's alone; never a bit.
 pub const SHORT_PART_MS_ENV: &str = "REXL3_GLM_PREFILL_SHORT_PART_MS";
 
+/// `REXL3_GLM_PREFILL_OPEN_MS`: with nothing decoding, a forward of prompts that all begin there (a burst's first forward, a lone
+/// prompt's first slice) runs its first layers, about this many milliseconds of them (at least one), and pauses: when prompts sent with
+/// them have reached the engine meanwhile (a burst whose clients connect a few milliseconds apart, past the idle engine's gather grace),
+/// rank 0 begins those slots again and every fresh prompt goes through one forward; otherwise the forward goes on to its end (default
+/// 50; `0`/`off`: whole). The first part's work is lost only when prompts join. Rank 0's alone; never a bit (a slot begun again starts
+/// over, and a part is the whole forward's launches).
+pub const OPEN_MS_ENV: &str = "REXL3_GLM_PREFILL_OPEN_MS";
+
 /// `REXL3_GLM_PREFILL_BATCH_ROWS`: while a sequence decodes, rank 0 puts at most this many rows of fresh short prompts (each at most
 /// [`PART_ROOM`] rows) through one forward, which the decoding streams wait for whole (default 2,048; with nothing decoding, the chunk's
 /// rows). Rank 0's alone; never a bit.
@@ -55,6 +63,11 @@ pub fn part_ms_from_env() -> Result<f64, ModelError> {
 /// The part target of [`SHORT_PART_MS_ENV`] (0: short forwards whole), refused by name when malformed.
 pub fn short_part_ms_from_env() -> Result<f64, ModelError> {
     parse_ms(SHORT_PART_MS_ENV, std::env::var(SHORT_PART_MS_ENV).ok().as_deref(), 300.0)
+}
+
+/// The first part of an opening forward of [`OPEN_MS_ENV`] (0: whole), refused by name when malformed.
+pub fn open_ms_from_env() -> Result<f64, ModelError> {
+    parse_ms(OPEN_MS_ENV, std::env::var(OPEN_MS_ENV).ok().as_deref(), 50.0)
 }
 
 fn parse_ms(var: &str, v: Option<&str>, default: f64) -> Result<f64, ModelError> {
