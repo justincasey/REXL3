@@ -159,6 +159,13 @@ impl GlmTp {
     }
 
     /// [`GlmTp::subbanks`] on the batched path (`sd`: the decode scratch, which a split-width subbank's windows run through).
+    ///
+    /// A width share at two ranks with a chunk of two 128-row slabs or more finishes only its own rows ([`RowSplit`]): the peer's rows
+    /// of this rank's K-split partials go to the peer and the peer's partials of this rank's rows come (one swap of half the pair
+    /// buffer, byte copies, into the gate/up input rows, free until the next layer's rotation), each own pair's sum is the exchange's
+    /// two-operand add made in the down epilogue (`MoeSubbanks::finish_sum`), and the finished output rows are swapped (16 KiB a row).
+    /// Every output row is the single node's: the same sum, epilogue and combine on the same values. Against the all-reduce of the
+    /// whole pair buffer: half its bytes cross each way plus the output rows, and the finish runs on half the rows.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn subbanks_big(
         &mut self,
@@ -173,9 +180,44 @@ impl GlmTp {
     ) -> Result<(), ModelError> {
         let d = m.dims;
         m.experts.run_prefill_pairs_windowed(x, Dtype::F16, rows, s, sd, &mut self.os, st)?;
-        self.exchange(&mut s.y_pairs, rows * d.topk * d.hidden, st)?;
-        m.experts.finish(&s.y_pairs, &s.pick, &s.wts, shared, out, rows, st)?;
+        let pb = d.topk * d.hidden * 4;
+        let split = self.p1_finish_rows(m, rows, s).and_then(|sp| s.rot_rows_view(sp.rows() * pb).map(|peer| (sp, peer)));
+        let Some((sp, mut peer)) = split else {
+            self.exchange(&mut s.y_pairs, rows * d.topk * d.hidden, st)?;
+            m.experts.finish(&s.y_pairs, &s.pick, &s.wts, shared, out, rows, st)?;
+            return Ok(());
+        };
+        let (n, pn) = (sp.rows(), sp.phi - sp.plo);
+        let send = s.y_pairs.subview(sp.plo * pb, pn * pb);
+        self.comm.swap_bytes(&send, 0, pn * pb, &mut peer, 0, n * pb, st)?;
+        self.exchanged_bytes += (n.max(pn) * pb) as u64;
+        self.exchanges += 1;
+        let (k, h) = (d.topk, d.hidden);
+        let y = s.y_pairs.subview(sp.lo * pb, n * pb);
+        let pick = s.pick.subview(sp.lo * k * 4, n * k * 4);
+        let wts = s.wts.subview(sp.lo * k * 2, n * k * 2);
+        let sh = shared.map(|b| b.subview(sp.lo * h * 4, n * h * 4));
+        let mut o = out.subview(sp.lo * h * 4, n * h * 4);
+        m.experts.finish_sum(&y, &peer, &pick, &wts, sh.as_ref(), &mut o, n, st)?;
+        let ob = h * 4;
+        let mine = out.subview(sp.lo * ob, n * ob);
+        let mut theirs = out.subview(sp.plo * ob, pn * ob);
+        self.comm.swap_bytes(&mine, 0, n * ob, &mut theirs, 0, pn * ob, st)?;
+        self.exchanged_bytes += (n.max(pn) * ob) as u64;
+        self.exchanges += 1;
         Ok(())
+    }
+
+    /// The rows of a batched (prefill) MoE layer of `rows` rows whose output this rank finishes itself ([`GlmTp::subbanks_big`]): a
+    /// width share at two ranks with a swap and a chunk of two 128-row slabs or more; `None`: the whole pair buffer is all-reduced and
+    /// every row finished. The layer's shared-expert op asks too (only these rows of its output are read).
+    pub(super) fn p1_finish_rows(&self, m: &MoeSubbankLayer, rows: usize, s: &PrefillScratch) -> Option<RowSplit> {
+        let t = self.comm.topology();
+        if m.experts.width_share().is_none() || t.ranks != 2 || !self.comm.supports_swap() {
+            return None;
+        }
+        let sp = RowSplit::of(rows, alloc::MAX_ROWS, t.rank)?;
+        s.rot_rows_view(sp.rows() * m.dims.topk * m.dims.hidden * 4).map(|_| sp)
     }
 
     /// Whether the shared-expert split ([`ShSplit`], `sh`) runs a call of `rows` rows: a decode window (`window`) no wider than the split's

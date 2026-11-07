@@ -1940,11 +1940,22 @@ impl GlmModel {
                             )?,
                         }
                     } else if big {
-                        let sc =
-                            s.pf.as_mut()
-                                .map(|p| &mut p.shared)
-                                .ok_or_else(|| ModelError::Config("no shared-expert scratch".into()))?;
-                        shared.forward_big(&s.hidden, Dtype::F16, rows, &mut s.moe_shared_out, sc, st)?;
+                        let pf = s.pf.as_mut().ok_or_else(|| ModelError::Config("no shared-expert scratch".into()))?;
+                        // a width-share rank that finishes only its own rows of this layer (`GlmTp::subbanks_big`) reads only those rows of
+                        // the shared expert's output: it runs on them alone (each row's big-path arithmetic is its own)
+                        let fin = match (&layer_of(layer).ffn, tp.as_ref()) {
+                            (FfnDevice::MoeSubbanks { layer: m, .. }, Some(t)) => t.p1_finish_rows(m, rows, &pf.moe),
+                            _ => None,
+                        };
+                        match fin {
+                            Some(fr) => {
+                                let h = cfg.hidden;
+                                let xr = s.hidden.subview(fr.lo * h * 2, fr.rows() * h * 2);
+                                let mut so = s.moe_shared_out.subview(fr.lo * h * 4, fr.rows() * h * 4);
+                                shared.forward_big(&xr, Dtype::F16, fr.rows(), &mut so, &mut pf.shared, st)?;
+                            }
+                            None => shared.forward_big(&s.hidden, Dtype::F16, rows, &mut s.moe_shared_out, &mut pf.shared, st)?,
+                        }
                     } else {
                         let sc = s.shared.as_mut().ok_or_else(|| ModelError::Config("no shared-expert scratch".into()))?;
                         match side.filter(|sd| sd.parts & graphs::PART_SHARED != 0) {

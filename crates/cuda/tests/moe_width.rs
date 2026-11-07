@@ -151,6 +151,26 @@ fn check_shares(shares: &[MoeSubbanks], d: &MoeDims, c: &Case, rows: usize, batc
         let bad = (0..rows * h).filter(|&i| got[i].to_bits() != want[i].to_bits()).count();
         assert_eq!(bad, 0, "{tag}: rank {r}, {rows} rows ({}): {bad} values differ from the single node", if batched { "batched" } else { "decode" });
     }
+    // the row-split finish of a prefill chunk at two ranks (`MoeSubbanks::finish_sum`, `GlmTp::subbanks_big`): rank r finishes rows
+    // [lo, hi) from its own partials and the peer's of those rows; its rows of the output must be the single node's
+    if batched && rows >= 2 {
+        let (m, k) = (rows / 2, d.topk);
+        for (r, sb) in shares.iter().enumerate() {
+            let (lo, hi) = if r == 0 { (0, m) } else { (m, rows) };
+            let n = hi - lo;
+            ps[r].y_pairs.upload(&parts[r]).unwrap();
+            let peer = up(&parts[1 - r][lo * k * h..hi * k * h]);
+            let y = ps[r].y_pairs.subview(lo * k * h * 4, n * k * h * 4);
+            let pk = ps[r].pick.subview(lo * k * 4, n * k * 4);
+            let w = ps[r].wts.subview(lo * k * 2, n * k * 2);
+            let sh = shared.subview(lo * h * 4, n * h * 4);
+            let mut out = DevBuf::zeroed(n * h * 4).unwrap();
+            sb.finish_sum(&y, &peer, &pk, &w, Some(&sh), &mut out, n, st).unwrap();
+            let got: Vec<f32> = dl(&out, st);
+            let bad = (0..n * h).filter(|&i| got[i].to_bits() != want[lo * h + i].to_bits()).count();
+            assert_eq!(bad, 0, "{tag}: rank {r}, rows {lo}..{hi} of {rows}: {bad} values of the row-split finish differ from the single node");
+        }
+    }
 }
 
 fn shares_of(lay: &Layer, d: &MoeDims) -> Vec<MoeSubbanks> {

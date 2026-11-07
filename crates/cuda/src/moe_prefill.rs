@@ -299,10 +299,11 @@ impl PrefillScratch {
             plan_cnt: DevBuf::zeroed(get("plan_cnt"))?,
             plan_cls: DevBuf::zeroed(get("plan_cls"))?,
             plan_parallel: false,
-            xs_g: DevBuf::zeroed(get("xs_g"))?,
+            // views too: a rank of the width split stages the peer's pair rows in `xs_g` and finishes its own rows of `y_pairs`
+            xs_g: DevBuf::zeroed_view(get("xs_g"))?,
             xs_u: DevBuf::zeroed(get("xs_u"))?,
             xd: DevBuf::zeroed(get("xd"))?,
-            y_pairs: DevBuf::zeroed(get("y_pairs"))?,
+            y_pairs: DevBuf::zeroed_view(get("y_pairs"))?,
         })
     }
 
@@ -310,6 +311,13 @@ impl PrefillScratch {
     /// Both produce bit-identical spair / items / nitems; this only changes how the plan is computed. Off by default.
     pub fn use_parallel_plan(&mut self, on: bool) {
         self.plan_parallel = on;
+    }
+
+    /// A view of the first `bytes` bytes of the gate/up input rows (`xs_g`), whose contents matter only from a layer's input rotation
+    /// to its gate/up GEMMs: a tensor-parallel rank stages the peer's pair rows there between its pairs stage and its combine (`None`:
+    /// the buffer is smaller).
+    pub fn rot_rows_view(&self, bytes: usize) -> Option<DevBuf> {
+        (bytes <= self.xs_g.bytes()).then(|| self.xs_g.subview(0, bytes))
     }
 
     /// Run the currently selected planner on `pick` and return the plan arrays (spair, items as `i32` int4 bytes,

@@ -348,10 +348,48 @@ impl MoeSubbanks {
         rows: usize,
         st: &Stream,
     ) -> Result<(), CudaError> {
+        match self.svh_tab.as_ref().filter(|_| self.width.is_some()) {
+            None => combine_pairs(y, pick, wts, shared, out, rows, &self.dims, st),
+            Some(_) => self.finish_width(y, None, pick, wts, shared, out, rows, st),
+        }
+    }
+
+    /// [`MoeSubbanks::finish`] of a width share on rows whose pairs' K-split partials are this rank's in `y` and the peer's in `peer`
+    /// (the same pair rows, `[rows * topk, hidden]` f32): each pair's sum `y + peer` is the exchange's exact two-operand add (fp32
+    /// addition commutes, so either rank's order), made on the rows this rank finishes instead of on every row by an all-reduce. The
+    /// caller passes views of those rows' pair rows, picks, weights, shared rows and output rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_sum(
+        &self,
+        y: &DevBuf,
+        peer: &DevBuf,
+        pick: &DevBuf,
+        wts: &DevBuf,
+        shared: Option<&DevBuf>,
+        out: &mut DevBuf,
+        rows: usize,
+        st: &Stream,
+    ) -> Result<(), CudaError> {
+        if self.width.is_none() || peer.bytes() < rows * self.dims.topk * self.dims.hidden * 4 {
+            return Err(INVALID);
+        }
+        self.finish_width(y, Some(peer), pick, wts, shared, out, rows, st)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_width(
+        &self,
+        y: &DevBuf,
+        peer: Option<&DevBuf>,
+        pick: &DevBuf,
+        wts: &DevBuf,
+        shared: Option<&DevBuf>,
+        out: &mut DevBuf,
+        rows: usize,
+        st: &Stream,
+    ) -> Result<(), CudaError> {
         let d = self.dims;
-        let Some(tab) = self.svh_tab.as_ref().filter(|_| self.width.is_some()) else {
-            return combine_pairs(y, pick, wts, shared, out, rows, &d, st);
-        };
+        let tab = self.svh_tab.as_ref().ok_or(INVALID)?;
         let p = rows * d.topk;
         if rows == 0
             || y.bytes() < p * d.hidden * 4
@@ -362,10 +400,11 @@ impl MoeSubbanks {
         {
             return Err(INVALID);
         }
-        // SAFETY: the sizes were checked above; `tab` holds an address for every global id
+        // SAFETY: the sizes were checked above (`peer` by the caller); `tab` holds an address for every global id
         unsafe {
             check(ffi_width::gb_moe_down_combine_multi(
                 y.ptr(),
+                peer.map_or(core::ptr::null(), |b| b.ptr() as *const _),
                 pick.ptr(),
                 tab.ptr(),
                 wts.ptr(),

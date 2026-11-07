@@ -118,6 +118,7 @@ pub(crate) mod ffi_width {
     crate::launchers! {
         pub fn gb_moe_down_combine_multi(
             z: *const c_void,
+            z2: *const c_void,
             pick: *const c_void,
             svh: *const c_void,
             wts: *const c_void,
