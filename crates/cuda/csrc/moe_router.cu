@@ -96,6 +96,57 @@ __device__ __forceinline__ void router_logits_warp(const void* __restrict__ x, c
     }
 }
 
+// router_logits_warp with the warp's whole gate row held in registers, loaded BEFORE the PDL wait (a weight: nothing the predecessor
+// writes), so the predecessor's run hides the trip to DRAM and only the x loads and the chain follow the wait. NP = pairs a lane
+// visits (K = 64 NP). THE SAME ARITHMETIC: lane j's chain visits the pairs j, j + 32, ... in this order, two explicit fmaf per pair
+// from 0, then the shfl_down tree 16 -> 1 and one rounding to fp16; UN only sets how many x pairs are loaded before they are consumed.
+template <int RB, int WARPS, int NP, int UN, int DT>
+__device__ __forceinline__ void router_logits_warp_held(const void* __restrict__ x, const half* __restrict__ gate, half* __restrict__ logits,
+                                                        int rows, int K, int E) {
+    static_assert(NP % UN == 0, "x pairs come in whole batches");
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int e = blockIdx.x * WARPS + warp;
+    half2 wv[NP];
+    if (e < E) {
+        const half2* w2 = reinterpret_cast<const half2*>(gate + (size_t)e * K);
+#pragma unroll
+        for (int t = 0; t < NP; ++t) wv[t] = __ldg(w2 + lane + 32 * t);
+    }
+    pdl_wait();
+    if (e >= E) return;
+    const int row0 = blockIdx.y * RB;
+    float sum[RB];
+#pragma unroll
+    for (int r = 0; r < RB; ++r) sum[r] = 0.0f;
+#pragma unroll
+    for (int t0 = 0; t0 < NP; t0 += UN) {
+        float2 xv[RB][UN];
+#pragma unroll
+        for (int u = 0; u < UN; ++u)
+#pragma unroll
+            for (int r = 0; r < RB; ++r)
+                if (row0 + r < rows) xv[r][u] = load_pair<DT>(x, (size_t)(row0 + r) * K + 2 * (size_t)(lane + 32 * (t0 + u)));
+#pragma unroll
+        for (int u = 0; u < UN; ++u) {
+            const float2 wf = __half22float2(wv[t0 + u]);
+#pragma unroll
+            for (int r = 0; r < RB; ++r) {
+                if (row0 + r < rows) {
+                    sum[r] = fmaf(xv[r][u].x, wf.x, sum[r]);
+                    sum[r] = fmaf(xv[r][u].y, wf.y, sum[r]);
+                }
+            }
+        }
+    }
+    pdl_trigger();                               // x is read: the successor may launch
+#pragma unroll
+    for (int r = 0; r < RB; ++r) {
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) sum[r] += __shfl_down_sync(0xffffffffu, sum[r], off);
+        if (lane == 0 && row0 + r < rows) logits[(size_t)(row0 + r) * E + e] = __float2half_rn(sum[r]);
+    }
+}
+
 template <int RB, int WARPS, int UN, int DT>
 __global__ void __launch_bounds__(WARPS * 32)
     router_logits_kernel(const void* __restrict__ x, const half* __restrict__ gate, half* __restrict__ logits, int rows, int K, int E) {
@@ -250,14 +301,16 @@ __global__ void __launch_bounds__(32)
 
 // The decode router in one launch: router_logits_kernel's blocks, then the LAST block to finish (a counter in `done`, back to 0 when it
 // is done) selects every row, one warp a row, exactly as router_select_kernel does. The arithmetic of a logit and of a selection is
-// the two kernels'; only the launch boundary between them is gone.
-template <int RB, int WARPS, int UN, int DT>
+// the two kernels'; only the launch boundary between them is gone. NP > 0: the logits of router_logits_warp_held (K = 64 NP; the same
+// bits), whose gate row is in registers before the PDL wait.
+template <int RB, int WARPS, int UN, int DT, int NP = 0>
 __global__ void __launch_bounds__(WARPS * 32)
     router_fused_kernel(const void* __restrict__ x, const half* __restrict__ gate, half* __restrict__ logits, const float* __restrict__ sig,
                         const float* __restrict__ bias, int* __restrict__ pick, half* __restrict__ wts, float scale, int rows, int K,
                         int E, int topk, unsigned* __restrict__ done) {
     __shared__ int last;
-    router_logits_warp<RB, WARPS, UN, DT>(x, gate, logits, rows, K, E);
+    if constexpr (NP > 0) router_logits_warp_held<RB, WARPS, NP, UN, DT>(x, gate, logits, rows, K, E);
+    else router_logits_warp<RB, WARPS, UN, DT>(x, gate, logits, rows, K, E);
     __syncthreads();
     if (threadIdx.x == 0) {
         __threadfence();                         // this block's logits are visible before it counts itself done
@@ -390,27 +443,36 @@ GB_EXPORT int gb_moe_router_select(const void* logits, const void* sig, const vo
 
 // gb_moe_router_logits then gb_moe_router_select, for a decode or verify window (rows < 32), as ONE launch (router_fused_kernel): the
 // same logits (the decode blocking) and the same picks and weights. done: a u32 that is 0 between launches (the launch leaves it 0);
-// one per stream of router launches.
+// one per stream of router launches. An fp16 x at K = 4096 (GLM-5.3-Flash) takes the held-gate logits (router_logits_warp_held: the
+// gate row in registers before the PDL wait) with up to 8 rows a warp, so every row of a block reuses the held row (a standalone
+// router with a 9 us predecessor and L2 flushed, after the predecessor: 1 row 21 -> 9 us, 8 rows 36 -> 15 us, 16 rows 65 -> 30 us).
 GB_EXPORT int gb_moe_router_route(const void* x, int x_dtype, const void* gate, void* logits, const void* sig, const void* bias, void* pick,
                                   void* wts, float scale, int rows, int K, int E, int topk, void* done, void* stream) {
     if (rows < 1 || rows >= 32 || K < 2 || (K & 1) || E < 1 || E > kMaxExperts || topk < 1 || topk > kMaxTopK || topk > E ||
         !dtype_ok(x_dtype) || !x || !gate || !logits || !sig || !bias || !pick || !wts || !done)
         return (int)cudaErrorInvalidValue;
     constexpr int WARPS = 8, UN = 16;
-    const int rb = rows >= 8 ? 2 : 1;
+    const bool held = K == 64 * 64 && x_dtype == F16;
+    const int rb = held ? (rows <= 2 ? rows : rows <= 4 ? 4 : 8) : rows >= 8 ? 2 : 1;
     const dim3 grid((unsigned)((E + WARPS - 1) / WARPS), (unsigned)((rows + rb - 1) / rb));
-#define GB_RF(RB_, DT_)                                                                                                       \
-    return gbp_pdl::launch_pdl(gbp_pdl::on(gbp_pdl::kMoe), router_fused_kernel<RB_, WARPS, UN, DT_>, grid, dim3(WARPS * 32), 0, \
-                               gb_stream(stream), x, static_cast<const half*>(gate), static_cast<half*>(logits),                \
-                               static_cast<const float*>(sig), static_cast<const float*>(bias), static_cast<int*>(pick),        \
+#define GB_RF(RB_, DT_, NP_, UN_)                                                                                                       \
+    return gbp_pdl::launch_pdl(gbp_pdl::on(gbp_pdl::kMoe), router_fused_kernel<RB_, WARPS, UN_, DT_, NP_>, grid, dim3(WARPS * 32), 0, \
+                               gb_stream(stream), x, static_cast<const half*>(gate), static_cast<half*>(logits),                     \
+                               static_cast<const float*>(sig), static_cast<const float*>(bias), static_cast<int*>(pick),             \
                                static_cast<half*>(wts), scale, rows, K, E, topk, static_cast<unsigned*>(done))
-    if (rb == 2) {
-        if (x_dtype == F32) GB_RF(2, F32);
-        if (x_dtype == BF16) GB_RF(2, BF16);
-        GB_RF(2, F16);
+    if (held) {
+        if (rb == 8) GB_RF(8, F16, 64, 4);
+        if (rb == 4) GB_RF(4, F16, 64, 8);
+        if (rb == 2) GB_RF(2, F16, 64, 16);
+        GB_RF(1, F16, 64, 16);
     }
-    if (x_dtype == F32) GB_RF(1, F32);
-    if (x_dtype == BF16) GB_RF(1, BF16);
-    GB_RF(1, F16);
+    if (rb == 2) {
+        if (x_dtype == F32) GB_RF(2, F32, 0, UN);
+        if (x_dtype == BF16) GB_RF(2, BF16, 0, UN);
+        GB_RF(2, F16, 0, UN);
+    }
+    if (x_dtype == F32) GB_RF(1, F32, 0, UN);
+    if (x_dtype == BF16) GB_RF(1, BF16, 0, UN);
+    GB_RF(1, F16, 0, UN);
 #undef GB_RF
 }
