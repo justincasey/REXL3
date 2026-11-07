@@ -57,6 +57,26 @@ pub trait DraftPeer {
     fn swap(&mut self, send: &DevBuf, send_off: usize, recv: &mut DevBuf, recv_off: usize, bytes: usize, st: &Stream) -> Result<(), ModelError>;
 }
 
+/// A split drafter's partial rows `o` (bf16, `n` elements: this rank's o or down projection over its heads or intermediate columns) become
+/// the whole projection's: the peer's partials swapped into `peer_o` and added, `bf16(o + peer)` in fp32 (one add of two operands, the
+/// same bits whichever rank's is first). A whole drafter (`peer` none) keeps `o`.
+fn sum_with_peer(peer: Option<&mut dyn DraftPeer>, o: &mut DevBuf, peer_o: &mut DevBuf, n: usize, st: &Stream) -> Result<(), ModelError> {
+    let Some(p) = peer else { return Ok(()) };
+    p.swap(o, 0, peer_o, 0, n * 2, st)?;
+    unsafe {
+        glue::add(cp(o), cp(peer_o), mp(o), n, st)?;
+    }
+    Ok(())
+}
+
+/// A reborrow of an optional peer for one call (the trait object's lifetime shortened to the borrow's).
+fn peer_mut<'s>(p: &'s mut Option<&mut dyn DraftPeer>) -> Option<&'s mut dyn DraftPeer> {
+    match p {
+        Some(p) => Some(&mut **p),
+        None => None,
+    }
+}
+
 /// Round graph shapes kept at once (each a few hundred launches; a new shape past the limit runs eagerly).
 const ROUND_GRAPHS: usize = 64;
 
@@ -451,9 +471,13 @@ pub struct Draft {
     share: Option<DraftShare>,
     /// With a share: bf16 `[block rows, hidden]`, the peer's o / down partial rows.
     peer_o: DevBuf,
-    /// With a share: i32 / f32 `[nd, SELECTOR_TOP_K]`, the peer's half of the head's top-k.
-    peer_ids: DevBuf,
-    peer_vals: DevBuf,
+    /// With a share: this rank's half of the head's top-k packed for the swap (i32 ids `[nd, SELECTOR_TOP_K]` then f32 values, both
+    /// `nd` rows long), and the peer's, swapped in.
+    top_send: DevBuf,
+    top_recv: DevBuf,
+    /// Rounds go through the round graphs ([`Draft::round_graphed`]); off: every round eager (a split drafter whose exchange cannot be
+    /// captured, [`Draft::set_round_graphs`]).
+    round_graphs: bool,
     sub: Option<SubHead>,
     /// With a restricted vocabulary: `Some(min)` runs the restricted head only in rounds where every sequence has at least `min` of
     /// its recent tokens inside the set (text the set cannot reach gets the full head), `None` runs it every round.
@@ -793,7 +817,7 @@ impl Draft {
             + nd * 12
             + max_seqs * std::mem::size_of::<WalkSampling>()
             + (max_seqs + 1) * 4
-            + share.map_or(0, |_| nb * h * 2 + nd * SELECTOR_TOP_K * 8)
+            + share.map_or(0, |_| nb * h * 2 + 2 * nd * SELECTOR_TOP_K * 8)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -901,7 +925,8 @@ impl Draft {
                 + Self::scratch_bytes(&dims, vocab, slots, max_ctx_rows, block, format, share);
         }
         let (kv, q) = (KV_HEADS * HEAD_DIM, Q_HEADS * HEAD_DIM);
-        let peer = |n: usize| if share.is_some() { DevBuf::zeroed(n) } else { DevBuf::zeroed(4) };
+        // views (the received top-k lists are read through subviews)
+        let peer = |n: usize| DevBuf::zeroed_view(if share.is_some() { n } else { 4 });
         let z = |n: usize| DevBuf::zeroed(n);
         let d = Self {
             dims,
@@ -959,8 +984,9 @@ impl Draft {
             row_off: z((max_seqs + 1) * 4)?,
             share,
             peer_o: peer(nb * h * 2)?,
-            peer_ids: peer(nd * SELECTOR_TOP_K * 4)?,
-            peer_vals: peer(nd * SELECTOR_TOP_K * 4)?,
+            top_send: peer(nd * SELECTOR_TOP_K * 8)?,
+            top_recv: peer(nd * SELECTOR_TOP_K * 8)?,
+            round_graphs: true,
             sub: None,
             adaptive_min: None,
             restrict_times: None,
@@ -978,28 +1004,52 @@ impl Draft {
         self.max_ctx_rows
     }
 
-    /// Bytes of one ring row (one position's K or V, all kv heads) of one draft layer.
+    /// Bytes of one ring row (one position's K or V, all kv heads) of one draft layer of a whole drafter.
     pub const RING_ROW_BYTES: usize = KV_HEADS * HEAD_DIM * 2;
 
-    /// Bytes of the context window a prefix-cache snapshot keeps: K and V of every draft layer for the last [`DraftCtxLayout::WINDOW`] positions.
+    /// Bytes of the context window a prefix-cache snapshot of a whole drafter keeps: K and V of every draft layer for the last
+    /// [`DraftCtxLayout::WINDOW`] positions.
     pub const fn window_snapshot_bytes() -> u64 {
         (LAYERS * 2 * DraftCtxLayout::WINDOW * Self::RING_ROW_BYTES) as u64
     }
 
+    /// Bytes of one ring row of a drafter with `share` (a split drafter's rings hold its kv heads only).
+    pub fn ring_row_bytes_of(share: Option<DraftShare>) -> usize {
+        share.map_or(KV_HEADS, |s| s.part(KV_HEADS).len()) * HEAD_DIM * 2
+    }
+
+    /// [`Draft::window_snapshot_bytes`] of a drafter with `share`: its kv heads' window.
+    pub fn window_snapshot_bytes_of(share: Option<DraftShare>) -> u64 {
+        (LAYERS * 2 * DraftCtxLayout::WINDOW * Self::ring_row_bytes_of(share)) as u64
+    }
+
+    /// Bytes of one of this drafter's ring rows ([`Draft::ring_row_bytes_of`]).
+    pub fn ring_row_bytes(&self) -> usize {
+        Self::ring_row_bytes_of(self.share)
+    }
+
+    /// This rank's part of a split drafter, `None` for a whole one.
+    pub fn share(&self) -> Option<DraftShare> {
+        self.share
+    }
+
+    /// Run the rounds through the round graphs (the default) or eagerly. A split drafter's round holds the group's exchanges: it may be
+    /// captured only when the communicator's collectives may (`TpComm::capturable`), and both ranks must say the same.
+    pub fn set_round_graphs(&mut self, on: bool) {
+        self.round_graphs = on;
+    }
+
     /// The ring segments (`(ring byte offset, bytes, offset in the window copy)`) of positions `lo..lo + n` of `slot`: one, or two when the
-    /// positions wrap the ring. A split drafter's rings hold its kv heads only, which the window snapshots (rows of every kv head) do not
-    /// take: refused.
-    fn ring_segments(&self, slot: usize, lo: usize, n: usize) -> Result<Vec<(usize, usize, usize)>, ModelError> {
-        if self.share.is_some() {
-            return Err(ModelError::Config("a split drafter's context rings are not snapshotted".into()));
-        }
+    /// positions wrap the ring. A split drafter's rows are its kv heads' ([`Draft::ring_row_bytes`]).
+    fn ring_segments(&self, slot: usize, lo: usize, n: usize) -> Vec<(usize, usize, usize)> {
         let l = &self.cache.layout;
+        let rb = self.ring_row_bytes();
         let first = n.min(l.cap - lo % l.cap);
-        let mut v = vec![((slot * l.cap + lo % l.cap) * Self::RING_ROW_BYTES, first * Self::RING_ROW_BYTES, 0)];
+        let mut v = vec![((slot * l.cap + lo % l.cap) * rb, first * rb, 0)];
         if first < n {
-            v.push((slot * l.cap * Self::RING_ROW_BYTES, (n - first) * Self::RING_ROW_BYTES, first * Self::RING_ROW_BYTES));
+            v.push((slot * l.cap * rb, (n - first) * rb, first * rb));
         }
-        Ok(v)
+        v
     }
 
     /// FNV-1a over the ring rows of positions `lo..lo + n` of `slot` (every layer, K then V, in position order), for tests that compare a
@@ -1012,7 +1062,7 @@ impl Draft {
         let mut h = 0xcbf2_9ce4_8422_2325u64;
         for layer in 0..LAYERS {
             for buf in [self.cache.k(layer), self.cache.v(layer)] {
-                for (off, bytes, _) in self.ring_segments(slot, lo, n)? {
+                for (off, bytes, _) in self.ring_segments(slot, lo, n) {
                     let mut v = vec![0u8; bytes];
                     buf.download_range(off, &mut v)?;
                     h = v.iter().fold(h, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
@@ -1023,7 +1073,8 @@ impl Draft {
     }
 
     /// Copy the context ring's rows of positions `lo..lo + n` of `slot` into snapshot `snap` of `dk` / `dv` (one buffer per draft layer, each
-    /// `[snapshots][WINDOW][kv_heads x head_dim]` bf16): row `i` of the snapshot is position `lo + i`. `n` is at most the window.
+    /// `[snapshots][WINDOW][kv_heads x head_dim]` bf16, the drafter's own kv heads): row `i` of the snapshot is position `lo + i`. `n` is at
+    /// most the window.
     #[allow(clippy::too_many_arguments)] // slot, the positions, both snapshot buffers and which snapshot, the stream
     pub fn save_window(
         &self,
@@ -1037,8 +1088,8 @@ impl Draft {
     ) -> Result<(), ModelError> {
         assert!(n <= DraftCtxLayout::WINDOW && dk.len() == LAYERS && dv.len() == LAYERS);
         for (layer, (k, v)) in dk.iter_mut().zip(dv.iter_mut()).enumerate() {
-            for (off, bytes, at) in self.ring_segments(slot, lo, n)? {
-                let dst = snap * DraftCtxLayout::WINDOW * Self::RING_ROW_BYTES + at;
+            for (off, bytes, at) in self.ring_segments(slot, lo, n) {
+                let dst = snap * DraftCtxLayout::WINDOW * self.ring_row_bytes() + at;
                 k.copy_range_from(dst, self.cache.k(layer), off, bytes, stream)?;
                 v.copy_range_from(dst, self.cache.v(layer), off, bytes, stream)?;
             }
@@ -1059,11 +1110,11 @@ impl Draft {
         stream: &Stream,
     ) -> Result<(), ModelError> {
         assert!(n <= DraftCtxLayout::WINDOW && dk.len() == LAYERS && dv.len() == LAYERS);
-        let segs = self.ring_segments(slot, lo, n)?;
+        let (segs, rb) = (self.ring_segments(slot, lo, n), self.ring_row_bytes());
         for (layer, (k, v)) in dk.iter().zip(dv.iter()).enumerate() {
             let (rk, rv) = self.cache.kv_mut(layer);
             for &(off, bytes, at) in &segs {
-                let src = snap * DraftCtxLayout::WINDOW * Self::RING_ROW_BYTES + at;
+                let src = snap * DraftCtxLayout::WINDOW * rb + at;
                 rk.copy_range_from(off, k, src, bytes, stream)?;
                 rv.copy_range_from(off, v, src, bytes, stream)?;
             }
@@ -1178,7 +1229,7 @@ impl Draft {
         reqs: &[DraftReq],
         stream: &Stream,
     ) -> Result<Vec<Vec<u32>>, ModelError> {
-        Ok(self.propose_batch_scored(embed, head, vocab, reqs, stream)?.into_iter().map(|p| p.tokens).collect())
+        Ok(self.propose_batch_scored(embed, head, vocab, reqs, None, stream)?.into_iter().map(|p| p.tokens).collect())
     }
 
     /// Restrict the draft's vocabulary head to the target `head`'s columns of these token-id ranges (each `(first id, end id)`,
@@ -1261,7 +1312,7 @@ impl Draft {
     }
 
     /// [`Draft::propose_batch`] with the draft's own confidence in each pick (see [`Picked`]). A split drafter runs its half of the round
-    /// with the peer (`peer`, in step with the other rank's same call) and leaves [`Draft::round_digest`] of the merged head candidates.
+    /// with the peer (`peer`, in step with the other rank's same call on the same requests); both ranks then hold the same picks.
     pub fn propose_batch_scored(
         &mut self,
         embed: &DevBuf,
@@ -1332,13 +1383,12 @@ impl Draft {
         }
         let nd = row_off[n] as usize;
         self.head_rounds[use_sub as usize] += 1;
-        if capture {
-            self.round_launches(embed, head, vocab, &wants, use_sub, true, peer, stream)?;
+        if capture || !self.round_graphs {
+            self.round_launches(embed, head, vocab, &wants, use_sub, capture, peer, stream)?;
         } else {
             self.round_graphed(embed, head, vocab, &wants, use_sub, peer, stream)?;
         }
-        let split = self.share.is_some();
-        let Draft { stage, out_tokens, conf, margin, top_ids, top_vals, edge, round_digest, .. } = self;
+        let Draft { stage, out_tokens, conf, margin, top_ids, top_vals, edge, .. } = self;
         stage.sync(stream)?;
         let mut t = vec![0i32; nd];
         out_tokens.download(&mut t)?;
@@ -1346,16 +1396,6 @@ impl Draft {
         conf.download(&mut c)?;
         let mut m = vec![0f32; nd];
         margin.download(&mut m)?;
-        if split {
-            // what both ranks of a split drafter hold alike: the merged candidates (the follower's walk draws greedily)
-            let mut ids = vec![0u32; nd * SELECTOR_TOP_K];
-            top_ids.download(&mut ids)?;
-            let mut vals = vec![0u32; nd * SELECTOR_TOP_K];
-            top_vals.download(&mut vals)?;
-            *round_digest = ids.iter().chain(&vals).flat_map(|v| v.to_le_bytes()).fold(*round_digest, |h, b| {
-                (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
-            });
-        }
         let lat = if capture {
             let mut ids = vec![0i32; nd * SELECTOR_TOP_K];
             top_ids.download(&mut ids)?;
@@ -1428,7 +1468,7 @@ impl Draft {
         let split = self.share.is_some();
         let mut peer = peer;
         let captured =
-            Graph::capture(&cap, || self.round_launches(embed, head, vocab, wants, use_sub, false, peer.as_deref_mut(), &cap));
+            Graph::capture(&cap, || self.round_launches(embed, head, vocab, wants, use_sub, false, peer_mut(&mut peer), &cap));
         self.rounds.cap = Some(cap);
         match captured {
             Ok(g) => {
@@ -1514,8 +1554,8 @@ impl Draft {
             edge,
             share,
             peer_o,
-            peer_ids,
-            peer_vals,
+            top_send,
+            top_recv,
             ..
         } = self;
         let capture = edges;
@@ -1568,7 +1608,7 @@ impl Draft {
                 stream,
             )?;
             layer.o.forward(att, o, rows, lin, stream)?;
-            sum_with_peer(peer.as_deref_mut(), o, peer_o, rows * hd, stream)?;
+            sum_with_peer(peer_mut(&mut peer), o, peer_o, rows * hd, stream)?;
             // x' = x + conv_finish(o), written to the other buffer, then swapped in
             dflash2::dynconv(o, dynv, &layer.attn_conv.base, 1, n, block, hd, CONV_GROUP, Some(x), x2, stream)?;
             std::mem::swap(x, x2);
@@ -1582,7 +1622,7 @@ impl Draft {
                 glue::swiglu(cp(g), cp(u), mp(sw), rows * fl, stream)?;
             }
             layer.down.forward(sw, o, rows, lin, stream)?;
-            sum_with_peer(peer.as_deref_mut(), o, peer_o, rows * hd, stream)?;
+            sum_with_peer(peer_mut(&mut peer), o, peer_o, rows * hd, stream)?;
             dflash2::dynconv(o, dynv, &layer.mlp_conv.base, 1, n, block, hd, CONV_GROUP, Some(x), x2, stream)?;
             std::mem::swap(x, x2);
         }
@@ -1650,9 +1690,12 @@ impl Draft {
         }
         if let Some(p) = peer {
             let bytes = nd * SELECTOR_TOP_K * 4;
-            p.swap(top_ids, 0, peer_ids, 0, bytes, stream)?;
-            p.swap(top_vals, 0, peer_vals, 0, bytes, stream)?;
-            dflash2::merge_topk(top_ids, top_vals, peer_ids, peer_vals, nd, SELECTOR_TOP_K, stream)?;
+            // one swap of this rank's lists packed (ids then values), the peer's into `top_recv` the same way
+            top_send.copy_range_from(0, top_ids, 0, bytes, stream)?;
+            top_send.copy_range_from(bytes, top_vals, 0, bytes, stream)?;
+            p.swap(top_send, 0, top_recv, 0, 2 * bytes, stream)?;
+            let (pi, pv) = (top_recv.subview(0, bytes), top_recv.subview(bytes, bytes));
+            dflash2::merge_topk(top_ids, top_vals, &pi, &pv, nd, SELECTOR_TOP_K, stream)?;
         }
         unsafe {
             glue::small_linear_f16w(cp(sel), cp(sel_proj), mp(gate), nd, hd, SELECTOR_RANK, stream)?;
@@ -1772,5 +1815,30 @@ mod tests {
         assert!(vocab_strips(&[(0, 248321)], 248320).is_err(), "past the head");
         let five: Vec<(usize, usize)> = (0..5).map(|i| (i * 20_000, i * 20_000 + 12_800)).collect();
         assert!(vocab_strips(&five, 248320).is_err(), "more than four ranges");
+    }
+
+    /// A split drafter is two ranks' halves: rank `r` of 2 takes `[n r / 2, n (r + 1) / 2)` of every count, its ring rows are its kv
+    /// heads' (the snapshot window halves with them), and its share of a restricted head's strips is its half counted across the ranges
+    /// in order (the two shares tile the set, no strip twice). Any other group is refused.
+    #[test]
+    fn a_split_drafters_halves_tile_every_count_and_the_head_strips() {
+        let (s0, s1) = (DraftShare::of(0, 2).unwrap(), DraftShare::of(1, 2).unwrap());
+        assert_eq!((s0.part(Q_HEADS), s1.part(Q_HEADS)), (0..16, 16..32));
+        assert_eq!((s0.part(KV_HEADS), s1.part(KV_HEADS)), (0..4, 4..8));
+        assert_eq!((s0.part(1210), s1.part(1210)), (0..605, 605..1210));
+        assert!(DraftShare::of(2, 2).is_err() && DraftShare::of(0, 3).is_err() && DraftShare::of(0, 1).is_err());
+        assert_eq!(Draft::ring_row_bytes_of(None), Draft::RING_ROW_BYTES);
+        assert_eq!(2 * Draft::ring_row_bytes_of(Some(s1)), Draft::RING_ROW_BYTES);
+        assert_eq!(2 * Draft::window_snapshot_bytes_of(Some(s0)), Draft::window_snapshot_bytes());
+        // the GLM default set (`REXL3_MTP_VOCAB` 512 strips): the prefix, the numbers' block and the last strip, 555 strips
+        let set = [(0, 512), (768, 810), (1209, 1210)];
+        let (a, b) = (share_strips(&set, s0), share_strips(&set, s1));
+        assert_eq!(a, vec![(0, 277)]);
+        assert_eq!(b, vec![(277, 512), (768, 810), (1209, 1210)]);
+        let n = |v: &[(usize, usize)]| v.iter().map(|&(lo, hi)| hi - lo).sum::<usize>();
+        assert_eq!((n(&a), n(&b)), (277, 278), "each at least the 64 strips that keep the full head's bits");
+        // a cut inside a later range splits it
+        assert_eq!(share_strips(&[(0, 10), (20, 40)], s0), vec![(0, 10), (20, 25)]);
+        assert_eq!(share_strips(&[(0, 10), (20, 40)], s1), vec![(25, 40)]);
     }
 }

@@ -742,13 +742,14 @@ fn a_ranks_nextn_layer_binds_as_subbanks_and_is_refused_by_name_where_it_would_r
     eprintln!("MemAvailable min {:.1} GiB", gib(guard.finish()));
 }
 
-/// The DFlash2 drafter of `REXL3_DFLASH_DIR` attached to `m` tapping `taps` (layers of the prefix: the pack's own taps reach past it).
-fn attach_drafter(m: &mut GlmModel, dir: &Path, taps: &[usize]) {
+/// The DFlash2 drafter of `REXL3_DFLASH_DIR` attached to `m` tapping `taps` (layers of the prefix: the pack's own taps reach past it), the
+/// whole drafter or `share` of a split one (attached after `enable_tp`: its rounds swap with the peer).
+fn attach_drafter(m: &mut GlmModel, dir: &Path, taps: &[usize], share: Option<gb_model::draft::DraftShare>) {
     use gb_model::draft::{Draft, BLOCK};
     let dims = gb_model::shapes::read_draft_config(dir).unwrap().dims(gb_model::families::glm::alloc::TOKENIZER_VOCAB);
     let pack = gb_model::pack::Pack::open(dir).unwrap();
     let mut ctx = gb_model::loadctx::LoadCtx::from_env();
-    let (draft, _) = Draft::declare_bf16(&mut ctx, &pack, dims, m.cfg.vocab, SLOTS, m.chunk_rows(), BLOCK).unwrap();
+    let (draft, _) = Draft::declare_bf16(&mut ctx, &pack, dims, m.cfg.vocab, SLOTS, m.chunk_rows(), BLOCK, share).unwrap();
     ctx.finish().unwrap();
     m.attach_dflash(draft, taps).unwrap();
 }
@@ -805,7 +806,7 @@ fn p2_redsnow_sequence_parallel_two_ranks_equal_one_p2_model_and_relay_the_taps(
     a.set_prefill_contract(PrefillContract::P2).unwrap();
     a.set_graphs(false);
     if let Some(d) = &draft_dir {
-        attach_drafter(&mut a, d, &taps);
+        attach_drafter(&mut a, d, &taps, None);
     }
     let reference = script(&mut a);
     let ref_336 = script_chunk(&mut a, 336);
@@ -861,7 +862,7 @@ fn p2_redsnow_sequence_parallel_two_ranks_equal_one_p2_model_and_relay_the_taps(
     a.enable_head_split(bits).unwrap();
     b.enable_head_split(bits).unwrap();
     if let Some(d) = &draft_dir {
-        attach_drafter(&mut a, d, &taps);
+        attach_drafter(&mut a, d, &taps, None);
         a.enable_tap_relay(&taps).unwrap();
         b.enable_tap_relay(&taps).unwrap();
     }
@@ -1107,7 +1108,7 @@ fn one_model(contract: PrefillContract, dir: &Path, layers: usize, draft: Option
     let (mut m, _) = load(dir, layers, None, |_| {});
     m.set_prefill_contract(contract).unwrap();
     if let Some(d) = draft {
-        attach_drafter(&mut m, d, taps);
+        attach_drafter(&mut m, d, taps, None);
     }
     if room > 0 {
         assert_eq!(m.enable_prefill_parts(room).map(|_| m.prefill_part_rows()).unwrap(), room);
@@ -1145,7 +1146,7 @@ fn two_ranks(
         m.enable_head_split(bits).unwrap();
     }
     if let Some(d) = draft {
-        attach_drafter(&mut ms[0], d, taps);
+        attach_drafter(&mut ms[0], d, taps, None);
         for m in ms.iter_mut() {
             m.enable_tap_relay(taps).unwrap();
         }
@@ -1389,9 +1390,10 @@ fn cache_script(m: &mut GlmModel, cached: bool, bound: usize) -> (Vec<u64>, Vec<
 
 /// The two ranks of the serving group (`tp_boot::plan_from_split` and `load_rank_with`'s moves on the test's load): the expert WIDTH
 /// split (every expert at the rank's columns), the head split of `REXL3_GLM_TP_SPLIT` (default all five; under the KDA split the rank is
-/// built from its heads' strips, so its state and its snapshot slots are its heads'), P2 with the sequence-parallel residual, rank 0
-/// drafting with `draft` (both ranks relaying its taps), the stash of `room` rows and four snapshot slots on each rank.
-fn serving_ranks(dir: &Path, layers: usize, draft: Option<&Path>, taps: &[usize], room: usize) -> (GlmModel, GlmModel) {
+/// built from its heads' strips, so its state and its snapshot slots are its heads'), P2 with the sequence-parallel residual, drafting
+/// with `draft` (rank 0's whole drafter, or with `split` each rank's half of it; both ranks relaying its taps), the stash of `room` rows
+/// and four snapshot slots on each rank.
+fn serving_ranks(dir: &Path, layers: usize, draft: Option<&Path>, taps: &[usize], room: usize, split: bool) -> (GlmModel, GlmModel) {
     use gb_model::families::glm::{GlmConfig, GlmPack};
     assert!(gb_model::families::glm::contract::p2_sp_on(), "REXL3_GLM_P2_SP is off: the serving residual would not be tested");
     let bits = gb_model::families::glm::model::tp::split_from_env().unwrap();
@@ -1417,8 +1419,12 @@ fn serving_ranks(dir: &Path, layers: usize, draft: Option<&Path>, taps: &[usize]
         m.enable_head_split(bits).unwrap();
     }
     if let Some(d) = draft {
-        attach_drafter(&mut ms[0], d, taps);
-        for m in ms.iter_mut() {
+        for (r, m) in ms.iter_mut().enumerate() {
+            if split {
+                attach_drafter(m, d, taps, Some(gb_model::draft::DraftShare::of(r, 2).unwrap()));
+            } else if r == 0 {
+                attach_drafter(m, d, taps, None);
+            }
             m.enable_tap_relay(taps).unwrap();
         }
     }
@@ -1459,11 +1465,15 @@ fn p2_a_restored_prefix_in_a_batched_and_a_paused_forward_equals_uncached_on_one
     eprintln!("one P2 model ({kv} latent cache): {} answering calls and {} drafts, cached == uncached", cold.0.len(), cold.1.len());
     drop(one);
 
-    let (a, b) = serving_ranks(&dir, layers, draft.as_deref(), &taps, PART_ROOM);
+    let split = gb_model::families::glm::dflash::split_on() && draft.is_some();
+    let (a, b) = serving_ranks(&dir, layers, draft.as_deref(), &taps, PART_ROOM, split);
     let (r0, r1, a, b) = on_ranks(a, b, |m| (cache_script(m, false, bound), cache_script(m, true, bound)));
     assert_eq!((&r0.0 .0, &r0.1 .0), (&r1.0 .0, &r1.1 .0), "the two ranks' answers differ");
     assert_eq!(r0.1 .0, r0.0 .0, "two ranks: a cached answer (or a window after) differs from the uncached run");
     assert_eq!(r0.1 .1, r0.0 .1, "rank 0: the drafts after a restore differ from the uncached run's");
+    if split {
+        assert_eq!((&r1.0 .1, &r1.1 .1), (&r0.0 .1, &r0.1 .1), "the split drafter's halves drafted differently on the two ranks");
+    }
     assert!(a.sp_chunks() > 0 && a.sp_chunks() == b.sp_chunks(), "sp chunks {} / {}", a.sp_chunks(), b.sp_chunks());
     eprintln!(
         "A RESTORED PREFIX BYTE-IDENTICAL TO UNCACHED (P2, {kv}, the drafter {}): {} answering calls and {} drafts on one model and on \
@@ -1473,6 +1483,71 @@ fn p2_a_restored_prefix_in_a_batched_and_a_paused_forward_equals_uncached_on_one
         r0.0 .1.len(),
         a.sp_chunks()
     );
+    drop((a, b));
+    eprintln!("MemAvailable min {:.1} GiB", gib(guard.finish()));
+}
+
+/// The DFlash2 drafter split over the two serving ranks (`REXL3_GLM_DRAFT_SPLIT`, `draft::DraftShare`: each rank its half of the heads,
+/// the intermediate columns and the head's columns, the o / down partials and the head's top-k swapped every round) against rank 0's
+/// whole drafter on the same serving ranks ([`cache_script`] uncached, cached, and uncached again):
+/// * the trunk does not see it: every answer equals the whole drafter's run (the follower's taps, absorbs and snapshot windows are its own);
+/// * both ranks hold the same drafts, every run alike, and the drafts after a restore are the uncached run's (each rank's half of the
+///   window snapshotted and put back);
+/// * the drafts track the whole drafter's (each partial is rounded to bf16 before the add, so a near tie may fall the other way): the
+///   share of draft tokens equal at their place is printed, and at least half of the first drafts must agree.
+///
+///     flock -x /tmp/rexl3-gpu.lock env REXL3_REDSNOW_DIR=... REXL3_DFLASH_DIR=... REXL3_GLM_KV=fp8 cargo test --release -p gb-model \
+///         --test glm_redsnow_tp p2_a_split_drafter -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+fn p2_a_split_drafter_agrees_on_both_ranks_repeats_and_tracks_the_whole_drafter() {
+    let Some(dir) = redsnow_dir() else { return };
+    let (layers, draft, taps) = prefix_setup();
+    let Some(draft) = draft else {
+        eprintln!("REXL3_DFLASH_DIR not set: not run");
+        return;
+    };
+    assert!(layers >= 4, "parts need a few layers");
+    require_available(if layers <= 8 { 60 } else { 80 } * GIB);
+    let guard = Guard::start(20 * GIB);
+    let bound = layers / 2;
+    let (a, b) = serving_ranks(&dir, layers, Some(&draft), &taps, PART_ROOM, false);
+    let (whole, _, a, b) = on_ranks(a, b, |m| cache_script(m, false, bound));
+    assert!(!b.has_dflash() && !a.dflash_split());
+    drop((a, b));
+
+    let (a, b) = serving_ranks(&dir, layers, Some(&draft), &taps, PART_ROOM, true);
+    assert!(a.dflash_split() && b.dflash_split());
+    let t = std::time::Instant::now();
+    let (r0, r1, a, b) =
+        on_ranks(a, b, |m| (cache_script(m, false, bound), cache_script(m, true, bound), cache_script(m, false, bound)));
+    eprintln!("two ranks with a split drafter ran the script three times in {:.1?}", t.elapsed());
+    assert_eq!(r0, r1, "the two ranks' answers or drafts differ");
+    let (cold, warm, again) = r0;
+    assert_eq!(cold.0, whole.0, "the split drafter moved an answer of the trunk");
+    assert_eq!((&warm.0, &again.0), (&cold.0, &cold.0), "a cached (or repeated) answer differs from the uncached run");
+    assert_eq!(again.1, cold.1, "the split drafter drafted differently on the same requests");
+    assert_eq!(warm.1, cold.1, "the split drafter's drafts after a restore differ from the uncached run's");
+    let (t0, t1) = (a.tp().unwrap(), b.tp().unwrap());
+    assert_eq!((t0.exchanges, t0.exchanged_bytes), (t1.exchanges, t1.exchanged_bytes), "the ranks exchanged alike");
+    assert_eq!(cold.1.len(), whole.1.len());
+    let (mut same, mut all, mut first) = (0usize, 0usize, 0usize);
+    for (s, w) in cold.1.iter().zip(&whole.1) {
+        assert_eq!(s.len(), w.len(), "every slot drafts its seven");
+        same += s.iter().zip(w).filter(|(x, y)| x == y).count();
+        all += s.len();
+        first += usize::from(s.first() == w.first());
+    }
+    eprintln!(
+        "A SPLIT DRAFTER (two ranks, {} exchanges a rank): both ranks alike, repeat and restore alike, the trunk's {} answers unchanged; \
+         {same} of {all} draft tokens and {first} of {} first drafts equal to the whole drafter's\n  split {:?}\n  whole {:?}",
+        t0.exchanges,
+        cold.0.len(),
+        cold.1.len(),
+        cold.1,
+        whole.1
+    );
+    assert!(2 * first >= cold.1.len(), "the split drafter's first drafts left the whole drafter's: {first} of {}", cold.1.len());
     drop((a, b));
     eprintln!("MemAvailable min {:.1} GiB", gib(guard.finish()));
 }

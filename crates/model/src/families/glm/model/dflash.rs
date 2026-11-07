@@ -17,7 +17,11 @@
 //! **Drafting** runs the draft's block for each asking sequence at the position of its pending token and returns the selector's chain
 //! with each pick's score and margin (`draft::Picked`). It reads the trunk's embedding and `lm_head` and writes only the draft's own ring
 //! and scratch: the trunk's state and every committed token are untouched, so drafted == serial whatever it proposes. On a
-//! tensor-parallel group it runs on rank 0 alone (the draft is dense, the head replicated): nothing is forwarded to a follower.
+//! tensor-parallel group it runs on rank 0 alone (the draft is dense, the head replicated), or SPLIT over both ranks
+//! (`dflash::share_of`, `REXL3_GLM_DRAFT_SPLIT`): each rank holds its half of the drafter (`draft::DraftShare`), rank 0 forwards each
+//! round's requests ([`DflashReq`], `tp_mtp`), and both ranks run the round together through the group's swaps (`draft::DraftPeer`), so
+//! both hold the same picks. Each rank of a split drafter then taps, absorbs and snapshots on its own (the prompt's end reaches the
+//! follower by its own call).
 //!
 //! **Prefix cache.** A snapshot keeps the drafter's context window (`model/snapshot.rs`: the ring rows of the last 2,048 positions before
 //! the cut, `Draft::save_window`) and a restore puts it back, so drafts after a hit are those of a cold prefill of the same tokens.
@@ -26,11 +30,12 @@
 //! each rank holds only its own rows of the streams. Both ranks of a group whose rank 0 drafts then hold a [`TapRelay`] (the taps are a
 //! fact of the Hello): after each tapped layer each rank writes its own rows' taps (rank 0 straight into its tap column, the follower
 //! into the relay's stage) and the stages are swapped, rank 0 copying the follower's rows into its tap column. The same kernel on the
-//! same stream values, so the tap rows are the bits a whole-row tap writes.
+//! same stream values, so the tap rows are the bits a whole-row tap writes. With a split drafter both ranks write their own rows into the
+//! stage, swap, and copy both halves into their tap columns.
 
 use super::tp::{GlmTp, RowSplit};
 use super::GlmModel;
-use crate::draft::{Absorb, Draft, DraftReq, Picked};
+use crate::draft::{Absorb, Draft, DraftPeer, DraftReq, Picked};
 use crate::error::ModelError;
 use crate::rows::RowBatch;
 use gb_cuda::{DevBuf, Stream};
@@ -82,14 +87,18 @@ pub(super) fn tap_layer(
     let (h, n, pn) = (rl.hidden, sp.rows(), sp.phi - sp.plo);
     let row_f32 = gb_cuda::mhc::ROW * 4;
     let x = streams.subview(sp.lo * row_f32, n * row_f32);
-    match dflash.as_mut() {
+    if let Some(d) = dflash.as_ref() {
+        if rows > d.rows || d.draft.dims.taps != rl.taps {
+            return Err(ModelError::Config(format!(
+                "a relayed tap of {rows} rows over {} taps; the drafter's taps hold {} rows of {}",
+                rl.taps, d.rows, d.draft.dims.taps
+            )));
+        }
+    }
+    // a split drafter (on both ranks): every rank needs every row, so each rank's own rows go through the stage too
+    let split = dflash.as_ref().is_some_and(|d| d.draft.share().is_some());
+    match dflash.as_mut().filter(|_| !split) {
         Some(d) => {
-            if rows > d.rows || d.draft.dims.taps != rl.taps {
-                return Err(ModelError::Config(format!(
-                    "a relayed tap of {rows} rows over {} taps; the drafter's taps hold {} rows of {}",
-                    rl.taps, d.rows, d.draft.dims.taps
-                )));
-            }
             let fc = rl.taps * h * 2;
             let mut own = d.taps.subview(sp.lo * fc, n * fc);
             gb_cuda::dsv4_mtp_gpu::tap_mean_bf16_dev(&x, &mut own, n, h, i, rl.taps, st)?;
@@ -104,6 +113,9 @@ pub(super) fn tap_layer(
     if let Some(d) = dflash.as_mut() {
         let fc = rl.taps * h * 2;
         d.taps.copy_2d_from(sp.plo * fc + i * h * 2, fc, &rl.stage, sp.plo * h * 2, h * 2, h * 2, pn, st)?;
+        if split {
+            d.taps.copy_2d_from(sp.lo * fc + i * h * 2, fc, &rl.stage, sp.lo * h * 2, h * 2, h * 2, n, st)?;
+        }
     }
     Ok(())
 }
@@ -171,6 +183,21 @@ pub struct DflashAsk<'a> {
     pub sampling: &'a gb_sampling::Sampling,
     /// Drafts wanted, 1..=7.
     pub want: usize,
+}
+
+/// One sequence's request of a draft round, as [`GlmModel::dflash_reqs`] makes it from a [`DflashAsk`] (host values only: the call that
+/// starts a split drafter's round on the follower carries them, `tp_mtp`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DflashReq {
+    pub slot: usize,
+    /// The anchor's position (the sequence's length before it).
+    pub p: usize,
+    pub anchor: u32,
+    /// Drafts wanted, 1..=7.
+    pub want: usize,
+    /// The share of its last tokens the restricted head covers (`Draft::coverage`).
+    pub coverage: f32,
+    pub sampling: gb_sampling::Sampling,
 }
 
 impl DflashState {
@@ -243,6 +270,12 @@ impl GlmModel {
     /// the model's widest forward.
     pub fn attach_dflash(&mut self, draft: Draft, tap_layers: &[usize]) -> Result<usize, ModelError> {
         let rows = self.s.rows.max(self.window_rows);
+        let mut draft = draft;
+        // a split drafter's rounds hold the group's swaps: captured only when the communicator's collectives may be
+        if draft.share().is_some() {
+            let tp = self.tp.as_ref().ok_or_else(|| ModelError::Config("a split drafter on a model that is no rank of a group".into()))?;
+            draft.set_round_graphs(tp.capturable());
+        }
         let st = DflashState::new(draft, tap_layers, self.layers, rows)?;
         let bytes = st.tap_bytes();
         self.dflash = Some(st);
@@ -361,31 +394,71 @@ impl GlmModel {
 
     /// One draft round: per ask, up to `want` drafts after its pending token, with the draft's score and margin of each. The pending commits
     /// must have been applied (`flush`): the context ring then holds every committed position. Synchronises once per batch of
-    /// `Draft::max_seqs` asks.
+    /// `Draft::max_seqs` asks. A split drafter's round needs the peer's same call ([`GlmModel::dflash_run`] of the same requests).
     pub fn dflash_draft(&mut self, asks: &[DflashAsk<'_>]) -> Result<Vec<Picked>, ModelError> {
-        let GlmModel { dflash, dev, cfg, stream, .. } = self;
+        let reqs = self.dflash_reqs(asks)?;
+        self.dflash_run(&reqs)
+    }
+
+    /// The requests of these asks: each sequence's anchor (its last token) at its position, its drafts wanted (clamped to 1..=7) and its
+    /// coverage by the restricted head (`Draft::coverage` of its last tokens). Host values only: rank 0 sends them to a split drafter's
+    /// follower, so both ranks run the same round (the restricted head or the full one alike).
+    pub fn dflash_reqs(&self, asks: &[DflashAsk<'_>]) -> Result<Vec<DflashReq>, ModelError> {
+        let d = self.dflash.as_ref().ok_or_else(|| ModelError::Config("this model has no DFlash2 drafter".into()))?;
+        Ok(asks
+            .iter()
+            .map(|a| {
+                let lo = a.tokens.len().saturating_sub(crate::draft::COVERAGE_WINDOW);
+                DflashReq {
+                    slot: a.slot,
+                    p: a.tokens.len().saturating_sub(1),
+                    anchor: *a.tokens.last().unwrap_or(&0),
+                    want: a.want.clamp(1, crate::draft::DRAFTS),
+                    coverage: d.draft.coverage(&a.tokens[lo..]),
+                    sampling: *a.sampling,
+                }
+            })
+            .collect())
+    }
+
+    /// The round of [`GlmModel::dflash_draft`] over requests already made: a whole drafter alone, a split one with its peer (both ranks
+    /// with the same requests, in the same place of the call stream).
+    pub fn dflash_run(&mut self, reqs: &[DflashReq]) -> Result<Vec<Picked>, ModelError> {
+        let GlmModel { dflash, dev, cfg, stream, tp, .. } = self;
         let d = dflash.as_mut().ok_or_else(|| ModelError::Config("this model has no DFlash2 drafter".into()))?;
-        let mut out = Vec::with_capacity(asks.len());
-        for group in asks.chunks(d.draft.max_seqs.max(1)) {
-            let reqs: Vec<DraftReq> = group
+        let split = d.draft.share().is_some();
+        if split && tp.is_none() {
+            return Err(ModelError::Config("a split drafter's round on a model that is no rank of a group".into()));
+        }
+        if let Some(r) = reqs.iter().find(|r| r.want == 0 || r.want > crate::draft::DRAFTS) {
+            return Err(ModelError::Request(format!("a draft request for {} drafts (1..={})", r.want, crate::draft::DRAFTS)));
+        }
+        let mut out = Vec::with_capacity(reqs.len());
+        for group in reqs.chunks(d.draft.max_seqs.max(1)) {
+            let dr: Vec<DraftReq> = group
                 .iter()
-                .map(|a| {
-                    let p = a.tokens.len().saturating_sub(1);
-                    let lo = a.tokens.len().saturating_sub(crate::draft::COVERAGE_WINDOW);
-                    DraftReq {
-                        anchor: *a.tokens.last().unwrap_or(&0),
-                        slot: a.slot,
-                        p,
-                        sampling: a.sampling,
-                        want: a.want.clamp(1, crate::draft::DRAFTS),
-                        coverage: d.draft.coverage(&a.tokens[lo..]),
-                    }
+                .map(|r| DraftReq {
+                    anchor: r.anchor,
+                    slot: r.slot,
+                    p: r.p,
+                    sampling: &r.sampling,
+                    want: r.want,
+                    coverage: r.coverage,
                 })
                 .collect();
-            out.extend(d.draft.propose_batch_scored(&dev.embed, &dev.lm_head, cfg.vocab, &reqs, stream)?);
+            let peer: Option<&mut dyn DraftPeer> = match tp.as_mut() {
+                Some(t) if split => Some(t),
+                _ => None,
+            };
+            out.extend(d.draft.propose_batch_scored(&dev.embed, &dev.lm_head, cfg.vocab, &dr, peer, stream)?);
             d.rounds += 1;
         }
         Ok(out)
+    }
+
+    /// Whether this model holds its rank's half of a drafter split over a group (`Draft::share`).
+    pub fn dflash_split(&self) -> bool {
+        self.dflash.as_ref().is_some_and(|d| d.draft.share().is_some())
     }
 }
 

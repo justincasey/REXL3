@@ -39,7 +39,7 @@ mod part;
 pub mod mtp;
 pub mod snapshot;
 pub mod tp;
-pub use dflash::{DflashAsk, DflashState, TapRelay};
+pub use dflash::{DflashAsk, DflashReq, DflashState, TapRelay};
 pub use graphs::{GraphKey, GraphMutant, GraphStats, Wait};
 pub use mtp::{
     vocab_ranges, BookError, ChainPick, DraftAsk, Drafts, HeadList, MtpCapture, MtpMutant, SubHead, TapBook, VocabMode, MTP_SHARE,

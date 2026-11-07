@@ -7,10 +7,11 @@
 //! starts the slot over (`begin_slot`), shares the snapshot's full pages by reference, copies the partial last page (latent cache AND pool plane of every
 //! layer, the NextN layer's included: copy-on-write at attach), and writes the rest back. Nothing here is allocated while serving.
 //!
-//! A model with the DFlash2 drafter (rank 0 of a group) also keeps the drafter's context window with each snapshot: the ring rows of the last
-//! [`DraftCtxLayout::WINDOW`] positions before the cut (`Draft::save_window`), put back by the restore (`Draft::load_window`), so drafts after a hit
-//! read what a cold prefill of the same tokens leaves. It is this rank's alone: the slot bytes two ranks compare are the trunk's
-//! ([`GlmModel::prefix_snapshot_bytes`]), and the content digest does not cover it (a draft only proposes: it moves no committed bit).
+//! A model with the DFlash2 drafter (rank 0 of a group, or either rank of a split drafter) also keeps the drafter's context window with each
+//! snapshot: the ring rows of the last [`DraftCtxLayout::WINDOW`] positions before the cut (`Draft::save_window`; a split drafter's rows are its
+//! kv heads'), put back by the restore (`Draft::load_window`), so drafts after a hit read what a cold prefill of the same tokens leaves. It is
+//! this rank's alone: the slot bytes two ranks compare are the trunk's ([`GlmModel::prefix_snapshot_bytes`]), and the content digest does not
+//! cover it (a draft only proposes: it moves no committed bit).
 //!
 //! Why the result is bit-identical to a cold prefill of the same tokens: every row a chunk writes (KV latent, pooled keys, the NextN entries) is a
 //! function of its token and the rows before it, whatever the chunk grid (`docs/GLM53.md`, "Prefill"); the recurrent state and the conv history are the
@@ -75,8 +76,9 @@ impl SnapPool {
         prefix::snapshot_bytes(cfg, mtp).map_err(ModelError::Config)
     }
 
-    /// The pool of `slots` snapshot slots of the trunk's state, each with the DFlash2 drafter's context window when `dflash` (a model that drafts with it).
-    pub fn new(cfg: &GlmConfig, slots: usize, mtp: bool, dflash: bool) -> Result<Self, ModelError> {
+    /// The pool of `slots` snapshot slots of the trunk's state, each with the DFlash2 drafter's context window when `dflash_row` is the
+    /// drafter's ring row bytes (`Draft::ring_row_bytes`; a model that drafts with it).
+    pub fn new(cfg: &GlmConfig, slots: usize, mtp: bool, dflash_row: Option<usize>) -> Result<Self, ModelError> {
         if slots == 0 {
             return Err(ModelError::Config("a prefix cache needs at least one snapshot slot".into()));
         }
@@ -89,8 +91,8 @@ impl SnapPool {
         }
         let ring = DevBuf::alloc(slots * layout.ring_bytes() as usize)?;
         let carry = if mtp { Some(DevBuf::alloc(slots * layout.carry as usize)?) } else { None };
-        let win = if dflash {
-            let per_layer = slots * DraftCtxLayout::WINDOW * Draft::RING_ROW_BYTES;
+        let win = if let Some(row) = dflash_row {
+            let per_layer = slots * DraftCtxLayout::WINDOW * row;
             let (mut k, mut v) = (Vec::new(), Vec::new());
             for _ in 0..crate::draft::LAYERS {
                 k.push(DevBuf::alloc(per_layer)?);
@@ -285,13 +287,14 @@ impl GlmModel {
         (lo >= self.dflash_kept_from(slot) && latest - lo <= DraftCtxLayout::DEFAULT_CAP).then_some((lo, len - lo))
     }
     /// Allocate the snapshot pool: `slots` snapshot slots of [`SnapPool::bytes_per_slot`] bytes each, with the NextN layer's share when the model has the
-    /// layer, and the DFlash2 drafter's context window ([`Draft::window_snapshot_bytes`]) when it drafts with one (attach the drafter first). Errors
-    /// when a pool exists already.
+    /// layer, and the DFlash2 drafter's context window ([`Draft::window_snapshot_bytes_of`] of its share) when it drafts with one (attach the
+    /// drafter first). Errors when a pool exists already.
     pub fn enable_prefix_cache(&mut self, slots: usize) -> Result<(), ModelError> {
         if self.snaps.is_some() {
             return Err(ModelError::Config("the prefix cache is already enabled".into()));
         }
-        let pool = SnapPool::new(&self.cfg, slots, self.mtp.is_some(), self.dflash.is_some())?;
+        let row = self.dflash.as_ref().map(|d| d.draft.ring_row_bytes());
+        let pool = SnapPool::new(&self.cfg, slots, self.mtp.is_some(), row)?;
         pool.check_dims(self.kda_dims)?;
         self.snaps = Some(pool);
         Ok(())

@@ -20,7 +20,7 @@
 //! whose `mtp_draft_keyed` forwards the call before it runs it here and whose `flush` is the core call (so the leader's stream is exactly
 //! the single node's list of model calls).
 
-use super::model::{DflashAsk, DraftAsk, Drafts, GlmModel, TapBook};
+use super::model::{DflashAsk, DflashReq, DraftAsk, Drafts, GlmModel, TapBook};
 use crate::draft::Picked;
 use super::tp::GlmCall;
 use crate::error::ModelError;
@@ -31,6 +31,10 @@ use gb_sampling::Sampling;
 pub const K_MTP_DRAFT: u8 = 32;
 /// The frame kind of [`GlmCall::MtpDisable`].
 pub const K_MTP_DISABLE: u8 = 33;
+/// The frame kind of [`GlmCall::DflashDraft`]: a round of the DFlash2 drafter split over the group.
+pub const K_DFLASH_DRAFT: u8 = 34;
+/// The frame kind of [`GlmCall::DflashPromptEnd`].
+pub const K_DFLASH_PROMPT_END: u8 = 35;
 
 /// One ask of a draft call on the wire (`DraftAsk` owns its tokens here).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -103,6 +107,54 @@ pub(super) fn decode_draft(d: &mut Dec<'_>) -> Result<GlmCall, WireError> {
         keyed.push(dec_sampling(d)?);
     }
     Ok(GlmCall::MtpDraft { asks, keyed })
+}
+
+/// The body of [`GlmCall::DflashDraft`]: per request its slot, position, anchor, drafts wanted, coverage (f32 bits) and sampler.
+pub(super) fn encode_dflash(e: &mut Enc, reqs: &[DflashReq]) {
+    e.u64(reqs.len() as u64);
+    for r in reqs {
+        e.u32(r.slot as u32);
+        e.u32(r.p as u32);
+        e.u32(r.anchor);
+        e.u32(r.want as u32);
+        e.u32(r.coverage.to_bits());
+        enc_sampling(e, &Some(r.sampling));
+    }
+}
+
+pub(super) fn decode_dflash(d: &mut Dec<'_>) -> Result<GlmCall, WireError> {
+    let n = d.len(21, "glm dflash requests")?;
+    let mut reqs = Vec::with_capacity(n);
+    for _ in 0..n {
+        let (slot, p, anchor, want) =
+            (d.u32("glm dflash slot")?, d.u32("glm dflash position")?, d.u32("glm dflash anchor")?, d.u32("glm dflash want")?);
+        let coverage = f32::from_bits(d.u32("glm dflash coverage")?);
+        let sampling = dec_sampling(d)?.ok_or_else(|| WireError::Invalid("a dflash request without its sampler".into()))?;
+        reqs.push(DflashReq { slot: slot as usize, p: p as usize, anchor, want: want as usize, coverage, sampling });
+    }
+    Ok(GlmCall::DflashDraft { reqs })
+}
+
+/// What a split draft round's ack carries: FNV-1a 64 over every sequence's picks (the count, each token, the bits of each score and
+/// margin). Both ranks of a split drafter hold the same picks; a rank that drafted anything else loses the group naming `dflash_draft`.
+pub fn picks_digest(p: &[Picked]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut eat = |bytes: &[u8]| {
+        for &b in bytes {
+            h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    };
+    eat(b"glm-dflash-picks-v1");
+    eat(&(p.len() as u64).to_le_bytes());
+    for x in p {
+        eat(&(x.tokens.len() as u64).to_le_bytes());
+        for (i, &t) in x.tokens.iter().enumerate() {
+            eat(&t.to_le_bytes());
+            eat(&x.score.get(i).copied().unwrap_or(f32::NAN).to_bits().to_le_bytes());
+            eat(&x.margin.get(i).copied().unwrap_or(f32::NAN).to_bits().to_le_bytes());
+        }
+    }
+    h
 }
 
 /// What a draft call's ack carries: FNV-1a 64 over every ask's result (a presence byte; then the count, each drafted id and the bits of each
@@ -198,16 +250,30 @@ pub trait GlmMtpRuntime: LockstepRuntime<Call = GlmCall> {
     fn graph_counters(&self) -> Option<gb_engine::GraphCounters> {
         None
     }
-    /// Whether this rank drafts with DFlash2 (rank 0 of a group with `--draft DIR`; a follower never does). The default: no.
+    /// Whether this rank drafts with DFlash2 (rank 0 of a group with `--draft DIR`, or either rank of a split drafter). The default: no.
     fn has_dflash(&self) -> bool {
         false
     }
-    /// A DFlash2 round on this rank alone (rank 0's: the draft is dense and the head replicated, so no follower takes part).
+    /// Whether this rank holds its half of a split drafter (`GlmModel::dflash_split`): its rounds and prompt ends are forwarded.
+    fn dflash_split(&self) -> bool {
+        false
+    }
+    /// A DFlash2 round of a whole drafter on this rank alone (rank 0's: the draft is dense and the head replicated, so no follower takes
+    /// part).
     fn dflash_draft(&mut self, _asks: &[DflashAsk<'_>]) -> Result<Vec<Picked>, ModelError> {
         Err(ModelError::Config("this rank has no DFlash2 drafter".into()))
     }
-    /// Rank 0's word to its DFlash2 drafter that `slot`'s prompt ends at `end` and takes its next snapshot at `cut`
-    /// (`GlmModel::dflash_prompt_end`): host state of this rank alone, never forwarded. The default: nothing (a rank without the drafter).
+    /// The requests of these asks (`GlmModel::dflash_reqs`): what a split round's call carries.
+    fn dflash_reqs(&self, _asks: &[DflashAsk<'_>]) -> Result<Vec<DflashReq>, ModelError> {
+        Err(ModelError::Config("this rank has no DFlash2 drafter".into()))
+    }
+    /// A round of requests (`GlmModel::dflash_run`): a split drafter's half, in step with the peer's same call.
+    fn dflash_run(&mut self, _reqs: &[DflashReq]) -> Result<Vec<Picked>, ModelError> {
+        Err(ModelError::Config("this rank has no DFlash2 drafter".into()))
+    }
+    /// The word to the DFlash2 drafter that `slot`'s prompt ends at `end` and takes its next snapshot at `cut`
+    /// (`GlmModel::dflash_prompt_end`): host state of a rank that drafts (rank 0's alone with a whole drafter, forwarded with a split one:
+    /// [`dflash_prompt_end`]). The default: nothing (a rank without the drafter).
     fn dflash_prompt_end(&mut self, _slot: usize, _end: Option<usize>, _cut: Option<usize>) {}
 }
 
@@ -230,10 +296,49 @@ impl<R: GlmMtpRuntime> DraftModel for TpLeader<R> {
     fn has_dflash(&self) -> bool {
         self.inner().has_dflash()
     }
-    /// Rank 0 alone: nothing is forwarded (the draft touches only rank 0's own ring and scratch, never the group's state).
+    /// A whole drafter: rank 0 alone, nothing is forwarded (the draft touches only rank 0's own ring and scratch, never the group's
+    /// state). A split one: the requests are forwarded first (the follower meets this rank in the round's swaps), then run here; the
+    /// follower's digest of its picks must equal this rank's ([`picks_digest`]).
     fn dflash_draft(&mut self, asks: &[DflashAsk<'_>]) -> Result<Vec<Picked>, ModelError> {
-        self.inner_mut().dflash_draft(asks)
+        if !self.inner().dflash_split() {
+            return self.inner_mut().dflash_draft(asks);
+        }
+        let reqs = self.inner().dflash_reqs(asks)?;
+        self.forward_call(GlmCall::DflashDraft { reqs: reqs.clone() }, |r, _| r.dflash_run(&reqs), |p| picks_digest(p))
     }
+}
+
+/// Rank 0's word to the drafter that `slot`'s prompt ends at `end` with its next cut at `cut` (`GlmModel::dflash_prompt_end`): to its own
+/// drafter alone when it is whole, forwarded first ([`GlmCall::DflashPromptEnd`]) when it is split (the follower's half absorbs, taps and
+/// keeps snapshot windows by the same rule, so both halves of the ring hold the same positions).
+pub fn dflash_prompt_end<R: GlmMtpRuntime>(leader: &mut TpLeader<R>, slot: usize, end: Option<usize>, cut: Option<usize>) {
+    if !leader.inner().dflash_split() {
+        leader.inner_mut().dflash_prompt_end(slot, end, cut);
+        return;
+    }
+    let call = GlmCall::DflashPromptEnd { slot: slot as u32, end: end.map(|e| e as u32), cut: cut.map(|c| c as u32) };
+    leader.forward_unit(call, |r| r.dflash_prompt_end(slot, end, cut));
+}
+
+/// The boot's agreement check of a split drafter: one round on both ranks (slot 0 at position 0, greedy, seven drafts: it reads no ring
+/// position and writes only the drafter's scratch), settled before anything is served, so two ranks whose halves do not make the same picks
+/// (another pack, another split, an exchange that does not carry) fail the boot naming `dflash_draft`. Nothing without a split.
+pub fn check_split<R: GlmMtpRuntime>(leader: &mut TpLeader<R>) -> Result<(), ModelError> {
+    if !leader.inner().dflash_split() {
+        return Ok(());
+    }
+    let req = DflashReq {
+        slot: 0,
+        p: 0,
+        anchor: 0,
+        want: crate::draft::DRAFTS,
+        coverage: 1.0,
+        sampling: Sampling { temperature: 0.0, ..Default::default() },
+    };
+    let picks = leader.forward_call(GlmCall::DflashDraft { reqs: vec![req] }, |r, _| r.dflash_run(&[req]), |p| picks_digest(p))?;
+    leader.settle(leader.last_seq())?;
+    eprintln!("rexl3 event=dflash_split_check picks={:?} digest={:016x}", picks[0].tokens, picks_digest(&picks));
+    Ok(())
 }
 
 /// Rank 0's half of [`GlmCall::MtpDisable`].
@@ -251,6 +356,14 @@ pub fn apply<R: GlmMtpRuntime + ?Sized>(r: &mut R, call: GlmCall) -> Result<Call
         }
         GlmCall::MtpDisable { slot } => {
             r.mtp_disable_slot(slot as usize);
+            Ok(CallReply::NONE)
+        }
+        GlmCall::DflashDraft { reqs } => {
+            let p = r.dflash_run(&reqs)?;
+            Ok(CallReply::digest(picks_digest(&p)))
+        }
+        GlmCall::DflashPromptEnd { slot, end, cut } => {
+            r.dflash_prompt_end(slot as usize, end.map(|e| e as usize), cut.map(|c| c as usize));
             Ok(CallReply::NONE)
         }
         // an image chunk is `tp_vision`'s and a prompt forward's part `tp_part`'s (`tp::apply_family` routes them there): a runtime that
@@ -311,7 +424,64 @@ mod tests {
         for cut in [20usize, 40, bytes.len() - 1] {
             assert!(Msg::<GlmCall>::decode(&bytes[4..cut]).is_err(), "cut at {cut}");
         }
-        assert!(GlmCall::decode(34, &mut Dec::new(&[])).unwrap().is_none());
+        assert!(GlmCall::decode(36, &mut Dec::new(&[])).unwrap().is_none());
+    }
+
+    fn dflash_sample() -> GlmCall {
+        let greedy = Sampling { seed: 9, temperature: 0.0, top_k: 0, top_p: 1.0, min_p: 0.0 };
+        let keyed = Sampling { seed: 1, temperature: 0.7, top_k: 40, top_p: 0.9, min_p: 0.05 };
+        GlmCall::DflashDraft {
+            reqs: vec![
+                DflashReq { slot: 2, p: 1000, anchor: 77, want: 7, coverage: 0.75, sampling: greedy },
+                DflashReq { slot: 0, p: 5, anchor: 3, want: 1, coverage: 1.0, sampling: keyed },
+            ],
+        }
+    }
+
+    /// Kind 34, seq 7: two requests, each slot, position, anchor, drafts wanted and coverage bits (u32s), then its sampler (tag 1, seed,
+    /// temperature, `top_k`, `top_p`, `min_p`).
+    const GOLDEN_DFLASH: &str = "8c00000005220700000000000000020000000000000002000000e80300004d000000070000000000403f01090000000000000000000000000000000000000000000000000000000000f03f0000000000000000000000000500000003000000010000000000803f010100000000000000666666666666e63f2800000000000000cdccccccccccec3f9a9999999999a93f";
+    /// Kind 35, seq 8: slot 1, end 700 (tag 1 and the u32), no cut (tag 0).
+    const GOLDEN_PROMPT_END: &str = "14000000052308000000000000000100000001bc02000000";
+
+    /// The split drafter's two calls (kinds 34 and 35): their bytes are pinned, each round-trips, a body one byte short is a wire error,
+    /// and the kinds are the family's own, clear of the core's and of every other family call's.
+    #[test]
+    fn the_split_drafter_calls_have_these_exact_bytes_and_round_trip() {
+        let end = GlmCall::DflashPromptEnd { slot: 1, end: Some(700), cut: None };
+        for (c, seq, golden, kind, name) in [
+            (dflash_sample(), 7u64, GOLDEN_DFLASH, K_DFLASH_DRAFT, "dflash_draft"),
+            (end, 8, GOLDEN_PROMPT_END, K_DFLASH_PROMPT_END, "dflash_prompt_end"),
+        ] {
+            let m: Msg<GlmCall> = Msg::Call(c.clone());
+            let bytes = m.encode(seq);
+            let (back_seq, back) = Msg::<GlmCall>::decode(&bytes[4..]).unwrap();
+            assert_eq!((back_seq, &back), (seq, &m), "round trip of {name}");
+            assert_eq!(hex(&bytes), golden, "the {name} frame's bytes moved");
+            assert!(Msg::<GlmCall>::decode(&bytes[4..bytes.len() - 1]).is_err(), "{name}");
+            assert_eq!((c.kind(), c.name(), c.is_prefix()), (kind, name, false));
+            assert!(!crate::lockstep::CORE_KINDS.contains(&kind));
+            assert!(![K_MTP_DRAFT, K_MTP_DISABLE, super::super::tp_vision::K_PREFILL_IMAGE, super::super::tp_part::K_PREFILL_PART]
+                .contains(&kind));
+        }
+    }
+
+    /// The split round's ack sees every token, every score bit and every margin bit of every sequence's picks.
+    #[test]
+    fn the_picks_digest_sees_every_token_score_and_margin() {
+        let p = |t: u32, s: f32, m: f32| Picked { tokens: vec![t, 5], score: vec![s, 1.0], margin: vec![m, 2.0], lattice: None };
+        let a = vec![p(4, 0.5, 3.0), p(9, -1.0, 0.25)];
+        let d = picks_digest(&a);
+        assert_eq!(d, picks_digest(&a.clone()), "a pure function");
+        for b in [
+            vec![p(4, 0.5, 3.0), p(8, -1.0, 0.25)],
+            vec![p(4, f32::from_bits(0.5f32.to_bits() + 1), 3.0), p(9, -1.0, 0.25)],
+            vec![p(4, 0.5, 3.0), p(9, -1.0, f32::from_bits(0.25f32.to_bits() + 1))],
+            vec![p(4, 0.5, 3.0)],
+            vec![p(9, -1.0, 0.25), p(4, 0.5, 3.0)],
+        ] {
+            assert_ne!(picks_digest(&b), d, "{b:?}");
+        }
     }
 
     #[test]
@@ -631,6 +801,7 @@ mod tests {
             cache_pages: 0,
             kv: "fp16".into(),
             taps: "none".into(),
+            draft_split: "off".into(),
         }
     }
 
