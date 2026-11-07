@@ -1715,7 +1715,7 @@ fn p2_the_last_layers_tail_on_the_head_rows_equals_every_rows() {
     );
     drop(a);
 
-    let (a, b) = serving_ranks(&dir, layers, draft.as_deref(), &taps, PART_ROOM);
+    let (a, b) = serving_ranks(&dir, layers, draft.as_deref(), &taps, PART_ROOM, false);
     let (h0, h1, a, b) = on_ranks(a, b, |m| head_rows_script_with(m, layers, first));
     let runs = (a.head_rows_runs(), b.head_rows_runs(), a.sp_chunks());
     let (e0, e1, a, b) = on_ranks(a, b, |m| {
