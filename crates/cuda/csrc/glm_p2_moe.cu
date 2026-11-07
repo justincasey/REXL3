@@ -216,29 +216,38 @@ __global__ void __launch_bounds__(kPlanThreads) plan_place(const int* __restrict
 
 // ---- input rotation -----------------------------------------------------------------------------------------------------------------
 
-// Sorted row s of matrix z (0 gate, 1 up): A_z[s] = fp16((x[row of pair spair[s]] * suh_z[e]) H_128 / sqrt 128), row-major [S][K]. One warp a
-// 128-wide block of one sorted row; padding rows (spair -1) and rows past the plan's count are not written (the GEMMs zero-fill them).
-__global__ void __launch_bounds__(128) rot_kernel(const void* __restrict__ x, int x_dtype, const int* __restrict__ pick,
-                                                  const int* __restrict__ spair, const int* __restrict__ nitems,
-                                                  const half* __restrict__ suh0, const half* __restrict__ suh1, half* __restrict__ a0,
-                                                  half* __restrict__ a1, int K, int topk) {
-    const int srow = blockIdx.x, mat = blockIdx.z;
-    const int blk = blockIdx.y * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
-    if (blk * 128 >= K || srow >= nitems[3]) return;
+// Sorted row s of matrix z (0 gate, 1 up): A_z[s] = fp16((x[row of pair spair[s]] * suh_z[e]) H_128 / sqrt 128), row-major [S][K]. One block
+// a sorted row, both matrices: warp w takes the 128-wide blocks w, w + 8, ..., lane l the values 4 l .. 4 l + 3 of a block (each block's
+// arithmetic is a warp's on its lanes, as it has always been), the x values loaded once for the two matrices. Padding rows (spair -1) and
+// rows past the plan's count are not written (the GEMMs zero-fill them).
+constexpr int kRotThreads = 256;
+__global__ void __launch_bounds__(kRotThreads) rot_kernel(const void* __restrict__ x, int x_dtype, const int* __restrict__ pick,
+                                                         const int* __restrict__ spair, const int* __restrict__ nitems,
+                                                         const half* __restrict__ suh0, const half* __restrict__ suh1,
+                                                         half* __restrict__ a0, half* __restrict__ a1, int K, int topk) {
+    const int srow = blockIdx.x;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (srow >= nitems[3]) return;
     const int p = spair[srow];
     if (p < 0) return;
     const int e = pick[p];
     const int row = p / topk;
-    const int k = blk * 128 + 4 * lane;
-    float v[4], s[4];
-    load4(x, x_dtype, (size_t)row * K + k, v);
-    load4h((mat ? suh1 : suh0) + (size_t)e * K + k, s);
+    for (int blk = warp; blk * 128 < K; blk += kRotThreads / 32) {
+        const int k = blk * 128 + 4 * lane;
+        float v[4];
+        load4(x, x_dtype, (size_t)row * K + k, v);
 #pragma unroll
-    for (int j = 0; j < 4; ++j) v[j] *= s[j];
-    fwht128(v, lane);
+        for (int mat = 0; mat < 2; ++mat) {
+            float s[4], w[4];
+            load4h((mat ? suh1 : suh0) + (size_t)e * K + k, s);
 #pragma unroll
-    for (int j = 0; j < 4; ++j) v[j] *= HAD_SCALE;
-    store4h((mat ? a1 : a0) + (size_t)srow * K + k, v);
+            for (int j = 0; j < 4; ++j) w[j] = v[j] * s[j];
+            fwht128(w, lane);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) w[j] *= HAD_SCALE;
+            store4h((mat ? a1 : a0) + (size_t)srow * K + k, w);
+        }
+    }
 }
 
 // ---- the grouped GEMM -----------------------------------------------------------------------------------------------------------------
@@ -670,10 +679,9 @@ GB_EXPORT int gb_glm_p2m_rotate(const void* x, int x_dtype, const void* pick, co
         !suh0 || !suh1 || !a0 || !a1)
         return (int)cudaErrorInvalidValue;
     const long long P = (long long)rows * topk, padded = (P + 15LL * (E < P ? E : P) + 15) / 16 * 16;
-    const dim3 grid((unsigned)padded, (unsigned)((K / 128 + 3) / 4), 2);
-    rot_kernel<<<grid, 128, 0, gb_stream(stream)>>>(x, x_dtype, static_cast<const int*>(pick), static_cast<const int*>(spair),
-                                                    static_cast<const int*>(nitems), static_cast<const half*>(suh0),
-                                                    static_cast<const half*>(suh1), static_cast<half*>(a0), static_cast<half*>(a1), K, topk);
+    rot_kernel<<<(unsigned)padded, kRotThreads, 0, gb_stream(stream)>>>(
+        x, x_dtype, static_cast<const int*>(pick), static_cast<const int*>(spair), static_cast<const int*>(nitems),
+        static_cast<const half*>(suh0), static_cast<const half*>(suh1), static_cast<half*>(a0), static_cast<half*>(a1), K, topk);
     return GB_CHECK_LAUNCH();
 }
 
