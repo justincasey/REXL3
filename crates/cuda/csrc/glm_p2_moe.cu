@@ -616,6 +616,7 @@ int dispatch(int bits, int fold, int shape, const GemmArgs& a, int cap, cudaStre
         GP2M(3, 6)
         GP2M(4, 8)
         GP2M(5, 10)
+        GP2M(6, 12)
         default: return (int)cudaErrorInvalidValue;
     }
 #undef GP2M
@@ -625,11 +626,13 @@ bool dtype_ok(int d) { return d >= 0 && d <= 2; }
 
 }  // namespace
 
-// Whether the P2 expert GEMMs take a layer: hidden and expert widths multiples of 128, the Mul1 codebook at 2 to 5 bits (GLM's packs: 2
-// and 3 bits on the 2.25 bpw pack, 4 on its NextN layer, 4 and 5 on sc_4.10bpw).
+// Whether the P2 expert GEMMs take a layer: hidden and expert widths multiples of 128, the Mul1 codebook at 2 to 6 bits (GLM's packs: 2
+// and 3 bits on the 2.25 bpw pack, 4 on its NextN layer, 4 and 5 on sc_4.10bpw, 4, 5 and 6 on RED-SNOW 4.91bpw). At 6 bits (K2 = 12) the
+// gate/up block of the default shape holds 3 stages of 2 x (8,192 + 6,144) bytes = 86,016 (the 4-stage shape 3 does not fit and is
+// refused by its guard); the down block 3 x 14,336 or 4 x 14,336 bytes.
 GB_EXPORT int gb_glm_p2m_supported(int hidden, int inter, int bits_gu, int bits_d, int codebook) {
     const bool shape = hidden > 0 && inter > 0 && hidden % 128 == 0 && inter % 128 == 0;
-    const bool b = bits_gu >= 2 && bits_gu <= 5 && bits_d >= 2 && bits_d <= 5;
+    const bool b = bits_gu >= 2 && bits_gu <= 6 && bits_d >= 2 && bits_d <= 6;
     return shape && b && codebook == CB_MUL1;
 }
 

@@ -1,6 +1,6 @@
 //! Lane P step 3 (GLM-5.3-Flash, contract P2): the routed experts of a prompt chunk on tensor cores (`gb_cuda::glm_p2_moe`,
 //! `csrc/glm_p2_moe.cu`), on SYNTHETIC Mul1 EXL3 experts of GLM's shapes (hidden 4,096, expert width 2,048, top-8; 2 and 3 bits as the
-//! 2.25 bpw pack's layers, 4 as its NextN layer, 4 and 5 as sc_4.10's).
+//! 2.25 bpw pack's layers, 4 as its NextN layer, 4 and 5 as sc_4.10's, 4, 5 and 6 as RED-SNOW 4.91bpw's).
 //!
 //! Gates (not ignored), for both K orders (`Order::Chain`, `Order::Fold128`):
 //! * `p2_experts_are_as_close_to_fp64_as_the_decode_path`: every pair's y and every row's out against an f64 reference of the exact
@@ -9,6 +9,8 @@
 //! * `p2_pairs_are_bit_identical_in_any_call`: 288 experts, five routing styles (uniform, skewed, one hot set, a quarter unrouted, many
 //!   single-pair experts): run to run with a poisoned scratch, calls of 1, 17, 129 and 333 rows, a row permutation: every computed pair's
 //!   y and every row's out bit for bit.
+//! * `p2_six_bit_pairs_are_bit_identical_in_any_call`: the 6-bit instantiation (6/4 and 6/6) run to run, in calls of 17 and 129 rows and
+//!   in the block shapes it fits, bit for bit.
 //! * `the_two_group_combine_is_the_tp_split`: the combine of one node (`Both`) equals each rank's own group (`Own(0)`, `Own(1)`) followed by
 //!   `Parts`, bit for bit, and equals the host's fmaf chains of the two groups (the contract's order, operation for operation).
 //! * `p2_per_subbank_equals_p2_single_bank` and `p2_mixed_width_subbanks_equal_the_uniform_banks_they_are_made_of` (mixed-width layers,
@@ -224,7 +226,7 @@ fn p2_experts_are_as_close_to_fp64_as_the_decode_path() {
     gpu!();
     let st = Stream::new().unwrap();
     let rows = 48;
-    for (li, &(bits_gu, bits_d)) in [(2usize, 2usize), (3, 3), (4, 4), (5, 5)].iter().enumerate() {
+    for (li, &(bits_gu, bits_d)) in [(2usize, 2usize), (3, 3), (4, 4), (5, 5), (6, 6), (6, 4)].iter().enumerate() {
         let d = glm_dims(12);
         let lay = synth_layer(d, bits_gu, bits_d, 40 + li as u64, true);
         let [gate, upg, down] = lay.groups.as_ref().unwrap();
@@ -347,6 +349,45 @@ fn p2_pairs_are_bit_identical_in_any_call() {
         let p1 = run(ex, &st, &mut s, &xh, &pick, &wts, &shared, rows, rows, None);
         let p2 = run(ex, &st, &mut s, &xh, &pick, &wts, &shared, rows, rows, Some(glm_p2_moe::DEFAULT_ORDER));
         assert!(p1.out.iter().zip(&p2.out).any(|(a, b)| a.to_bits() != b.to_bits()), "{style:?}: P2 gave P1's bits");
+    }
+}
+
+/// The 6-bit instantiation (RED-SNOW 4.91bpw's gate/up 6 and down 4, and its uniform 6/6/6 layer): every pair's y and every row's out bit
+/// for bit run to run (poisoned scratch), in calls of 17 and 129 rows, and in every block shape the width fits (gate/up 3, 16 warps and 4
+/// stages, does not: refused by its guard, the default's bits checked on the shapes that run).
+#[test]
+fn p2_six_bit_pairs_are_bit_identical_in_any_call() {
+    gpu!();
+    let st = Stream::new().unwrap();
+    let d = glm_dims(288);
+    let rows = 400;
+    let mut s = PrefillScratch::new(&d, rows).unwrap();
+    for (li, &(bg, bd)) in [(6usize, 4usize), (6, 6)].iter().enumerate() {
+        let lay = synth_layer(d, bg, bd, 90 + li as u64, false);
+        assert!(glm_p2_moe::supported(&lay.ex), "{bg}/{bd} bits");
+        for (si, &style) in [Style::Uniform, Style::Skewed, Style::Holes].iter().enumerate() {
+            let mut r = Rng(4000 + 10 * li as u64 + si as u64);
+            let xh = activations(&mut r, rows, d.hidden, 1.5);
+            let (pick, wts) = make_picks(&mut r, style, rows, d.experts, d.topk);
+            let shared: Vec<f32> = (0..rows * d.hidden).map(|_| 0.1 * normal(&mut r) as f32).collect();
+            let o = Some(glm_p2_moe::DEFAULT_ORDER);
+            let whole = run(&lay.ex, &st, &mut s, &xh, &pick, &wts, &shared, rows, rows, o);
+            assert!(whole.out.iter().all(|v| v.is_finite()) && whole.out.iter().any(|v| *v != 0.0), "{style:?}: degenerate");
+            s.poison(0xa5, &st).unwrap();
+            let again = run(&lay.ex, &st, &mut s, &xh, &pick, &wts, &shared, rows, rows, o);
+            assert_same(&format!("{bg}/{bd} {style:?} run to run"), &again, &whole, &d, &pick);
+            for chunk in [17usize, 129] {
+                let got = run(&lay.ex, &st, &mut s, &xh, &pick, &wts, &shared, rows, chunk, o);
+                assert_same(&format!("{bg}/{bd} {style:?} calls of {chunk}"), &got, &whole, &d, &pick);
+            }
+            for (gu, dn) in [(1, 1), (2, 2)] {
+                glm_p2_moe::set_shapes(gu, dn);
+                let got = run(&lay.ex, &st, &mut s, &xh, &pick, &wts, &shared, rows, rows, o);
+                glm_p2_moe::set_shapes(0, 0);
+                assert_same(&format!("{bg}/{bd} {style:?} block shapes {gu}/{dn}"), &got, &whole, &d, &pick);
+            }
+        }
+        eprintln!("{bg}/{bd}-bit P2 experts: bit-identical run to run, in calls of 17 / 129, in block shapes 1/1 and 2/2");
     }
 }
 
@@ -637,14 +678,14 @@ fn a_layer_of_subbanks_the_p2_gemms_do_not_take_is_refused_by_name() {
     gpu!();
     let d = MoeDims { hidden: 128, inter: 128, experts: 16, topk: 8, scale: 2.5, limit: 10.0 };
     let mk = |bits: usize, seed: u64| synth_layer(d, bits, bits, seed, true);
-    // 6-bit experts: no P2 kernel; the supported subbanks of the same layer are
-    let (a, b) = (mk(2, 1), mk(6, 2));
+    // 7-bit experts: no P2 kernel; the supported subbanks of the same layer are
+    let (a, b) = (mk(2, 1), mk(7, 2));
     fn parts(l: &Layer, ids: Vec<u32>) -> (Vec<u32>, &[Vec<LoadedGroup>; 3]) {
         (ids, l.groups.as_ref().unwrap())
     }
     let sb = subbanks_of(d, &[parts(&a, (0..8).collect()), parts(&b, (8..16).collect())]);
     let why = glm_p2_moe::supported_subbanks(&sb).unwrap_err();
-    assert!(why.contains("subbank 1") && why.contains("6/6/6"), "{why}");
+    assert!(why.contains("subbank 1") && why.contains("7/7/7"), "{why}");
     let st = Stream::new().unwrap();
     let mut s = PrefillScratch::new(&d, 16).unwrap();
     let mut os = OwnScratch::new(&d, 16).unwrap();
@@ -790,7 +831,7 @@ fn golden_glm_p2_moe_hashes() {
     let st = Stream::new().unwrap();
     let hash = |v: &[f32]| gb_exl3::fnv1a(v.iter().flat_map(|x| x.to_bits().to_le_bytes()));
     let mut lines = vec![format!("arith {} default {:?}", glm_p2_moe::ARITH_ID, glm_p2_moe::DEFAULT_ORDER)];
-    for (li, &(bg, bd)) in [(2usize, 2usize), (3, 3), (4, 4), (5, 4)].iter().enumerate() {
+    for (li, &(bg, bd)) in [(2usize, 2usize), (3, 3), (4, 4), (5, 4), (6, 4), (6, 6)].iter().enumerate() {
         let d = glm_dims(48);
         let lay = synth_layer(d, bg, bd, 70 + li as u64, false);
         let ex = &lay.ex;

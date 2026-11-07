@@ -136,7 +136,7 @@ pub fn runs_here() -> u64 {
 }
 
 /// Whether the P2 expert GEMMs take this bank: every expert of the layer (a single node's bank; a rank's share is step (c)), one width for
-/// gate and up, Mul1 at 2 to 5 bits, widths multiples of 128.
+/// gate and up, Mul1 at 2 to 6 bits, widths multiples of 128.
 pub fn supported(ex: &MoeExperts) -> bool {
     let d = ex.dims;
     ex.holds_every_expert()
@@ -214,7 +214,7 @@ pub fn pairs_with(
 }
 
 /// Whether the P2 expert GEMMs take this bank whatever experts it holds (a TP rank's share included): one width for gate and up, Mul1 at
-/// 2 to 5 bits, widths multiples of 128.
+/// 2 to 6 bits, widths multiples of 128.
 pub fn supported_bank(ex: &MoeExperts) -> bool {
     let d = ex.dims;
     ex.bits_u == ex.bits_gu
