@@ -93,6 +93,11 @@ pub(in crate::families::glm) struct P2Exchange {
     zero_copy: Option<crate::families::nemotron_h_omni::tp_roce::ZeroCopySwap>,
     /// Of `swaps`, the zero-copy ones (the launch audit).
     zero_copy_swaps: u64,
+    /// Under the sequence-parallel residual: the hidden rows' swap begun on the exchange stream ([`GlmTp::sp_gather_begin`]), its two
+    /// events, and whether it is in flight (not yet joined by the main stream).
+    gather_ready: Event,
+    gather_done: Event,
+    gather_pending: bool,
 }
 
 impl P2Exchange {
@@ -109,6 +114,9 @@ impl P2Exchange {
             swaps: 0,
             zero_copy: None,
             zero_copy_swaps: 0,
+            gather_ready: Event::new()?,
+            gather_done: Event::new()?,
+            gather_pending: false,
         })
     }
 
@@ -169,6 +177,51 @@ impl GlmTp {
         // the larger direction (the ranks of an uneven cut count alike)
         self.exchanged_bytes += sb.max(rb) as u64;
         self.exchanges += 1;
+        Ok(())
+    }
+
+    /// Under the sequence-parallel residual: [`GlmTp::swap_rows`] of `buf` begun on the exchange stream after everything queued on `st`,
+    /// so that `st` computes what needs only this rank's rows meanwhile; [`GlmTp::sp_gather_join`] makes `st` wait for it. At most one
+    /// is in flight, and nothing else crosses the link until it is joined (the caller joins before its next exchange): every exchange
+    /// keeps one order on both ranks.
+    pub(in crate::families::glm::model) fn sp_gather_begin(
+        &mut self,
+        buf: &DevBuf,
+        row_bytes: usize,
+        sp: RowSplit,
+        st: &Stream,
+    ) -> Result<(), ModelError> {
+        let p2 = self.p2.as_mut().ok_or_else(|| ModelError::Config("a sequence-parallel gather off a P2 rank".into()))?;
+        if p2.gather_pending {
+            return Err(ModelError::Config("a sequence-parallel gather begun while another is in flight".into()));
+        }
+        gb_cuda::graph::fork(st, &p2.stream, &p2.gather_ready)?;
+        let send = buf.subview(sp.lo * row_bytes, sp.rows() * row_bytes);
+        let mut recv = buf.subview(sp.plo * row_bytes, (sp.phi - sp.plo) * row_bytes);
+        let (sb, rb) = (send.bytes(), recv.bytes());
+        self.comm.swap_bytes_for(
+            crate::families::nemotron_h_omni::tp_roce::SiteUser::PrefillGather,
+            &send,
+            0,
+            sb,
+            &mut recv,
+            0,
+            rb,
+            &p2.stream,
+        )?;
+        p2.gather_done.record(&p2.stream)?;
+        p2.gather_pending = true;
+        self.exchanged_bytes += sb.max(rb) as u64;
+        self.exchanges += 1;
+        Ok(())
+    }
+
+    /// The main stream `st` waits for the gather [`GlmTp::sp_gather_begin`] began (nothing when none is in flight).
+    pub(in crate::families::glm::model) fn sp_gather_join(&mut self, st: &Stream) -> Result<(), ModelError> {
+        if let Some(p2) = self.p2.as_mut().filter(|p| p.gather_pending) {
+            gb_cuda::graph::wait(st, &p2.gather_done)?;
+            p2.gather_pending = false;
+        }
         Ok(())
     }
 
@@ -319,6 +372,27 @@ impl GlmTp {
                 glm_p2_moe::combine_dims(CombineMode::Both, &s.y_pairs, &s.pick, &s.wts, shared, None, out, rows, d, st)?;
             }
         }
+        Ok(())
+    }
+
+    /// [`GlmTp::p2_finish`] of a row-split chunk under the sequence-parallel residual (`GlmModel::run`'s `sp`): the parts' sum on this
+    /// rank's rows `[sp.lo, sp.hi)` of `out` alone, and no output swap (the rank's residual holds only its own rows). The rows it writes
+    /// are `p2_finish`'s with `Some(sp)`: the same sum of the same values.
+    pub(in crate::families::glm::model) fn p2_finish_own_rows(
+        &mut self,
+        d: &MoeDims,
+        shared: Option<&DevBuf>,
+        out: &mut DevBuf,
+        sp: RowSplit,
+        st: &Stream,
+    ) -> Result<(), ModelError> {
+        let p2 = self
+            .p2
+            .as_mut()
+            .ok_or_else(|| ModelError::Config("a P2 MoE layer on a rank built without the P2 exchange".into()))?;
+        p2.pending.take().ok_or_else(|| ModelError::Config("a P2 exchange finished before it began".into()))?;
+        gb_cuda::graph::wait(st, &p2.done)?;
+        glm_p2_moe::combine_parts_rows(shared, (&p2.parts[0], &p2.parts[1]), out, sp.lo, sp.rows(), d, st)?;
         Ok(())
     }
 }

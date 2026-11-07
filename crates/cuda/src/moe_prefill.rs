@@ -285,9 +285,10 @@ impl PrefillScratch {
             max_rows,
             dims: *dims,
             cap: item_cap(p, dims.experts),
-            logits: DevBuf::zeroed(get("logits"))?,
-            pick: DevBuf::zeroed(get("pick"))?,
-            wts: DevBuf::zeroed(get("wts"))?,
+            // views: a rank of the sequence-parallel residual routes its own rows into them (`DevBuf::subview`)
+            logits: DevBuf::zeroed_view(get("logits"))?,
+            pick: DevBuf::zeroed_view(get("pick"))?,
+            wts: DevBuf::zeroed_view(get("wts"))?,
             wts_f32: DevBuf::zeroed(get("wts_f32"))?,
             pick_local: DevBuf::zeroed(get("pick_local"))?,
             spair: DevBuf::zeroed(get("spair"))?,

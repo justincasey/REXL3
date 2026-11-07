@@ -152,6 +152,11 @@ pub struct GlmFacts {
     /// different values in the replicated MLA layers. Flagged by bit 5 of the first byte and appended last only when it is not `fp16` (a
     /// Hello of an fp16 group keeps its bytes).
     pub kv: String,
+    /// The DFlash2 drafter's tapped layers (`--draft DIR`: its `target_layer_ids`, comma-joined; `none` without a drafter), which both
+    /// ranks read from their options: under the sequence-parallel residual of a P2 prompt chunk both ranks relay the taps of the
+    /// follower's rows to rank 0 (`model::dflash::TapRelay`), so the ranks must agree on them. Flagged by bit 6 of the first byte and
+    /// appended last only when set (a Hello of a group without a drafter keeps its bytes).
+    pub taps: String,
 }
 
 impl GlmFacts {
@@ -178,6 +183,7 @@ impl GlmFacts {
             cache_slot_bytes: 0,
             cache_pages: 0,
             kv: gb_cuda::mla::configured_kv().unwrap_or_default().name().into(),
+            taps: "none".into(),
         }
     }
 
@@ -236,6 +242,16 @@ impl GlmFacts {
     /// These facts with the rank's head split (`model::tp::split_from_env`).
     pub fn with_split(mut self, split: u8) -> GlmFacts {
         self.split = split;
+        self
+    }
+
+    /// These facts with the DFlash2 drafter's tapped layers (`dflash::tap_layers`; none: `none`).
+    pub fn with_taps(mut self, layers: &[usize]) -> GlmFacts {
+        self.taps = if layers.is_empty() {
+            "none".into()
+        } else {
+            layers.iter().map(|l| l.to_string()).collect::<Vec<_>>().join(",")
+        };
         self
     }
 }
@@ -337,13 +353,14 @@ impl FamilyCall for GlmCall {
     fn encode_facts(f: &GlmFacts, e: &mut Enc) {
         // the first byte (MAIN's layout): bit 0 graphs (the byte the earlier builds wrote as a boolean), bit 1 the adaptive slice (lane E),
         // bit 2 the NextN draft calls' graphs (lane T), only with graphs on, bit 3 a head split (lane E), bit 4 the prefix cache's arena,
-        // bit 5 a latent cache that is not fp16
+        // bit 5 a latent cache that is not fp16, bit 6 the DFlash2 drafter's taps
         e.u8(u8::from(f.graphs)
             | (u8::from(f.prefill_small != 0) << 1)
             | (u8::from(f.graphs && f.draft_graphs) << 2)
             | (u8::from(f.split != 0) << 3)
             | (u8::from(f.cache_on_wire()) << 4)
-            | (u8::from(f.kv != "fp16") << 5));
+            | (u8::from(f.kv != "fp16") << 5)
+            | (u8::from(f.taps != "none") << 6));
         e.bool(f.mtp);
         if f.mtp {
             e.u32(f.mtp_depth);
@@ -377,14 +394,18 @@ impl FamilyCall for GlmCall {
         if f.kv != "fp16" {
             e.str(&f.kv);
         }
+        // the drafter's taps after it, only with bit 6 (a Hello without a drafter keeps its bytes)
+        if f.taps != "none" {
+            e.str(&f.taps);
+        }
     }
 
     fn decode_facts(d: &mut Dec<'_>) -> Result<GlmFacts, WireError> {
         let flags = d.u8("glm graphs and adaptive slice")?;
-        if flags > 63 || (flags & 4 != 0 && flags & 1 == 0) {
+        if flags > 127 || (flags & 4 != 0 && flags & 1 == 0) {
             return Err(WireError::Invalid(format!(
-                "glm graphs, adaptive slice, draft graphs, head split, prefix cache and latent cache format: flags {flags:#04x} (bits 0 to \
-                 5 only, bit 2 only with bit 0)"
+                "glm graphs, adaptive slice, draft graphs, head split, prefix cache, latent cache format and drafter taps: flags \
+                 {flags:#04x} (bits 0 to 6 only, bit 2 only with bit 0)"
             )));
         }
         let (graphs, adaptive, draft_graphs, split) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0, flags & 8 != 0);
@@ -410,6 +431,7 @@ impl FamilyCall for GlmCall {
             cache_slot_bytes: 0,
             cache_pages: 0,
             kv: "fp16".into(),
+            taps: "none".into(),
         };
         if graphs {
             f.overlap = d.u8("glm graph branches")?;
@@ -430,6 +452,9 @@ impl FamilyCall for GlmCall {
         }
         if flags & 32 != 0 {
             f.kv = d.str("glm latent cache format")?;
+        }
+        if flags & 64 != 0 {
+            f.taps = d.str("glm drafter taps")?;
         }
         Ok(f)
     }
@@ -477,6 +502,7 @@ impl FamilyCall for GlmCall {
             ),
             fact_differs("the prefill contract (REXL3_GLM_PREFILL_CONTRACT)", &a.prefill, &b.prefill, who),
             fact_differs("the latent cache format (--kv-dtype / REXL3_GLM_KV; pass the same to every rank)", &a.kv, &b.kv, who),
+            fact_differs("the DFlash2 drafter's taps (--draft; pass the same to every rank)", &a.taps, &b.taps, who),
             // the prefix cache's arena (Nemotron's protocol 4): rank 0 forwards `EnableSnapshots` of its slots and every follower builds
             // exactly that pool, so the request and a slot's bytes must be equal and a follower's plan must hold at least rank 0's slots
             // and pages (each named, never the generic "KV pages" refusal the cache's pages would otherwise show up as)
@@ -844,6 +870,11 @@ impl GlmMtpRuntime for GlmRank {
         }
         self.m.dflash_draft(asks)
     }
+    fn dflash_prompt_end(&mut self, slot: usize, end: Option<usize>) {
+        if slot < self.m.slots {
+            self.m.dflash_prompt_end(slot, end);
+        }
+    }
 }
 
 /// The engine's counters of a model's window graph cache.
@@ -870,11 +901,6 @@ pub static RANK_DRAFT_GRAPHS: std::sync::Mutex<Option<(u64, u64, u64, u64)>> = s
 /// `draft_replays=.. draft_captures=.. draft_eager=.. draft_capture_failures=..` of [`RANK_DRAFT_GRAPHS`] (zeros before the first draft call).
 pub fn rank_draft_graphs_line() -> String {
     let (r, c, e, f) = RANK_DRAFT_GRAPHS.lock().unwrap_or_else(|p| p.into_inner()).unwrap_or((0, 0, 0, 0));
-    fn dflash_prompt_end(&mut self, slot: usize, end: Option<usize>) {
-        if slot < self.m.slots {
-            self.m.dflash_prompt_end(slot, end);
-        }
-    }
     format!("draft_replays={r} draft_captures={c} draft_eager={e} draft_capture_failures={f}")
 }
 

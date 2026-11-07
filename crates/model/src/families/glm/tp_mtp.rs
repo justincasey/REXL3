@@ -629,6 +629,7 @@ mod tests {
             cache_slot_bytes: 0,
             cache_pages: 0,
             kv: "fp16".into(),
+            taps: "none".into(),
         }
     }
 

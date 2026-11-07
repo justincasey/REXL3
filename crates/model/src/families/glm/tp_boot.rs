@@ -352,6 +352,10 @@ pub struct RankPlan {
     pub mtp: bool,
     /// The DFlash2 drafter this rank loads (rank 0 with `--draft DIR`): its bytes are out of what the pool is planned from.
     pub dflash: Option<super::dflash::DflashPlan>,
+    /// The DFlash2 drafter's tapped layers (`dflash::tap_layers`: on every rank of a drafting group, a fact of the Hello) and, when this
+    /// rank relays them under the sequence-parallel residual (`dflash::relay_bytes`), the bytes of the relay's stage.
+    pub taps: Vec<usize>,
+    pub relay_bytes: u64,
 }
 
 /// Whether a rank (or one node) loads the NextN layer: the same rule as `engine::build_engine`. A DFlash2 draft (`--draft DIR`) drafts in
@@ -459,7 +463,10 @@ pub fn plan_from_split(
     // rank 0 drafting with DFlash2: the drafter (weights, rings, scratch, the trunk's taps) is out of the room too (a follower: none)
     let dflash = super::dflash::plan(o, &cfg, o.slots, chunk)?;
     let draft_bytes = dflash.as_ref().map_or(0, |d| d.bytes);
-    let free = free_now.saturating_sub(weight_bytes + tower_bytes + draft_bytes);
+    // a drafting group at TP=2 under P2: both ranks relay the taps of the follower's rows (`model::dflash::TapRelay`)
+    let taps = super::dflash::tap_layers(o)?;
+    let relay_bytes = super::dflash::relay_bytes(o, &cfg, chunk);
+    let free = free_now.saturating_sub(weight_bytes + tower_bytes + draft_bytes + relay_bytes);
     let kv_cap = o.kv_tokens.unwrap_or(o.max_model_len) as u64;
     // the prefix cache as one node plans it (`engine::build_engine`): a snapshot slot is THIS rank's state (its KDA heads under the split,
     // `cfg` is the rank's), the cache carved out before the KV pool is sized (an explicit size) or out of what the plan leaves (`Auto`)
@@ -501,6 +508,8 @@ pub fn plan_from_split(
         scan_s,
         mtp,
         dflash,
+        taps,
+        relay_bytes,
     })
 }
 
@@ -625,7 +634,8 @@ fn gate_of(o: &ServeOptions, p: &RankPlan, tp: &TpOptions) -> Result<BootGate<Gl
     let facts = facts_of(&p.cfg, tp.ranks, p.mtp)?
         .with_vision(tp_vision::holds_tower(o, &p.pack))
         .with_prefill_small(adaptive_small(p.chunk)?, p.chunk)
-        .with_cache(crate::families::nemotron_h_omni::tp_runtime::cache_request_label(o.prefix_cache), &p.cache);
+        .with_cache(crate::families::nemotron_h_omni::tp_runtime::cache_request_label(o.prefix_cache), &p.cache)
+        .with_taps(&p.taps);
     Ok(tp::gate(pack, &p.mo, p.chunk, facts).at(tp.rank, tp.ranks))
 }
 
@@ -733,6 +743,9 @@ pub fn build_leader(
             // rank 0's DFlash2 drafter, before its Ready: a drafter that does not load fails the group's boot by name
             if let Some(d) = &p.dflash {
                 super::dflash::load(&mut rank.m, d)?;
+            }
+            if p.relay_bytes > 0 {
+                rank.m.enable_tap_relay(&p.taps)?;
             }
             tower = tp_vision::load_leader_tower(o, &p.pack)?;
             Ok(rank)
@@ -876,7 +889,12 @@ pub fn follow(ctx: &BuildCtx<'_>) -> Result<(), ModelError> {
         |rv| make_comm(topo, rv),
         |leader_gate, comm| {
             let (mo, chunk) = tp::options_of(leader_gate);
-            load_rank_with(&dir, &p.cfg, p.pack.clone(), p.own.as_ref(), &mo, chunk, floor, p.scan_s, comm, mtp)
+            let mut rank = load_rank_with(&dir, &p.cfg, p.pack.clone(), p.own.as_ref(), &mo, chunk, floor, p.scan_s, comm, mtp)?;
+            // the follower's half of the drafter's tap relay (the taps are a fact of the Hello: rank 0's are these)
+            if p.relay_bytes > 0 {
+                rank.m.enable_tap_relay(&p.taps)?;
+            }
+            Ok(rank)
         },
     )?;
     eprintln!("rexl3 event=tp_follower_ready family=glm boot_s={:.1}", t0.elapsed().as_secs_f64());
