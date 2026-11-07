@@ -66,6 +66,13 @@ pub fn render(s: &PrefixStats) -> String {
     );
     put(
         &mut out,
+        "rexl3_prefix_cache_evicted_for_pool_total",
+        c,
+        "Evictions made to give idle KV pool pages back to the admitted sequences (a cache whose pages are the pool's).",
+        s.evicted_for_pool,
+    );
+    put(
+        &mut out,
         "rexl3_prefix_cache_restore_failures_total",
         c,
         "Restores that failed (the entry was dropped and the prompt prefilled cold).",

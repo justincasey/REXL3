@@ -655,7 +655,9 @@ impl Ghost {
 pub struct CutPolicy {
     /// No cut below this many tokens: a snapshot costs 187 MiB and saves `min_cut` tokens of prefill at best.
     pub min_cut: usize,
-    /// The end cut is `total - tail`: the generation prompt a chat's next turn renders differently stays outside the entry.
+    /// The end cut is `total - tail`: the generation prompt a chat's next turn renders differently stays outside the entry. 0 cuts at the
+    /// prompt's end (a template whose next turn repeats this one's prompt token for token): the whole prompt is reused by the next turn and
+    /// the cut costs no extra slice, but a request that differs from this one only after its last token is the only one that can hit it.
     pub tail: usize,
     /// The shared cut must save at least this many more tokens than the hit the request already got.
     pub ghost_min_gain: usize,
@@ -699,7 +701,7 @@ pub fn align_down(tokens: usize, align: usize) -> usize {
 
 /// The cuts to snapshot while prefilling a prompt of `total` tokens that resumed at `hit` (0: cold), ascending. `ghost_blocks` is the number of
 /// leading blocks an earlier prompt shared (`Ghost::observe`); `have(len)` says whether an entry for exactly `tokens[..len]` is already stored.
-/// A cut is only ever planned above `hit` and below `total`.
+/// A cut is only ever planned above `hit` and at most `total` (`total` itself only with a policy of no tail).
 pub fn plan_cuts(policy: &CutPolicy, total: usize, hit: usize, ghost_blocks: usize, have: &dyn Fn(usize) -> bool) -> Vec<usize> {
     plan_cuts_with(policy, total, hit, ghost_blocks, have, &Some)
 }
@@ -730,7 +732,7 @@ pub fn plan_cuts_with(
         }
     }
     if let Some(c) = fit(end) {
-        if c >= policy.min_cut && c > hit && c < total && !have(c) && c >= prev + policy.min_gap && (cuts.is_empty() || c > prev)
+        if c >= policy.min_cut && c > hit && c <= total && !have(c) && c >= prev + policy.min_gap && (cuts.is_empty() || c > prev)
         {
             cuts.push(c);
         }

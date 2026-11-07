@@ -143,6 +143,10 @@ impl Admission {
     pub fn kv_tokens_in_use(&self) -> u64 {
         self.kv_in_use
     }
+    /// Each reserving slot and the tokens its sequence reserved (prompt + max new tokens).
+    pub fn reserved_tokens(&self) -> impl Iterator<Item = (usize, u64)> + '_ {
+        self.slots.iter().enumerate().filter_map(|(slot, s)| s.map(|(_, tokens)| (slot, tokens)))
+    }
     pub fn capacity(&self) -> u64 {
         self.capacity
     }

@@ -63,9 +63,11 @@ pub struct PrefixStats {
     /// Captures dropped because they could not fit.
     pub no_room: u64,
     pub evictions: u64,
-    /// Of the evictions: made to fit a new entry's pages in the cache's page budget, and made to free a snapshot slot for a capture.
+    /// Of the evictions: made to fit a new entry's pages in the cache's page budget, made to free a snapshot slot for a capture, and made to
+    /// give a cache that keeps idle pool pages (`Backend::kv_pool`) back to the sequences that may claim them.
     pub evicted_for_pages: u64,
     pub evicted_for_slots: u64,
+    pub evicted_for_pool: u64,
     /// A restore that failed (the entry was dropped and the prompt prefilled cold).
     pub restore_failures: u64,
     /// Snapshots a prefill took that were released unused (the sequence failed or was cancelled before its prompt was complete).

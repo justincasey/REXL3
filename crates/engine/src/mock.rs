@@ -348,6 +348,11 @@ pub struct MockBackend {
     /// (`Backend::take_score_rows`): row `i` is the logits after the scored context's tokens `0..=i`.
     score_rows_on: bool,
     score_rows: Vec<Vec<f32>>,
+    /// The prefix cache keeps idle pool pages, takes cuts in a batched call and at a prompt's end, as the GLM group does
+    /// (`with_pool_cache`).
+    pool_cache: bool,
+    /// Jobs of `prefill_slices` calls of two jobs or more that had cuts to take or resumed a restored slot (`batched_cache_jobs`).
+    batched_cache_jobs: usize,
 }
 
 /// What the GLM shape keeps per slot outside the pages.
@@ -388,6 +393,8 @@ impl MockBackend {
             floor_per_token: None,
             score_rows_on: false,
             score_rows: Vec::new(),
+            pool_cache: false,
+            batched_cache_jobs: 0,
         }
     }
     /// State a lower bound on prefill time (`Backend::prefill_floor`) of `per_token` a prompt token, as a family with measured rates does.
@@ -414,6 +421,22 @@ impl MockBackend {
         self.deep = true;
         self
     }
+    /// A prefix cache of `snapshots` snapshot slots whose entries keep idle pages of a KV pool of `pages` pages (the index may hold all of
+    /// them), as a GLM group's `--prefix-cache on` does: `Backend::kv_pool` reports the pool, `prefill_slices` takes each job's cuts and
+    /// resumes restored slots, and a cut may be the prompt's end.
+    pub fn with_pool_cache(mut self, snapshots: usize, pages: usize, fault: PrefixFault) -> Self {
+        let slots = self.ctx.len();
+        let budget = gb_sched::prefix::CacheBudget { snapshot_slots: snapshots, page_blocks: pages, snapshot_bytes: 141 << 20, page_bytes: 3 << 20 };
+        self.kv = Some(MockKv::new(pages, slots));
+        self.cache = Some(MockCache {
+            caps: PrefixCaps { namespace: 0x6D6F_636B, budget },
+            snaps: (0..snapshots).map(|_| None).collect(),
+            fault,
+        });
+        self.deep = true;
+        self.pool_cache = true;
+        self
+    }
     /// Drafts come from the draft context ring (kept like the real draft's: prompt rows from `total - 2064`, accepted rows as they commit).
     pub fn with_native_draft(mut self) -> Self {
         self.ring = Some(vec![vec![(-1, 0); MOCK_RING]; self.ctx.len()]);
@@ -434,6 +457,10 @@ impl MockBackend {
         self.path_state = false;
         self.deep = true;
         self
+    }
+    /// Jobs that reached `prefill_slices` beside another job with cuts to take or a restored slot to resume.
+    pub fn batched_cache_jobs(&self) -> usize {
+        self.batched_cache_jobs
     }
     /// Pages with at least one holder (a slot or an entry).
     pub fn pages_in_use(&self) -> usize {
@@ -847,6 +874,22 @@ impl Backend for MockBackend {
         }
         let r = self.prefill(slot, done as u64, &prompt[done..end], candidates);
         crate::CutStep { step: crate::PrefillStep { done: end, row: (end == n).then_some(r) }, captured: Vec::new() }
+    }
+    fn prefill_slices(&mut self, jobs: &[crate::PrefillJob<'_>]) -> Vec<crate::CutStep> {
+        if jobs.len() >= 2 {
+            self.batched_cache_jobs += jobs.iter().filter(|j| !j.cuts.is_empty() || j.done > 0).count();
+        }
+        jobs.iter().map(|j| self.prefill_slice_cuts(j.slot, j.prompt, j.images, j.done, j.candidates, j.cuts)).collect()
+    }
+    fn prefill_slices_take_cuts(&self) -> bool {
+        self.pool_cache
+    }
+    fn prefix_end_cut(&self) -> bool {
+        self.pool_cache
+    }
+    fn kv_pool(&self) -> Option<crate::KvPool> {
+        let kv = self.kv.as_ref().filter(|_| self.pool_cache)?;
+        Some(crate::KvPool { free: kv.free.len(), slot_pages: kv.tables.iter().map(|t| t.len()).collect() })
     }
     fn prefix_caps(&self) -> Option<PrefixCaps> {
         self.cache.as_ref().map(|c| c.caps)

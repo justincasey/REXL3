@@ -1031,14 +1031,15 @@ impl<M: NemotronRuntime> Backend for NemotronBackend<M> {
     /// is row invariant, so each prompt comes out with the bits its own `prefill_slice` gives it; a prompt that fails is failed alone
     /// when the failure is its own (a refused request) and with its forward's other prompts when the forward failed. Prompts with images
     /// and runtimes that cannot gather rows are served one slice at a time, as the default does.
-    fn prefill_slices(&mut self, jobs: &[PrefillJob<'_>]) -> Vec<PrefillStep> {
-        if self.dead() {
-            return jobs.iter().map(|j| PrefillStep { done: j.prompt.len(), row: Some(nan_row(j.candidates)) }).collect();
-        }
-        if jobs.len() < 2 || !self.m.prefill_rows_supported() || jobs.iter().any(|j| !j.images.is_empty()) {
-            return jobs.iter().map(|j| self.prefill_slice(j.slot, j.prompt, j.images, j.done, j.candidates)).collect();
-        }
-        self.slices_batched(jobs)
+    fn prefill_slices(&mut self, jobs: &[PrefillJob<'_>]) -> Vec<CutStep> {
+        let steps = if self.dead() {
+            jobs.iter().map(|j| PrefillStep { done: j.prompt.len(), row: Some(nan_row(j.candidates)) }).collect()
+        } else if jobs.len() < 2 || !self.m.prefill_rows_supported() || jobs.iter().any(|j| !j.images.is_empty()) {
+            jobs.iter().map(|j| self.prefill_slice(j.slot, j.prompt, j.images, j.done, j.candidates)).collect()
+        } else {
+            self.slices_batched(jobs)
+        };
+        steps.into_iter().map(|step| CutStep { step, captured: Vec::new() }).collect::<Vec<_>>()
     }
 
     fn prefill_mm(&mut self, slot: usize, start: u64, tokens: &[u32], images: &[ImageSpan], candidates: usize) -> RowOutput {
