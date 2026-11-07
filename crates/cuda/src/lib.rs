@@ -105,6 +105,7 @@ pub mod nemotron_tp;
 pub mod nemotron_vit;
 pub mod num;
 pub mod ple;
+pub mod q4_linear;
 pub mod qfn_verify;
 pub mod qsa;
 pub mod roce;
