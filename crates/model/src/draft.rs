@@ -476,11 +476,18 @@ fn load_group<'p>(
     let len = q4_linear::bytes(n, k);
     let shapes: Vec<(String, usize)> = tensors.into_iter().zip(parts.iter().copied()).collect();
     let buf = ctx.computed(len, move || {
-        let mut w = Vec::with_capacity(n * k);
-        for (t, rows) in &shapes {
-            w.extend_from_slice(&pack.bf16(t, &[*rows, k])?);
+        // each part's rows in place (no stacked copy): the row accessor walks the parts in order
+        let ws = shapes.iter().map(|(t, rows)| pack.bf16(t, &[*rows, k])).collect::<Result<Vec<_>, _>>()?;
+        let mut at = Vec::with_capacity(ws.len());
+        let mut r0 = 0;
+        for (_, rows) in &shapes {
+            at.push(r0);
+            r0 += rows;
         }
-        Ok(q4_linear::quantize_bf16(&w, n, k))
+        Ok(q4_linear::quantize_bf16_rows(n, k, |r| {
+            let p = at.partition_point(|&s| s <= r) - 1;
+            &ws[p][(r - at[p]) * k..(r - at[p] + 1) * k]
+        }))
     })?;
     *bytes += len;
     Ok(LinGroup::Stacked { w: Q4Weights::from_buf(buf, n, k)?, parts: parts.to_vec() })
