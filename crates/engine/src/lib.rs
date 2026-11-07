@@ -218,6 +218,14 @@ pub trait Backend {
     /// with an adaptive slice (GLM's tensor-parallel rank 0) runs its big slices only when none is; the slices are row-invariant, so
     /// no bit depends on it. The default ignores it.
     fn set_decode_waiting(&mut self, _waiting: bool) {}
+    /// A prompt slice the backend runs in parts (several `prefill_slice` calls that each return the prompt's `done` unchanged and no row
+    /// until the last, with the decode rounds of the steps between them) and has begun: its slot, and the most rows another prompt's slice
+    /// may have while it waits (0: none). The engine then serves that prompt before any other whose rows left would not fit those rows
+    /// (and before every other once it was passed over [`PREFILL_PASS_GUARD`] steps). Only when slices run moves, never a bit. The
+    /// default: none.
+    fn prefill_in_flight(&self) -> Option<(usize, usize)> {
+        None
+    }
     /// A proven cold-call bound, when available (CPU mock); native families require observed work, not a guessed rate.
     fn cold_step_budget(&self) -> Option<std::time::Duration> {
         None
@@ -1691,14 +1699,13 @@ impl<B: Backend> Engine<B> {
         } else {
             let mut rows = 0usize;
             for i in 0..slices {
-                if let Some(at) = self.choose_prefill() {
-                    let r = self.slice_rows(at);
-                    if i > 0 && rows + r > PREFILL_STEP_ROWS {
-                        break;
-                    }
-                    rows += r;
+                let Some(at) = self.choose_prefill(rows) else { break };
+                let r = self.slice_rows(at);
+                if i > 0 && rows + r > PREFILL_STEP_ROWS {
+                    break;
                 }
-                self.pick_next_prefill();
+                rows += r;
+                self.pick_prefill(at);
                 if !self.advance_prefill()? {
                     break;
                 }
@@ -1726,13 +1733,13 @@ impl<B: Backend> Engine<B> {
         let mut picked: Vec<Option<Prefilling>> = Vec::new();
         let mut rows = 0usize;
         for i in 0..k {
-            let Some(at) = self.choose_prefill() else { break };
+            let Some(at) = self.choose_prefill(rows) else { break };
             let r = self.slice_rows(at);
             if i > 0 && rows + r > PREFILL_STEP_ROWS {
                 break;
             }
             rows += r;
-            self.pick_next_prefill();
+            self.pick_prefill(at);
             match self.prefilling.pop_front() {
                 Some(p) => picked.push(Some(p)),
                 None => break,
@@ -1843,29 +1850,45 @@ impl<B: Backend> Engine<B> {
     }
 
     /// Index of the prompt that gets the next slice: the front one under `Serial`; under `Burst` one passed over `PREFILL_PASS_GUARD` steps
-    /// (the oldest of them), else the one with the fewest rows left (the oldest among equals). `None` with nothing waiting. No side effects.
-    fn choose_prefill(&self) -> Option<usize> {
+    /// (the oldest of them), else the one with the fewest rows left (the oldest among equals). While the backend runs a prompt's slice in
+    /// parts ([`Backend::prefill_in_flight`]), that prompt goes first, except that under `Burst` another whose rows left fit the backend's
+    /// room (with the `taken` rows this step already holds) goes before it, the fewest rows left first, until the pass-over guard serves
+    /// it. `None` with nothing waiting. No side effects.
+    fn choose_prefill(&self, taken: usize) -> Option<usize> {
         if self.prefilling.is_empty() {
             return None;
         }
-        if !matches!(self.prefill_policy, PrefillPolicy::Burst { .. }) {
+        let burst = matches!(self.prefill_policy, PrefillPolicy::Burst { .. });
+        let left = |p: &Prefilling| p.req.prompt.len() - p.done;
+        if let Some((slot, room)) = self.backend.prefill_in_flight() {
+            let pin = self.prefilling.iter().position(|p| p.slot == slot);
+            if let Some(at) = pin.filter(|&at| !burst || self.prefilling[at].passed >= PREFILL_PASS_GUARD) {
+                return Some(at);
+            }
+            let fits = self
+                .prefilling
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.slot != slot && !p.full_row && taken + left(p) <= room)
+                .min_by_key(|(i, p)| (left(p), *i))
+                .map(|(i, _)| i);
+            return fits.or(pin);
+        }
+        if !burst {
             return Some(0);
         }
         self.prefilling
             .iter()
             .position(|p| p.passed >= PREFILL_PASS_GUARD)
-            .or_else(|| self.prefilling.iter().enumerate().min_by_key(|(i, p)| (p.req.prompt.len() - p.done, *i)).map(|(i, _)| i))
+            .or_else(|| self.prefilling.iter().enumerate().min_by_key(|(i, p)| (left(p), *i)).map(|(i, _)| i))
     }
 
-    /// Put the prompt that should get the next slice at the front of the queue (`Burst` only; `Serial` keeps its turn order): one passed
-    /// over `PREFILL_PASS_GUARD` steps, the oldest of them, else the one with the fewest rows left, the oldest among equals. Its own
-    /// passed-over count restarts (the others were counted at the start of the step).
-    fn pick_next_prefill(&mut self) {
-        if !matches!(self.prefill_policy, PrefillPolicy::Burst { .. }) || self.prefilling.len() < 2 {
-            return;
+    /// Put the prompt [`Engine::choose_prefill`] chose (at `at`) at the front of the queue, where the slice takes it from. Under `Burst`
+    /// its own passed-over count restarts when others wait (they were counted at the start of the step).
+    fn pick_prefill(&mut self, at: usize) {
+        if matches!(self.prefill_policy, PrefillPolicy::Burst { .. }) && self.prefilling.len() >= 2 {
+            self.prefilling[at].passed = 0;
         }
-        let at = self.choose_prefill().expect("two or more waiting prompts");
-        self.prefilling[at].passed = 0;
         if at > 0 {
             let p = self.prefilling.remove(at).expect("an index inside the queue");
             self.prefilling.push_front(p);
