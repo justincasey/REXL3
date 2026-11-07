@@ -338,6 +338,9 @@ fn parallel_plan_is_bit_identical_to_legacy_on_dispersed_routes() {
         (1024, 1, &[10, 256, 257, 4096]),
         (1, 1, &[5, 100, 1000, 4096]),
         (512, 1, &[1, 32, 33, 1000]),
+        // GLM-5.3-Flash (E288/topk8), and the expert count of one of its mixed-width subbanks
+        (288, 8, &[1, 129, 512, 2048]),
+        (58, 8, &[129, 2048]),
     ];
     let mut seed = 0x9E3779B97F4A7C15u64;
     for &(e, topk, rows) in shapes {
@@ -352,6 +355,22 @@ fn parallel_plan_is_bit_identical_to_legacy_on_dispersed_routes() {
             let parallel = parallel_plan(&pick, e, cap, p);
             assert_plans_equal(&format!("E{e}/topk{topk}/rows{rows}"), &legacy, &parallel);
         }
+    }
+}
+
+/// A mixed-width layer's subbank (GLM-5.3-Flash's P1 path plans each subbank on the remapped picks): about a fifth of the pairs land in
+/// the subbank's 58 local ids, every other pick is -1.
+#[test]
+fn parallel_plan_is_bit_identical_to_legacy_on_a_subbank_remap() {
+    let (e, topk) = (58usize, 8usize);
+    let mut r = Rng(0x5eed_5ab0);
+    for rows in [1usize, 16, 129, 512, 2048] {
+        let p = rows * topk;
+        let cap = item_cap(p, 288);
+        let pick: Vec<i32> = (0..p).map(|_| if r.below(5) == 0 { r.below(e) as i32 } else { -1 }).collect();
+        let legacy = legacy_plan(&pick, e, cap, p);
+        let parallel = parallel_plan(&pick, e, cap, p);
+        assert_plans_equal(&format!("subbank E{e}/topk{topk}/rows{rows}"), &legacy, &parallel);
     }
 }
 

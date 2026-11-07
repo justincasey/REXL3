@@ -492,8 +492,12 @@ impl GlmModel {
             pf: if cr > r {
                 let sh =
                     first_moe.ok_or_else(|| ModelError::Config("a large prefill chunk needs a shared expert's shapes".into()))?;
+                // the multi-block plan: the single-block one's bytes (`moe_prefill.rs` tests), without scanning every pair once per expert
+                // in one block, which a mixed-width layer does once per subbank
+                let mut moe = PrefillScratch::new(&moe_dims, cr)?;
+                moe.use_parallel_plan(true);
                 Some(PfScratch {
-                    moe: PrefillScratch::new(&moe_dims, cr)?,
+                    moe,
                     shared: SharedScratchBig::new(sh, cr)?,
                     dense: match first_dense {
                         Some(d) => Some(SharedScratchBig::new(d, cr.min(PF_DENSE_ROWS))?),

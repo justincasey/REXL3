@@ -743,17 +743,8 @@ impl MoeExperts {
                 st.raw(),
             ))?;
             let pl = os.pick_local.ptr();
-            check(ffi::gb_moe_pf_plan(
-                pl,
-                s.spair.ptr(),
-                s.items.ptr(),
-                s.nitems.ptr(),
-                rows as i32,
-                d.topk as i32,
-                el as i32,
-                s.cap as i32,
-                st.raw(),
-            ))?;
+            // the scratch's planner (the single block, or the bit-identical multi-block plan the family selected)
+            s.run_plan(pl, rows, el as i32, st)?;
             check(ffi::gb_moe_pf_rot_in(
                 x.ptr(),
                 x_dtype as i32,
