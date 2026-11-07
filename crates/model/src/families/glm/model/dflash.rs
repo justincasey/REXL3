@@ -120,12 +120,13 @@ impl GlmModel {
     }
 
     /// After a prompt chunk of `slot` ran through the trunk (its taps are in the tap buffer): its rows join the slot's draft context at
-    /// positions `start..start + n`.
+    /// positions `start..start + n`, in writes of at most the ring's window (a write must span fewer positions than the ring holds; a
+    /// row's ring entry is row-invariant, so a 4,096-row chunk leaves the ring a 2,048-row chunk pair leaves).
     pub(super) fn dflash_prefill_chunk(&mut self, slot: usize, start: usize, n: usize) -> Result<(), ModelError> {
         let Some(d) = self.dflash.as_mut() else { return Ok(()) };
         let mut at = 0;
         while at < n {
-            let k = (n - at).min(d.draft_rows());
+            let k = (n - at).min(d.draft_rows()).min(gb_cuda::dflash2::DraftCtxLayout::WINDOW);
             d.draft.absorb_batch(&d.taps, &[Absorb { row0: at, n: k, slot, pos0: start + at }], &self.stream)?;
             at += k;
         }
