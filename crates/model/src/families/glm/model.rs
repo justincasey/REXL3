@@ -1518,9 +1518,11 @@ impl GlmModel {
                         Op::MixerCore { layer } => (layer, MixerKind::Kda, true),
                         _ => unreachable!(),
                     };
-                    // a KDA layer on a split rank joins the gather inside itself, after its own rows' qkv
+                    // a KDA layer on a split rank joins the gather inside itself, after its own rows' qkv; a row-split MLA layer after its
+                    // own rows' query chain (`layers::mla_dsa_mixer`'s `join`)
                     let kda_join = std::mem::take(&mut gather_pending);
-                    if kda_join && kind != MixerKind::Kda {
+                    let mla_join = kda_join && kind != MixerKind::Kda && big && p2 && sp.is_some();
+                    if kda_join && kind != MixerKind::Kda && !mla_join {
                         tp.as_mut().expect("sp is a rank's").sp_gather_join(st)?;
                     }
                     last_sublayer_was_mixer = true;
@@ -2043,6 +2045,14 @@ impl GlmModel {
                             // a large P2 chunk on a rank of two: the per-row tail on this rank's rows, then the output rows swapped
                             // (`tp::RowSplit`)
                             let split = if big && p2 { tp.as_ref().and_then(|t| t.p2_row_split(rows)) } else { None };
+                            // under `sp` the peer's hidden rows are joined inside, once this rank's rows' query chain is queued
+                            if mla_join && split.is_none() {
+                                tp.as_mut().expect("sp is a rank's").sp_gather_join(st)?;
+                            }
+                            let tp_join = tp.as_mut().filter(|_| mla_join && split.is_some());
+                            let mut join_fn = tp_join.map(|t| move || t.sp_gather_join(st));
+                            let join: Option<&mut dyn FnMut() -> Result<(), ModelError>> =
+                                join_fn.as_mut().map(|f| f as &mut dyn FnMut() -> Result<(), ModelError>);
                             layers::mla_dsa_mixer(
                                 &ctx,
                                 w,
@@ -2054,6 +2064,7 @@ impl GlmModel {
                                 max_pos,
                                 (b.n_seq() > 1).then_some(&b.positions[..]),
                                 split.map(|sp| (sp.lo, sp.hi)),
+                                join,
                                 if big && !cuts_here.is_empty() { Some(&mut ring_hook) } else { None },
                                 &mut |name| {
                                     if let Some(t) = &timer {
