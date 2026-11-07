@@ -347,14 +347,17 @@ pub struct RankPlan {
     pub vision_reserve: u64,
     pub free_after_weights: u64,
     pub scan_s: f64,
-    /// The NextN layer is loaded (`--spec mtp|auto` with drafting on, a pack that has it): its regions (the rank's share of its experts)
-    /// are in `weight_bytes`, its cache in the plan's KV bytes per token.
+    /// The NextN layer is loaded (`--spec mtp|auto` with drafting on, a pack that has it, no DFlash2 draft): its regions (the rank's share
+    /// of its experts) are in `weight_bytes`, its cache in the plan's KV bytes per token.
     pub mtp: bool,
+    /// The DFlash2 drafter this rank loads (rank 0 with `--draft DIR`): its bytes are out of what the pool is planned from.
+    pub dflash: Option<super::dflash::DflashPlan>,
 }
 
-/// Whether a rank (or one node) loads the NextN layer: the same rule as `engine::build_engine`.
+/// Whether a rank (or one node) loads the NextN layer: the same rule as `engine::build_engine`. A DFlash2 draft (`--draft DIR`) drafts in
+/// its place, so with one the layer is neither loaded nor given a cache, on every rank.
 pub fn mtp_wanted(o: &ServeOptions, cfg: &GlmConfig) -> bool {
-    super::MTP_BUILT && o.drafting && o.spec.uses_mtp() && cfg.has_mtp()
+    super::MTP_BUILT && o.drafting && o.spec.uses_mtp() && cfg.has_mtp() && !super::dflash::wanted(o)
 }
 
 /// The plan of a rank: the pack scanned and checked, the memory planned from what is free now minus the pack's text weights, at the
@@ -452,7 +455,11 @@ pub fn plan_from_split(
     let weight_bytes = rank_weight_bytes_with(&pack, mtp);
     // rank 0 serving images: the tower and its scratch are out of the room, the features of the images in flight held back (a follower: 0)
     let (tower_bytes, vision_reserve) = tp_vision::planned_vision(o, &pack, &profile, mem_opts.vision)?;
-    let free = free_now.saturating_sub(weight_bytes + tower_bytes);
+    let chunk = alloc::prefill_chunk_for(o.prefill_chunk);
+    // rank 0 drafting with DFlash2: the drafter (weights, rings, scratch, the trunk's taps) is out of the room too (a follower: none)
+    let dflash = super::dflash::plan(o, &cfg, o.slots, chunk)?;
+    let draft_bytes = dflash.as_ref().map_or(0, |d| d.bytes);
+    let free = free_now.saturating_sub(weight_bytes + tower_bytes + draft_bytes);
     let kv_cap = o.kv_tokens.unwrap_or(o.max_model_len) as u64;
     // the prefix cache as one node plans it (`engine::build_engine`): a snapshot slot is THIS rank's state (its KDA heads under the split,
     // `cfg` is the rank's), the cache carved out before the KV pool is sized (an explicit size) or out of what the plan leaves (`Auto`)
@@ -469,13 +476,12 @@ pub fn plan_from_split(
         0,
         o.max_model_len as u64,
     )
-    .map_err(|e| ModelError::Config(format!("this rank cannot plan {} slots: {e} (free {:.1} GiB after the pack's {:.1} GiB and the vision tower's {:.2} GiB, vision reserve {:.2} GiB)", o.slots, gib(free), gib(weight_bytes), gib(tower_bytes), gib(vision_reserve))))?;
+    .map_err(|e| ModelError::Config(format!("this rank cannot plan {} slots: {e} (free {:.1} GiB after the pack's {:.1} GiB, the vision tower's {:.2} GiB and the drafter's {:.2} GiB, vision reserve {:.2} GiB)", o.slots, gib(free), gib(weight_bytes), gib(tower_bytes), gib(draft_bytes), gib(vision_reserve))))?;
     let mm = ModelMemory::from_profile(&profile, 0, 0);
     let admission = plan.admission(mm, o.slots, o.max_model_len).map_err(|e| ModelError::Config(e.to_string()))?;
     // the pool holds the pages the cache may keep on top of the pages admission hands out
     let kv_blocks = plan.kv_blocks + plan.cache.page_blocks;
     let mo = ModelOptions { slots: o.slots, kv_blocks, max_context: o.max_model_len, layers: cfg.layers.len() };
-    let chunk = alloc::prefill_chunk_for(o.prefill_chunk);
     Ok(RankPlan {
         cfg,
         ck,
@@ -494,6 +500,7 @@ pub fn plan_from_split(
         free_after_weights: free,
         scan_s,
         mtp,
+        dflash,
     })
 }
 
@@ -721,7 +728,12 @@ pub fn build_leader(
         &t,
         |rv| make_comm(topo, rv),
         |comm| {
-            let rank = load_rank_with(&dir, &p.cfg, p.pack.clone(), p.own.as_ref(), &p.mo, p.chunk, floor, p.scan_s, comm, mtp)?;
+            let mut rank =
+                load_rank_with(&dir, &p.cfg, p.pack.clone(), p.own.as_ref(), &p.mo, p.chunk, floor, p.scan_s, comm, mtp)?;
+            // rank 0's DFlash2 drafter, before its Ready: a drafter that does not load fails the group's boot by name
+            if let Some(d) = &p.dflash {
+                super::dflash::load(&mut rank.m, d)?;
+            }
             tower = tp_vision::load_leader_tower(o, &p.pack)?;
             Ok(rank)
         },

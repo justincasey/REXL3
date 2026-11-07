@@ -15,6 +15,7 @@ pub mod bind;
 pub mod config;
 pub mod contract;
 pub mod device;
+pub mod dflash;
 pub mod digest_log;
 pub mod dump;
 pub mod engine;
@@ -94,7 +95,8 @@ impl ModelFamily for GlmFamily {
             max_image_tokens: cfg.processor.as_ref().map_or(8000, |p| p.image.max_image_tokens),
         });
         let required: Vec<&'static str> = REQUIRED.to_vec();
-        let drafters = if MTP_BUILT && cfg.has_mtp() { vec!["mtp", "copy"] } else { vec!["copy"] };
+        // the pack's NextN layer, an external DFlash2 draft (`--draft DIR`, in the NextN layer's place) and the copy drafter
+        let drafters = if MTP_BUILT && cfg.has_mtp() { vec!["mtp", "dflash2", "copy"] } else { vec!["dflash2", "copy"] };
         Ok(FamilyPlan {
             family: self.id(),
             dir: dir.to_path_buf(),
@@ -345,7 +347,7 @@ pub fn glm_memory_plan(
     mem_available: u64,
 ) -> Result<GlmPlanReport, ModelError> {
     // the pack's own NextN layer is GLM's drafter when the mode uses it; `--no-drafts` / `--spec none|copy` turn it, and so its cache, off
-    let mtp = MTP_BUILT && o.drafting && o.spec.uses_mtp() && g.has_mtp();
+    let mtp = tp_boot::mtp_wanted(o, g);
     let opts = memory::engine_options(&memory_options(o, mtp));
     let profile = memory::memory_profile(g, &opts).map_err(|e| ModelError::Config(e.to_string()))?;
     let vision_reserve_bytes = match opts.vision {
@@ -428,7 +430,7 @@ mod tests {
         let plan = GlmFamily.probe(&dir).unwrap();
         assert_eq!((plan.family, plan.chat_format), ("glm5_next", "glm5_next"));
         assert_eq!((plan.layers.len(), plan.mtp_layers.len()), (45, 1));
-        assert_eq!(plan.drafters, vec!["mtp", "copy"], "the pack's NextN layer and the copy drafter");
+        assert_eq!(plan.drafters, vec!["mtp", "dflash2", "copy"], "the pack's NextN layer, a DFlash2 draft and the copy drafter");
         assert_eq!(plan.required_components, vec!["exl3_linear", "kda", "mla_dsa", "mhc", "moe"]);
         assert!(plan.missing_components().is_empty());
         assert_eq!(plan.unbuilt_vision(), None, "the tower is built");
@@ -549,7 +551,7 @@ mod tests {
         let r = glm_memory_plan(&o, &config(&o), 91 * GIB, 121 * GIB).unwrap();
         assert!(!r.mtp, "drafting is on but the pack has no NextN layer");
         assert_eq!(r.plan.unwrap().block_bytes, 11 * 278_528);
-        assert_eq!(GlmFamily.probe(&dir).unwrap().drafters, vec!["copy"]);
+        assert_eq!(GlmFamily.probe(&dir).unwrap().drafters, vec!["dflash2", "copy"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

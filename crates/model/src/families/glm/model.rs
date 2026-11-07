@@ -32,11 +32,13 @@ use gb_cuda::moe_prefill::{PrefillScratch, SharedScratchBig};
 use gb_cuda::{dsa, glm_glue, glue, kda, DevBuf, Stream};
 use std::collections::BTreeMap;
 
+pub mod dflash;
 pub mod graphs;
 mod layers;
 pub mod mtp;
 pub mod snapshot;
 pub mod tp;
+pub use dflash::{DflashAsk, DflashState};
 pub use graphs::{GraphKey, GraphMutant, GraphStats, Wait};
 pub use mtp::{
     vocab_ranges, BookError, ChainPick, DraftAsk, Drafts, HeadList, MtpCapture, MtpMutant, SubHead, TapBook, VocabMode, MTP_SHARE,
@@ -289,6 +291,8 @@ pub struct GlmModel {
     splice: Vec<SpliceOp>,
     /// The NextN (MTP) drafter's layer, state and scratch: present exactly when the weights carry the layer (`dev.mtp`).
     mtp: Option<mtp::MtpState>,
+    /// The DFlash2 drafter (`--draft DIR`, `attach_dflash`): its taps, context ring and scratch. Rank 0 alone on a tensor-parallel group.
+    dflash: Option<dflash::DflashState>,
     /// The CUDA graphs of the decode windows (see `graphs.rs`).
     graphs: graphs::GraphCache,
     /// The shared expert's side stream and its two events (fork: the layer's input is ready, join: the expert's output is).
@@ -521,6 +525,7 @@ impl GlmModel {
             tp: None,
             own_s,
             mtp,
+            dflash: None,
             graphs: graphs::GraphCache::new(),
             side: graphs::Side::new(),
             run_shape: None,
@@ -889,6 +894,8 @@ impl GlmModel {
         }
         // the kept rows' final-normed hidden rows join their slots' stores (the NextN drafter's input) before the next forward overwrites them
         self.mtp_commit_taps(&w.win, &keep)?;
+        // and the DFlash2 drafter's tap rows of the accepted rows join their slots' draft contexts
+        self.dflash_commit_taps(&w.win, &keep)?;
         // every sequence kept whole: the window already wrote each one's final state, so its replay (which `skip_full` makes a no-op for a sequence
         // kept whole) is skipped altogether and the commit is the conv shift and the flip of every row (`keep == None`: two launches a layer fewer)
         let all_whole = keep.iter().enumerate().all(|(i, &k)| k >= 0 && k as usize >= w.win.seq_rows(i).len());
@@ -1031,6 +1038,7 @@ impl GlmModel {
             profile,
             splice,
             mtp,
+            dflash,
             run_shape,
             side,
             graphs,
@@ -2129,6 +2137,10 @@ impl GlmModel {
                     if cap {
                         capture_streams(capture.as_mut().unwrap(), &s.streams, st, rows, last_sublayer_was_mixer, cur_layer)?;
                     }
+                    // the drafter's taps of a completed layer (its FFN's partials applied: the next site is the next layer's attention)
+                    if let (Some(d), SiteKind::Attn) = (dflash.as_mut(), next.kind) {
+                        d.tap(&s.streams, cur_layer, rows, st)?;
+                    }
                 }
                 Op::Apply => {
                     unsafe {
@@ -2136,6 +2148,9 @@ impl GlmModel {
                     }
                     if cap {
                         capture_streams(capture.as_mut().unwrap(), &s.streams, st, rows, last_sublayer_was_mixer, cur_layer)?;
+                    }
+                    if let Some(d) = dflash.as_mut() {
+                        d.tap(&s.streams, cur_layer, rows, st)?;
                     }
                 }
                 Op::HeadMean => {
@@ -2293,12 +2308,14 @@ impl GlmModel {
             None => {
                 self.forward(&b, Mode::Prefill, Head::None)?;
                 self.mtp_prefill_chunk(slot, start, tokens)?;
+                self.dflash_prefill_chunk(slot, start, tokens.len())?;
                 self.stream.sync()?;
                 Ok(None)
             }
             Some(count) => {
                 self.forward(&b, Mode::Prefill, Head::LastRow)?;
                 self.mtp_prefill_chunk(slot, start, tokens)?;
+                self.dflash_prefill_chunk(slot, start, tokens.len())?;
                 self.candidates_of(1, count).map(Some)
             }
         }

@@ -18,7 +18,7 @@
 
 use super::alloc::{MTP_MAX_DEPTH, MTP_TAP_CAP};
 use super::backend::window_is_text;
-use super::model::DraftAsk;
+use super::model::{DflashAsk, DraftAsk};
 use super::tp_mtp::DraftModel;
 use crate::error::ModelError;
 use gb_engine::ProposeRequest;
@@ -458,6 +458,93 @@ impl SpecStats {
     }
 }
 
+// ------------------------------------------------------------------------------------------------------------------- DFlash2's cut
+
+/// Upper edges of the margin bins of [`DflashCut`] (the selector's lead of a pick over the runner-up: a raw score gap for a greedy
+/// request, the noised gap in temperature units for a sampled one; at most 30). The last bin is open.
+const CUT_EDGES: [f32; 11] = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 20.0];
+const CUT_BINS: usize = CUT_EDGES.len() + 1;
+/// The prior's weight in rounds, and the decay of a bin's counts each time it is observed (it follows the text, slowly).
+const CUT_PRIOR_WEIGHT: f64 = 6.0;
+const CUT_DECAY: f64 = 0.998;
+/// The draft call's time before any was measured (ms), and the smoothing of the measurements.
+const DFLASH_MS_PRIOR: f64 = 6.0;
+const DFLASH_MS_DECAY: f64 = 0.9;
+
+/// DFlash2's chain cut: the chance that a draft is accepted given the drafts before it were, by the selector's margin of the pick,
+/// learned online from what the verify windows accepted (per margin bin: hits over trials, decayed, with a prior that rises with the
+/// margin). A round's drafts are then cut where one more row no longer pays for itself ([`allocate_chains`]).
+#[derive(Clone, Debug)]
+pub struct DflashCut {
+    hits: [f64; CUT_BINS],
+    trials: [f64; CUT_BINS],
+}
+
+impl Default for DflashCut {
+    fn default() -> Self {
+        Self { hits: [0.0; CUT_BINS], trials: [0.0; CUT_BINS] }
+    }
+}
+
+impl DflashCut {
+    fn bin(margin: f32) -> usize {
+        CUT_EDGES.iter().position(|&e| margin < e).unwrap_or(CUT_EDGES.len())
+    }
+    /// The prior chance of a bin: 0.3 at no margin, rising to 0.95 (the middle of the bin).
+    fn prior(bin: usize) -> f64 {
+        let lo = if bin == 0 { 0.0 } else { CUT_EDGES[bin - 1] as f64 };
+        let hi = CUT_EDGES.get(bin).map_or(lo * 1.5, |&e| e as f64);
+        0.3 + 0.65 * (1.0 - (-(lo + hi) / 2.0 / 2.5).exp())
+    }
+    /// The chance a pick of this margin is accepted, given every pick before it was.
+    pub fn chance(&self, margin: f32) -> f64 {
+        let b = Self::bin(margin);
+        (self.hits[b] + Self::prior(b) * CUT_PRIOR_WEIGHT) / (self.trials[b] + CUT_PRIOR_WEIGHT)
+    }
+    /// A round verified the first `verified` picks (their margins) and accepted the first `accepted`: every pick up to the first rejected
+    /// one was reached.
+    pub fn observe(&mut self, margins: &[f32], verified: usize, accepted: usize) {
+        for (j, &m) in margins.iter().take(verified).enumerate() {
+            if j > accepted {
+                break;
+            }
+            let b = Self::bin(m);
+            self.hits[b] = self.hits[b] * CUT_DECAY + (j < accepted) as u8 as f64;
+            self.trials[b] = self.trials[b] * CUT_DECAY + 1.0;
+        }
+    }
+}
+
+/// How many drafts of each stream's chain to verify: `reach[s][j]` is the chance draft `j` of stream `s` and every one before it are
+/// accepted. Rows are added one at a time, the likeliest next draft of any stream first (ties to the lower stream), and the counts with the
+/// most expected tokens per millisecond of `round_ms(streams, rows) + overhead_ms` are kept (TensorFold's allocation over node chances).
+/// Every stream holds its base row; the window holds at most `max_rows`.
+pub fn allocate_chains(reach: &[Vec<f64>], max_rows: usize, overhead_ms: f64, round_ms: &dyn Fn(usize, usize) -> f64) -> Vec<usize> {
+    let s = reach.len();
+    let mut counts = vec![0usize; s];
+    let mut best_counts = counts.clone();
+    let mut rows = s;
+    let mut expected = s as f64;
+    let rate = |rows: usize, expected: f64| expected / (round_ms(s, rows) + overhead_ms);
+    let mut best = rate(rows, expected);
+    while rows < max_rows {
+        let pick = (0..s).filter(|&i| counts[i] < reach[i].len()).fold(None, |b: Option<usize>, i| match b {
+            Some(j) if reach[j][counts[j]] >= reach[i][counts[i]] => Some(j),
+            _ => Some(i),
+        });
+        let Some(i) = pick else { break };
+        expected += reach[i][counts[i]];
+        counts[i] += 1;
+        rows += 1;
+        let now = rate(rows, expected);
+        if now > best {
+            best = now;
+            best_counts.clone_from(&counts);
+        }
+    }
+    best_counts
+}
+
 // ----------------------------------------------------------------------------------------------------------------------- runtime
 
 /// What a slot's last `propose` offered, until its commit.
@@ -466,6 +553,8 @@ struct Round {
     drafts: Vec<u32>,
     /// How many of `drafts` were in the window (the engine may trim the offer); 0 until `on_step`.
     verified: usize,
+    /// A DFlash2 round's margins of its drafts (what [`DflashCut`] learns from); empty for every other round.
+    margins: Vec<f32>,
 }
 
 struct SlotSpec {
@@ -475,11 +564,20 @@ struct SlotSpec {
     rounds: u64,
     committed: u64,
     by_source: [u64; 3],
+    /// The runtime's draft and window counters when the sequence began (`(draft ms, draft calls, window ms, windows, window rows)`).
+    since: (f64, u64, f64, u64, u64),
 }
 
 impl SlotSpec {
     fn new() -> Self {
-        Self { copy: CopyDrafter::new(COPY_MIN_MATCH, COPY_MAX), round: None, rounds: 0, committed: 0, by_source: [0; 3] }
+        Self {
+            copy: CopyDrafter::new(COPY_MIN_MATCH, COPY_MAX),
+            round: None,
+            rounds: 0,
+            committed: 0,
+            by_source: [0; 3],
+            since: (0.0, 0, 0.0, 0, 0),
+        }
     }
 }
 
@@ -490,6 +588,9 @@ pub struct SpecRuntime {
     pub stats: SpecStats,
     pub arbiter: Arbiter,
     pub cost: GlmCost,
+    /// DFlash2's chain cut and the draft call's smoothed time (ms): used when the model drafts with DFlash2.
+    pub cut: DflashCut,
+    pub dflash_ms: f64,
 }
 
 impl SpecRuntime {
@@ -514,27 +615,39 @@ impl SpecRuntime {
             stats: SpecStats::default(),
             arbiter: Arbiter::new(arb),
             cost: GlmCost::for_config(&cfg),
+            cut: DflashCut::default(),
+            dflash_ms: DFLASH_MS_PRIOR,
         }
     }
 
     /// A new sequence starts in `slot`.
     pub fn begin(&mut self, slot: usize) {
-        self.slots[slot] = SlotSpec::new();
+        let st = &self.stats;
+        self.slots[slot] = SlotSpec { since: (st.mtp_ms, st.mtp_calls, st.window_ms, st.windows, st.window_rows), ..SlotSpec::new() };
         self.arbiter.begin(slot);
     }
 
-    /// The sequence in `slot` ended (or failed): log its totals and forget it.
+    /// The sequence in `slot` ended (or failed): log its totals and forget it. The draft and window times are the runtime's over the
+    /// sequence's life (every stream's: exact for one stream at a time).
     pub fn end(&mut self, slot: usize) {
         let s = std::mem::replace(&mut self.slots[slot], SlotSpec::new());
         if s.rounds > 0 {
+            let st = &self.stats;
+            let (dm, dc, wm, wc, wr) = s.since;
+            let per = |ms: f64, n: u64| if n == 0 { 0.0 } else { ms / n as f64 };
             eprintln!(
-                "rexl3 event=spec_seq slot={slot} rounds={} tokens={} tokens_per_round={:.3} rounds_none={} rounds_copy={} rounds_mtp={}",
+                "rexl3 event=spec_seq slot={slot} rounds={} tokens={} tokens_per_round={:.3} rounds_none={} rounds_copy={} rounds_mtp={} draft_ms={:.2} draft_calls={} window_ms={:.2} window_rows={:.2} windows={}",
                 s.rounds,
                 s.committed,
                 s.committed as f64 / s.rounds as f64,
                 s.by_source[0],
                 s.by_source[1],
-                s.by_source[2]
+                s.by_source[2],
+                per(st.mtp_ms - dm, st.mtp_calls - dc),
+                st.mtp_calls - dc,
+                per(st.window_ms - wm, st.windows - wc),
+                per((st.window_rows - wr) as f64, st.windows - wc),
+                st.windows - wc
             );
         }
     }
@@ -546,6 +659,10 @@ impl SpecRuntime {
         reqs: &[ProposeRequest],
         images: &[Vec<std::ops::Range<usize>>],
     ) -> Result<Vec<Option<Vec<u32>>>, ModelError> {
+        // a DFlash2 drafter takes the head's place (`--draft DIR`): one block pass drafts every asking stream, the cut decides the depths
+        if m.has_dflash() && self.cfg.mode.uses_mtp() {
+            return self.propose_dflash(m, reqs);
+        }
         let mode = self.cfg.mode;
         let head = m.has_mtp() && mode.uses_mtp();
         // the previous round's commits (the KDA flips and the tapped rows joining their slots' stores) are applied lazily, at the next forward: apply them
@@ -662,7 +779,71 @@ impl SpecRuntime {
                 Choice::Mtp(_) => Choice::Mtp(drafts.len()),
                 Choice::None => Choice::None,
             };
-            self.slots[r.slot].round = Some(Round { choice: c, drafts, verified: 0 });
+            self.slots[r.slot].round = Some(Round { choice: c, drafts, verified: 0, margins: Vec::new() });
+        }
+        Ok(out)
+    }
+
+    /// [`SpecRuntime::propose`] with the DFlash2 drafter: every stream that may draft gets a chain of up to `min(max, 7)` drafts with the
+    /// selector's margin of each, and the chains are cut by [`allocate_chains`] over the chances [`DflashCut`] gives the margins, priced with
+    /// the verify table and the draft call's measured time. `--spec mtp` keeps the fixed depth (`REXL3_MTP_DEPTH`) as a cap instead.
+    fn propose_dflash<M: DraftModel + ?Sized>(
+        &mut self,
+        m: &mut M,
+        reqs: &[ProposeRequest],
+    ) -> Result<Vec<Option<Vec<u32>>>, ModelError> {
+        // the last window's accepted rows join the draft contexts first (the commit is applied lazily)
+        m.flush()?;
+        let cap = if self.cfg.mode == SpecMode::Mtp { self.cfg.mtp_depth.max(1) } else { crate::draft::DRAFTS };
+        let asking: Vec<usize> = (0..reqs.len()).filter(|&i| reqs[i].max > 0 && reqs[i].tokens.len() > 1).collect();
+        let mut out: Vec<Option<Vec<u32>>> = vec![Some(Vec::new()); reqs.len()];
+        let mut margins: Vec<Vec<f32>> = vec![Vec::new(); reqs.len()];
+        if !asking.is_empty() {
+            let asks: Vec<DflashAsk> = asking
+                .iter()
+                .map(|&i| DflashAsk {
+                    slot: reqs[i].slot,
+                    tokens: reqs[i].tokens,
+                    sampling: reqs[i].sampling,
+                    want: reqs[i].max.min(cap),
+                })
+                .collect();
+            let t = Instant::now();
+            let picked = m.dflash_draft(&asks)?;
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            self.stats.mtp_ms += ms;
+            self.stats.mtp_calls += 1;
+            cost_log(format_args!("D {} 0 {} {ms:.4}", asks.len(), cap));
+            self.dflash_ms = self.dflash_ms * DFLASH_MS_DECAY + ms * (1.0 - DFLASH_MS_DECAY);
+            // each stream's chance of reaching each depth, from its picks' margins
+            let reach: Vec<Vec<f64>> = picked
+                .iter()
+                .map(|p| {
+                    let mut r = 1.0;
+                    p.margin.iter().map(|&mg| {
+                        r *= self.cut.chance(mg);
+                        r
+                    })
+                    .collect()
+                })
+                .collect();
+            let counts = if self.cfg.mode == SpecMode::Mtp {
+                reach.iter().map(|r| r.len()).collect()
+            } else {
+                let cost = &self.cost;
+                allocate_chains(&reach, super::alloc::WINDOW_ROWS, self.dflash_ms, &|s, rows| cost.verify_ms_of(s, rows))
+            };
+            for ((&i, p), n) in asking.iter().zip(picked).zip(counts) {
+                let n = n.min(p.tokens.len());
+                out[i] = Some(p.tokens[..n].to_vec());
+                margins[i] = p.margin[..n].to_vec();
+            }
+        }
+        for (i, r) in reqs.iter().enumerate() {
+            let drafts = out[i].clone().unwrap_or_default();
+            let choice = if drafts.is_empty() { Choice::None } else { Choice::Mtp(drafts.len()) };
+            let margins = std::mem::take(&mut margins[i]);
+            self.slots[r.slot].round = Some(Round { choice, drafts, verified: 0, margins });
         }
         Ok(out)
     }
@@ -692,9 +873,9 @@ impl SpecRuntime {
     pub fn on_commit(&mut self, slot: usize, keep: usize) {
         let accepted = keep.saturating_sub(1);
         let s = &mut self.slots[slot];
-        let (choice, verified) = match s.round.take() {
-            Some(r) => (if r.verified == 0 { Choice::None } else { r.choice }, r.verified),
-            None => (Choice::None, 0),
+        let (choice, verified, margins) = match s.round.take() {
+            Some(r) => (if r.verified == 0 { Choice::None } else { r.choice }, r.verified, r.margins),
+            None => (Choice::None, 0, Vec::new()),
         };
         let source = Source::of(choice);
         s.rounds += 1;
@@ -702,7 +883,10 @@ impl SpecRuntime {
         s.by_source[source.idx()] += 1;
         let accepted = accepted.min(verified);
         self.stats.record(source, verified, accepted);
-        if self.cfg.mode == SpecMode::Auto {
+        if !margins.is_empty() {
+            // a DFlash2 round: its margins teach the cut (the arbiter does not choose its depths)
+            self.cut.observe(&margins, verified, accepted);
+        } else if self.cfg.mode == SpecMode::Auto {
             self.arbiter.observe(slot, choice, verified, accepted);
         }
     }
@@ -738,12 +922,12 @@ mod tests {
     fn a_round_with_no_drafts_in_the_window_counts_as_none() {
         let mut r = SpecRuntime::new(SpecConfig::new(SpecMode::Mtp), 2);
         // the engine asked, the drafter offered two, the engine's budget trimmed them to nothing: the round is a serial one
-        r.slots[1].round = Some(Round { choice: Choice::Mtp(2), drafts: vec![5, 6], verified: 0 });
+        r.slots[1].round = Some(Round { choice: Choice::Mtp(2), drafts: vec![5, 6], verified: 0, margins: Vec::new() });
         r.on_step(1, 1);
         r.on_commit(1, 1);
         assert_eq!((r.stats.rounds[0], r.stats.rounds[2]), (1, 0));
         // a trimmed offer: two drafts offered, one in the window and accepted
-        r.slots[0].round = Some(Round { choice: Choice::Mtp(2), drafts: vec![5, 6], verified: 0 });
+        r.slots[0].round = Some(Round { choice: Choice::Mtp(2), drafts: vec![5, 6], verified: 0, margins: Vec::new() });
         r.on_step(0, 2);
         r.on_commit(0, 2);
         assert_eq!((r.stats.rounds[2], r.stats.verified[2], r.stats.accepted[2], r.stats.committed[2]), (1, 1, 1, 2));
@@ -758,14 +942,14 @@ mod tests {
         let mut auto = SpecRuntime::new(SpecConfig::new(SpecMode::Auto), 1);
         let before = auto.arbiter.mtp_alpha(0, 1);
         for _ in 0..30 {
-            auto.slots[0].round = Some(Round { choice: Choice::Mtp(2), drafts: vec![1, 2], verified: 0 });
+            auto.slots[0].round = Some(Round { choice: Choice::Mtp(2), drafts: vec![1, 2], verified: 0, margins: Vec::new() });
             auto.on_step(0, 3);
             auto.on_commit(0, 1); // both drafts rejected
         }
         assert!(auto.arbiter.mtp_alpha(0, 1) < before - 0.3, "{} -> {}", before, auto.arbiter.mtp_alpha(0, 1));
         let mut fixed = SpecRuntime::new(SpecConfig::new(SpecMode::Mtp), 1);
         for _ in 0..30 {
-            fixed.slots[0].round = Some(Round { choice: Choice::Mtp(2), drafts: vec![1, 2], verified: 0 });
+            fixed.slots[0].round = Some(Round { choice: Choice::Mtp(2), drafts: vec![1, 2], verified: 0, margins: Vec::new() });
             fixed.on_step(0, 3);
             fixed.on_commit(0, 1);
         }
@@ -896,5 +1080,54 @@ mod tests {
         let mut t2 = GlmCost::for_config(&cfg(true, true));
         t2.observe_window_of(3, 8, VERIFY_MS_TP.iter().find(|p| p.0 == 8).unwrap().1 + 2.0 * VERIFY_PER_STREAM_MS_TP);
         assert!((t2.verify_scale - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_cut_learns_the_acceptance_of_a_margin_from_the_drafts_that_were_reached() {
+        let mut c = DflashCut::default();
+        // the prior rises with the margin
+        assert!(c.chance(0.1) < c.chance(2.0) && c.chance(2.0) < c.chance(25.0));
+        let (lo, hi) = (c.chance(0.1), c.chance(25.0));
+        // a round of three drafts with margins 5, 5, 0.1: the first two accepted, the third rejected
+        for _ in 0..200 {
+            c.observe(&[5.0, 5.0, 0.1], 3, 2);
+        }
+        assert!(c.chance(5.0) > 0.97, "{}", c.chance(5.0));
+        assert!(c.chance(0.1) < 0.05, "{}", c.chance(0.1));
+        // a draft past the first rejected one was never reached: it teaches nothing
+        let mut d = DflashCut::default();
+        d.observe(&[0.1, 25.0, 25.0], 3, 0);
+        assert!(d.chance(0.1) < lo);
+        assert_eq!(d.chance(25.0), hi);
+        // nor does a draft the window did not verify
+        d.observe(&[25.0, 25.0], 0, 0);
+        assert_eq!(d.chance(25.0), hi);
+    }
+
+    #[test]
+    fn chains_are_cut_where_one_more_row_stops_paying_for_itself() {
+        let reach = |p: &[f64]| {
+            let mut r = 1.0;
+            p.iter()
+                .map(|&x| {
+                    r *= x;
+                    r
+                })
+                .collect::<Vec<f64>>()
+        };
+        let tp = GlmCost::for_config(&SpecConfig { two_ranks: true, ..SpecConfig::new(SpecMode::Auto) });
+        let cost = |s: usize, rows: usize| tp.verify_ms_of(s, rows);
+        // confident drafts all the way: the whole chain is verified
+        assert_eq!(allocate_chains(&[reach(&[0.98; 7])], 64, 5.0, &cost), vec![7]);
+        // a chain that falls off a cliff after two drafts stops there
+        assert_eq!(allocate_chains(&[reach(&[0.95, 0.95, 0.05, 0.9, 0.9, 0.9, 0.9])], 64, 5.0, &cost), vec![2]);
+        // nothing worth a row: a serial round
+        assert_eq!(allocate_chains(&[reach(&[0.02; 7])], 64, 5.0, &cost), vec![0]);
+        // two streams share the window: the likelier chain gets the deeper offer
+        let two = allocate_chains(&[reach(&[0.95; 7]), reach(&[0.6; 7])], 64, 5.0, &cost);
+        assert!(two[0] > two[1], "{two:?}");
+        // the window's row cap holds
+        let many: Vec<Vec<f64>> = (0..16).map(|_| reach(&[0.99; 7])).collect();
+        assert!(allocate_chains(&many, 64, 5.0, &cost).iter().sum::<usize>() + 16 <= 64);
     }
 }

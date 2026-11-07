@@ -819,6 +819,15 @@ impl GlmMtpRuntime for GlmRank {
     fn graph_counters(&self) -> Option<gb_engine::GraphCounters> {
         Some(graph_counters_of(&self.m.graph_stats()))
     }
+    fn has_dflash(&self) -> bool {
+        self.m.has_dflash()
+    }
+    fn dflash_draft(&mut self, asks: &[super::model::DflashAsk<'_>]) -> Result<Vec<crate::draft::Picked>, ModelError> {
+        if let Some(a) = asks.iter().find(|a| a.slot >= self.m.slots) {
+            return Err(ModelError::Request(format!("a draft ask for slot {} of a model of {} slots", a.slot, self.m.slots)));
+        }
+        self.m.dflash_draft(asks)
+    }
 }
 
 /// The engine's counters of a model's window graph cache.

@@ -20,7 +20,8 @@
 //! whose `mtp_draft_keyed` forwards the call before it runs it here and whose `flush` is the core call (so the leader's stream is exactly
 //! the single node's list of model calls).
 
-use super::model::{DraftAsk, Drafts, GlmModel, TapBook};
+use super::model::{DflashAsk, DraftAsk, Drafts, GlmModel, TapBook};
+use crate::draft::Picked;
 use super::tp::GlmCall;
 use crate::error::ModelError;
 use crate::lockstep::{CallReply, Dec, Enc, LockstepRuntime, TpLeader, WireError};
@@ -161,6 +162,10 @@ pub trait DraftModel {
     /// The slot's tap book (host state, identical on every rank).
     fn mtp_book(&self, slot: usize) -> Option<TapBook>;
     fn mtp_draft_keyed(&mut self, asks: &[DraftAsk<'_>], keyed: &[Option<Sampling>]) -> Result<Vec<Option<Drafts>>, ModelError>;
+    /// Whether the model drafts with DFlash2 (`--draft DIR`), which then takes the NextN head's place.
+    fn has_dflash(&self) -> bool;
+    /// A DFlash2 round (`GlmModel::dflash_draft`): the pending commits must have been applied.
+    fn dflash_draft(&mut self, asks: &[DflashAsk<'_>]) -> Result<Vec<Picked>, ModelError>;
 }
 
 impl DraftModel for GlmModel {
@@ -176,6 +181,12 @@ impl DraftModel for GlmModel {
     fn mtp_draft_keyed(&mut self, asks: &[DraftAsk<'_>], keyed: &[Option<Sampling>]) -> Result<Vec<Option<Drafts>>, ModelError> {
         GlmModel::mtp_draft_keyed(self, asks, keyed)
     }
+    fn has_dflash(&self) -> bool {
+        GlmModel::has_dflash(self)
+    }
+    fn dflash_draft(&mut self, asks: &[DflashAsk<'_>]) -> Result<Vec<Picked>, ModelError> {
+        GlmModel::dflash_draft(self, asks)
+    }
 }
 
 /// A rank's runtime as the drafter needs it (the real one is `tp::GlmRank`; the CPU tests drive a recording mock).
@@ -186,6 +197,14 @@ pub trait GlmMtpRuntime: LockstepRuntime<Call = GlmCall> {
     /// This rank's window graph cache (lane E: rank 0's backend reports it at `/metrics`). The default: none (the CPU mocks).
     fn graph_counters(&self) -> Option<gb_engine::GraphCounters> {
         None
+    }
+    /// Whether this rank drafts with DFlash2 (rank 0 of a group with `--draft DIR`; a follower never does). The default: no.
+    fn has_dflash(&self) -> bool {
+        false
+    }
+    /// A DFlash2 round on this rank alone (rank 0's: the draft is dense and the head replicated, so no follower takes part).
+    fn dflash_draft(&mut self, _asks: &[DflashAsk<'_>]) -> Result<Vec<Picked>, ModelError> {
+        Err(ModelError::Config("this rank has no DFlash2 drafter".into()))
     }
 }
 
@@ -204,6 +223,13 @@ impl<R: GlmMtpRuntime> DraftModel for TpLeader<R> {
     fn mtp_draft_keyed(&mut self, asks: &[DraftAsk<'_>], keyed: &[Option<Sampling>]) -> Result<Vec<Option<Drafts>>, ModelError> {
         let call = GlmCall::MtpDraft { asks: asks.iter().map(AskWire::of).collect(), keyed: keyed.to_vec() };
         self.forward_call(call, |r, _| r.mtp_draft_keyed(asks, keyed), |d| drafts_digest(d))
+    }
+    fn has_dflash(&self) -> bool {
+        self.inner().has_dflash()
+    }
+    /// Rank 0 alone: nothing is forwarded (the draft touches only rank 0's own ring and scratch, never the group's state).
+    fn dflash_draft(&mut self, asks: &[DflashAsk<'_>]) -> Result<Vec<Picked>, ModelError> {
+        self.inner_mut().dflash_draft(asks)
     }
 }
 

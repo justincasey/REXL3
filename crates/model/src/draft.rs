@@ -702,6 +702,11 @@ impl Draft {
         Ok((d, bytes))
     }
 
+    /// The most context rows one absorb takes.
+    pub fn max_ctx_rows(&self) -> usize {
+        self.max_ctx_rows
+    }
+
     /// Bytes of one ring row (one position's K or V, all kv heads) of one draft layer.
     pub const RING_ROW_BYTES: usize = KV_HEADS * HEAD_DIM * 2;
 

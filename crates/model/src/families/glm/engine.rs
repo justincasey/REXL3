@@ -192,8 +192,9 @@ pub fn build_engine(o: &ServeOptions) -> Result<GlmEngine, ModelError> {
     check_options(o)?;
     loadstats::set_component(Component::Scan);
     let cfg = GlmConfig::from_dir(&o.model_dir).map_err(ModelError::Config)?;
-    // the pack's NextN layer is loaded (3.5 GiB) and its cache allocated only when the mode drafts with it (`--spec auto|mtp`)
-    let with_mtp = super::MTP_BUILT && o.drafting && o.spec.uses_mtp() && cfg.has_mtp();
+    // the pack's NextN layer is loaded (3.5 GiB) and its cache allocated only when the mode drafts with it (`--spec auto|mtp`) and no DFlash2 draft
+    // (`--draft DIR`) drafts in its place
+    let with_mtp = super::tp_boot::mtp_wanted(o, &cfg);
     // the family's memory model, validated before a single weight is read
     let mem_opts = memory::engine_options(&memory_options(o, with_mtp));
     let profile = memory::memory_profile(&cfg, &mem_opts).map_err(|e| ModelError::Config(e.to_string()))?;
@@ -300,6 +301,11 @@ pub fn build_engine(o: &ServeOptions) -> Result<GlmEngine, ModelError> {
     eprintln!("{}", hostmem::memory_view_line(cuda_free, host.as_ref(), o.floor_bytes));
     boot::fact("plan_free_gib", format!("{:.1}", gib(free)));
     let kv_tokens_cap = o.kv_tokens.unwrap_or(o.max_model_len) as u64;
+    // a DFlash2 drafter (`--draft DIR`): its weights, rings (one a slot), scratch and the trunk's taps are out of what the pool is planned from
+    let chunk = alloc::prefill_chunk_for(o.prefill_chunk);
+    let dflash_at = |slots: usize| super::dflash::plan(o, &cfg, slots, chunk);
+    dflash_at(o.slots)?;
+    let draft_bytes = |slots: usize| dflash_at(slots).ok().flatten().map_or(0, |d| d.bytes);
     // a snapshot slot of the prefix cache is the recurrent state of a prompt plus a few raw rows and the drafter's carry (the model's own figure,
     // `prefix::snapshot_bytes`); the cache is carved out of what the plan leaves (`Auto`) or before the KV pool is sized (an explicit size)
     let snapshot_bytes = prefix::snapshot_bytes(&cfg, with_mtp).map_err(ModelError::Config)?;
@@ -309,7 +315,7 @@ pub fn build_engine(o: &ServeOptions) -> Result<GlmEngine, ModelError> {
         plan_for_slots(
             &profile,
             mem_opts.vision.filter(|_| has_tower),
-            free,
+            free.saturating_sub(draft_bytes(slots)),
             o.floor_bytes,
             kv_tokens_cap,
             slots,
@@ -381,7 +387,6 @@ pub fn build_engine(o: &ServeOptions) -> Result<GlmEngine, ModelError> {
     let planned = plan.planned_bytes(slots);
     let refuse = |what: &str, e: ModelError| allocation_error(what, e, planned, o.floor_bytes, host.as_ref());
     // the prefill chunk: the scratch of a chunk of more than 128 rows (the large-row kernels') was priced into the plan above
-    let chunk = alloc::prefill_chunk_for(o.prefill_chunk);
     // the pool holds the pages the cache may keep on top of the pages admission hands out
     let pool_blocks = plan.kv_blocks + plan.cache.page_blocks;
     let mut model = GlmModel::new_chunked(
@@ -393,6 +398,9 @@ pub fn build_engine(o: &ServeOptions) -> Result<GlmEngine, ModelError> {
     .map_err(|e| refuse("the engine's buffers (KV pool, slot state, scratch)", e))?;
     if plan.cache.enabled() {
         model.enable_prefix_cache(plan.cache.snapshot_slots).map_err(|e| refuse("the prefix cache's snapshot pool", e))?;
+    }
+    if let Some(d) = dflash_at(slots)? {
+        super::dflash::load(&mut model, &d).map_err(|e| refuse("the DFlash2 drafter", e))?;
     }
     loadstats::phase_end(ph);
     // the plan the admission was priced with is what was allocated: say so loudly if it is not (a bug in the memory model, never a property of the pack)
