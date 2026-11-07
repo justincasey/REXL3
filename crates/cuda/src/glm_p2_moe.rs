@@ -13,10 +13,11 @@
 //! groups in one kernel ([`CombineMode::Both`]); a TP=2 rank runs its own group ([`CombineMode::Own`]), the ranks exchange one fp32 row
 //! each, and [`CombineMode::Parts`] adds them in the same order: P2 at TP=2 equals P2 on one node bit for bit.
 //!
-//! **Schedule** (per layer, one stream): P1's plan (`gb_moe_pf_plan`: pairs sorted by expert, items of 1, 2 and 3-4 tiles of 16 rows of
-//! one expert), the rotation into row-major fp16 A rows, ONE grouped gate/up GEMM with the SwiGLU epilogue (warps 0-3 gate, 4-7 up,
-//! the same 128 columns), the grouped down GEMM writing each pair's y, the combine. The scratch is P1's [`PrefillScratch`] (its sorted-row
-//! buffers have the bytes the row-major rows need), so P2 needs no memory of its own.
+//! **Schedule** (per layer, one stream): the plan (P1's sorted rows, `gb_moe_pf_plan`: pairs sorted by expert; P1's work items of 1 to 4
+//! tiles of 16 rows of one expert, listed in expert order so that one launch per GEMM takes them all and an expert's items share its
+//! weights through L2), the rotation into row-major fp16 A rows, ONE grouped gate/up GEMM with the SwiGLU epilogue (warps 0-3 gate, 4-7
+//! up, the same 128 columns), the grouped down GEMM writing each pair's y, the combine. The scratch is P1's [`PrefillScratch`] (its
+//! sorted-row buffers have the bytes the row-major rows need), so P2 needs no memory of its own.
 //!
 //! **Mixed-width layers** ([`run_subbanks`]). A layer whose experts do not share one width binds as homogeneous subbanks
 //! (`moe_subbanks.rs`). Because a pair's output depends on its row and its expert's weights only, the pairs stage runs once per subbank
@@ -94,19 +95,26 @@ mod ffi {
     use core::ffi::c_void;
     crate::launchers! {
         pub fn gb_glm_p2m_supported(hidden: i32, inter: i32, bits_gu: i32, bits_d: i32, codebook: i32) -> i32;
-        pub fn gb_glm_p2m_rotate(x: *const c_void, x_dtype: i32, pick: *const c_void, spair: *const c_void, nitems: *const c_void,
-                                 suh0: *const c_void, suh1: *const c_void, a0: *mut c_void, a1: *mut c_void, rows: i32, topk: i32, k: i32,
-                                 e: i32, stream: *mut c_void) -> i32;
+        pub fn gb_glm_p2m_rotate(x: *const c_void, x_dtype: i32, pick: *const c_void, pos: *const c_void, suh0: *const c_void,
+                                 suh1: *const c_void, tab: i32, a0: *mut c_void, a1: *mut c_void, rows: i32, topk: i32, k: i32,
+                                 stream: *mut c_void) -> i32;
         pub fn gb_glm_p2m_gateup(a0: *const c_void, a1: *const c_void, tg: *const c_void, tu: *const c_void, items: *const c_void,
                                  nitems: *const c_void, svh_g: *const c_void, svh_u: *const c_void, suh_d: *const c_void, ad: *mut c_void,
                                  k: i32, n: i32, bits: i32, fold: i32, shape: i32, cap: i32, limit: f32, stream: *mut c_void) -> i32;
         pub fn gb_glm_p2m_down(ad: *const c_void, td: *const c_void, items: *const c_void, nitems: *const c_void, svh_d: *const c_void,
                                spair: *const c_void, y: *mut c_void, k: i32, n: i32, bits: i32, fold: i32, shape: i32, cap: i32,
                                stream: *mut c_void) -> i32;
+        pub fn gb_glm_p2m_gateup_mixed(a0: *const c_void, a1: *const c_void, tg: *const c_void, tu: *const c_void, bits: *const c_void,
+                                       items: *const c_void, nitems: *const c_void, sc: *const c_void, e: i32, ad: *mut c_void, k: i32,
+                                       n: i32, wmax: i32, fold: i32, cap: i32, limit: f32, stream: *mut c_void) -> i32;
+        pub fn gb_glm_p2m_down_mixed(ad: *const c_void, td: *const c_void, bits: *const c_void, items: *const c_void,
+                                     nitems: *const c_void, sc: *const c_void, e: i32, spair: *const c_void, y: *mut c_void, k: i32,
+                                     n: i32, wmax: i32, fold: i32, cap: i32, stream: *mut c_void) -> i32;
         pub fn gb_glm_p2m_combine(mode: i32, y: *const c_void, pick: *const c_void, wts: *const c_void, shared: *const c_void,
                                   part0: *const c_void, part1: *const c_void, out: *mut c_void, rows: i32, topk: i32, d: i32, e: i32,
                                   gsplit: i32, only: i32, stream: *mut c_void) -> i32;
         pub fn gb_glm_p2m_plan_ws_bytes(rows: i32, topk: i32, e: i32) -> i64;
+        pub fn gb_glm_p2m_pos_offset(rows: i32, topk: i32, e: i32) -> i64;
         pub fn gb_moe_own_remap(pick: *const c_void, local_of: *const c_void, pick_local: *mut c_void, y: *mut c_void, p: i32, d: i32,
                                 e: i32, stream: *mut c_void) -> i32;
         pub fn gb_glm_p2m_plan(pick: *const c_void, spair: *mut c_void, items: *mut c_void, nitems: *mut c_void, ws: *mut c_void,
@@ -407,15 +415,128 @@ fn pairs_subbanks_on(
     }
     RUNS.fetch_add(1, Ordering::Relaxed);
     RUNS_HERE.with(|c| c.set(c.get() + 1));
-    for b in sb.banks() {
-        if b.fused_gate_up() {
-            pairs_bank(b, x, x_dtype, rows, s, os, order, false, st, mark)?;
-        } else {
-            b.subbank_prefill_pairs_windowed(x, x_dtype, rows, s, sd, os, false, crate::moe_subbanks::DownOut::Y, st)?;
-            mark("split_gu_windows")?;
+    let shapes_default = SHAPE_GU.load(Ordering::Relaxed) <= 1 && SHAPE_D.load(Ordering::Relaxed) <= 1;
+    match sb.multi().filter(|m| shapes_default && m.wmax_gu > 0) {
+        Some(m) => pairs_multi(sb, m, x, x_dtype, rows, s, os, order, st, mark)?,
+        None => {
+            for b in sb.banks().iter().filter(|b| b.fused_gate_up()) {
+                pairs_bank(b, x, x_dtype, rows, s, os, order, false, st, mark)?;
+            }
         }
     }
+    for b in sb.banks().iter().filter(|b| !b.fused_gate_up()) {
+        b.subbank_prefill_pairs_windowed(x, x_dtype, rows, s, sd, os, false, crate::moe_subbanks::DownOut::Y, st)?;
+        mark("split_gu_windows")?;
+    }
     Ok(())
+}
+
+/// The pairs stage of every subbank of one gate/up width (the P2 GEMMs') in ONE launch a stage, over the layer's tables by global id
+/// ([`crate::moe_subbanks::MultiTables`]): the picks of the other experts (a split gate/up bank's, the ones the rank does not hold) remapped
+/// to -1, one plan over the global ids, one rotation, one gate/up and one down GEMM whose blocks each take their expert's width. Each
+/// pair's arithmetic is its bank's launch's (the same block at the same width on the same scales), so its y is the per-bank chain's.
+#[allow(clippy::too_many_arguments)]
+fn pairs_multi(
+    sb: &MoeSubbanks,
+    m: &crate::moe_subbanks::MultiTables,
+    x: &DevBuf,
+    x_dtype: Dtype,
+    rows: usize,
+    s: &mut PrefillScratch,
+    os: &mut OwnScratch,
+    order: Order,
+    st: &Stream,
+    mark: &mut dyn FnMut(&'static str) -> Result<(), CudaError>,
+) -> Result<(), CudaError> {
+    let d = sb.banks()[0].dims; // the banks' (a width share's: its half of the expert width)
+    if rows == 0
+        || rows > s.max_rows
+        || rows > os.max_rows
+        || !s.fits(&d)
+        || x.bytes() < rows * d.hidden * x_dtype.size()
+        || os.dims.experts != d.experts
+        || os.dims.topk != d.topk
+        || m.wmax_gu == 0
+    {
+        return Err(INVALID);
+    }
+    let fold = (order == Order::Fold128) as i32;
+    let e = d.experts as i32;
+    // SAFETY: every buffer was checked against the shapes above (the scratches are priced for at least `rows` rows of these dims); the
+    // tables hold [E] entries (u64 addresses of the banks' own buffers, which the subbanks own as long as `m`)
+    unsafe {
+        let pick = if m.fused_all {
+            s.pick.ptr() as *const c_void
+        } else {
+            check(ffi::gb_moe_own_remap(
+                s.pick.ptr(),
+                m.fused_ids.ptr(),
+                os.pick_local.ptr(),
+                core::ptr::null_mut(),
+                (rows * d.topk) as i32,
+                d.hidden as i32,
+                e,
+                st.raw(),
+            ))?;
+            os.pick_local.ptr() as *const c_void
+        };
+        let pos = plan_on(s, pick, rows, d.topk, d.experts, st)?;
+        mark("plan")?;
+        check(ffi::gb_glm_p2m_rotate(
+            x.ptr(),
+            x_dtype as i32,
+            pick,
+            pos,
+            m.suh[0].ptr(),
+            m.suh[1].ptr(),
+            1,
+            s.xs_g.ptr(),
+            s.xs_u.ptr(),
+            rows as i32,
+            d.topk as i32,
+            d.hidden as i32,
+            st.raw(),
+        ))?;
+        mark("rot_in")?;
+        check(ffi::gb_glm_p2m_gateup_mixed(
+            s.xs_g.ptr(),
+            s.xs_u.ptr(),
+            m.tp[0].ptr(),
+            m.tp[1].ptr(),
+            m.bits[0].ptr(),
+            s.items.ptr(),
+            s.nitems.ptr(),
+            m.epi.ptr(),
+            e,
+            s.xd.ptr(),
+            d.hidden as i32,
+            d.inter as i32,
+            m.wmax_gu,
+            fold,
+            s.cap as i32,
+            d.limit,
+            st.raw(),
+        ))?;
+        mark("gate_up")?;
+        check(ffi::gb_glm_p2m_down_mixed(
+            s.xd.ptr(),
+            m.tp[2].ptr(),
+            m.bits[2].ptr(),
+            s.items.ptr(),
+            s.nitems.ptr(),
+            m.svh_d.ptr(),
+            e,
+            s.spair.ptr(),
+            s.y_pairs.ptr(),
+            d.inter as i32,
+            d.hidden as i32,
+            m.wmax_d,
+            fold,
+            s.cap as i32,
+            st.raw(),
+        ))?;
+        mark("down")
+    }
 }
 
 /// The pairs stage on `pick` (`rows * topk` ids into this bank's tables, -1 for none) over `experts` table entries. `count`: whether this
@@ -452,22 +573,21 @@ fn pairs_on(
     // SAFETY: every buffer was checked against the shapes above (the scratch is priced for `s.max_rows` rows of these dims; its sorted-row
     // buffers hold [padded rows][hidden] / [padded rows][inter] fp16, the bytes of P1's fragment layout)
     unsafe {
-        plan_on(s, pick, rows, d.topk, experts, st)?;
+        let pos = plan_on(s, pick, rows, d.topk, experts, st)?;
         mark("plan")?;
         check(ffi::gb_glm_p2m_rotate(
             x.ptr(),
             x_dtype as i32,
             pick,
-            s.spair.ptr(),
-            s.nitems.ptr(),
+            pos,
             ex.suh_g.ptr(),
             ex.suh_u.ptr(),
+            0,
             s.xs_g.ptr(),
             s.xs_u.ptr(),
             rows as i32,
             d.topk as i32,
             d.hidden as i32,
-            experts as i32,
             st.raw(),
         ))?;
         mark("rot_in")?;
@@ -512,13 +632,15 @@ fn pairs_on(
     }
 }
 
-/// P1's plan (the pairs sorted by expert, the work items: `s.spair`, `s.items`, `s.nitems`, the same bytes as `gb_moe_pf_plan` gives) on
-/// many blocks. Its workspace is the down projection's A rows (`s.xd`), which nothing reads before the gate/up GEMM writes them.
+/// The plan (`s.spair`: P1's sorted pairs, the same bytes as `gb_moe_pf_plan` gives; `s.items`: P1's items in expert order, `s.nitems`:
+/// {items, 0, 0, sorted rows}) on many blocks. Its workspace is the down projection's A rows (`s.xd`), which nothing reads before the
+/// gate/up GEMM writes them.
 pub(crate) fn plan(s: &mut PrefillScratch, rows: usize, d: &crate::moe::MoeDims, st: &Stream) -> Result<(), CudaError> {
     let pick = s.pick.ptr() as *const c_void;
-    plan_on(s, pick, rows, d.topk, d.experts, st)
+    plan_on(s, pick, rows, d.topk, d.experts, st).map(|_| ())
 }
 
+/// The plan of `pick`; returns where in its workspace (`s.xd`) it left each pair's sorted row (-1: not planned), which the rotation reads.
 fn plan_on(
     s: &mut PrefillScratch,
     pick: *const c_void,
@@ -526,10 +648,15 @@ fn plan_on(
     topk: usize,
     experts: usize,
     st: &Stream,
-) -> Result<(), CudaError> {
-    // SAFETY: a pure function of its integer arguments
-    let ws = unsafe { ffi::gb_glm_p2m_plan_ws_bytes(rows as i32, topk as i32, experts as i32) };
-    if ws < 0 || ws as usize > s.xd.bytes() {
+) -> Result<*const c_void, CudaError> {
+    // SAFETY: pure functions of their integer arguments
+    let (ws, pos) = unsafe {
+        (
+            ffi::gb_glm_p2m_plan_ws_bytes(rows as i32, topk as i32, experts as i32),
+            ffi::gb_glm_p2m_pos_offset(rows as i32, topk as i32, experts as i32),
+        )
+    };
+    if ws < 0 || pos < 0 || ws as usize > s.xd.bytes() {
         return Err(INVALID);
     }
     // SAFETY: the scratch is sized for `s.max_rows >= rows` rows of these dims, the workspace checked above
@@ -546,8 +673,9 @@ fn plan_on(
             experts as i32,
             s.cap as i32,
             st.raw(),
-        ))
+        ))?;
     }
+    Ok((s.xd.ptr() as usize + pos as usize) as *const c_void)
 }
 
 /// The plan alone into `s` (a test compares it with P1's).
@@ -559,11 +687,11 @@ pub fn plan_only(s: &mut PrefillScratch, rows: usize, st: &Stream) -> Result<(),
     plan(s, rows, &d, st)
 }
 
-/// What [`plan_view`] returns: the sorted pair of each row, the items of the three classes, and their counts, as host vectors.
+/// What [`plan_view`] returns: the sorted pair of each row, the items (in expert order), and the counts, as host vectors.
 pub type PlanView = (Vec<i32>, Vec<i32>, Vec<i32>);
 
-/// The plan's outputs (sorted pair of each row, the items of the three classes, their counts and the sorted rows) as host vectors, for a
-/// test (synchronises).
+/// The plan's outputs (sorted pair of each row, the items in expert order, the counts `{items, 0, 0, sorted rows}`) as host vectors, for
+/// a test (synchronises).
 pub fn plan_view(s: &PrefillScratch, st: &Stream) -> Result<PlanView, CudaError> {
     st.sync()?;
     Ok((s.spair.to_vec()?, s.items.to_vec()?, s.nitems.to_vec()?))
