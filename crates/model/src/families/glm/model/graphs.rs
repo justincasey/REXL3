@@ -251,6 +251,11 @@ pub(super) struct Side {
     /// recorded on `s1` / `s2` at the end of the branch
     pub done1: gb_cuda::rt::Event,
     pub done2: gb_cuda::rt::Event,
+    /// The KDA commits of a window's accepted rows ([`commit_side_on`]): forked off the main stream after the drafter's absorb (`cm_go`),
+    /// joined (`cm_done`) by the next flush, so they run beside the draft round.
+    pub cm: Stream,
+    pub cm_go: gb_cuda::rt::Event,
+    pub cm_done: gb_cuda::rt::Event,
     /// Which layer parts run as branches (`PART_*`).
     pub parts: u8,
 }
@@ -292,10 +297,26 @@ impl Side {
             c: ev()?,
             done1: ev()?,
             done2: ev()?,
+            cm: Stream::new_nonblocking().ok()?,
+            cm_go: ev()?,
+            cm_done: ev()?,
             parts,
         })
     }
 }
+
+/// `REXL3_GLM_COMMIT_SIDE`: `0` / `off` applies a window's KDA commits on the main stream at the flush (as before); otherwise (the
+/// default) on the side's commit stream beside what follows the flush (a draft round, which reads none of their buffers), joined by the
+/// next flush, which every reader of the KDA state, the window record or the row arrays calls first. The same kernels on the same
+/// inputs in the same order: no bit moves. Read once a process.
+pub fn commit_side_on() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| !matches!(std::env::var(ENV_COMMIT_SIDE).as_deref().map(str::trim), Ok("0" | "off" | "false" | "no")));
+    *ON
+}
+
+/// See [`commit_side_on`].
+pub const ENV_COMMIT_SIDE: &str = "REXL3_GLM_COMMIT_SIDE";
 
 /// The environment variable that switches the layer branches: `0` / `off` is off, a number is the mask of parts (`PART_*`), anything else (and unset)
 /// is all of them.

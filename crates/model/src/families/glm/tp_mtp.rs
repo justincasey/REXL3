@@ -209,7 +209,8 @@ pub fn mtp_vocab_fact(mtp: bool, setting: Option<(usize, f32)>, vocab: usize) ->
 /// `TpLeader`, which forwards the state-changing calls first.
 pub trait DraftModel {
     fn has_mtp(&self) -> bool;
-    /// The pending commits applied (the core `flush`).
+    /// The pending commits applied before a draft round (the core `flush`; a model's KDA commits may still run beside the round:
+    /// `GlmModel::flush_lazy`, joined by the next forward).
     fn flush(&mut self) -> Result<(), ModelError>;
     /// The slot's tap book (host state, identical on every rank).
     fn mtp_book(&self, slot: usize) -> Option<TapBook>;
@@ -225,7 +226,7 @@ impl DraftModel for GlmModel {
         GlmModel::has_mtp(self)
     }
     fn flush(&mut self) -> Result<(), ModelError> {
-        GlmModel::flush(self)
+        GlmModel::flush_lazy(self)
     }
     fn mtp_book(&self, slot: usize) -> Option<TapBook> {
         GlmModel::mtp_book(self, slot).cloned()
