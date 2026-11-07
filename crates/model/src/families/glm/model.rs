@@ -373,6 +373,10 @@ impl GlmModel {
         let cr = chunk_rows;
         // every head's state, or a KDA head split rank's heads only (`KdaConfig::rank`: its pools, records and workspace from the start)
         let dims = alloc::dims_of(&cfg).map_err(ModelError::Config)?;
+        // Blackwell programmatic dependent launch (pdl.cuh): a launch may start while its predecessor still runs and reads the
+        // predecessor's writes only after `pdl_wait`, so only timing changes. Default every family (7); `REXL3_GLM_PDL` (0..7) overrides.
+        let pdl = std::env::var("REXL3_GLM_PDL").ok().and_then(|v| v.trim().parse::<i32>().ok()).unwrap_or(7) & 7;
+        gb_cuda::exl3_linear::set_pdl_mask(pdl).map_err(|e| ModelError::Config(format!("pdl mask: {e}")))?;
         let kda_layers: Vec<usize> = (0..layers).filter(|&l| ops::mixer_kind(&cfg, l) == MixerKind::Kda).collect();
         let mla_layers: Vec<usize> = (0..layers).filter(|&l| ops::mixer_kind(&cfg, l) == MixerKind::MlaDsa).collect();
         let mut kda_ord = vec![usize::MAX; layers];

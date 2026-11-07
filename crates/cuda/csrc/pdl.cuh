@@ -12,7 +12,7 @@
 //     launch only when the kernel does.
 //
 // The mask (env REXL3_GLM_PDL, read once; the test hook gb_pdl_set_mask): which kernel families are launched with the attribute.
-// Default 0 (every launch as before) until the in-model ABBA decides.
+// Default 0 here (every launch as before); the GLM and Bailing models set 7 at load unless REXL3_GLM_PDL says otherwise.
 #pragma once
 #include <cuda_runtime.h>
 #include <stdint.h>
