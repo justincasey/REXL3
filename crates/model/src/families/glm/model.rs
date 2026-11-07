@@ -215,8 +215,8 @@ fn p2_shared_side_on() -> bool {
     *ON.get_or_init(|| matches!(std::env::var("REXL3_GLM_P2_SHARED_SIDE").as_deref(), Ok("1" | "on" | "true" | "yes")))
 }
 
-/// `REXL3_GLM_HEAD_ROWS` (`0`/`off` turns it off; on by default): a P1 prompt forward whose last layer is KDA runs that layer's tail on
-/// the head rows alone ([`ops::plan_forward_head_rows`]). Never a bit: a P1 row's bits do not depend on the rows beside it.
+/// `REXL3_GLM_HEAD_ROWS` (`0`/`off` turns it off; on by default): a prompt forward (P1 or P2) whose last layer is KDA runs that layer's
+/// tail on the head rows alone ([`ops::plan_forward_head_rows`]). Never a bit: a P1 or P2 row's bits do not depend on the rows beside it.
 static HEAD_ROWS_ON: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| !matches!(std::env::var("REXL3_GLM_HEAD_ROWS").as_deref(), Ok("0" | "off" | "false" | "no")));
 
@@ -398,7 +398,7 @@ pub struct GlmModel {
     p2_kda_chunked: bool,
     /// Prompt chunks this model ran under the sequence-parallel residual (`run`'s `sp`; the tests' audit).
     sp_chunks: u64,
-    /// A P1 prompt forward whose last layer is KDA runs that layer's tail on the head rows alone (`REXL3_GLM_HEAD_ROWS`, on by default;
+    /// A prompt forward whose last layer is KDA runs that layer's tail on the head rows alone (`REXL3_GLM_HEAD_ROWS`, on by default;
     /// [`GlmModel::set_head_rows`]; see [`GlmModel::head_rows_tail`]).
     head_rows_on: bool,
     /// The group's drafter taps the last trunk layer ([`GlmModel::keep_tapped_rows`]): every row's tail then runs.
@@ -743,7 +743,7 @@ impl GlmModel {
         self.p2_kda_chunked = on;
     }
 
-    /// Run a P1 prompt forward's last-layer tail on the head rows alone (true) or on every row (false); the bits are the same either way.
+    /// Run a prompt forward's last-layer tail on the head rows alone (true) or on every row (false); the bits are the same either way.
     /// Every rank of a group sets the same.
     pub fn set_head_rows(&mut self, on: bool) {
         self.head_rows_on = on;
@@ -760,21 +760,43 @@ impl GlmModel {
         self.head_rows_runs
     }
 
-    /// Whether this prompt forward runs its last layer's tail on the head rows alone ([`ops::plan_forward_head_rows`]): a P1 prompt
-    /// forward whose head is each sequence's last row (or none) and whose rows after the last recurrence nothing else reads (no NextN
-    /// drafter, which taps every row's final norm; no drafter's tap of the last layer; no capture or forced routing; no snapshot inside
-    /// the chunk). Every input is a fact both ranks of a group share, so they skip the same exchanges.
+    /// Whether this prompt forward runs its last layer's tail on the head rows alone ([`ops::plan_forward_head_rows`]): a prompt forward
+    /// (P1, or P2 on its chunked KDA recurrence) whose head is each sequence's last row (or none) and whose rows after the last recurrence
+    /// nothing else reads (no NextN drafter, which taps every row's final norm; no drafter's tap of the last layer; no capture or forced
+    /// routing; no snapshot inside the chunk). Every input is a fact both ranks of a group share, so they skip the same exchanges. Under
+    /// P2 the tail is a P2 forward of the head rows: every P2 op is row-independent at any rows, so they are the whole chunk's bits.
     fn head_rows_tail(&self, b: &RowBatch, mode: Mode, head: Head) -> bool {
         self.head_rows_on
             && mode == Mode::Prefill
             && head != Head::AllRows
-            && !self.prefill.p2_prefill(true)
+            && (!self.prefill.p2_prefill(true) || self.p2_kda_chunked)
             && self.mtp.is_none()
             && !self.last_tapped
             && self.capture.is_none()
             && self.forced.is_none()
             && self.snap_cuts.is_empty()
             && b.n_seq() <= alloc::MAX_ROWS
+    }
+
+    /// The sequence-parallel residual's cut of a forward of `rows` rows in `mode` (`run`'s `sp`): a large P2 prompt chunk on a rank of two
+    /// with the KDA head split ([`tp::GlmTp::p2_row_split`]), never with a capture, forced routing, an image splice, a snapshot inside the
+    /// chunk, a drafter without the taps' relay, a NextN mutant, or `REXL3_GLM_P2_SP` off. `None`: the residual holds every row.
+    fn sp_split(&self, rows: usize, mode: Mode) -> Option<tp::RowSplit> {
+        let p2 = self.prefill.p2_prefill(mode == Mode::Prefill);
+        let big = mode == Mode::Prefill && (rows > alloc::MAX_ROWS || (!self.snap_cuts.is_empty() && self.s.pf.is_some()));
+        let on = p2
+            && big
+            && self.capture.is_none()
+            && self.snap_cuts.is_empty()
+            && self.splice.is_empty()
+            && self.forced.is_none()
+            && (self.dflash.is_none() || self.tap_relay.is_some())
+            && self.mtp.as_ref().is_none_or(|m| m.mutant.is_none())
+            && super::contract::p2_sp_on();
+        if !on {
+            return None;
+        }
+        self.tp.as_ref().filter(|t| t.split_bits() & tp::SPLIT_KDA != 0).and_then(|t| t.p2_row_split(rows))
     }
 
     /// The prefill contract the model's prompt chunks run (`contract.rs`).
@@ -1171,7 +1193,7 @@ impl GlmModel {
         let plan = match self.mutant {
             _ if replay => Vec::new(),
             Some(m) => ops::plan_forward_mutated(&self.cfg, self.layers, head != Head::None, m),
-            // the last layer's tail on the head rows alone (a P1 prompt forward whose last layer is KDA, nothing else reading those rows)
+            // the last layer's tail on the head rows alone (a prompt forward whose last layer is KDA, nothing else reading those rows)
             None if self.head_rows_tail(b, mode, head) => ops::plan_forward_head_rows(&self.cfg, self.layers, head != Head::None)
                 .unwrap_or_else(|| ops::plan_forward(&self.cfg, self.layers, head != Head::None)),
             // the drafter taps the head's mean and norm for every row, with or without logits
@@ -1213,32 +1235,55 @@ impl GlmModel {
     /// [`Op::HeadRows`], after the last KDA layer's recurrence ([`Op::MixerCore`]): each sequence's last row moved to row `i` (sequence
     /// order; row `i`'s source is at or past it, so no move reads a row an earlier one wrote) in everything the tail reads: the streams,
     /// the mixing of the layer's attention site (`post`, `comb`) and the core output (into `kda_out`, from a split rank's own half-width
-    /// rows on the large path, `GlmTp::kda_split_layer`). Returns the batch of those rows alone, each its own sequence.
+    /// rows on P1's large path, `GlmTp::kda_split_layer`). Under P2 a split rank's core rows are gathered with the peer's columns
+    /// (`GlmTp::kda_head_rows_p2`: the full row the P2 o_proj reads), and under the sequence-parallel residual of the forward
+    /// ([`GlmModel::sp_split`]) the rank that owns a head row moves its streams and mixing, the other takes them from it
+    /// (`GlmTp::sp_head_rows`). Returns the batch of those rows alone, each its own sequence.
     fn gather_head_rows(&mut self, b: &RowBatch) -> Result<RowBatch, ModelError> {
         let core = self.kda_dims.v_dim() * 2;
+        let p2 = self.prefill.p2_prefill(true);
+        let sp = self.sp_split(b.rows, Mode::Prefill);
         let GlmModel { s, tp, stream: st, .. } = self;
-        let split_big =
-            b.rows > alloc::MAX_ROWS && tp.as_ref().is_some_and(|t| t.split_bits() & tp::SPLIT_KDA != 0);
+        let split = tp.as_ref().is_some_and(|t| t.split_bits() & tp::SPLIT_KDA != 0);
+        // a split rank's core rows are its own half-width ones (P1's large path), gathered by the P2 o_proj's way (P2)
+        let (split_big, split_p2) = (split && !p2 && b.rows > alloc::MAX_ROWS, split && p2);
         let (xr, pr, cr) = (mhc::ROW * 4, mhc::STREAMS * 4, mhc::STREAMS * mhc::STREAMS * 4);
-        let mut reqs = Vec::with_capacity(b.n_seq());
-        for i in 0..b.n_seq() {
+        let n = b.n_seq();
+        let mut reqs = Vec::with_capacity(n);
+        let (mut moves, mut mine) = (Vec::with_capacity(n), Vec::with_capacity(n));
+        for i in 0..n {
             let last = b.seq_rows(i).end - 1;
+            let owned = sp.is_none_or(|sp| (sp.lo..sp.hi).contains(&last));
             if last != i {
-                s.streams.copy_within(i * xr, last * xr, xr, st)?;
-                s.mhc.post.copy_within(i * pr, last * pr, pr, st)?;
-                s.mhc.comb.copy_within(i * cr, last * cr, cr, st)?;
-                if !split_big {
+                if owned {
+                    s.streams.copy_within(i * xr, last * xr, xr, st)?;
+                    s.mhc.post.copy_within(i * pr, last * pr, pr, st)?;
+                    s.mhc.comb.copy_within(i * cr, last * cr, cr, st)?;
+                }
+                if !split_big && !split_p2 {
                     s.kda_out.copy_within(i * core, last * core, core, st)?;
                 }
             }
             if split_big {
                 tp.as_ref().expect("a split rank").kda_core_row(&mut s.kda_out, i * core, last * core, core, st)?;
             }
+            moves.push((i, last));
+            mine.push(owned);
             reqs.push(gb_engine::RowRequest {
                 slot: b.seq_slot[i] as usize,
                 tokens: vec![b.ids[last] as u32],
                 first_position: b.positions[last] as u64,
             });
+        }
+        if let Some(t) = tp.as_mut() {
+            if sp.is_some() {
+                t.sp_head_rows(&mut s.streams, xr, &mine, st)?;
+                t.sp_head_rows(&mut s.mhc.post, pr, &mine, st)?;
+                t.sp_head_rows(&mut s.mhc.comb, cr, &mine, st)?;
+            }
+            if split_p2 {
+                t.kda_head_rows_p2(&mut s.kda_out, &moves, core / 2, st)?;
+            }
         }
         Ok(RowBatch::from_requests(&reqs))
     }
@@ -1246,6 +1291,7 @@ impl GlmModel {
     #[allow(clippy::too_many_lines, unused_assignments)]
     fn run(&mut self, plan: &[Op], b: &RowBatch, mode: Mode, head: Head, max_pos: usize) -> Result<(), ModelError> {
         let rows = b.rows;
+        let sp = self.sp_split(rows, mode);
         let GlmModel {
             cfg,
             dev,
@@ -1343,21 +1389,7 @@ impl GlmModel {
         // peer's where a layer reads every row (a mixer, the routed experts, the head), never before a dense MLP; the mixers', the dense
         // MLPs' and the experts' outputs are kept on this rank's rows alone (no output swap). Every one of these ops is row-independent,
         // so each row is the same bits on whichever rank computes it. The drafter's taps of the peer's rows cross the link
-        // (`dflash::TapRelay`). Never with a capture, forced routing, an image splice or a snapshot inside the chunk.
-        let sp = if p2
-            && big
-            && !cap
-            && snap_cuts.is_empty()
-            && splice.is_empty()
-            && forced.is_none()
-            && (dflash.is_none() || tap_relay.is_some())
-            && mtp.as_ref().is_none_or(|m| m.mutant.is_none())
-            && super::contract::p2_sp_on()
-        {
-            tp.as_ref().filter(|t| t.split_bits() & tp::SPLIT_KDA != 0).and_then(|t| t.p2_row_split(rows))
-        } else {
-            None
-        };
+        // (`dflash::TapRelay`). Never with a capture, forced routing, an image splice or a snapshot inside the chunk ([`GlmModel::sp_split`]).
         // the rows of the mHC streams this rank keeps (every row without `sp`), and the mHC buffers at its first one
         let (r0, mrows) = sp.map_or((0, rows), |sp| (sp.lo, sp.rows()));
         // (counted once a forward: a forward run in parts starts with the embedding in its first part)
@@ -1486,9 +1518,6 @@ impl GlmModel {
                         Op::MixerCore { layer } => (layer, MixerKind::Kda, true),
                         _ => unreachable!(),
                     };
-                    if core && p2 {
-                        return Err(ModelError::Config("a P2 prompt forward runs its last layer on every row".into()));
-                    }
                     // a KDA layer on a split rank joins the gather inside itself, after its own rows' qkv
                     let kda_join = std::mem::take(&mut gather_pending);
                     if kda_join && kind != MixerKind::Kda {
@@ -1528,7 +1557,7 @@ impl GlmModel {
                                 let segs = kda_segs(b, &kda_descs);
                                 t.kda_split_layer_p2(
                                     ord,
-                                    &w.o,
+                                    (!core).then_some(&w.o),
                                     *kda_dims,
                                     &params,
                                     &mut pools[ord],
@@ -1634,8 +1663,10 @@ impl GlmModel {
                                 }
                             }
                             mark!("kda: P2 prefill (projections, prep, chunked state, norm, commit)");
-                            layers::lin(&w.o, &s.kda_out, &mut s.mixer_out, rows, Dtype::F16, Dtype::F32, &mut s.ws, st, path)?;
-                            mark!("kda: o_proj");
+                            if !core {
+                                layers::lin(&w.o, &s.kda_out, &mut s.mixer_out, rows, Dtype::F16, Dtype::F32, &mut s.ws, st, path)?;
+                                mark!("kda: o_proj");
+                            }
                         }
                         (MixerDevice::Kda(w), MixerKind::Kda) if big => {
                             let ord = kda_ord[layer];
@@ -2049,13 +2080,14 @@ impl GlmModel {
                 }
                 Op::MixerOut { layer } => {
                     // the o_proj of the last KDA layer's core output on the head rows (`gather_head_rows` put them first in `kda_out`): a
-                    // split rank's by K-split partials, as a window's
+                    // P1 split rank's by K-split partials, as a window's; under P2 the full P2 o_proj of the gathered rows (a split rank's
+                    // too: `GlmTp::kda_head_rows_p2`), every row's bits the whole chunk's
                     last_sublayer_was_mixer = true;
                     cur_layer = layer;
                     let MixerDevice::Kda(w) = &layer_of(layer).mixer else {
                         return Err(ModelError::Config(format!("layer {layer} has no KDA mixer")));
                     };
-                    match tp.as_mut().filter(|t| t.split_bits() & tp::SPLIT_KDA != 0) {
+                    match tp.as_mut().filter(|t| !p2 && t.split_bits() & tp::SPLIT_KDA != 0) {
                         Some(t) => {
                             let x = s.kda_out.subview(0, rows * kda_dims.v_dim() * 2);
                             t.split_o(&w.o, &x, rows, &mut s.mixer_out, &mut s.ws, st)?;
