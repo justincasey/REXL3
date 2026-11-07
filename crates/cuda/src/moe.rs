@@ -89,6 +89,23 @@ mod ffi {
             k: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn gb_moe_router_route(
+            x: *const c_void,
+            x_dtype: i32,
+            gate: *const c_void,
+            logits: *mut c_void,
+            sig: *const c_void,
+            bias: *const c_void,
+            pick: *mut c_void,
+            wts: *mut c_void,
+            scale: f32,
+            rows: i32,
+            k: i32,
+            e: i32,
+            topk: i32,
+            done: *mut c_void,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn gb_moe_default_plan(k: i32, n: i32, bits: i32, mats: i32, out: *mut i32) -> i32;
         pub fn gb_moe_swiglu_limit(g: *const c_void, u: *const c_void, a: *mut c_void, n: i64, limit: f32, stream: *mut c_void) -> i32;
         pub fn gb_moe_swiglu_clamped(g: *const c_void, u: *const c_void, a: *mut c_void, n: i64, limit: f32, stream: *mut c_void) -> i32;
@@ -371,6 +388,8 @@ pub struct MoeRouter {
     pub experts: usize,
     pub topk: usize,
     pub scale: f32,
+    /// u32, 0 between launches: the one-launch decode route's count of finished blocks ([`MoeRouter::route`]).
+    done: DevBuf,
 }
 
 impl MoeRouter {
@@ -386,7 +405,15 @@ impl MoeRouter {
         {
             return Err(INVALID);
         }
-        Ok(Self { gate: DevBuf::from_slice(gate_f16)?, bias: DevBuf::from_slice(bias_f32)?, hidden, experts, topk, scale })
+        Ok(Self {
+            gate: DevBuf::from_slice(gate_f16)?,
+            bias: DevBuf::from_slice(bias_f32)?,
+            hidden,
+            experts,
+            topk,
+            scale,
+            done: DevBuf::zeroed(4)?,
+        })
     }
 
     /// The router from device buffers the loader fills: `gate` fp16 `[experts, hidden]` as the pack stores it and `bias` fp32
@@ -404,7 +431,7 @@ impl MoeRouter {
         {
             return Err(INVALID);
         }
-        Ok(Self { gate, bias, hidden, experts, topk, scale })
+        Ok(Self { gate, bias, hidden, experts, topk, scale, done: DevBuf::zeroed(4)? })
     }
 
     /// logits [rows, E] fp16 into `logits`. The same arithmetic at every row count.
@@ -525,6 +552,53 @@ impl MoeRouter {
                 rows as i32,
                 self.experts as i32,
                 self.topk as i32,
+                st.raw(),
+            ))
+        }
+    }
+
+    /// [`MoeRouter::logits`] then [`MoeRouter::select`]: the same logits, picks and weights. A decode or verify window (under 32 rows) runs
+    /// them as one launch, the last block to finish selecting every row (unless a test hook sets the router's blocking).
+    #[allow(clippy::too_many_arguments)]
+    pub fn route(
+        &self,
+        x: &DevBuf,
+        x_dtype: Dtype,
+        rows: usize,
+        tab: &SigmoidTable,
+        logits: &mut DevBuf,
+        pick: &mut DevBuf,
+        wts: &mut DevBuf,
+        st: &Stream,
+    ) -> Result<(), CudaError> {
+        if rows >= 32 || ROUTER_SHAPE.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            self.logits(x, x_dtype, rows, logits, st)?;
+            return self.select(tab, logits, rows, pick, wts, st);
+        }
+        if rows == 0
+            || x.bytes() < rows * self.hidden * x_dtype.size()
+            || logits.bytes() < rows * self.experts * 2
+            || pick.bytes() < rows * self.topk * 4
+            || wts.bytes() < rows * self.topk * 2
+        {
+            return Err(INVALID);
+        }
+        unsafe {
+            check(ffi::gb_moe_router_route(
+                x.ptr(),
+                x_dtype as i32,
+                self.gate.ptr(),
+                logits.ptr(),
+                tab.buf.ptr(),
+                self.bias.ptr(),
+                pick.ptr(),
+                wts.ptr(),
+                self.scale,
+                rows as i32,
+                self.hidden as i32,
+                self.experts as i32,
+                self.topk as i32,
+                self.done.ptr(),
                 st.raw(),
             ))
         }
@@ -1833,8 +1907,7 @@ impl MoeLayer {
         if rows == 0 || rows > s.max_rows || !s.fits(&self.dims, &self.experts) {
             return Err(INVALID);
         }
-        self.router.logits(x, x_dtype, rows, &mut s.logits, st)?;
-        self.router.select(tab, &s.logits, rows, &mut s.pick, &mut s.wts, st)
+        self.router.route(x, x_dtype, rows, tab, &mut s.logits, &mut s.pick, &mut s.wts, st)
     }
 
     /// The routed experts on the picks already in `s` (from `route`, or written by the caller with `MoeScratch::set_picks`).

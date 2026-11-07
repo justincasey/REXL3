@@ -1143,8 +1143,7 @@ impl MoeSubbankLayer {
         if rows == 0 || rows > s.max_rows || s.dims != self.dims {
             return Err(INVALID);
         }
-        self.router.logits(x, x_dtype, rows, &mut s.logits, st)?;
-        self.router.select(tab, &s.logits, rows, &mut s.pick, &mut s.wts, st)
+        self.router.route(x, x_dtype, rows, tab, &mut s.logits, &mut s.pick, &mut s.wts, st)
     }
 }
 
