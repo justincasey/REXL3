@@ -499,11 +499,12 @@ __global__ void __launch_bounds__(128) down_pairs_multi_kernel(const float* __re
 }
 
 // Block (row, 128 columns of the model width), warp k = slot k: y_k = H(sum of the K splits) * svh_down[e_k] (fp32); warp 0 then
-// adds the slots in slot order, acc = fmaf(w_k, y_k, acc) from 0, and the shared expert's output last.
+// adds the slots in slot order, acc = fmaf(w_k, y_k, acc) from 0, and the shared expert's output last. The expert's svh_down row is
+// svh_d + e * D, or, with svh_tab (several banks: a TP rank's width share after the exchange), the address svh_tab[e].
 __global__ void __launch_bounds__(32 * kMaxTopK) down_combine_kernel(
-    const float* __restrict__ Z, const int* __restrict__ pick, const half* __restrict__ svh_d, const half* __restrict__ wts,
-    const float* __restrict__ shared, float* __restrict__ y_pairs, float* __restrict__ out, int P, int D, int SK, int E,
-    int topk) {
+    const float* __restrict__ Z, const int* __restrict__ pick, const half* __restrict__ svh_d, const uint64_t* __restrict__ svh_tab,
+    const half* __restrict__ wts, const float* __restrict__ shared, float* __restrict__ y_pairs, float* __restrict__ out, int P, int D,
+    int SK, int E, int topk) {
     __shared__ float4 part[kMaxTopK][32];
     __shared__ int ok_sh[kMaxTopK];
     pdl_wait();                                  // Z, pick, the weights and the shared output are the predecessors' outputs
@@ -517,7 +518,8 @@ __global__ void __launch_bounds__(32 * kMaxTopK) down_combine_kernel(
         const bool ok = e >= 0 && e < E;
         float o[4] = {0.f, 0.f, 0.f, 0.f};
         if (ok) {
-            down_lane(Z, p, P, D, SK, n, lane, svh_d + (size_t)e * D + n, o);
+            const half* sv = svh_tab ? reinterpret_cast<const half*>(svh_tab[e]) : svh_d + (size_t)e * D;
+            down_lane(Z, p, P, D, SK, n, lane, sv + n, o);
             if (y_pairs) *reinterpret_cast<float4*>(y_pairs + (size_t)p * D + n) = make_float4(o[0], o[1], o[2], o[3]);
         }
         part[k][lane] = make_float4(o[0], o[1], o[2], o[3]);
@@ -767,8 +769,22 @@ GB_EXPORT int gb_moe_down_combine(const void* z, const void* pick, const void* s
     const dim3 grid((unsigned)rows, (unsigned)(D / 128));
     return gbp_pdl::launch_pdl(gbp_pdl::on(gbp_pdl::kMoe), down_combine_kernel, grid, dim3(32 * topk), 0, gb_stream(stream),
                                static_cast<const float*>(z), static_cast<const int*>(pick), static_cast<const half*>(svh_d),
-                               static_cast<const half*>(wts), static_cast<const float*>(shared), static_cast<float*>(y_pairs),
-                               static_cast<float*>(out), P, D, sk, E, topk);
+                               static_cast<const uint64_t*>(nullptr), static_cast<const half*>(wts), static_cast<const float*>(shared),
+                               static_cast<float*>(y_pairs), static_cast<float*>(out), P, D, sk, E, topk);
+}
+
+// gb_moe_down_combine over several banks: pick holds global ids (or -1), svh [E] the device address of each expert's svh_down row (D
+// halves). A TP rank of the width split runs it after the exchange, on the summed K-split partials (sk = 1).
+GB_EXPORT int gb_moe_down_combine_multi(const void* z, const void* pick, const void* svh, const void* wts, const void* shared,
+                                        void* y_pairs, void* out, int rows, int topk, int D, int sk, int E, void* stream) {
+    const int P = rows * topk;
+    if (rows < 1 || topk < 1 || topk > kMaxTopK || D <= 0 || D % 128 || sk < 1 || E < 1 || !z || !pick || !svh || !wts || !out)
+        return (int)cudaErrorInvalidValue;
+    const dim3 grid((unsigned)rows, (unsigned)(D / 128));
+    return gbp_pdl::launch_pdl(gbp_pdl::on(gbp_pdl::kMoe), down_combine_kernel, grid, dim3(32 * topk), 0, gb_stream(stream),
+                               static_cast<const float*>(z), static_cast<const int*>(pick), static_cast<const half*>(nullptr),
+                               static_cast<const uint64_t*>(svh), static_cast<const half*>(wts), static_cast<const float*>(shared),
+                               static_cast<float*>(y_pairs), static_cast<float*>(out), P, D, sk, E, topk);
 }
 
 // a [n] fp16 = swiglu with the limit of g [n] fp32 and u [n] fp32 (limit <= 0: no clamp).
