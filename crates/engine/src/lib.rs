@@ -1741,9 +1741,15 @@ impl<B: Backend> Engine<B> {
         self.backend.set_decode_waiting(decoded || !self.active.is_empty());
         if matches!(self.prefill_policy, PrefillPolicy::Burst { .. }) {
             // every prompt waiting at the start of the step is passed over by it unless it is served (a pick resets its count): the guard
-            // counts steps, not the slices of one step, which are served together
+            // counts steps, not the slices of one step, which are served together. While the backend runs a slice in parts, its parts
+            // are that ONE slice: a prompt waiting behind it is not passed over by each of them (counted so, the prompt behind would be
+            // served before a shorter one when the slice ends, and two long prompts would take turns slice by slice), only the prompt in
+            // flight is, by the prompts that run between its parts
+            let pinned = self.backend.prefill_in_flight().map(|(slot, _)| slot);
             for p in self.prefilling.iter_mut() {
-                p.passed += 1;
+                if pinned.is_none_or(|s| s == p.slot) {
+                    p.passed += 1;
+                }
             }
         }
         if slices >= 2 && self.prefill_batching {
