@@ -1033,21 +1033,25 @@ fn batch_script(m: &mut GlmModel, together: bool, drafts: bool) -> (Vec<u64>, Ve
     (out, d)
 }
 
-/// The rows of the stash of [`pause_script`]'s models: a quarter of the 512-row slice paused, so the slice has rows past the stash.
-const PART_ROOM: usize = 128;
+/// The rows of the stash of [`pause_script`]'s models: less than the 512-row slice paused, so the slice has rows past the stash, and
+/// more than slot 2's prompt, which runs (whole or in parts of its own) while the slice is paused.
+const PART_ROOM: usize = 192;
 
-/// [`pause_script`]'s prompts: slot 0's 200 tokens, slot 1's 900 (its first 512-row slice the forward that pauses), slot 2's 100.
+/// [`pause_script`]'s prompts: slot 0's 200 tokens, slot 1's 900 (its first 512-row slice the forward that pauses), slot 2's 160 (more
+/// than a window's 128 rows: under P2 a row-split forward on two ranks, as a short prompt's in a server is).
 fn pause_prompts() -> Vec<Vec<u32>> {
     let mut r = Rng(0x6a09_e667_f3bc_c908);
-    vec![r.tokens(200), r.tokens(900), r.tokens(100)]
+    vec![r.tokens(200), r.tokens(900), r.tokens(160)]
 }
 
 /// Slot 0's prompt; slot 1's first 512-row slice, paused at the first of `parts` (layer bounds, ascending; none: the slice whole); a
-/// verify window of slot 0 (4 rows, 2 kept); resumed to the next bound; slot 2's whole prompt; resumed to the next; a window of slots 0
-/// and 2; the slice's remaining parts; then the rest of slot 1's prompt and three greedy windows of the three. Every answering call's
-/// digest in call order (the slice does not end its prompt: it answers nothing wherever it pauses), and (with `drafts`) each slot's
-/// drafts after. While paused, a forward of more rows than the stash, one on the paused slot and a second forward in parts are refused.
-fn pause_script(m: &mut GlmModel, parts: &[usize], drafts: bool) -> (Vec<u64>, Vec<Vec<u32>>) {
+/// verify window of slot 0 (4 rows, 2 kept); resumed to the next bound; slot 2's whole prompt, itself paused at `inner`'s bounds (none:
+/// whole) with a window of slot 0 between its parts (both forwards paused while it runs: a short prompt in parts on top of a long one;
+/// the window after slot 2's prompt when it runs whole); resumed to the next; a window of slots 0 and 2; the slice's remaining parts; then
+/// the rest of slot 1's prompt and three greedy windows of the three. Every answering call's digest in call order (the slice does not
+/// end its prompt: it answers nothing wherever it pauses), and (with `drafts`) each slot's drafts after. While paused, a forward of more
+/// rows than the stash and one on the paused slot are refused, and a third forward in parts while two are paused.
+fn pause_script(m: &mut GlmModel, parts: &[usize], inner: &[usize], drafts: bool) -> (Vec<u64>, Vec<Vec<u32>>) {
     let p = pause_prompts();
     let mut sq = Seqs::new();
     let mut out = Vec::new();
@@ -1064,16 +1068,39 @@ fn pause_script(m: &mut GlmModel, parts: &[usize], drafts: bool) -> (Vec<u64>, V
         assert_eq!(m.prefill_paused().map(|b| b.seq_slot.clone()), Some(vec![1]), "the slice is paused");
         let room = m.prefill_part_rows();
         assert!(m.prefill_rows(&slice_of(2, 0, &p[1][..room + 1]), None, usize::MAX).is_err(), "a forward past the stash");
+        assert!(m.prefill_rows(&slice_of(2, 0, &p[1][..room + 1]), None, 1).is_err(), "a forward in parts past the stash");
         assert!(m.prefill_rows(&slice_of(1, CHUNK, &p[1][CHUNK..CHUNK + 16]), None, usize::MAX).is_err(), "a forward on the paused slot");
-        assert!(m.prefill_rows(&slice_of(2, 0, &p[2]), None, 1).is_err(), "a second forward in parts");
     }
     out.push(window(m, &mut sq, &[(0, vec![11, 12, 13], 2)]));
     if let Some(k) = bounds.next() {
         assert!(m.prefill_resume(k).unwrap().is_none());
     }
     m.begin_slot(2).unwrap();
-    let c = m.prefill_chunk(2, 0, &p[2], Some(COUNT)).unwrap().expect("slot 2's candidates");
-    out.push(digest_row(m, &c, 0));
+    // slot 2's answer is digested as soon as it comes back (the digest reads the logits, which the next window overwrites), and pushed
+    // after the window either way
+    let (c, d) = match inner.split_first() {
+        None => {
+            let c = m.prefill_chunk(2, 0, &p[2], Some(COUNT)).unwrap().expect("slot 2's candidates");
+            let d = digest_row(m, &c, 0);
+            out.push(window(m, &mut sq, &[(0, Vec::new(), 1)]));
+            (c, d)
+        }
+        Some((&first, rest)) => {
+            assert!(m.prefill_rows(&slice_of(2, 0, &p[2]), Some(COUNT), first).unwrap().is_none());
+            assert_eq!(m.prefill_paused().map(|b| b.seq_slot.clone()), Some(vec![2]), "slot 2's forward goes on first");
+            if !parts.is_empty() {
+                assert!(m.prefill_rows(&slice_of(0, 200, &p[0][..16]), None, 1).is_err(), "a third forward in parts");
+            }
+            out.push(window(m, &mut sq, &[(0, Vec::new(), 1)]));
+            for &k in rest {
+                assert!(m.prefill_resume(k).unwrap().is_none());
+            }
+            let c = m.prefill_resume(usize::MAX).unwrap().expect("slot 2's candidates");
+            let d = digest_row(m, &c, 0);
+            (c, d)
+        }
+    };
+    out.push(d);
     sq.prompt(2, &p[2], Some((&c, 0)));
     if let Some(k) = bounds.next() {
         assert!(m.prefill_resume(k).unwrap().is_none());
@@ -1227,35 +1254,54 @@ fn p1_several_prompts_in_one_forward_equal_each_prompts_solo_forward() {
 }
 
 /// A prompt forward in parts under `contract` (`model/part.rs`): slot 1's 512-row slice paused at one, two and three layer bounds, with
-/// a verify window of slot 0, slot 2's whole 100-row prompt and a window of slots 0 and 2 run between its parts (the stash holds 128 rows:
-/// the slice's later rows are kept where they are), gives every call the bits of the run with the slice whole, and the same drafts after,
-/// on one model and on the two ranks of the serving split (under P2 the slice row-split across them).
+/// a verify window of slot 0, slot 2's whole 160-row prompt and windows run between its parts (the stash holds 192 rows: the slice's
+/// later rows are kept where they are), and slot 2's prompt itself in parts of its own on top of it (two forwards paused, a window
+/// between) or alone, gives every call the bits of the run with everything whole, and the same drafts after, on one model and on the two
+/// ranks of the serving split (under P2 the slice and slot 2's prompt row-split across them).
 fn a_forward_paused_equals_the_whole_forward(contract: PrefillContract) {
     let Some(dir) = redsnow_dir() else { return };
     let (layers, draft, taps) = prefix_setup();
     assert!(layers >= 4, "parts need a few layers");
     require_available(if layers <= 8 { 60 } else { 80 } * GIB);
     let guard = Guard::start(20 * GIB);
-    let bounds: Vec<Vec<usize>> = vec![vec![layers / 2], vec![2, layers - 3], vec![1, layers / 2, layers - 1]];
+    // (the slice's bounds, slot 2's bounds)
+    let cases: Vec<(Vec<usize>, Vec<usize>)> = vec![
+        (vec![layers / 2], vec![]),
+        (vec![2, layers - 3], vec![]),
+        (vec![1, layers / 2, layers - 1], vec![]),
+        (vec![], vec![layers / 2]),
+        (vec![2, layers - 3], vec![layers / 2]),
+        (vec![1, layers / 2, layers - 1], vec![1, layers - 1]),
+    ];
     let mut a = one_model(contract, &dir, layers, draft.as_deref(), &taps, PART_ROOM);
-    let whole = pause_script(&mut a, &[], true);
-    for parts in &bounds {
-        assert_eq!(pause_script(&mut a, parts, true), whole, "one {contract:?} model: the slice paused at {parts:?} differs from the slice whole");
-    }
-    eprintln!("one {contract:?} model: the slice paused at {bounds:?} == whole ({} answering calls, {} slots' drafts)", whole.0.len(), whole.1.len());
+    let whole = pause_script(&mut a, &[], &[], true);
+    let differs: Vec<String> = cases
+        .iter()
+        .filter_map(|(parts, inner)| {
+            let got = pause_script(&mut a, parts, inner, true);
+            let call = got.0.iter().zip(&whole.0).position(|(x, y)| x != y);
+            (got != whole).then(|| format!("{parts:?}/{inner:?}: first differing call {call:?}, drafts equal {}", got.1 == whole.1))
+        })
+        .collect();
+    assert!(differs.is_empty(), "one {contract:?} model: the slice paused / slot 2's prompt paused differ from everything whole: {differs:?}");
+    eprintln!("one {contract:?} model: paused at {cases:?} == whole ({} answering calls, {} slots' drafts)", whole.0.len(), whole.1.len());
     drop(a);
 
     let (a, b) = two_ranks(contract, &dir, layers, draft.as_deref(), &taps, PART_ROOM);
-    let (r0, r1, a, b) =
-        on_ranks(a, b, |m| std::iter::once(&Vec::new()).chain(&bounds).map(|p| pause_script(m, p, false).0).collect::<Vec<_>>());
+    let all: Vec<(Vec<usize>, Vec<usize>)> = std::iter::once((Vec::new(), Vec::new())).chain(cases.iter().cloned()).collect();
+    let (r0, r1, a, b) = on_ranks(a, b, |m| all.iter().map(|(p, q)| pause_script(m, p, q, false).0).collect::<Vec<_>>());
     assert_eq!(a.sp_chunks(), b.sp_chunks());
     assert_eq!(a.sp_chunks() > 0, contract == PrefillContract::P2, "sp chunks {} (P2's alone)", a.sp_chunks());
-    for (i, parts) in std::iter::once(&Vec::new()).chain(&bounds).enumerate() {
-        assert_eq!((&r0[i], &r1[i]), (&whole.0, &whole.0), "two {contract:?} ranks: the slice paused at {parts:?} differs from the one model's whole");
+    for (i, (parts, inner)) in all.iter().enumerate() {
+        assert_eq!(
+            (&r0[i], &r1[i]),
+            (&whole.0, &whole.0),
+            "two {contract:?} ranks: the slice paused at {parts:?}, slot 2's prompt at {inner:?}, differs from the one model's whole"
+        );
     }
     eprintln!(
-        "A FORWARD IN PARTS BYTE-IDENTICAL ({contract:?}): paused at {bounds:?} with windows and a prompt between == whole, one model and two \
-         ranks ({} sp forwards)",
+        "A FORWARD IN PARTS BYTE-IDENTICAL ({contract:?}): paused at {cases:?} (the slice's bounds, slot 2's) with windows and a prompt \
+         between == whole, one model and two ranks ({} sp forwards)",
         a.sp_chunks()
     );
     drop((a, b));
@@ -1615,8 +1661,8 @@ fn head_rows_script_with(m: &mut GlmModel, layers: usize, first: usize) -> (Vec<
     }
     answers.extend(script(m));
     answers.extend(batch_script(m, true, false).0);
-    answers.extend(pause_script(m, &[], false).0);
-    answers.extend(pause_script(m, &[1, layers / 2, layers - 1], false).0);
+    answers.extend(pause_script(m, &[], &[], false).0);
+    answers.extend(pause_script(m, &[1, layers / 2, layers - 1], &[layers / 2], false).0);
     (answers, states)
 }
 
@@ -1715,7 +1761,8 @@ fn p2_the_last_layers_tail_on_the_head_rows_equals_every_rows() {
     );
     drop(a);
 
-    let (a, b) = serving_ranks(&dir, layers, draft.as_deref(), &taps, PART_ROOM);
+    let split = gb_model::families::glm::dflash::split_on() && draft.is_some();
+    let (a, b) = serving_ranks(&dir, layers, draft.as_deref(), &taps, PART_ROOM, split);
     let (h0, h1, a, b) = on_ranks(a, b, |m| head_rows_script_with(m, layers, first));
     let runs = (a.head_rows_runs(), b.head_rows_runs(), a.sp_chunks());
     let (e0, e1, a, b) = on_ranks(a, b, |m| {

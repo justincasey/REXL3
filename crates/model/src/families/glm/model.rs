@@ -413,10 +413,10 @@ pub struct GlmModel {
     last_tapped: bool,
     /// Prompt forwards that ran the last layer's tail on the head rows alone (the tests' audit).
     head_rows_runs: u64,
-    /// A prompt forward paused at a layer boundary (`prefill_rows` with a layer bound, `part.rs`) and the stash of the rows another
-    /// forward may overwrite while it waits (`enable_prefill_parts`; `None`: parts are off).
-    paused: Option<part::Paused>,
-    stash: Option<part::Stash>,
+    /// The prompt forwards paused at a layer boundary (`prefill_rows` with a layer bound, `part.rs`; a resume goes on with the last) and
+    /// the stashes of the rows another forward may overwrite while one waits (`enable_prefill_parts`; empty: parts are off).
+    paused: Vec<part::Paused>,
+    stash: Vec<part::Stash>,
     /// `REXL3_GLM_PROFILE_SLICES` (`profile_slices.rs`): the forward calls a rank's runtime brackets with the profiler API. Host
     /// counters only; inert without the setting.
     pub(in crate::families::glm) slices: crate::families::glm::profile_slices::SliceProfiler,
@@ -630,8 +630,8 @@ impl GlmModel {
             head_rows_on: *HEAD_ROWS_ON,
             last_tapped: false,
             head_rows_runs: 0,
-            paused: None,
-            stash: None,
+            paused: Vec::new(),
+            stash: Vec::new(),
             slices: crate::families::glm::profile_slices::SliceProfiler::from_env()?,
             cfg,
             dev,
