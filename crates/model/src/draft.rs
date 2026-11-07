@@ -15,7 +15,38 @@ use core::ffi::c_void;
 use gb_cuda::dflash2::{self, DraftCache, DraftCtxLayout, GateDtype, WalkSampling};
 use gb_cuda::exl3_linear::{linear_workspace_bytes, prefill_scratch_bytes, Dtype, Exl3Weights};
 use gb_cuda::q4_linear::{self, Q4Weights};
+use gb_cuda::graph::Graph;
 use gb_cuda::{glue, DevBuf, Stream};
+use std::collections::HashMap;
+
+/// Round graph shapes kept at once (each a few hundred launches; a new shape past the limit runs eagerly).
+const ROUND_GRAPHS: usize = 64;
+
+/// What identifies a captured draft round: every host value its launches take (`Draft::round_launches`): the sequences and the picks
+/// each one asks for, the head (restricted or full), and the target's embedding and head it reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct RoundKey {
+    n: usize,
+    wants: [u8; MAX_DRAFT_SEQS],
+    use_sub: bool,
+    embed: usize,
+    head: usize,
+}
+
+enum RoundSlot {
+    /// Seen once: the next round of the shape is captured.
+    Seen,
+    Ready(Graph),
+    /// The capture failed: eager rounds.
+    Eager,
+}
+
+/// The draft's round graphs and the stream they are captured on.
+#[derive(Default)]
+struct RoundGraphs {
+    slots: HashMap<RoundKey, RoundSlot>,
+    cap: Option<Stream>,
+}
 
 pub const BLOCK: usize = 8;
 /// Most sequences one batched draft round carries (its rows go through the decode kernels, which take at most 128).
@@ -330,6 +361,8 @@ pub struct Draft {
     /// The host bytes of the round's and the absorbs' index uploads, queued on the stream in its order (the host does not wait for the
     /// work queued before them) and kept until the stream has run them.
     stage: gb_cuda::rt::HostStage,
+    /// The draft rounds' CUDA graphs (`Draft::round_graphed`).
+    rounds: RoundGraphs,
 }
 
 fn load_exl3<'p>(
@@ -702,6 +735,7 @@ impl Draft {
             capture_lattice: false,
             edge: None,
             stage: gb_cuda::rt::HostStage::new(),
+            rounds: RoundGraphs::default(),
         };
         Ok((d, bytes))
     }
@@ -1042,6 +1076,122 @@ impl Draft {
         if capture && self.edge.is_none() {
             self.edge = Some(DevBuf::zeroed(self.max_seqs * (self.block - 1) * SELECTOR_TOP_K * SELECTOR_TOP_K * 4)?);
         }
+        let nd = row_off[n] as usize;
+        self.head_rounds[use_sub as usize] += 1;
+        if capture {
+            self.round_launches(embed, head, vocab, &wants, use_sub, true, stream)?;
+        } else {
+            self.round_graphed(embed, head, vocab, &wants, use_sub, stream)?;
+        }
+        let Draft { stage, out_tokens, conf, margin, top_ids, top_vals, edge, .. } = self;
+        stage.sync(stream)?;
+        let mut t = vec![0i32; nd];
+        out_tokens.download(&mut t)?;
+        let mut c = vec![0f32; nd];
+        conf.download(&mut c)?;
+        let mut m = vec![0f32; nd];
+        margin.download(&mut m)?;
+        let lat = if capture {
+            let mut ids = vec![0i32; nd * SELECTOR_TOP_K];
+            top_ids.download(&mut ids)?;
+            let mut vals = vec![0f32; nd * SELECTOR_TOP_K];
+            top_vals.download(&mut vals)?;
+            let mut ed = vec![0f32; nd * SELECTOR_TOP_K * SELECTOR_TOP_K];
+            edge.as_ref().expect("allocated above").download(&mut ed)?;
+            Some((ids, vals, ed))
+        } else {
+            None
+        };
+        Ok((0..n)
+            .map(|s| {
+                let (a, b) = (row_off[s] as usize, row_off[s + 1] as usize);
+                let k = SELECTOR_TOP_K;
+                let lattice = lat.as_ref().map(|(ids, vals, ed)| Lattice {
+                    rows: b - a,
+                    k,
+                    ids: ids[a * k..b * k].iter().map(|&x| x as u32).collect(),
+                    unary: vals[a * k..b * k].to_vec(),
+                    edge: ed[a * k * k..b * k * k].to_vec(),
+                    restricted_head: use_sub,
+                });
+                Picked {
+                    tokens: t[a..b].iter().map(|&x| x as u32).collect(),
+                    score: c[a..b].to_vec(),
+                    margin: m[a..b].to_vec(),
+                    lattice,
+                }
+            })
+            .collect())
+    }
+
+    /// A round's launches through the round graphs: the first round of a shape runs eagerly, the second is captured (on the draft's
+    /// own capture stream) and launched, every later one replays the graph. Only the host values that reach a launcher are in the
+    /// key (sequences and each one's picks, the head); every other input of the round is read from the draft's device buffers, which
+    /// the round's uploads rewrote in place. A shape whose capture fails runs eagerly from then on.
+    fn round_graphed(
+        &mut self,
+        embed: &DevBuf,
+        head: &Exl3Weights,
+        vocab: usize,
+        wants: &[usize],
+        use_sub: bool,
+        stream: &Stream,
+    ) -> Result<(), ModelError> {
+        let mut w = [0u8; MAX_DRAFT_SEQS];
+        for (d, &s) in w.iter_mut().zip(wants) {
+            *d = s as u8;
+        }
+        let key = RoundKey { n: wants.len(), wants: w, use_sub, embed: embed.ptr() as usize, head: head as *const _ as usize };
+        match self.rounds.slots.get(&key) {
+            Some(RoundSlot::Ready(g)) => return Ok(g.launch(stream)?),
+            Some(RoundSlot::Eager) => return self.round_launches(embed, head, vocab, wants, use_sub, false, stream),
+            Some(RoundSlot::Seen) => {}
+            None => {
+                if self.rounds.slots.len() < ROUND_GRAPHS {
+                    self.rounds.slots.insert(key, RoundSlot::Seen);
+                }
+                return self.round_launches(embed, head, vocab, wants, use_sub, false, stream);
+            }
+        }
+        let cap = match self.rounds.cap.take() {
+            Some(c) => c,
+            None => Stream::new()?,
+        };
+        let captured = Graph::capture(&cap, || self.round_launches(embed, head, vocab, wants, use_sub, false, &cap));
+        self.rounds.cap = Some(cap);
+        match captured {
+            Ok(g) => {
+                g.launch(stream)?;
+                self.rounds.slots.insert(key, RoundSlot::Ready(g));
+                Ok(())
+            }
+            Err(e) => {
+                if let Some(fatal) = e.fatal() {
+                    return Err(ModelError::Cuda(fatal.clone()));
+                }
+                eprintln!("rexl3 level=warn event=draft_round_capture_failed rows={} (this round shape runs eagerly)", wants.len());
+                self.rounds.slots.insert(key, RoundSlot::Eager);
+                self.round_launches(embed, head, vocab, wants, use_sub, false, stream)
+            }
+        }
+    }
+
+    /// The launches of a draft round on `stream` (the index arrays already uploaded): the block's layers, the head over each sequence's
+    /// first `wants[s]` picks, the top-k, the selector walk, and with `edges` the lattice's edge terms.
+    #[allow(clippy::too_many_arguments)]
+    fn round_launches(
+        &mut self,
+        embed: &DevBuf,
+        head: &Exl3Weights,
+        vocab: usize,
+        wants: &[usize],
+        use_sub: bool,
+        edges: bool,
+        stream: &Stream,
+    ) -> Result<(), ModelError> {
+        let n = wants.len();
+        let nd: usize = wants.iter().sum();
+        let block = self.block;
         let Draft {
             dims,
             layers,
@@ -1084,11 +1234,10 @@ impl Draft {
             walk,
             row_off: row_off_d,
             sub,
-            head_rounds,
             edge,
-            stage,
             ..
         } = self;
+        let capture = edges;
         let rows = n * block;
         let (hd, eps, dw) = (dims.hidden, dims.eps, dims.dyn_width());
         let prep = dims.attn_prep();
@@ -1172,7 +1321,6 @@ impl Draft {
                 at += want;
             }
         }
-        let nd = row_off[n] as usize;
         // a head whose last columns are padding (GLM's 24): the top-k never reads them (`topk_valid`); one without keeps `topk`
         let topk = |logits: &DevBuf, cols: usize, valid: usize, top_ids: &mut DevBuf, top_vals: &mut DevBuf, top_ws: &mut DevBuf| unsafe {
             if valid < cols {
@@ -1194,7 +1342,6 @@ impl Draft {
         };
         let pad = vocab - dims.valid_vocab;
         // the head over every column, or over the restricted set (whose top-k ids are then mapped back to token ids)
-        head_rounds[use_sub as usize] += 1;
         match sub.as_mut().filter(|_| use_sub) {
             None => {
                 head.forward(sel, logits, nd, Dtype::BF16, Dtype::BF16, &mut lin.ws, stream)?;
@@ -1249,44 +1396,7 @@ impl Draft {
                 stream,
             )?;
         }
-        stage.sync(stream)?;
-        let mut t = vec![0i32; nd];
-        out_tokens.download(&mut t)?;
-        let mut c = vec![0f32; nd];
-        conf.download(&mut c)?;
-        let mut m = vec![0f32; nd];
-        margin.download(&mut m)?;
-        let lat = if capture {
-            let mut ids = vec![0i32; nd * SELECTOR_TOP_K];
-            top_ids.download(&mut ids)?;
-            let mut vals = vec![0f32; nd * SELECTOR_TOP_K];
-            top_vals.download(&mut vals)?;
-            let mut ed = vec![0f32; nd * SELECTOR_TOP_K * SELECTOR_TOP_K];
-            edge.as_ref().expect("allocated above").download(&mut ed)?;
-            Some((ids, vals, ed))
-        } else {
-            None
-        };
-        Ok((0..n)
-            .map(|s| {
-                let (a, b) = (row_off[s] as usize, row_off[s + 1] as usize);
-                let k = SELECTOR_TOP_K;
-                let lattice = lat.as_ref().map(|(ids, vals, ed)| Lattice {
-                    rows: b - a,
-                    k,
-                    ids: ids[a * k..b * k].iter().map(|&x| x as u32).collect(),
-                    unary: vals[a * k..b * k].to_vec(),
-                    edge: ed[a * k * k..b * k * k].to_vec(),
-                    restricted_head: use_sub,
-                });
-                Picked {
-                    tokens: t[a..b].iter().map(|&x| x as u32).collect(),
-                    score: c[a..b].to_vec(),
-                    margin: m[a..b].to_vec(),
-                    lattice,
-                }
-            })
-            .collect())
+        Ok(())
     }
 }
 
