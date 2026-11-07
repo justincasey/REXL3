@@ -54,6 +54,10 @@ pub const ATOMS: usize = 32;
 pub const PART_FLOATS_PER_ROW: usize = ATOMS * 32;
 /// Rows a single launch accepts.
 pub const MAX_ROWS: usize = 65535;
+/// Rows of a slab of [`apply_partials_finalize`] in a prompt chunk: 256 rows of streams (16 MiB) stay in the GB10's L2 between a slab's
+/// apply-partials and its finalize. Measured on the GB10 (`tests/mhc.rs` with `REXL3_BENCH_SLABS=1`), the pair at 2,048 rows: 2.10 ms
+/// whole, 1.99 / 1.89 / 1.85 / 1.94 / 2.20 ms in slabs of 128 / 192 / 256 / 320 / 512.
+pub const SLAB_ROWS: usize = 256;
 
 /// Element type of an activation / weight buffer handed to a kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -406,6 +410,42 @@ pub unsafe fn finalize(
         cfg.sinkhorn_iters,
         stream.raw(),
     ))
+}
+
+/// [`apply_partials`] of `next` followed by `next`'s [`finalize`] (with `norm_w`, into `out` of `out_ty`), in slabs of `slab` rows:
+/// each slab's apply-partials, then its finalize, which re-reads the slab's streams while the L2 still holds them (over a whole prompt
+/// chunk the finalize reads them back from DRAM). Both kernels are row-independent and `post`, `comb`, `part` and `out` are per row (a
+/// slab's finalize overwrites only post and comb rows its own apply has read), so the bits are those of the two calls over every row.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn apply_partials_finalize(
+    x: *mut f32,
+    y: *const c_void,
+    y_ty: Ty,
+    post: *mut f32,
+    comb: *mut f32,
+    next: &MhcSite,
+    part: *mut f32,
+    norm_w: Option<*const f32>,
+    out: *mut c_void,
+    out_ty: Ty,
+    rows: usize,
+    slab: usize,
+    cfg: &MhcCfg,
+    norm_eps: f32,
+    stream: &Stream,
+) -> Result<(), CudaError> {
+    let slab = slab.max(1);
+    let mut r0 = 0;
+    while r0 < rows {
+        let n = (rows - r0).min(slab);
+        let xs = x.add(r0 * ROW);
+        let (ps, cs, pt) = (post.add(r0 * STREAMS), comb.add(r0 * STREAMS * STREAMS), part.add(r0 * PART_FLOATS_PER_ROW));
+        apply_partials(xs, (y as *const u8).add(r0 * HIDDEN * y_ty.size()) as *const c_void, y_ty, ps, cs, next, pt, n, Tune::AUTO, stream)?;
+        let o = (out as *mut u8).add(r0 * HIDDEN * out_ty.size()) as *mut c_void;
+        finalize(xs, pt, next, norm_w, ps, cs, None, o, out_ty, n, cfg, norm_eps, stream)?;
+        r0 += n;
+    }
+    Ok(())
 }
 
 /// `x[h] <- post[h] y + sum_g comb[g][h] x[g]` in place; `y` `[rows][4096]` of `y_ty`.

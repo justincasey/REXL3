@@ -1446,6 +1446,8 @@ impl GlmModel {
         };
         // the KDA layers' prefill descriptors, one per sequence of the forward, uploaded by the first one and kept for the forward
         let mut kda_descs: Vec<DevBuf> = Vec::new();
+        // a site whose finalize already ran with the apply-partials before it (`mhc::apply_partials_finalize`, an op pair of a large chunk)
+        let mut finalized = None;
         // under `sp`: a gather of the peer's hidden rows is in flight on the exchange stream (`GlmTp::sp_gather_begin`); the first op that
         // reads the peer's rows (or exchanges anything) joins it first
         let mut gather_pending = false;
@@ -1499,27 +1501,29 @@ impl GlmModel {
                     mhc::partials(x, site_of(site), part, mrows, Tune::AUTO, st)?;
                 },
                 Op::Finalize(site) => {
-                    let l = layer_of(site.layer);
-                    let norm = match site.kind {
-                        SiteKind::Attn => &l.input_norm,
-                        SiteKind::Ffn => &l.post_norm,
-                    };
-                    unsafe {
-                        mhc::finalize(
-                            x,
-                            part,
-                            site_of(site),
-                            Some(norm.ptr() as *const f32),
-                            post,
-                            comb,
-                            None,
-                            hidden_at,
-                            Ty::F16,
-                            mrows,
-                            &MhcCfg::GLM53,
-                            RMS_EPS,
-                            st,
-                        )?;
+                    if finalized.take() != Some(site) {
+                        let l = layer_of(site.layer);
+                        let norm = match site.kind {
+                            SiteKind::Attn => &l.input_norm,
+                            SiteKind::Ffn => &l.post_norm,
+                        };
+                        unsafe {
+                            mhc::finalize(
+                                x,
+                                part,
+                                site_of(site),
+                                Some(norm.ptr() as *const f32),
+                                post,
+                                comb,
+                                None,
+                                hidden_at,
+                                Ty::F16,
+                                mrows,
+                                &MhcCfg::GLM53,
+                                RMS_EPS,
+                                st,
+                            )?;
+                        }
                     }
                     // under `sp`, the peer's hidden rows swapped in where the next op reads every row (not a dense MLP: per row), on the
                     // exchange stream while the main stream runs what reads only this rank's rows (the router, a KDA layer's own rows)
@@ -2589,8 +2593,38 @@ impl GlmModel {
                     }
                 }
                 Op::ApplyPartials { next } => {
-                    unsafe {
-                        mhc::apply_partials(x, mixer_out_at, Ty::F32, post, comb, site_of(next), part, mrows, Tune::AUTO, st)?;
+                    // a large chunk's apply-partials and the next site's finalize right after it run in slabs of rows, each slab's
+                    // finalize re-reading its streams from the L2 (row-independent kernels, per-row scratch: the same bits as the two ops)
+                    if !cap && mrows > mhc::SLAB_ROWS && plan.get(i + 1) == Some(&Op::Finalize(next)) {
+                        let l = layer_of(next.layer);
+                        let norm = match next.kind {
+                            SiteKind::Attn => &l.input_norm,
+                            SiteKind::Ffn => &l.post_norm,
+                        };
+                        unsafe {
+                            mhc::apply_partials_finalize(
+                                x,
+                                mixer_out_at,
+                                Ty::F32,
+                                post,
+                                comb,
+                                site_of(next),
+                                part,
+                                Some(norm.ptr() as *const f32),
+                                hidden_at,
+                                Ty::F16,
+                                mrows,
+                                mhc::SLAB_ROWS,
+                                &MhcCfg::GLM53,
+                                RMS_EPS,
+                                st,
+                            )?;
+                        }
+                        finalized = Some(next);
+                    } else {
+                        unsafe {
+                            mhc::apply_partials(x, mixer_out_at, Ty::F32, post, comb, site_of(next), part, mrows, Tune::AUTO, st)?;
+                        }
                     }
                     if cap {
                         capture_streams(capture.as_mut().unwrap(), &s.streams, st, rows, last_sublayer_was_mixer, cur_layer)?;

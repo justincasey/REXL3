@@ -1497,6 +1497,90 @@ fn bench_mhc_kernels() {
     }
 }
 
+/// `apply_partials_finalize` in slabs: the bits of `apply_partials` over every row followed by `finalize` over every row (streams, post,
+/// comb, the normed output), for slabs that divide the rows and slabs that leave a remainder; and its time against the two whole calls at
+/// a prompt chunk's rows (`--ignored --nocapture`: REXL3_BENCH_SLABS=1 prints it).
+#[test]
+fn slabbed_apply_partials_finalize_equals_the_whole_calls() {
+    gpu!();
+    let st = Stream::new().unwrap();
+    let mut rng = Rng(17);
+    let (cur, next) = (make_site(31), make_site(32));
+    let nw = up(&(0..HIDDEN).map(|_| rng.uniform(0.5, 1.5)).collect::<Vec<f32>>());
+    let bench = std::env::var("REXL3_BENCH_SLABS").is_ok();
+    for rows in if bench { vec![300usize, 2048, 4096] } else { vec![300usize] } {
+        let x0 = synth_streams(&mut rng, rows.min(512), 3.0).iter().cycle().take(rows * ROW).cloned().collect::<Vec<f32>>();
+        let y = up(&synth_rows(&mut rng, rows, 1.0));
+        let w0 = MhcWork::new(rows).unwrap();
+        let h0 = up(&vec![0u16; rows * HIDDEN]);
+        let x_init = up(&x0);
+        // a previous site's post and comb for every row
+        unsafe {
+            mhc::partials(fp(&x_init), &cur.dev, fm(&w0.part), rows, Tune::AUTO, &st).unwrap();
+            mhc::finalize(fp(&x_init), fp(&w0.part), &cur.dev, None, fm(&w0.post), fm(&w0.comb), None, h0.ptr(), Ty::F16, rows, &CFG, NORM_EPS, &st)
+                .unwrap();
+        }
+        let (post0, comb0): (Vec<f32>, Vec<f32>) = (w0.post.to_vec().unwrap(), w0.comb.to_vec().unwrap());
+        let run = |slab: Option<usize>| {
+            let (xd, mut w, out) = (up(&x0), MhcWork::new(rows).unwrap(), up(&vec![0u16; rows * HIDDEN]));
+            w.post.upload(&post0).unwrap();
+            w.comb.upload(&comb0).unwrap();
+            let go = || unsafe {
+                match slab {
+                    None => {
+                        mhc::apply_partials(fm(&xd), vp(&y), Ty::F32, fp(&w.post), fp(&w.comb), &next.dev, fm(&w.part), rows, Tune::AUTO, &st)
+                            .unwrap();
+                        mhc::finalize(fp(&xd), fp(&w.part), &next.dev, Some(fp(&nw)), fm(&w.post), fm(&w.comb), None, out.ptr(), Ty::F16, rows, &CFG, NORM_EPS, &st)
+                            .unwrap();
+                    }
+                    Some(s) => mhc::apply_partials_finalize(
+                        fm(&xd),
+                        vp(&y),
+                        Ty::F32,
+                        fm(&w.post),
+                        fm(&w.comb),
+                        &next.dev,
+                        fm(&w.part),
+                        Some(fp(&nw)),
+                        out.ptr(),
+                        Ty::F16,
+                        rows,
+                        s,
+                        &CFG,
+                        NORM_EPS,
+                        &st,
+                    )
+                    .unwrap(),
+                }
+            };
+            go();
+            st.sync().unwrap();
+            let got = (xd.to_vec::<f32>().unwrap(), w.post.to_vec::<f32>().unwrap(), w.comb.to_vec::<f32>().unwrap(), out.to_vec::<u16>().unwrap());
+            let mut ms = 0.0;
+            if bench {
+                // (the streams keep moving: every call applies another update; only the time is read)
+                let t = std::time::Instant::now();
+                for _ in 0..20 {
+                    go();
+                }
+                st.sync().unwrap();
+                ms = t.elapsed().as_secs_f64() * 1e3 / 20.0;
+            }
+            (got, ms)
+        };
+        let (want, ms_whole) = run(None);
+        for slab in [64usize, 100, 128, 192, 256, 320, 384, 512] {
+            let (got, ms) = run(Some(slab));
+            assert!(bits_eq(&got.0, &want.0), "streams, {rows} rows, slab {slab}");
+            assert!(bits_eq(&got.1, &want.1) && bits_eq(&got.2, &want.2), "post / comb, {rows} rows, slab {slab}");
+            assert_eq!(got.3, want.3, "normed output, {rows} rows, slab {slab}");
+            if bench {
+                eprintln!("apply+partials+finalize {rows} rows: whole {ms_whole:.3} ms, slabs of {slab} {ms:.3} ms");
+            }
+        }
+    }
+}
+
 /// One forward's mHC chain for 45 layers x 2 sites in a CUDA graph (activations between sites omitted), per variant:
 ///   unfused : partials, finalize (collapsed bf16), rmsnorm (glue), apply          = 4 launches per site, 8 per layer (the oracle's count)
 ///   norm    : partials, finalize + norm, apply                                      = 3 per site, 6 per layer
