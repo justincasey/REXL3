@@ -132,9 +132,16 @@ impl Backend for Routed {
         self.hurt(prompt.len(), done, candidates, &mut step);
         step
     }
-    fn prefill_slices(&mut self, jobs: &[PrefillJob<'_>]) -> Vec<PrefillStep> {
+    fn prefill_slices(&mut self, jobs: &[PrefillJob<'_>]) -> Vec<CutStep> {
         self.log.borrow_mut().push(Ev::Batch(jobs.iter().map(|j| j.prompt.len()).collect()));
         for j in jobs {
+            if !j.cuts.is_empty() {
+                self.violations.borrow_mut().push(format!(
+                    "the prompt of {} tokens was put in a batch with cuts {:?}",
+                    j.prompt.len(),
+                    j.cuts
+                ));
+            }
             if self.restored[j.slot] {
                 self.violations
                     .borrow_mut()
@@ -146,7 +153,7 @@ impl Backend for Routed {
                 // what the real backend does with a job it cannot batch: its own `prefill_slice`
                 let mut step = self.inner.prefill_slice(j.slot, j.prompt, j.images, j.done, j.candidates);
                 self.hurt(j.prompt.len(), j.done, j.candidates, &mut step);
-                step
+                CutStep { step, captured: Vec::new() }
             })
             .collect()
     }

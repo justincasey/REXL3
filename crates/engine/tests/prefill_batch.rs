@@ -3,8 +3,8 @@
 
 use gb_engine::mock::{ChainDrafter, Fault, MockBackend};
 use gb_engine::{
-    Backend, BackendError, Drafter, Engine, EngineConfig, ImageSpan, PrefillJob, PrefillPolicy, PrefillStep, Request, RowOutput,
-    RowRequest, StepError,
+    Backend, BackendError, CutStep, Drafter, Engine, EngineConfig, ImageSpan, PrefillJob, PrefillPolicy, PrefillStep, Request,
+    RowOutput, RowRequest, StepError,
 };
 use gb_sampling::Sampling;
 use gb_sched::{Admission, CostModel, ModelMemory};
@@ -53,7 +53,7 @@ impl Backend for Batching {
         self.log.borrow_mut().singles += 1;
         self.inner.prefill_slice(slot, prompt, images, done, candidates)
     }
-    fn prefill_slices(&mut self, jobs: &[PrefillJob<'_>]) -> Vec<PrefillStep> {
+    fn prefill_slices(&mut self, jobs: &[PrefillJob<'_>]) -> Vec<CutStep> {
         self.log.borrow_mut().batches.push(jobs.len());
         if self.fatal {
             self.error = Some(BackendError::fatal("injected fatal error in a batched prefill"));
@@ -67,7 +67,7 @@ impl Backend for Batching {
                     }
                     self.error.get_or_insert(BackendError::retryable("injected failure of one prompt"));
                 }
-                step
+                CutStep { step, captured: Vec::new() }
             })
             .collect()
     }

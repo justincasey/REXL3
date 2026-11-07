@@ -344,7 +344,7 @@ impl Backend for QwenBackend {
     /// time on. Every prompt comes out with the bits its own `prefill_slice` gives it (`Model::prefill_batch`), and one that cannot be
     /// served with the others is prefilled on its own, so a failure belongs to the prompt that has it. Everything else (a long prompt, a
     /// resumed one, one with images) takes `prefill_slice`, in job order.
-    fn prefill_slices(&mut self, jobs: &[PrefillJob<'_>]) -> Vec<PrefillStep> {
+    fn prefill_slices(&mut self, jobs: &[PrefillJob<'_>]) -> Vec<CutStep> {
         let short = |j: &PrefillJob<'_>| {
             j.done == 0 && j.images.is_empty() && j.prompt.len() <= PrefillPath::GEMV_MAX_PROMPT && j.prompt.len() <= self.chunk
         };
@@ -403,9 +403,12 @@ impl Backend for QwenBackend {
         }
         jobs.iter()
             .enumerate()
-            .map(|(i, j)| match out[i].take() {
-                Some(step) => step,
-                None => self.prefill_slice(j.slot, j.prompt, j.images, j.done, j.candidates),
+            .map(|(i, j)| {
+                let step = match out[i].take() {
+                    Some(step) => step,
+                    None => self.prefill_slice(j.slot, j.prompt, j.images, j.done, j.candidates),
+                };
+                CutStep { step, captured: Vec::new() }
             })
             .collect()
     }

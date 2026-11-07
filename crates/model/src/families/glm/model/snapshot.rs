@@ -7,17 +7,24 @@
 //! starts the slot over (`begin_slot`), shares the snapshot's full pages by reference, copies the partial last page (latent cache AND pool plane of every
 //! layer, the NextN layer's included: copy-on-write at attach), and writes the rest back. Nothing here is allocated while serving.
 //!
+//! A model with the DFlash2 drafter (rank 0 of a group) also keeps the drafter's context window with each snapshot: the ring rows of the last
+//! [`DraftCtxLayout::WINDOW`] positions before the cut (`Draft::save_window`), put back by the restore (`Draft::load_window`), so drafts after a hit
+//! read what a cold prefill of the same tokens leaves. It is this rank's alone: the slot bytes two ranks compare are the trunk's
+//! ([`GlmModel::prefix_snapshot_bytes`]), and the content digest does not cover it (a draft only proposes: it moves no committed bit).
+//!
 //! Why the result is bit-identical to a cold prefill of the same tokens: every row a chunk writes (KV latent, pooled keys, the NextN entries) is a
 //! function of its token and the rows before it, whatever the chunk grid (`docs/GLM53.md`, "Prefill"); the recurrent state and the conv history are the
 //! committed state after those rows; the only other thing the next row reads is the ring tail and the drafter's carry, which are copied.
 
 use super::{DevBuf, GlmModel, SpliceOp, TapBook};
+use crate::draft::Draft;
 use crate::error::ModelError;
 use crate::families::glm::alloc::MTP_TAP_CAP;
 use crate::families::glm::config::GlmConfig;
 use crate::families::glm::prefix::{self, SnapLayout, MAX_TAIL_ROWS, RING_ROW_BYTES};
 use crate::forward::Candidates;
 use crate::kvtables::BLOCK_TOKENS;
+use gb_cuda::dflash2::DraftCtxLayout;
 use gb_cuda::{dsa, kda, Stream};
 
 /// What a snapshot slot says about itself.
@@ -31,6 +38,8 @@ pub struct SnapMeta {
     /// The snapshot's content digest ([`GlmModel::seal_snapshot`]), once sealed: a restore of it must leave the slot in a state of the same
     /// digest ([`GlmModel::prefix_state_digest`]), or it is refused and the prompt prefilled cold.
     pub digest: Option<u64>,
+    /// The drafter's context window kept with the snapshot: positions `lo..lo + n` (`None`: no drafter, or the ring did not hold them).
+    pub win: Option<(usize, usize)>,
 }
 
 /// A snapshot to take INSIDE the prefill chunk being run (`GlmModel::prefill_chunk_cuts`): the state of the slot after the first `row` rows of the chunk
@@ -54,6 +63,8 @@ pub struct SnapPool {
     ring: DevBuf,
     /// `[slots][hidden]` fp16: the drafter's carry (only with the NextN layer).
     carry: Option<DevBuf>,
+    /// Per DFlash2 draft layer, `[slots][WINDOW]` ring rows of K and of V (only on a model with the drafter).
+    win: Option<(Vec<DevBuf>, Vec<DevBuf>)>,
     free: Vec<u32>,
     meta: Vec<Option<SnapMeta>>,
 }
@@ -64,7 +75,8 @@ impl SnapPool {
         prefix::snapshot_bytes(cfg, mtp).map_err(ModelError::Config)
     }
 
-    pub fn new(cfg: &GlmConfig, slots: usize, mtp: bool) -> Result<Self, ModelError> {
+    /// The pool of `slots` snapshot slots of the trunk's state, each with the DFlash2 drafter's context window when `dflash` (a model that drafts with it).
+    pub fn new(cfg: &GlmConfig, slots: usize, mtp: bool, dflash: bool) -> Result<Self, ModelError> {
         if slots == 0 {
             return Err(ModelError::Config("a prefix cache needs at least one snapshot slot".into()));
         }
@@ -77,13 +89,39 @@ impl SnapPool {
         }
         let ring = DevBuf::alloc(slots * layout.ring_bytes() as usize)?;
         let carry = if mtp { Some(DevBuf::alloc(slots * layout.carry as usize)?) } else { None };
-        Ok(Self { slots, layout, kda_s, kda_conv, ring, carry, free: (0..slots as u32).rev().collect(), meta: vec![None; slots] })
+        let win = if dflash {
+            let per_layer = slots * DraftCtxLayout::WINDOW * Draft::RING_ROW_BYTES;
+            let (mut k, mut v) = (Vec::new(), Vec::new());
+            for _ in 0..crate::draft::LAYERS {
+                k.push(DevBuf::alloc(per_layer)?);
+                v.push(DevBuf::alloc(per_layer)?);
+            }
+            Some((k, v))
+        } else {
+            None
+        };
+        Ok(Self {
+            slots,
+            layout,
+            kda_s,
+            kda_conv,
+            ring,
+            carry,
+            win,
+            free: (0..slots as u32).rev().collect(),
+            meta: vec![None; slots],
+        })
     }
 
-    /// Bytes allocated on the device.
+    /// Bytes allocated on the device for the trunk's state (what two ranks of a group compare: the drafter's window is rank 0's alone).
     pub fn allocated_bytes(&self) -> u64 {
         let sum = |v: &[DevBuf]| v.iter().map(|b| b.bytes() as u64).sum::<u64>();
         sum(&self.kda_s) + sum(&self.kda_conv) + self.ring.bytes() as u64 + self.carry.as_ref().map_or(0, |c| c.bytes() as u64)
+    }
+
+    /// Bytes allocated on the device for the drafter's windows (0 without the drafter).
+    pub fn window_bytes(&self) -> u64 {
+        self.win.as_ref().map_or(0, |(k, v)| k.iter().chain(v).map(|b| b.bytes() as u64).sum())
     }
 
     pub fn free_count(&self) -> usize {
@@ -166,6 +204,21 @@ impl SnapPool {
     fn ring_off(&self, snap: u32, layer: usize) -> usize {
         (snap as usize * self.layout.ring_layers + layer) * MAX_TAIL_ROWS * RING_ROW_BYTES
     }
+
+    /// Copy `draft`'s context ring rows of positions `lo..lo + n` of `slot` (`win`) into snapshot `snap`'s window, and return what it holds:
+    /// `None` (nothing copied) without a drafter, a pool without windows or no window to keep.
+    pub(super) fn save_window(
+        &mut self,
+        snap: u32,
+        draft: Option<&Draft>,
+        slot: usize,
+        win: Option<(usize, usize)>,
+        st: &Stream,
+    ) -> Result<Option<(usize, usize)>, ModelError> {
+        let (Some((k, v)), Some(d), Some((lo, n))) = (self.win.as_mut(), draft, win) else { return Ok(None) };
+        d.save_window(slot, lo, n, k, v, snap as usize, st)?;
+        Ok(Some((lo, n)))
+    }
 }
 
 /// Everything a prompt leaves in a slot that a cached run must reproduce, read back to the host (tests compare two of them bit for bit).
@@ -223,16 +276,40 @@ impl PrefixDigest {
 }
 
 impl GlmModel {
+    /// The drafter's context window of a snapshot at `len` when the ring holds it: positions `len - WINDOW .. len` (from 0 for a shorter prefix)
+    /// were absorbed by this prompt (or put back with the prefix it resumed from) and no row absorbed since, up to position `latest`, has
+    /// overwritten them. `None` without a drafter or when the ring does not hold them (a restore of the snapshot then leaves the ring as it is).
+    fn dflash_window_of(&self, slot: usize, len: usize, latest: usize) -> Option<(usize, usize)> {
+        self.dflash.as_ref()?;
+        let lo = len.saturating_sub(DraftCtxLayout::WINDOW);
+        (lo >= self.dflash_kept_from(slot) && latest - lo <= DraftCtxLayout::DEFAULT_CAP).then_some((lo, len - lo))
+    }
     /// Allocate the snapshot pool: `slots` snapshot slots of [`SnapPool::bytes_per_slot`] bytes each, with the NextN layer's share when the model has the
-    /// layer. Errors when a pool exists already.
+    /// layer, and the DFlash2 drafter's context window ([`Draft::window_snapshot_bytes`]) when it drafts with one (attach the drafter first). Errors
+    /// when a pool exists already.
     pub fn enable_prefix_cache(&mut self, slots: usize) -> Result<(), ModelError> {
         if self.snaps.is_some() {
             return Err(ModelError::Config("the prefix cache is already enabled".into()));
         }
-        let pool = SnapPool::new(&self.cfg, slots, self.mtp.is_some())?;
+        let pool = SnapPool::new(&self.cfg, slots, self.mtp.is_some(), self.dflash.is_some())?;
         pool.check_dims(self.kda_dims)?;
         self.snaps = Some(pool);
         Ok(())
+    }
+
+    /// Bytes of the snapshot pool's drafter windows (0 without a pool or a drafter): rank 0's alone in a group.
+    pub fn prefix_window_bytes(&self) -> u64 {
+        self.snaps.as_ref().map_or(0, |s| s.window_bytes())
+    }
+
+    /// Pages of the KV pool no slot and no snapshot holds.
+    pub fn kv_free_pages(&self) -> usize {
+        self.kv_tab.free_blocks()
+    }
+
+    /// Pages `slot`'s table holds (its own and those it shares with a snapshot it was restored from).
+    pub fn kv_slot_pages(&self, slot: usize) -> usize {
+        self.kv_tab.blocks_of(slot).len()
     }
 
     /// Whether the snapshot pool exists (`enable_prefix_cache`).
@@ -250,8 +327,9 @@ impl GlmModel {
         self.snaps.as_ref().map_or(0, |s| s.free_count())
     }
 
-    /// Bytes of one slot of the snapshot pool as it was built (0 without one): a rank of a KDA head split holds its own heads' state
-    /// (`SnapPool::check_dims`), so this is what two ranks of a group compare (`tp::GlmCall::EnableSnapshots`).
+    /// Bytes of one slot of the snapshot pool's trunk state as it was built (0 without one; the drafter's window is not in it): a rank of a
+    /// KDA head split holds its own heads' state (`SnapPool::check_dims`), so this is what two ranks of a group compare
+    /// (`tp::GlmCall::EnableSnapshots`).
     pub fn prefix_snapshot_bytes(&self) -> u64 {
         self.snaps.as_ref().map_or(0, |s| s.allocated_bytes() / s.slots as u64)
     }
@@ -297,7 +375,8 @@ impl GlmModel {
             }
             None => true,
         };
-        let GlmModel { pools, planes, mtp, snaps, stream, kda_dims, .. } = self;
+        let win = self.dflash_window_of(slot, len, len);
+        let GlmModel { pools, planes, mtp, snaps, stream, kda_dims, dflash, .. } = self;
         let sp = snaps.as_mut().ok_or_else(|| ModelError::Request("the prefix cache is not enabled".into()))?;
         if snap as usize >= sp.slots {
             return Err(ModelError::Request(format!("snapshot slot {snap} is out of range")));
@@ -317,7 +396,8 @@ impl GlmModel {
             let h2 = c.bytes() / sp.slots;
             c.copy_range_from(snap as usize * h2, m.store(), slot * MTP_TAP_CAP * h2, h2, stream)?;
         }
-        sp.meta[snap as usize] = Some(SnapMeta { len, mtp_ok, digest: None });
+        let win = sp.save_window(snap, dflash.as_ref().map(|d| &d.draft), slot, win, stream)?;
+        sp.meta[snap as usize] = Some(SnapMeta { len, mtp_ok, digest: None, win });
         stream.sync()?;
         Ok(())
     }
@@ -371,14 +451,17 @@ impl GlmModel {
             }
             None => true,
         };
-        let GlmModel { mtp, snaps, stream, .. } = self;
+        // the drafter's window of each cut, when the chunk's later rows left it in the ring (the chunk's rows were absorbed after its forward)
+        let wins: Vec<Option<(usize, usize)>> = taken.iter().map(|c| self.dflash_window_of(slot, c.at, start + rows)).collect();
+        let GlmModel { mtp, snaps, stream, dflash, .. } = self;
         let sp = snaps.as_mut().expect("checked above");
-        for cut in &taken {
+        for (cut, win) in taken.iter().zip(wins) {
             if let (Some(m), Some(c)) = (mtp.as_ref(), sp.carry.as_mut()) {
                 let h2 = c.bytes() / sp.slots;
                 c.copy_range_from(cut.snap as usize * h2, &m.tap, (cut.row - 1) * h2, h2, stream)?;
             }
-            sp.meta[cut.snap as usize] = Some(SnapMeta { len: cut.at, mtp_ok, digest: None });
+            let win = sp.save_window(cut.snap, dflash.as_ref().map(|d| &d.draft), slot, win, stream)?;
+            sp.meta[cut.snap as usize] = Some(SnapMeta { len: cut.at, mtp_ok, digest: None, win });
         }
         stream.sync()?;
         Ok(c)
@@ -446,7 +529,7 @@ impl GlmModel {
         }
         // which buffer of the slot is current (begin_slot leaves the parity word alone, and the stream must be done with the commits it flushed)
         self.stream.sync()?;
-        let GlmModel { pools, planes, mtp, snaps, stream, kda_dims, .. } = self;
+        let GlmModel { pools, planes, mtp, snaps, stream, kda_dims, dflash, .. } = self;
         let sp = snaps.as_mut().expect("checked above");
         let (e, ce) = (kda_dims.s_buf_elems() * 4, kda_dims.conv_slot_elems() * 2);
         for (ord, pool) in pools.iter_mut().enumerate() {
@@ -481,6 +564,10 @@ impl GlmModel {
             m.store_mut().copy_range_from(slot * MTP_TAP_CAP * h2, c, snap as usize * h2, h2, stream)?;
             // the next prompt chunk continues from the carry: entries below `len` are built (they are in the pages), the carry is the tap of `len - 1`
             *m.book_mut(slot) = TapBook { ok: meta.mtp_ok, first: len, n: 1 };
+        }
+        // the drafter's context window, when the snapshot kept one (`begin_slot` left the ring as the slot's previous owner left it)
+        if let (Some((k, v)), Some(d), Some((lo, n))) = (sp.win.as_ref(), dflash.as_mut(), meta.win) {
+            d.draft.load_window(slot, lo, n, k, v, snap as usize, stream)?;
         }
         // under P2 the restored state opens the slot's next prefill segment at `len`: the snapshot was taken on its own segment's 16-row grid, so
         // the resumed chunks fall where the fresh prefill's do (`docs/GLM_PREFILL_P2.md` 8.1)

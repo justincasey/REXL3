@@ -4,7 +4,10 @@
 //! every reply equals its solo run.
 
 use gb_engine::mock::{ChainDrafter, Fault, MockBackend};
-use gb_engine::{Backend, Drafter, Engine, EngineConfig, ImageSpan, PrefillJob, PrefillPolicy, PrefillStep, Request, RowOutput, RowRequest};
+use gb_engine::{
+    Backend, CutStep, Drafter, Engine, EngineConfig, ImageSpan, PrefillJob, PrefillPolicy, PrefillStep, Request, RowOutput,
+    RowRequest,
+};
 use gb_sampling::Sampling;
 use gb_sched::{Admission, CostModel, ModelMemory};
 use std::cell::RefCell;
@@ -82,8 +85,10 @@ impl Backend for Parts {
         }
         self.inner.prefill_slice(slot, prompt, images, done, candidates)
     }
-    fn prefill_slices(&mut self, jobs: &[PrefillJob<'_>]) -> Vec<PrefillStep> {
-        jobs.iter().map(|j| self.prefill_slice(j.slot, j.prompt, j.images, j.done, j.candidates)).collect()
+    fn prefill_slices(&mut self, jobs: &[PrefillJob<'_>]) -> Vec<CutStep> {
+        jobs.iter()
+            .map(|j| CutStep { step: self.prefill_slice(j.slot, j.prompt, j.images, j.done, j.candidates), captured: Vec::new() })
+            .collect()
     }
     fn step(&mut self, reqs: &[RowRequest], candidates: usize) -> Vec<Vec<RowOutput>> {
         self.inner.step(reqs, candidates)

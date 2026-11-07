@@ -340,15 +340,21 @@ pub trait Backend {
         };
         PrefillStep { done: prompt.len(), row: Some(row) }
     }
-    /// One [`Backend::prefill_slice`] for each of several prompts (distinct slots), in one call, one step per job in job order. The
+    /// One [`Backend::prefill_slice_cuts`] for each of several prompts (distinct slots), in one call, one step per job in job order. The
     /// default runs them one after another. A backend that can put the rows of several short prompts through one forward (the Qwen
     /// backend: prompts of at most 128 tokens share one pass of the row-invariant decode kernel) overrides this; each prompt must come out
     /// with the bits its own `prefill_slice` gives it, whatever else is in the call, and a prompt that fails must not fail the others
-    /// (a recoverable error is reported through `take_error`, and the failed prompt's row is NaN). The engine only puts a prompt in this call
-    /// when the prefix cache plays no part in its slice (it was not restored from a hit and has no snapshot to take: those need
-    /// [`Backend::prefill_slice_cuts`], one prompt at a time), so a backend needs no cut handling here.
-    fn prefill_slices(&mut self, jobs: &[PrefillJob<'_>]) -> Vec<PrefillStep> {
-        jobs.iter().map(|j| self.prefill_slice(j.slot, j.prompt, j.images, j.done, j.candidates)).collect()
+    /// (a recoverable error is reported through `take_error`, and the failed prompt's row is NaN). The engine puts a prompt that uses the
+    /// prefix cache (restored from a hit, or with cuts to take: `PrefillJob::cuts`) in this call only when the backend says it takes them
+    /// here ([`Backend::prefill_slices_take_cuts`]); for every other backend each job's `cuts` is empty and none of its slots was restored.
+    fn prefill_slices(&mut self, jobs: &[PrefillJob<'_>]) -> Vec<CutStep> {
+        jobs.iter().map(|j| self.prefill_slice_cuts(j.slot, j.prompt, j.images, j.done, j.candidates, j.cuts)).collect()
+    }
+    /// Whether [`Backend::prefill_slices`] takes each job's cuts (as [`Backend::prefill_slice_cuts`] does, the snapshots returned in its
+    /// job's `CutStep`) and resumes a slot restored from a hit in the same call as other prompts. `false` (the default): a prompt that uses
+    /// the cache gets a call of its own.
+    fn prefill_slices_take_cuts(&self) -> bool {
+        false
     }
     /// `propose` for several sequences at once, one entry per request. A backend whose drafter shares work across
     /// sequences (one read of the draft's weights for all of them) overrides this.
@@ -416,6 +422,19 @@ pub trait Backend {
         let _ = cuts;
         CutStep { step: self.prefill_slice(slot, prompt, images, done, candidates), captured: Vec::new() }
     }
+    /// Whether [`Backend::prefill_slice_cuts`] (and [`Backend::prefill_slices`]) may be given a cut at the prompt's END (`cut ==
+    /// prompt.len()`: the state after the whole prompt, taken after its last slice, before its first token is sampled), which a cut policy
+    /// of no tail plans (`CutPolicy::tail == 0`). `false` (the default): every cut is strictly inside the prompt, and such a policy keeps one
+    /// token of tail.
+    fn prefix_end_cut(&self) -> bool {
+        false
+    }
+    /// The KV pool, when the prefix cache's pages are the pool's idle ones (`None`, the default: the cache's pages are reserved beside the
+    /// pages admission hands out, and the cache never needs to give a page back to a sequence). With a pool, the engine evicts entries
+    /// whenever the free pages fall below what the admitted sequences may still allocate ([`KvPool`]).
+    fn kv_pool(&self) -> Option<KvPool> {
+        None
+    }
 }
 
 /// Drafts for one sequence, with the drafter's confidence in each when it has one.
@@ -461,13 +480,24 @@ fn outside_images(c: usize, images: &[ImageSpan], min_cut: usize, hit: usize) ->
     }
 }
 
-/// One prompt's turn in [`Backend::prefill_slices`]: the arguments of a [`Backend::prefill_slice`] call.
+/// One prompt's turn in [`Backend::prefill_slices`]: the arguments of a [`Backend::prefill_slice_cuts`] call.
 pub struct PrefillJob<'a> {
     pub slot: usize,
     pub prompt: &'a [u32],
     pub images: &'a [ImageSpan],
     pub done: usize,
     pub candidates: usize,
+    /// The cuts of the prompt still to take (ascending; empty when it takes none, always for a backend that does not take cuts in this
+    /// call: [`Backend::prefill_slices_take_cuts`]).
+    pub cuts: &'a [usize],
+}
+
+/// The KV pool of a backend whose prefix cache keeps idle pool pages ([`Backend::kv_pool`]): the pages no slot and no entry holds, and the
+/// pages each slot's table holds (its own and those it shares with an entry it was restored from), indexed by slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KvPool {
+    pub free: usize,
+    pub slot_pages: Vec<usize>,
 }
 
 /// Progress of one `Backend::prefill_slice`.
@@ -790,6 +820,10 @@ pub const PREFILL_STEP_ROWS: usize = 4096;
 
 /// Steps after which a waiting prompt that keeps being passed over for shorter ones is served first (`PrefillPolicy::Burst`).
 pub const PREFILL_PASS_GUARD: u32 = 8;
+
+/// Tokens past its reservation a sequence may write into its pages: a verify window's drafts after its last committable position
+/// (`Engine::keep_pool_room` counts them in what a sequence may still allocate).
+const POOL_DRAFT_SLACK_TOKENS: usize = 16;
 
 /// Pseudo-trials of the logistic prior behind each bin of the margin-to-acceptance table.
 const MARGIN_PRIOR_WEIGHT: f64 = 20.0;
@@ -1183,6 +1217,8 @@ impl<B: Backend> Engine<B> {
     pub fn submit_with_budget(&mut self, req: Request, budget: Option<ReasoningBudget>) -> Result<u64, SubmitError> {
         let id = self.submit_deferred_with_budget(req, budget)?;
         while self.prefilling.iter().any(|p| p.id == id) {
+            // as `step` does before anything allocates: a pool cache's entries give back the pages the admitted sequences may claim
+            self.keep_pool_room();
             self.advance_prefill().map_err(|e| SubmitError::Backend(e.to_string()))?;
         }
         match self.failed.iter().position(|(f, _)| *f == id) {
@@ -1196,6 +1232,7 @@ impl<B: Backend> Engine<B> {
     pub fn submit(&mut self, req: Request) -> Result<u64, SubmitError> {
         let id = self.submit_deferred(req)?;
         while self.prefilling.iter().any(|p| p.id == id) {
+            self.keep_pool_room();
             self.advance_prefill().map_err(|e| SubmitError::Backend(e.to_string()))?;
         }
         match self.failed.iter().position(|(f, _)| *f == id) {
@@ -1270,7 +1307,14 @@ impl<B: Backend> Engine<B> {
                 }
             }
         }
+        // a policy of no tail cuts at the prompt's end, which only a backend that takes a snapshot after a prompt's last slice is given
+        let end_cut = self.backend.prefix_end_cut();
         let st = self.prefix.as_mut().unwrap();
+        let policy = if st.cfg.policy.tail == 0 && !end_cut {
+            gb_sched::prefix::CutPolicy { tail: 1, ..st.cfg.policy }
+        } else {
+            st.cfg.policy
+        };
         let ghost = st.ghost.observe(path, &prompt);
         // a cut never falls inside an image: it moves to the image's first placeholder (a prefix that ends before it), or goes; that happens BEFORE the
         // gap rule, so a moved or dropped cut does not suppress the one after it
@@ -1281,14 +1325,8 @@ impl<B: Backend> Engine<B> {
         // whose restore is exact at any cut (Flash-Next scrubs the copied partial page).
         let align = st.cfg.cut_align.max(1);
         let fit = |c: usize| outside_images(c, images, min_cut, hit_len).map(|c| gb_sched::prefix::align_down(c, align));
-        let mut cuts = gb_sched::prefix::plan_cuts_with(
-            &st.cfg.policy,
-            total,
-            hit_len,
-            ghost,
-            &|l| st.index.contains(path, &prompt, l),
-            &fit,
-        );
+        let mut cuts =
+            gb_sched::prefix::plan_cuts_with(&policy, total, hit_len, ghost, &|l| st.index.contains(path, &prompt, l), &fit);
         cuts.retain(|&c| !st.index.contains(path, &prompt, c));
         if !cuts.is_empty() {
             // a snapshot needs a free slot: evict the least recently used entries until there is one per cut, and take fewer cuts (the
@@ -1691,6 +1729,7 @@ impl<B: Backend> Engine<B> {
         // delays the others by one slice a round instead of stalling them for its whole prefill, and a short prompt behind it
         // gets its slice at the next turn
         let decoded = !self.active.is_empty();
+        self.keep_pool_room();
         let more = if decoded { self.decode_round()? } else { false };
         // `Serial` runs one slice; `Burst` several while a burst of prompts waits, each to the prompt `pick_next_prefill` puts in front,
         // and the backend gets them in one call when it can put short prompts through one forward
@@ -1737,11 +1776,12 @@ impl<B: Backend> Engine<B> {
     /// cache exactly as `advance_prefill` does for its own, right before its slice (`plan_first_slice`: a hit is restored, the cuts are planned),
     /// so a prompt picked behind one that leaves a snapshot in this same step still finds it. One that uses the cache (a hit, or cuts to take:
     /// `Prefilling::uses_cache`) gets its slice at once, alone (`slice_alone`: the call that restores into one slot and takes snapshots inside
-    /// one prompt's chunk). The others (prompts of 128 tokens or fewer are always these: they are on the GEMV path and never cached) wait, and
-    /// go to the backend together in ONE `prefill_slices` call, which is what lets it share a forward among the short ones. Every prompt then
-    /// ends in the same tail, `settle_slice`, whichever call served it: a recoverable backend error fails the prompts whose rows the backend
-    /// could not produce (NaN) and no other, a finished prompt is sampled, leaves its snapshots and joins the running set, an unfinished one
-    /// goes to the back of the queue. A fatal error puts back every prompt not yet settled, in order, and stops.
+    /// one prompt's chunk), unless the backend takes cuts and restored slots in its batched call ([`Backend::prefill_slices_take_cuts`]; a
+    /// full-vocabulary score slice is always alone). The others (prompts of 128 tokens or fewer are always these: they are on the GEMV path
+    /// and never cached) wait, and go to the backend together in ONE `prefill_slices` call, which is what lets it share a forward among the
+    /// short ones. Every prompt then ends in the same tail, `settle_slice`, whichever call served it: a recoverable backend error fails the
+    /// prompts whose rows the backend could not produce (NaN) and no other, a finished prompt is sampled, leaves its snapshots and joins the
+    /// running set, an unfinished one goes to the back of the queue. A fatal error puts back every prompt not yet settled, in order, and stops.
     fn advance_prefills(&mut self, k: usize) -> Result<(), StepError> {
         let mut picked: Vec<Option<Prefilling>> = Vec::new();
         let mut rows = 0usize;
@@ -1759,12 +1799,14 @@ impl<B: Backend> Engine<B> {
             }
         }
         let mut together: Vec<usize> = Vec::new();
+        let cuts_together = self.backend.prefill_slices_take_cuts();
         for i in 0..picked.len() {
             if let Err(e) = self.plan_first_slice(picked[i].as_mut().expect("waiting")) {
                 self.requeue(picked);
                 return Err(e);
             }
-            if !picked[i].as_ref().expect("waiting").uses_cache() {
+            let p = picked[i].as_ref().expect("waiting");
+            if !p.uses_cache() || (cuts_together && !p.full_row) {
                 together.push(i);
                 continue;
             }
@@ -1804,9 +1846,10 @@ impl<B: Backend> Engine<B> {
         }
     }
 
-    /// The prompts of `picked` at `ix` (none of which uses the cache), one slice each in ONE `Backend::prefill_slices` call, with each
-    /// prompt's outcome in the same order. A recoverable error pins on the prompts whose row came back NaN; one that left no NaN row cannot be
-    /// pinned on a prompt and fails the whole call. A fatal error, or an answer of the wrong length, is the `Err`.
+    /// The prompts of `picked` at `ix`, one slice each in ONE `Backend::prefill_slices` call (each with the cuts it still has to take, which
+    /// only a backend that takes them there is given), with each prompt's outcome in the same order. A recoverable error pins on the prompts
+    /// whose row came back NaN; one that left no NaN row cannot be pinned on a prompt and fails the whole call. A fatal error, or an answer of
+    /// the wrong length, is the `Err`.
     fn slices_together(&mut self, picked: &[Option<Prefilling>], ix: &[usize]) -> Result<Vec<SliceResult>, StepError> {
         let vocab = self.backend.vocab_size();
         let ps: Vec<&Prefilling> = ix.iter().map(|&i| picked[i].as_ref().expect("waiting")).collect();
@@ -1819,6 +1862,7 @@ impl<B: Backend> Engine<B> {
                     images: &p.req.images,
                     done: p.done,
                     candidates: p.req.sampling.candidate_count(vocab),
+                    cuts: p.cache.as_ref().map_or(&[][..], |c| c.cuts.as_slice()),
                 })
                 .collect();
             self.backend.prefill_slices(&jobs)
@@ -1828,12 +1872,12 @@ impl<B: Backend> Engine<B> {
             return Err(StepError::BackendShape(format!("{} prefill steps for {} prompts", steps.len(), ps.len())));
         }
         let broken = |step: &PrefillStep| step.row.as_ref().is_some_and(|r| r.values.iter().any(|v| v.is_nan()));
-        let blame_all = fault.is_some() && !steps.iter().any(broken);
+        let blame_all = fault.is_some() && !steps.iter().any(|s| broken(&s.step));
         Ok(steps
             .into_iter()
-            .map(|step| match &fault {
-                Some(why) if blame_all || broken(&step) => SliceResult::Failed { why: why.clone(), captured: Vec::new() },
-                _ => SliceResult::Done { step, captured: Vec::new() },
+            .map(|s| match &fault {
+                Some(why) if blame_all || broken(&s.step) => SliceResult::Failed { why: why.clone(), captured: s.captured },
+                _ => SliceResult::Done { step: s.step, captured: s.captured },
             })
             .collect())
     }
@@ -1858,6 +1902,35 @@ impl<B: Backend> Engine<B> {
                 } else {
                     waiting.div_ceil(div.max(1)).min(cap.max(1)).min(waiting)
                 }
+            }
+        }
+    }
+
+    /// With a prefix cache that keeps idle pool pages ([`Backend::kv_pool`]): evict entries, least recently used first, until the pool's free
+    /// pages cover what every admitted sequence may still allocate (the pages of its reserved tokens, plus a draft window's overshoot, less
+    /// the pages its table already holds). Admission never reserves more than the pool, so with no entry left this always holds: the cache
+    /// only ever holds pages no admitted sequence can claim. Runs at the start of every step, before anything allocates.
+    fn keep_pool_room(&mut self) {
+        let Some(st) = self.prefix.as_mut() else { return };
+        if st.index.pages_held() == 0 {
+            return;
+        }
+        let Some(mut pool) = self.backend.kv_pool() else { return };
+        let need: usize = self
+            .admission
+            .reserved_tokens()
+            .map(|(slot, tokens)| {
+                let pages = (tokens as usize + POOL_DRAFT_SLACK_TOKENS).div_ceil(gb_sched::prefix::BLOCK_TOKENS);
+                pages.saturating_sub(pool.slot_pages.get(slot).copied().unwrap_or(0))
+            })
+            .sum();
+        while pool.free < need {
+            let Some(h) = st.index.evict_lru() else { break };
+            st.stats.evicted_for_pool += 1;
+            self.backend.prefix_release(h);
+            match self.backend.kv_pool() {
+                Some(p) => pool = p,
+                None => break,
             }
         }
     }

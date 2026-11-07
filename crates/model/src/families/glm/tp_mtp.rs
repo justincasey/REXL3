@@ -206,9 +206,9 @@ pub trait GlmMtpRuntime: LockstepRuntime<Call = GlmCall> {
     fn dflash_draft(&mut self, _asks: &[DflashAsk<'_>]) -> Result<Vec<Picked>, ModelError> {
         Err(ModelError::Config("this rank has no DFlash2 drafter".into()))
     }
-    /// Rank 0's word to its DFlash2 drafter that `slot`'s prompt ends at `end` (`GlmModel::dflash_prompt_end`): host state of this rank
-    /// alone, never forwarded. The default: nothing (a rank without the drafter).
-    fn dflash_prompt_end(&mut self, _slot: usize, _end: Option<usize>) {}
+    /// Rank 0's word to its DFlash2 drafter that `slot`'s prompt ends at `end` and takes its next snapshot at `cut`
+    /// (`GlmModel::dflash_prompt_end`): host state of this rank alone, never forwarded. The default: nothing (a rank without the drafter).
+    fn dflash_prompt_end(&mut self, _slot: usize, _end: Option<usize>, _cut: Option<usize>) {}
 }
 
 impl<R: GlmMtpRuntime> DraftModel for TpLeader<R> {

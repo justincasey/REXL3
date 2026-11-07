@@ -938,7 +938,7 @@ impl GlmModel {
         self.kv_tab.release(slot);
         self.mtp_begin(slot);
         self.p2_seg[slot] = None;
-        self.dflash_prompt_end(slot, None);
+        self.dflash_prompt_end(slot, None, None);
         Ok(())
     }
 
@@ -948,7 +948,7 @@ impl GlmModel {
         self.pending.remove(&slot);
         self.kv_tab.release(slot);
         self.p2_seg[slot] = None;
-        self.dflash_prompt_end(slot, None);
+        self.dflash_prompt_end(slot, None, None);
     }
 
     /// Under P2, the first position of `slot`'s open prefill segment (`None`: the next prompt chunk starts one). The backend cuts a P2

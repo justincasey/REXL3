@@ -379,7 +379,12 @@ pub struct RankPlan {
     pub fingerprint: String,
     /// The prefix cache this rank planned (`docs/GLM_TP.md` 4.2): its snapshot slots of the rank's own state and the pages they may keep,
     /// on top of the KV pool admission hands out (`mo.kv_blocks` holds both). A Hello fact: the arena rank 0 forwards in `EnableSnapshots`.
+    /// The pool cache (`--prefix-cache on`, [`RankPlan::pool_cache`]) keeps no page of its own: `page_blocks` is 0.
     pub cache: gb_engine::CacheBudget,
+    /// `--prefix-cache on`: the cache's entries keep idle pages of the KV pool (`GlmTpBackend::with_pool_prefix_cache`), and the plan
+    /// carved out only its snapshot slots (and rank 0's drafter windows): `pool_cache_bytes`.
+    pub pool_cache: bool,
+    pub pool_cache_bytes: u64,
     /// The plan's admitted KV pool (pages and tokens, without the cache's pages) and what it left spare: the single node's `kv_plan` and
     /// `prefix_cache_plan` boot lines, which rank 0 prints so a recipe's markers read one format on every topology.
     pub kv_admitted: (usize, u64),
@@ -408,6 +413,28 @@ pub struct RankPlan {
     pub taps: Vec<usize>,
     pub relay_bytes: u64,
 }
+
+/// Snapshot slots of the pool cache (`--prefix-cache on` on a GLM group): `REXL3_GLM_PREFIX_ENTRIES`, at least 2 (one entry would evict
+/// itself on every insert); the slot count by default (a live conversation per slot keeps its latest turn). Every entry costs the rank's
+/// snapshot slot (and on rank 0 the drafter's window), carved out of the KV pool; its pages are the pool's idle ones. The variable must be
+/// the same on every rank (the Hello compares the slots).
+pub fn pool_cache_entries_from(var: Option<String>, slots: usize) -> Result<usize, ModelError> {
+    let n = match var {
+        Some(v) => v.trim().parse::<usize>().map_err(|_| {
+            ModelError::Config(format!("{POOL_CACHE_ENTRIES_ENV} must be a number of snapshot slots (at least 2), got `{v}`"))
+        })?,
+        None => slots,
+    };
+    if n < 2 {
+        return Err(ModelError::Config(format!(
+            "{POOL_CACHE_ENTRIES_ENV}={n}: a prefix cache needs at least 2 snapshot slots (one entry evicts itself on every insert)"
+        )));
+    }
+    Ok(n)
+}
+
+/// The variable of [`pool_cache_entries_from`].
+pub const POOL_CACHE_ENTRIES_ENV: &str = "REXL3_GLM_PREFIX_ENTRIES";
 
 /// Whether a rank (or one node) loads the NextN layer: the same rule as `engine::build_engine`. A DFlash2 draft (`--draft DIR`) drafts in
 /// its place, so with one the layer is neither loaded nor given a cache, on every rank.
@@ -536,11 +563,22 @@ pub fn plan_from_split(
     // a drafting group at TP=2 under P2: both ranks relay the taps of the follower's rows (`model::dflash::TapRelay`)
     let taps = super::dflash::tap_layers(o)?;
     let relay_bytes = super::dflash::relay_bytes(o, &cfg, chunk);
-    let free = free_now.saturating_sub(weight_bytes + tower_bytes + draft_bytes + relay_bytes);
-    let kv_cap = o.kv_tokens.unwrap_or(o.max_model_len) as u64;
-    // the prefix cache as one node plans it (`engine::build_engine`): a snapshot slot is THIS rank's state (its KDA heads under the split,
-    // `cfg` is the rank's), the cache carved out before the KV pool is sized (an explicit size) or out of what the plan leaves (`Auto`)
+    // `--prefix-cache on`: the pool cache (`pool_cache_entries` snapshot slots of THIS rank's state, carved out before the KV pool is
+    // sized, plus rank 0's drafter windows; the entries keep idle pages of the KV pool, which the engine gives back whenever the admitted
+    // sequences may need them: no page is reserved for the cache). Otherwise the prefix cache as one node plans it
+    // (`engine::build_engine`): the cache carved out before the KV pool is sized (an explicit size) or out of what the plan leaves (`Auto`).
+    // A snapshot slot is the rank's own state (its KDA heads under the split, `cfg` is the rank's).
     let snapshot_bytes = super::prefix::snapshot_bytes(&cfg, mtp).map_err(ModelError::Config)?;
+    let entries = if o.prefix_cache == crate::serve::PrefixCacheOption::On {
+        pool_cache_entries_from(std::env::var(POOL_CACHE_ENTRIES_ENV).ok(), o.slots)?
+    } else {
+        0
+    };
+    let window_bytes = if dflash.is_some() { crate::draft::Draft::window_snapshot_bytes() } else { 0 };
+    let pool_cache_bytes = entries as u64 * (snapshot_bytes + window_bytes);
+    let free = free_now.saturating_sub(weight_bytes + tower_bytes + draft_bytes + relay_bytes + pool_cache_bytes);
+    let kv_cap = o.kv_tokens.unwrap_or(o.max_model_len) as u64;
+    let request = if entries > 0 { crate::plan::CacheRequest::Off } else { o.prefix_cache.request() };
     let plan = plan_memory_cached_windowed(
         &profile,
         free,
@@ -548,22 +586,29 @@ pub fn plan_from_split(
         o.slots,
         kv_cap,
         vision_reserve,
-        o.prefix_cache.request(),
+        request,
         snapshot_bytes,
         0,
         o.max_model_len as u64,
     )
-    .map_err(|e| ModelError::Config(format!("this rank cannot plan {} slots: {e} (free {:.1} GiB after the pack's {:.1} GiB, the vision tower's {:.2} GiB and the drafter's {:.2} GiB, vision reserve {:.2} GiB)", o.slots, gib(free), gib(weight_bytes), gib(tower_bytes), gib(draft_bytes), gib(vision_reserve))))?;
+    .map_err(|e| ModelError::Config(format!("this rank cannot plan {} slots: {e} (free {:.1} GiB after the pack's {:.1} GiB, the vision tower's {:.2} GiB, the drafter's {:.2} GiB and the prefix cache's {:.2} GiB, vision reserve {:.2} GiB)", o.slots, gib(free), gib(weight_bytes), gib(tower_bytes), gib(draft_bytes), gib(pool_cache_bytes), gib(vision_reserve))))?;
+    let cache = if entries > 0 {
+        gb_engine::CacheBudget { snapshot_slots: entries, page_blocks: 0, snapshot_bytes, page_bytes: profile.kv_page_bytes() }
+    } else {
+        plan.cache
+    };
     let mm = ModelMemory::from_profile(&profile, 0, 0);
     let admission = plan.admission(mm, o.slots, o.max_model_len).map_err(|e| ModelError::Config(e.to_string()))?;
-    // the pool holds the pages the cache may keep on top of the pages admission hands out
-    let kv_blocks = plan.kv_blocks + plan.cache.page_blocks;
+    // the pool holds the pages the cache may keep on top of the pages admission hands out (none for the pool cache: its pages are the pool's)
+    let kv_blocks = plan.kv_blocks + cache.page_blocks;
     let mo = ModelOptions { slots: o.slots, kv_blocks, max_context: o.max_model_len, layers: cfg.layers.len() };
     Ok(RankPlan {
         cfg,
         ck,
         fingerprint: String::new(),
-        cache: plan.cache,
+        cache,
+        pool_cache: entries > 0,
+        pool_cache_bytes,
         kv_admitted: (plan.kv_blocks, plan.kv_tokens),
         spare_bytes: plan.spare_bytes,
         pack,
@@ -897,7 +942,23 @@ pub fn build_leader(
         p.mo.slots,
         p.cfg.latent_kv.name()
     );
-    if p.cache.enabled() {
+    if p.pool_cache {
+        // the pool cache: its snapshot slots (and this rank's drafter windows) were carved out of the KV pool, its pages are the pool's
+        let pool_pages = p.mo.kv_blocks;
+        let reach = pool_pages as u64 * gb_sched::prefix::BLOCK_TOKENS as u64;
+        eprintln!(
+            "rexl3 event=prefix_cache_plan mode=pool entries={} snapshot_mib={:.1} gib={:.2} pool_pages={pool_pages} reach_tokens={reach} window={} ranks={}",
+            p.cache.snapshot_slots,
+            p.cache.snapshot_bytes as f64 / 1048576.0,
+            gib(p.pool_cache_bytes),
+            o.max_model_len,
+            tp_o.ranks
+        );
+        boot::fact("prefix_cache", format!("{} entries in the KV pool, {:.2} GiB a rank", p.cache.snapshot_slots, gib(p.pool_cache_bytes)));
+        boot::fact("prefix_cache_reach_tokens", reach.to_string());
+        let ns = super::prefix::namespace_of(&p.fingerprint, p.mtp);
+        backend = backend.with_pool_prefix_cache(ns, p.cache, pool_pages)?;
+    } else if p.cache.enabled() {
         eprintln!(
             "rexl3 event=prefix_cache_plan entries={} pages={} gib={:.2} spare_gib={:.1} reach_tokens={} window={} ranks={}",
             p.cache.snapshot_slots,

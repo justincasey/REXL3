@@ -192,6 +192,9 @@ impl PrefixRuntime for Probe {
     fn prefix_state_digest(&mut self, slot: usize, len: usize) -> Result<u64, ModelError> {
         self.r.prefix_state_digest(slot, len)
     }
+    fn kv_pages(&self) -> (usize, Vec<usize>) {
+        self.r.kv_pages()
+    }
     fn snapshot_handles(&mut self) -> &mut SnapHandles {
         self.r.snapshot_handles()
     }
