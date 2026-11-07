@@ -30,6 +30,7 @@ use super::alloc::{TOKENIZER_VOCAB, WINDOW_ROWS};
 use super::model::{DraftAsk, Drafts, GlmModel, ModelOptions, TapBook};
 use super::profile_slices::Kind;
 use super::tp_mtp::{self, GlmMtpRuntime};
+use super::tp_part::{self, PartRuntime, PrefillPart, K_PREFILL_PART};
 use super::tp_vision::{self, ImageRuntime, PrefillImage, K_PREFILL_IMAGE};
 use crate::error::ModelError;
 use crate::forward::Candidates;
@@ -65,6 +66,8 @@ pub enum GlmCall {
     /// A prefill chunk with the f32 feature rows of the images inside it (rank 0's tower made them; every rank splices these bytes, and
     /// the NextN drafter's prefill of the chunk reads the same rows: `docs/GLM_TP.md` 11).
     PrefillImage(PrefillImage),
+    /// A part of a prompt forward of one or several prompts (`tp_part`: `GlmModel::prefill_rows` / `prefill_resume`, kind 41).
+    PrefillPart(PrefillPart),
     /// `GlmModel::enable_prefix_cache(slots)`: the snapshot pool on every rank, `slots` of rank 0's plan (a boot-time call: rank 0 settles
     /// it before anything is served). Acked with the bytes of one slot of the pool the rank built (`prefix_snapshot_bytes`), so a rank
     /// whose pool holds other state loses the group's boot naming the call.
@@ -313,6 +316,7 @@ impl FamilyCall for GlmCall {
             GlmCall::MtpDraft { .. } => tp_mtp::K_MTP_DRAFT,
             GlmCall::MtpDisable { .. } => tp_mtp::K_MTP_DISABLE,
             GlmCall::PrefillImage(_) => K_PREFILL_IMAGE,
+            GlmCall::PrefillPart(_) => K_PREFILL_PART,
             GlmCall::EnableSnapshots { .. } => K_ENABLE_SNAPSHOTS,
             GlmCall::Snapshot { .. } => K_SNAPSHOT,
             GlmCall::Restore { .. } => K_RESTORE,
@@ -324,6 +328,7 @@ impl FamilyCall for GlmCall {
             GlmCall::MtpDraft { .. } => "mtp_draft",
             GlmCall::MtpDisable { .. } => "mtp_disable_slot",
             GlmCall::PrefillImage(_) => "prefill_image",
+            GlmCall::PrefillPart(_) => "prefill_part",
             GlmCall::EnableSnapshots { .. } => "enable_snapshots",
             GlmCall::Snapshot { .. } => "prefix_snapshot",
             GlmCall::Restore { .. } => "restore_prefix",
@@ -335,6 +340,7 @@ impl FamilyCall for GlmCall {
             GlmCall::MtpDraft { asks, keyed } => tp_mtp::encode_draft(e, asks, keyed),
             GlmCall::MtpDisable { slot } => e.u32(*slot),
             GlmCall::PrefillImage(p) => p.encode(e),
+            GlmCall::PrefillPart(p) => p.encode(e),
             GlmCall::EnableSnapshots { slots } => e.u32(*slots),
             GlmCall::Snapshot { slot, len } => {
                 e.u32(*slot);
@@ -353,6 +359,7 @@ impl FamilyCall for GlmCall {
             tp_mtp::K_MTP_DRAFT => Some(tp_mtp::decode_draft(d)?),
             tp_mtp::K_MTP_DISABLE => Some(GlmCall::MtpDisable { slot: d.u32("glm disable slot")? }),
             K_PREFILL_IMAGE => Some(GlmCall::PrefillImage(PrefillImage::decode(d)?)),
+            K_PREFILL_PART => Some(GlmCall::PrefillPart(PrefillPart::decode(d)?)),
             K_ENABLE_SNAPSHOTS => Some(GlmCall::EnableSnapshots { slots: d.u32("glm snapshot slots")? }),
             K_SNAPSHOT => Some(GlmCall::Snapshot { slot: d.u32("glm snapshot slot")?, len: d.u32("glm snapshot length")? }),
             K_RESTORE => Some(GlmCall::Restore {
@@ -365,7 +372,7 @@ impl FamilyCall for GlmCall {
         })
     }
     fn counts_as_prefill(&self) -> bool {
-        matches!(self, GlmCall::PrefillImage(_))
+        matches!(self, GlmCall::PrefillImage(_) | GlmCall::PrefillPart(_))
     }
 
     fn encode_facts(f: &GlmFacts, e: &mut Enc) {
@@ -697,11 +704,13 @@ impl LockstepRuntime for GlmRank {
     }
 }
 
-/// A follower applies a family call (`GlmRank::apply_call`, and every mock's): an image chunk through `tp_vision`, a draft call through
-/// `tp_mtp`. The prefix cache's calls need the call's sequence number: a runtime that keeps snapshots routes them to [`apply_prefix`] first.
-pub fn apply_family<R: GlmMtpRuntime + ImageRuntime>(r: &mut R, call: GlmCall) -> Result<CallReply, ModelError> {
+/// A follower applies a family call (`GlmRank::apply_call`, and every mock's): an image chunk through `tp_vision`, a prompt forward's part
+/// through `tp_part`, a draft call through `tp_mtp`. The prefix cache's calls need the call's sequence number: a runtime that keeps
+/// snapshots routes them to [`apply_prefix`] first.
+pub fn apply_family<R: GlmMtpRuntime + ImageRuntime + PartRuntime>(r: &mut R, call: GlmCall) -> Result<CallReply, ModelError> {
     match call {
         GlmCall::PrefillImage(p) => tp_vision::apply_image(r, &p),
+        GlmCall::PrefillPart(p) => tp_part::apply_part(r, &p),
         other => tp_mtp::apply(r, other),
     }
 }

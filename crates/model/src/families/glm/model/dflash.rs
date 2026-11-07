@@ -275,38 +275,55 @@ impl GlmModel {
         d.prompt_end[slot] = end;
     }
 
-    /// Before the forward of a prompt chunk of `slot` at `start..start + n`: whether any of its rows will be absorbed (when none is, the
-    /// forward writes no taps).
-    pub(super) fn dflash_begin_chunk(&mut self, slot: usize, start: usize, n: usize) {
+    /// Before the forward of the prompt rows of `b` (each sequence's consecutive rows of its prompt): whether any of its rows will be
+    /// absorbed (when none is, the forward writes no taps).
+    pub(super) fn dflash_begin_rows(&mut self, b: &RowBatch) {
         if let Some(d) = self.dflash.as_mut() {
-            d.skip_taps = start + n <= d.keep_from(slot);
+            d.skip_taps = (0..b.n_seq()).all(|i| {
+                let r = b.seq_rows(i);
+                b.positions[r.start] as usize + r.len() <= d.keep_from(b.seq_slot[i] as usize)
+            });
+        }
+    }
+
+    /// Whether the prompt forward in flight writes no taps ([`GlmModel::dflash_begin_rows`]), and setting it back (a paused forward
+    /// resumes with its own setting: `part.rs`).
+    pub(super) fn dflash_skips_taps(&self) -> bool {
+        self.dflash.as_ref().is_some_and(|d| d.skip_taps)
+    }
+    pub(super) fn dflash_set_skip_taps(&mut self, skip: bool) {
+        if let Some(d) = self.dflash.as_mut() {
+            d.skip_taps = skip;
         }
     }
 
     /// After a prompt chunk's forward: the next forward taps every row again.
     pub(super) fn dflash_end_chunk(&mut self) {
-        if let Some(d) = self.dflash.as_mut() {
-            d.skip_taps = false;
-        }
+        self.dflash_set_skip_taps(false);
     }
 
-    /// After a prompt chunk of `slot` ran through the trunk (its taps are in the tap buffer): its rows join the slot's draft context at
-    /// positions `start..start + n`, in writes of at most the ring's window (a write must span fewer positions than the ring holds; a
-    /// row's ring entry is row-invariant, so a 4,096-row chunk leaves the ring a 2,048-row chunk pair leaves), all but the rows more than a
-    /// ring before the prompt's end when the backend named it.
-    pub(super) fn dflash_prefill_chunk(&mut self, slot: usize, start: usize, n: usize) -> Result<(), ModelError> {
+    /// After a prompt forward ran through the trunk (its taps are in the tap buffer): the `n` rows of `slot` from tap row `row0` join the
+    /// slot's draft context at positions `start..start + n`, in writes of at most the ring's window (a write must span fewer positions than
+    /// the ring holds; a row's ring entry is row-invariant, so a 4,096-row chunk leaves the ring a 2,048-row chunk pair leaves), all but the
+    /// rows more than a ring before the prompt's end when the backend named it.
+    pub(super) fn dflash_prefill_rows(&mut self, slot: usize, start: usize, n: usize, row0: usize) -> Result<(), ModelError> {
         let Some(d) = self.dflash.as_mut() else { return Ok(()) };
         d.skip_taps = false;
         let first = d.keep_from(slot).saturating_sub(start).min(n);
         let mut at = first;
         while at < n {
             let k = (n - at).min(d.draft_rows()).min(gb_cuda::dflash2::DraftCtxLayout::WINDOW);
-            d.draft.absorb_batch(&d.taps, &[Absorb { row0: at, n: k, slot, pos0: start + at }], &self.stream)?;
+            d.draft.absorb_batch(&d.taps, &[Absorb { row0: row0 + at, n: k, slot, pos0: start + at }], &self.stream)?;
             at += k;
         }
         d.absorbed += (n - first) as u64;
         d.skipped += first as u64;
         Ok(())
+    }
+
+    /// The tap buffer's bytes per row (the stash of a paused prompt forward keeps its rows: `part.rs`), 0 without the drafter.
+    pub(super) fn dflash_tap_row_bytes(&self) -> usize {
+        self.dflash.as_ref().map_or(0, |d| d.draft.dims.fc_in() * 2)
     }
 
     /// The last window's accepted rows join their slots' draft contexts (called by the commit flush, before the next forward overwrites the

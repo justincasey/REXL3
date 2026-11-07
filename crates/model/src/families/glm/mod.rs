@@ -33,6 +33,7 @@ pub mod tp;
 pub mod tp_backend;
 pub mod tp_boot;
 pub mod tp_mtp;
+pub mod tp_part;
 pub mod tp_vision;
 pub mod vision;
 pub mod vision_serve;

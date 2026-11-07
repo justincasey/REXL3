@@ -261,9 +261,19 @@ pub fn overlap_parts() -> u8 {
     }
 }
 
-/// `REXL3_GLM_GRAPH_AT=0`: shapes are captured at their first sighting (the Hello fact `graph_at_first`).
+/// `REXL3_GLM_GRAPH_AT=0`: shapes are captured at their first sighting (the Hello fact `graph_at_first`); otherwise at their second.
 pub fn capture_at_first() -> bool {
-    std::env::var(ENV_AT).as_deref() == Ok("0")
+    capture_at_first_or(false)
+}
+
+/// The capture policy with `default` when `REXL3_GLM_GRAPH_AT` is unset: `0` captures a shape at its first sighting, `1` at its second
+/// (a serving group captures at the first: `tp_boot`).
+pub fn capture_at_first_or(default: bool) -> bool {
+    match std::env::var(ENV_AT).as_deref().map(str::trim) {
+        Ok("0") => true,
+        Ok("1") => false,
+        _ => default,
+    }
 }
 
 impl Side {
@@ -338,6 +348,12 @@ impl GlmModel {
     /// Switch graphs on or off for the windows that follow (eager and graphs run the same arithmetic; the digest tests run both).
     pub fn set_graphs(&mut self, on: bool) {
         self.graphs.on = on && self.graphs.cap.is_some();
+    }
+
+    /// Capture a window shape at its first sighting (`true`) or its second (the model's default, `REXL3_GLM_GRAPH_AT`). Only when a
+    /// shape's graph is made moves: a replay and an eager window are the same bits.
+    pub fn set_graph_capture_first(&mut self, on: bool) {
+        self.graphs.capture_first = on;
     }
 
     /// Run the shared expert on a side stream, concurrent with the router and the routed experts, in the windows that go through the graph path. The

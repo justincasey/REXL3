@@ -35,6 +35,7 @@ use std::collections::BTreeMap;
 pub mod dflash;
 pub mod graphs;
 mod layers;
+mod part;
 pub mod mtp;
 pub mod snapshot;
 pub mod tp;
@@ -65,7 +66,7 @@ pub enum Head {
     None,
     /// The logits of every row (a decode or verify window).
     AllRows,
-    /// The logits of the last row only (the end of a prefill).
+    /// The logits of the last row of each sequence, in sequence order (the end of a prefill: of one prompt, or of several in one forward).
     LastRow,
 }
 
@@ -226,6 +227,28 @@ fn p2_kda_piece(rec: &kda::Record, ws: &kda::Workspace) -> usize {
     }
 }
 
+/// The chunked KDA recurrence's descriptors of a P2 prompt forward: one per sequence of `b` (`kda::prefill_descriptor_pieces` of its slot
+/// and rows), uploaded by the forward's first KDA layer and kept for the others.
+fn kda_seg_descs(b: &RowBatch, piece: usize) -> Result<Vec<DevBuf>, ModelError> {
+    (0..b.n_seq()).map(|i| Ok(kda::prefill_descriptor_pieces(b.seq_slot[i] as usize, b.seq_rows(i).len(), piece)?)).collect()
+}
+
+/// Each sequence of `b` with its rows and its descriptor (of [`kda_seg_descs`]).
+fn kda_segs<'a>(b: &RowBatch, descs: &'a [DevBuf]) -> Vec<tp::KdaSeg<'a>> {
+    (0..b.n_seq())
+        .map(|i| {
+            let r = b.seq_rows(i);
+            tp::KdaSeg { slot: b.seq_slot[i] as usize, row0: r.start, rows: r.len(), desc: &descs[i] }
+        })
+        .collect()
+}
+
+/// The row-by-row KDA recurrence's descriptors of a P1 prompt forward: one per sequence of `b` (`kda::prefill_descriptor` of its slot
+/// and rows), uploaded by the forward's first KDA layer and kept for the others.
+fn kda_p1_descs(b: &RowBatch) -> Result<Vec<DevBuf>, ModelError> {
+    (0..b.n_seq()).map(|i| Ok(kda::prefill_descriptor(b.seq_slot[i] as usize, b.seq_rows(i).len())?)).collect()
+}
+
 fn moe_stage_name(stage: &'static str) -> &'static str {
     match stage {
         "group" => "experts: group",
@@ -262,6 +285,14 @@ pub fn op_class(op: &Op) -> &'static str {
 /// The last window's layout, until its commit is applied.
 struct PendingWindow {
     win: RowBatch,
+}
+
+/// What [`GlmModel::forward_begin`] set up: the schedule, the batch's largest position and, under P2, each prompt's `(slot, segment
+/// anchor)` in sequence order.
+struct Begun {
+    plan: Vec<Op>,
+    max_pos: usize,
+    segs: Vec<(usize, usize)>,
 }
 
 pub struct GlmModel {
@@ -359,6 +390,10 @@ pub struct GlmModel {
     p2_kda_chunked: bool,
     /// Prompt chunks this model ran under the sequence-parallel residual (`run`'s `sp`; the tests' audit).
     sp_chunks: u64,
+    /// A prompt forward paused at a layer boundary (`prefill_rows` with a layer bound, `part.rs`) and the stash of the rows another
+    /// forward may overwrite while it waits (`enable_prefill_parts`; `None`: parts are off).
+    paused: Option<part::Paused>,
+    stash: Option<part::Stash>,
     /// `REXL3_GLM_PROFILE_SLICES` (`profile_slices.rs`): the forward calls a rank's runtime brackets with the profiler API. Host
     /// counters only; inert without the setting.
     pub(in crate::families::glm) slices: crate::families::glm::profile_slices::SliceProfiler,
@@ -569,6 +604,8 @@ impl GlmModel {
             p2_side_on: p2_shared_side_on(),
             p2_kda_chunked: true,
             sp_chunks: 0,
+            paused: None,
+            stash: None,
             slices: crate::families::glm::profile_slices::SliceProfiler::from_env()?,
             cfg,
             dev,
@@ -840,6 +877,7 @@ impl GlmModel {
     /// Start a sequence in `slot`: zero its KDA state, drop any pages it held. (The DSA rings and pool planes need no reset: nothing reads
     /// a ring row or a pool entry of positions the sequence has not written.)
     pub fn begin_slot(&mut self, slot: usize) -> Result<(), ModelError> {
+        self.drop_paused_of(slot);
         self.flush()?;
         let st = &self.stream;
         for p in &mut self.pools {
@@ -852,8 +890,9 @@ impl GlmModel {
         Ok(())
     }
 
-    /// Give back a slot's pages and forget its pending commit.
+    /// Give back a slot's pages and forget its pending commit (and its paused prompt forward, if one is).
     pub fn end_slot(&mut self, slot: usize) {
+        self.drop_paused_of(slot);
         self.pending.remove(&slot);
         self.kv_tab.release(slot);
         self.p2_seg[slot] = None;
@@ -1024,26 +1063,47 @@ impl GlmModel {
     }
 
     /// Run the layers over `b`'s rows. A [`Mode::Window`] takes 1..=`WINDOW_ROWS` rows of any number of sequences and leaves their KDA
-    /// records for `commit`; a [`Mode::Prefill`] takes 1..=128 consecutive rows of ONE sequence and commits them layer by layer. With a
-    /// head, the logits are left in the scratch (see [`GlmModel::candidates_of`]).
+    /// records for `commit`; a [`Mode::Prefill`] takes the consecutive prompt rows of ONE sequence (or, under P2, of several: `part.rs`),
+    /// at most the scratch's rows, and commits them layer by layer. With a head, the logits are left in the scratch (see
+    /// [`GlmModel::candidates_of`]).
     pub fn forward(&mut self, b: &RowBatch, mode: Mode, head: Head) -> Result<(), ModelError> {
+        let f = self.forward_begin(b, mode, head)?;
+        if self.graph_eligible(mode, head) {
+            self.run_window(&f.plan, b, head, f.max_pos)?;
+        } else {
+            self.run(&f.plan, b, mode, head, f.max_pos)?;
+        }
+        self.forward_end(b, mode, &f.segs);
+        Ok(())
+    }
+
+    /// Everything a forward does before its layers run: the checks (refusals before any work), the P2 segments of its prompts, the
+    /// previous window's commits, the row arrays, the pages and the schedule.
+    fn forward_begin(&mut self, b: &RowBatch, mode: Mode, head: Head) -> Result<Begun, ModelError> {
         let rows = b.rows;
         match mode {
             Mode::Window if rows == 0 || rows > self.window_rows => {
                 return Err(ModelError::Request(format!("a window takes 1..={} rows, got {rows}", self.window_rows)))
             }
-            Mode::Prefill if b.n_seq() != 1 || rows == 0 || rows > self.s.rows => {
-                return Err(ModelError::Request(format!("a prefill chunk takes one sequence of 1..={} rows", self.s.rows)))
+            Mode::Prefill if b.n_seq() == 0 || rows == 0 || rows > self.s.rows => {
+                return Err(ModelError::Request(format!("a prefill chunk takes 1..={} rows", self.s.rows)))
             }
+            Mode::Prefill if b.n_seq() > 1 => self.check_prompts(b)?,
             _ => {}
         }
-        // under P2 a prompt chunk joins (or opens) its slot's prefill segment, on the segment's 16-row grid (refused otherwise, before any work)
-        let p2_seg = if mode == Mode::Prefill && self.prefill == PrefillContract::P2 {
-            let slot = b.seq_slot[0] as usize;
+        // a prompt forward paused at a layer boundary keeps its rows of the streams in the stash: what runs meanwhile must fit it
+        self.check_room(b)?;
+        // under P2 each prompt joins (or opens) its slot's prefill segment, on the segment's 16-row grid (refused otherwise, before any work)
+        let segs = if mode == Mode::Prefill && self.prefill == PrefillContract::P2 {
             let cuts: Vec<usize> = self.snap_cuts.iter().map(|c| c.row).collect();
-            Some((slot, self.p2_segment_of(slot, b.positions[0] as usize, &cuts)?))
+            (0..b.n_seq())
+                .map(|i| {
+                    let slot = b.seq_slot[i] as usize;
+                    Ok((slot, self.p2_segment_of(slot, b.positions[b.seq_rows(i).start] as usize, &cuts)?))
+                })
+                .collect::<Result<Vec<_>, ModelError>>()?
         } else {
-            None
+            Vec::new()
         };
         // the previous window's commits first: they read its index arrays, which this forward overwrites
         self.flush()?;
@@ -1063,11 +1123,12 @@ impl GlmModel {
             None if head == Head::None && self.mtp.is_some() => ops::plan_forward_tap(&self.cfg, self.layers),
             None => ops::plan_forward(&self.cfg, self.layers, head != Head::None),
         };
-        if self.graph_eligible(mode, head) {
-            self.run_window(&plan, b, head, max_pos)?;
-        } else {
-            self.run(&plan, b, mode, head, max_pos)?;
-        }
+        Ok(Begun { plan, max_pos, segs })
+    }
+
+    /// After a forward's last layer: a window's layout kept for its commit (and the end of its slots' prefill segments), each prompt's
+    /// P2 segment extended over its rows.
+    fn forward_end(&mut self, b: &RowBatch, mode: Mode, segs: &[(usize, usize)]) {
         if mode == Mode::Window {
             self.last_window = Some(PendingWindow { win: b.clone() });
             // a window ends every open prefill segment of its slots: the next prompt chunk of one starts a new segment
@@ -1075,10 +1136,10 @@ impl GlmModel {
                 self.p2_seg[sl as usize] = None;
             }
         }
-        if let Some((slot, anchor)) = p2_seg {
-            self.p2_seg[slot] = Some((anchor, b.positions[0] as usize + rows));
+        for (i, &(slot, anchor)) in segs.iter().enumerate() {
+            let r = b.seq_rows(i);
+            self.p2_seg[slot] = Some((anchor, b.positions[r.start] as usize + r.len()));
         }
-        Ok(())
     }
 
     #[allow(clippy::too_many_lines, unused_assignments)]
@@ -1198,7 +1259,8 @@ impl GlmModel {
         };
         // the rows of the mHC streams this rank keeps (every row without `sp`), and the mHC buffers at its first one
         let (r0, mrows) = sp.map_or((0, rows), |sp| (sp.lo, sp.rows()));
-        *sp_chunks += u64::from(sp.is_some());
+        // (counted once a forward: a forward run in parts starts with the embedding in its first part)
+        *sp_chunks += u64::from(sp.is_some() && plan.first() == Some(&Op::Embed));
         let x = unsafe { (s.streams.ptr() as *mut f32).add(r0 * mhc::ROW) };
         let (post, comb, part) = unsafe {
             (
@@ -1232,8 +1294,8 @@ impl GlmModel {
             Some(sh) => (sh.n_pools_max, sh.any_sparse, sh.mla_ctx),
             None => ((max_pos + 1) / dsa::P, dsa::is_sparse(max_pos), max_pos + 1),
         };
-        // the KDA layers' prefill descriptor, uploaded by the first one and kept for the forward
-        let mut kda_desc: Option<DevBuf> = None;
+        // the KDA layers' prefill descriptors, one per sequence of the forward, uploaded by the first one and kept for the forward
+        let mut kda_descs: Vec<DevBuf> = Vec::new();
         // under `sp`: a gather of the peer's hidden rows is in flight on the exchange stream (`GlmTp::sp_gather_begin`); the first op that
         // reads the peer's rows (or exchanges anything) joins it first
         let mut gather_pending = false;
@@ -1346,13 +1408,14 @@ impl GlmModel {
                                 kws: &mut s.kda_ws,
                             };
                             if p2 && *p2_kda_chunked {
-                                // P5b: a P2 prompt chunk on the rank's heads (any rows): the qkv strips through the P2 GEMM, the chunked
-                                // recurrence on the rank's pool, the gathered core output, the full P2 o_proj (`tp/p2_split.rs`)
-                                let slot = b.seq_slot[0] as usize;
+                                // P5b: a P2 prompt forward on the rank's heads (any rows, one or several prompts): the qkv strips through
+                                // the P2 GEMM, each prompt's chunked recurrence on its slot of the rank's pool, the gathered core output,
+                                // the full P2 o_proj (`tp/p2_split.rs`)
                                 let piece = p2_kda_piece(&s.kda_prefill_rec, io.kws);
-                                if kda_desc.is_none() {
-                                    kda_desc = Some(kda::prefill_descriptor_pieces(slot, rows, piece)?);
+                                if kda_descs.is_empty() {
+                                    kda_descs = kda_seg_descs(b, piece)?;
                                 }
+                                let segs = kda_segs(b, &kda_descs);
                                 t.kda_split_layer_p2(
                                     ord,
                                     &w.o,
@@ -1360,25 +1423,22 @@ impl GlmModel {
                                     &params,
                                     &mut pools[ord],
                                     io,
-                                    slot,
+                                    &segs,
                                     rows,
                                     &mut s.kda_prefill_rec,
-                                    kda_desc.as_ref().unwrap(),
                                     piece,
                                     st,
                                     sp,
                                     kda_join,
                                 )?;
                             } else if big {
+                                // P1: each prompt's row-by-row recurrence on its own slot and rows (one or several prompts)
                                 t.sp_gather_join(st)?;
-                                if kda_desc.is_none() {
-                                    kda_desc = Some(kda::prefill_descriptor(b.seq_slot[0] as usize, rows)?);
+                                if kda_descs.is_empty() {
+                                    kda_descs = kda_p1_descs(b)?;
                                 }
-                                let path = tp::KdaPath::Prefill {
-                                    slot: b.seq_slot[0] as usize,
-                                    rec: &mut s.kda_prefill_rec,
-                                    desc: kda_desc.as_ref().unwrap(),
-                                };
+                                let segs = kda_segs(b, &kda_descs);
+                                let path = tp::KdaPath::Prefill { segs: &segs, rec: &mut s.kda_prefill_rec };
                                 t.kda_split_layer(ord, &w.o, *kda_dims, &params, &mut pools[ord], io, path, rows, st)?;
                             } else {
                                 t.sp_gather_join(st)?;
@@ -1390,7 +1450,8 @@ impl GlmModel {
                             mark!("kda: a rank's heads (qkv strips, core, split o_proj)");
                         }
                         // under P2 every prompt chunk's KDA recurrence is the chunked one (16-row chunks from the call's first row, which the
-                        // segment rule put on its segment's grid), whatever the chunk's rows; the snapshot cuts split it at chunk boundaries
+                        // segment rule put on its segment's grid), whatever the chunk's rows; the snapshot cuts split it at chunk boundaries.
+                        // A forward of several prompts runs each one's recurrence on its own rows and slot
                         (MixerDevice::Kda(w), MixerKind::Kda) if p2 && *p2_kda_chunked => {
                             let ord = kda_ord[layer];
                             layers::lin(&w.qkv, &s.hidden, &mut s.kda_qkv, rows, Dtype::F16, Dtype::F32, &mut s.ws, st, path)?;
@@ -1398,31 +1459,33 @@ impl GlmModel {
                             let slot = b.seq_slot[0] as usize;
                             let piece = p2_kda_piece(&s.kda_prefill_rec, &s.kda_ws);
                             if snap_cuts.is_empty() {
-                                let desc = match kda_desc.as_ref() {
-                                    Some(d) => d,
-                                    None => {
-                                        kda_desc = Some(kda::prefill_descriptor_pieces(slot, rows, piece)?);
-                                        kda_desc.as_ref().unwrap()
-                                    }
-                                };
-                                kda::prefill_chunked(
-                                    st,
-                                    *kda_dims,
-                                    &w.view(),
-                                    &params,
-                                    &s.hidden,
-                                    Dtype::F16,
-                                    &s.kda_qkv,
-                                    Dtype::F32,
-                                    &mut pools[ord],
-                                    slot,
-                                    rows,
-                                    &mut s.kda_prefill_rec,
-                                    &mut s.kda_ws,
-                                    &mut s.kda_out,
-                                    desc,
-                                    piece,
-                                )?;
+                                if kda_descs.is_empty() {
+                                    kda_descs = kda_seg_descs(b, piece)?;
+                                }
+                                let (h, ch) = (cfg.hidden, cfg.kda.heads * cfg.kda.head_dim);
+                                for g in kda_segs(b, &kda_descs) {
+                                    let hv = s.hidden.subview(g.row0 * h * 2, g.rows * h * 2);
+                                    let qv = s.kda_qkv.subview(g.row0 * 3 * ch * 4, g.rows * 3 * ch * 4);
+                                    let mut ov = s.kda_out.subview(g.row0 * ch * 2, g.rows * ch * 2);
+                                    kda::prefill_chunked(
+                                        st,
+                                        *kda_dims,
+                                        &w.view(),
+                                        &params,
+                                        &hv,
+                                        Dtype::F16,
+                                        &qv,
+                                        Dtype::F32,
+                                        &mut pools[ord],
+                                        g.slot,
+                                        g.rows,
+                                        &mut s.kda_prefill_rec,
+                                        &mut s.kda_ws,
+                                        &mut ov,
+                                        g.desc,
+                                        piece,
+                                    )?;
+                                }
                             } else {
                                 let (h, ch) = (cfg.hidden, cfg.kda.heads * cfg.kda.head_dim);
                                 let ends: Vec<usize> = snap_cuts.iter().map(|c| c.row).chain(std::iter::once(rows)).collect();
@@ -1470,30 +1533,33 @@ impl GlmModel {
                             mark!("kda: qkv_proj");
                             // the exact row-by-row path in pieces of 128 rows, every row's bits the serial step's, the state committed piece by piece
                             if snap_cuts.is_empty() {
-                                let desc = match kda_desc.as_ref() {
-                                    Some(d) => d,
-                                    None => {
-                                        kda_desc = Some(kda::prefill_descriptor(b.seq_slot[0] as usize, rows)?);
-                                        kda_desc.as_ref().unwrap()
-                                    }
-                                };
-                                kda::prefill_with(
-                                    st,
-                                    *kda_dims,
-                                    &w.view(),
-                                    &params,
-                                    &s.hidden,
-                                    Dtype::F16,
-                                    &s.kda_qkv,
-                                    Dtype::F32,
-                                    &mut pools[ord],
-                                    b.seq_slot[0] as usize,
-                                    rows,
-                                    &mut s.kda_prefill_rec,
-                                    &mut s.kda_ws,
-                                    &mut s.kda_out,
-                                    desc,
-                                )?;
+                                // each prompt's recurrence on its own slot and rows (one or several prompts: `part.rs`)
+                                if kda_descs.is_empty() {
+                                    kda_descs = kda_p1_descs(b)?;
+                                }
+                                let (h, ch) = (cfg.hidden, cfg.kda.heads * cfg.kda.head_dim);
+                                for g in kda_segs(b, &kda_descs) {
+                                    let hv = s.hidden.subview(g.row0 * h * 2, g.rows * h * 2);
+                                    let qv = s.kda_qkv.subview(g.row0 * 3 * ch * 4, g.rows * 3 * ch * 4);
+                                    let mut ov = s.kda_out.subview(g.row0 * ch * 2, g.rows * ch * 2);
+                                    kda::prefill_with(
+                                        st,
+                                        *kda_dims,
+                                        &w.view(),
+                                        &params,
+                                        &hv,
+                                        Dtype::F16,
+                                        &qv,
+                                        Dtype::F32,
+                                        &mut pools[ord],
+                                        g.slot,
+                                        g.rows,
+                                        &mut s.kda_prefill_rec,
+                                        &mut s.kda_ws,
+                                        &mut ov,
+                                        g.desc,
+                                    )?;
+                                }
                             } else {
                                 // snapshots inside the chunk: the same path in segments that end at each cut (the pieces start again at a cut, which
                                 // changes no row's bits), the layer's state copied out between two segments
@@ -1841,6 +1907,7 @@ impl GlmModel {
                                 None,
                                 rows,
                                 max_pos,
+                                (b.n_seq() > 1).then_some(&b.positions[..]),
                                 split.map(|sp| (sp.lo, sp.hi)),
                                 if big && !cuts_here.is_empty() { Some(&mut ring_hook) } else { None },
                                 &mut |name| {
@@ -2392,21 +2459,25 @@ impl GlmModel {
                     let n = match head {
                         Head::AllRows => rows,
                         Head::LastRow => {
-                            // the head wants rows from the start of its input: move the last normed row to the front
-                            if rows > 1 {
-                                unsafe {
-                                    glue::copy_rows(
-                                        (s.hidden.ptr() as *const u16).add((rows - 1) * cfg.hidden) as *const c_void,
-                                        cfg.hidden,
-                                        s.hidden.ptr(),
-                                        cfg.hidden,
-                                        1,
-                                        cfg.hidden,
-                                        st,
-                                    )?;
+                            // the head wants rows from the start of its input: move each sequence's last normed row to the front, in
+                            // sequence order (row i's source is at or past row i, so no move reads a row an earlier move wrote)
+                            for i in 0..b.n_seq() {
+                                let last = b.seq_rows(i).end - 1;
+                                if last != i {
+                                    unsafe {
+                                        glue::copy_rows(
+                                            s.hidden.ptr_at(last * cfg.hidden * 2) as *const c_void,
+                                            cfg.hidden,
+                                            s.hidden.ptr_at(i * cfg.hidden * 2),
+                                            cfg.hidden,
+                                            1,
+                                            cfg.hidden,
+                                            st,
+                                        )?;
+                                    }
                                 }
                             }
-                            1
+                            b.n_seq()
                         }
                         Head::None => return Err(ModelError::Config("the schedule has a head the call did not ask for".into())),
                     };
@@ -2484,8 +2555,8 @@ impl GlmModel {
         self.candidates_of(b.rows, count)
     }
 
-    /// Prefill one chunk (at most 128 rows) of one sequence: `tokens` are positions `start..start + tokens.len()`. With `want` set, also
-    /// returns the candidates of the chunk's LAST row (the chunk must then end the prompt).
+    /// Prefill one chunk of one sequence: `tokens` are positions `start..start + tokens.len()`. With `want` set, also returns the candidates
+    /// of the chunk's LAST row (the chunk must then end the prompt). [`GlmModel::prefill_rows`] of that one sequence, whole.
     pub fn prefill_chunk(
         &mut self,
         slot: usize,
@@ -2494,23 +2565,7 @@ impl GlmModel {
         want: Option<usize>,
     ) -> Result<Option<Candidates>, ModelError> {
         let b = RowBatch::from_requests(&[gb_engine::RowRequest { slot, tokens: tokens.to_vec(), first_position: start as u64 }]);
-        let head = if want.is_some() { Head::LastRow } else { Head::None };
-        self.dflash_begin_chunk(slot, start, tokens.len());
-        let r = self.forward(&b, Mode::Prefill, head);
-        if let Err(e) = r {
-            // the next forward taps again
-            self.dflash_end_chunk();
-            return Err(e);
-        }
-        self.mtp_prefill_chunk(slot, start, tokens)?;
-        self.dflash_prefill_chunk(slot, start, tokens.len())?;
-        match want {
-            None => {
-                self.stream.sync()?;
-                Ok(None)
-            }
-            Some(count) => self.candidates_of(1, count).map(Some),
-        }
+        self.prefill_rows(&b, want, usize::MAX)
     }
 
     /// [`GlmModel::forward`] with an image splice (see [`GlmModel::prefill_chunk_mm`]): the capture-friendly entry the oracle dump uses.
