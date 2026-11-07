@@ -870,6 +870,11 @@ pub static RANK_DRAFT_GRAPHS: std::sync::Mutex<Option<(u64, u64, u64, u64)>> = s
 /// `draft_replays=.. draft_captures=.. draft_eager=.. draft_capture_failures=..` of [`RANK_DRAFT_GRAPHS`] (zeros before the first draft call).
 pub fn rank_draft_graphs_line() -> String {
     let (r, c, e, f) = RANK_DRAFT_GRAPHS.lock().unwrap_or_else(|p| p.into_inner()).unwrap_or((0, 0, 0, 0));
+    fn dflash_prompt_end(&mut self, slot: usize, end: Option<usize>) {
+        if slot < self.m.slots {
+            self.m.dflash_prompt_end(slot, end);
+        }
+    }
     format!("draft_replays={r} draft_captures={c} draft_eager={e} draft_capture_failures={f}")
 }
 

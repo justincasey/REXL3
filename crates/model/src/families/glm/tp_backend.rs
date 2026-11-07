@@ -239,6 +239,8 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime> GlmTpBackend<R> {
             }
             self.digests.begin(slot);
         }
+        // rank 0's drafter absorbs only the rows that reach its ring after the prompt
+        self.leader.inner_mut().dflash_prompt_end(slot, Some(n));
         let at = done;
         let want = (end == n).then_some(candidates);
         let c = self.leader.prefill_chunk(&Self::chunk_batch(slot, at, &prompt[at..end]), want)?;
@@ -279,6 +281,7 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime> GlmTpBackend<R> {
             }
             self.digests.begin(slot);
         }
+        self.leader.inner_mut().dflash_prompt_end(slot, Some(n));
         // set on every slice, as the single node does
         self.images.set(slot, images);
         let c = match call {
@@ -521,7 +524,7 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime> Backend for GlmTpBackend<R
         self.prefill_piece(slot, start, tokens, start as usize + tokens.len(), candidates)
     }
 
-    fn prefill_piece(&mut self, slot: usize, start: u64, tokens: &[u32], _total: usize, candidates: usize) -> RowOutput {
+    fn prefill_piece(&mut self, slot: usize, start: u64, tokens: &[u32], total: usize, candidates: usize) -> RowOutput {
         if self.dead() {
             return nan_row(candidates);
         }
@@ -534,6 +537,7 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime> Backend for GlmTpBackend<R
                 }
                 self.digests.begin(slot);
             }
+            self.leader.inner_mut().dflash_prompt_end(slot, Some(total.max(start as usize + tokens.len())));
             let (mut pos, n) = (start as usize, tokens.len());
             let mut at = 0;
             let mut last = None;

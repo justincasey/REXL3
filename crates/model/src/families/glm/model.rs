@@ -844,6 +844,7 @@ impl GlmModel {
         self.pending.remove(&slot);
         self.kv_tab.release(slot);
         self.p2_seg[slot] = None;
+        self.dflash_prompt_end(slot, None);
     }
 
     /// Under P2, the first position of `slot`'s open prefill segment (`None`: the next prompt chunk starts one). The backend cuts a P2
@@ -852,6 +853,7 @@ impl GlmModel {
         self.p2_seg.get(slot).copied().flatten().map(|(a, _)| a)
     }
 
+        self.dflash_prompt_end(slot, None);
     /// Set `slot`'s open P2 prefill segment to start at `len` (a prefix restore: the restored state is the state after `len` prompt rows).
     pub(in crate::families::glm) fn p2_open_segment(&mut self, slot: usize, len: usize) {
         self.p2_seg[slot] = Some((len, len));
@@ -2376,18 +2378,10 @@ impl GlmModel {
         let b = RowBatch::from_requests(&[gb_engine::RowRequest { slot, tokens: tokens.to_vec(), first_position: start as u64 }]);
         match want {
             None => {
-                self.forward(&b, Mode::Prefill, Head::None)?;
-                self.mtp_prefill_chunk(slot, start, tokens)?;
-                self.dflash_prefill_chunk(slot, start, tokens.len())?;
                 self.stream.sync()?;
                 Ok(None)
             }
-            Some(count) => {
-                self.forward(&b, Mode::Prefill, Head::LastRow)?;
-                self.mtp_prefill_chunk(slot, start, tokens)?;
-                self.dflash_prefill_chunk(slot, start, tokens.len())?;
-                self.candidates_of(1, count).map(Some)
-            }
+            Some(count) => self.candidates_of(1, count).map(Some),
         }
     }
 
@@ -2471,6 +2465,16 @@ impl GlmModel {
             let at = (blocks[p / per] as usize * per + p % per) * dsa::D;
             out.extend_from_slice(&all[at..at + dsa::D]);
         }
+        let head = if want.is_some() { Head::LastRow } else { Head::None };
+        self.dflash_begin_chunk(slot, start, tokens.len());
+        let r = self.forward(&b, Mode::Prefill, head);
+        if let Err(e) = r {
+            // the next forward taps again
+            self.dflash_end_chunk();
+            return Err(e);
+        }
+        self.mtp_prefill_chunk(slot, start, tokens)?;
+        self.dflash_prefill_chunk(slot, start, tokens.len())?;
         Ok(out)
     }
 }
