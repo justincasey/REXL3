@@ -94,6 +94,12 @@ impl<'p> LoadCtx<'p> {
         Self::new(LoadMode::from_env())
     }
 
+    /// [`LoadCtx::from_env`] for a load whose carves are known to sum to at most `bytes` (each rounded up to `gb_cuda::arena::ALIGN`): its
+    /// arena is one block of that size (`Arena::exact`), so the tail of a fixed 1 GiB block is not stranded for the process's life.
+    pub fn exact_from_env(bytes: usize) -> Self {
+        Self { arena: Arena::exact(bytes), ..Self::from_env() }
+    }
+
     pub fn mode(&self) -> LoadMode {
         self.mode
     }

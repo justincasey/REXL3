@@ -90,7 +90,8 @@ fn restricted_head_bytes(cfg: &GlmConfig, slots: usize) -> Result<u64, ModelErro
 pub fn load(m: &mut GlmModel, p: &DflashPlan) -> Result<(), ModelError> {
     let t = std::time::Instant::now();
     let pack = Pack::open(&p.dir).map_err(|e| ModelError::Config(format!("--draft {}: {e}", p.dir.display())))?;
-    let mut ctx = LoadCtx::from_env();
+    // the arena is exactly the drafter's weights: a fixed 1 GiB block would strand ~0.22 GiB of rank 0 for the process's life
+    let mut ctx = LoadCtx::exact_from_env(Draft::bf16_weight_bytes(&p.dims, m.cfg.vocab));
     let (draft, bytes) = Draft::declare_bf16(&mut ctx, &pack, p.dims, m.cfg.vocab, m.slots, m.chunk_rows(), BLOCK)
         .map_err(|e| ModelError::Config(format!("--draft {}: {e}", p.dir.display())))?;
     ctx.finish()?;

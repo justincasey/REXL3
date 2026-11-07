@@ -77,33 +77,44 @@ fn quantize_group(v: &[f32], q: &mut [u8]) -> (u16, u16) {
 /// A bf16 `[n, k]` matrix (row-major, as stored in a checkpoint) to the device buffer's bytes ([`bytes`] long). `k % 64 == 0`.
 pub fn quantize_bf16(w: &[u16], n: usize, k: usize) -> Vec<u8> {
     assert!(k % GROUP == 0 && w.len() == n * k, "a [{n}, {k}] bf16 matrix with k a multiple of {GROUP}");
+    quantize_bf16_rows(n, k, |r| &w[r * k..(r + 1) * k])
+}
+
+/// [`quantize_bf16`] of the matrix whose row `r` is `row(r)` (`k` bf16 values): the rows of several tensors stacked without first
+/// copying them into one matrix. The codes are packed one 64-row tile at a time, so besides the output only one tile's codes are held
+/// (a loader thread quantizing the drafter's 200 MB gate/up stack held a copy of it and its codes on top of the tensors: the boot's peak).
+pub fn quantize_bf16_rows<'a>(n: usize, k: usize, row: impl Fn(usize) -> &'a [u16]) -> Vec<u8> {
+    assert!(k % GROUP == 0, "a [{n}, {k}] bf16 matrix with k a multiple of {GROUP}");
     let (npad, kg) = (npad_of(n), k / GROUP);
     let [cb, sb, _] = part_bytes(n, k);
     let mut out = vec![0u8; bytes(n, k)];
-    let mut codes = vec![0u8; n * k];
-    let mut row = vec![0f32; k];
-    for r in 0..n {
-        for (o, &x) in row.iter_mut().zip(&w[r * k..(r + 1) * k]) {
-            *o = bf16_to_f32(x);
-        }
-        for g in 0..kg {
-            let (s, b) = quantize_group(&row[g * GROUP..(g + 1) * GROUP], &mut codes[r * k + g * GROUP..r * k + (g + 1) * GROUP]);
-            let at = (g * npad + r) * 2;
-            out[cb + at..cb + at + 2].copy_from_slice(&s.to_le_bytes());
-            out[cb + sb + at..cb + sb + at + 2].copy_from_slice(&b.to_le_bytes());
-        }
-    }
-    let words = &mut out[..cb];
+    let mut codes = vec![0u8; 64 * k];
+    let mut f = vec![0f32; k];
     for t in 0..npad / 64 {
+        for i in 0..64.min(n.saturating_sub(t * 64)) {
+            let r = t * 64 + i;
+            let w = row(r);
+            assert_eq!(w.len(), k, "row {r} of a [{n}, {k}] matrix");
+            for (o, &x) in f.iter_mut().zip(w) {
+                *o = bf16_to_f32(x);
+            }
+            for g in 0..kg {
+                let (s, b) = quantize_group(&f[g * GROUP..(g + 1) * GROUP], &mut codes[i * k + g * GROUP..i * k + (g + 1) * GROUP]);
+                let at = (g * npad + r) * 2;
+                out[cb + at..cb + at + 2].copy_from_slice(&s.to_le_bytes());
+                out[cb + sb + at..cb + sb + at + 2].copy_from_slice(&b.to_le_bytes());
+            }
+        }
+        let words = &mut out[..cb];
         for g in 0..kg {
             for j in 0..8 {
                 for lane in 0..32 {
-                    let r = t * 64 + j * 8 + lane / 4;
-                    if r >= n {
+                    let i = j * 8 + lane / 4;
+                    if t * 64 + i >= n {
                         continue;
                     }
                     for v in 0..2 {
-                        let base = r * k + g * GROUP + 32 * v + 2 * (lane % 4);
+                        let base = i * k + g * GROUP + 32 * v + 2 * (lane % 4);
                         let mut word = 0u32;
                         for (p, &o) in OFFS.iter().enumerate() {
                             word |= (codes[base + o] as u32) << (4 * p);
@@ -311,5 +322,16 @@ mod tests {
         assert_eq!((cb, sb, bb), (64 * 64 / 2, 64 * 2, 64 * 2));
         // rows 3..64 of the tile hold nothing
         assert!(q[cb + 3 * 2..cb + sb].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn rows_from_several_tensors_quantize_as_the_stacked_matrix() {
+        let mut seed = 11u64;
+        for (n, k, cut) in [(130usize, 128usize, 64usize), (65, 64, 1), (200, 192, 100)] {
+            let w: Vec<u16> = (0..n * k).map(|_| f32_to_bf16(lcg(&mut seed))).collect();
+            let (a, b) = w.split_at(cut * k);
+            let rows = quantize_bf16_rows(n, k, |r| if r < cut { &a[r * k..(r + 1) * k] } else { &b[(r - cut) * k..(r - cut + 1) * k] });
+            assert_eq!(rows, quantize_bf16(&w, n, k), "[{n}, {k}] cut at {cut}");
+        }
     }
 }

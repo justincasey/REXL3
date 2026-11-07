@@ -34,6 +34,9 @@ pub struct Arena {
     block_bytes: usize,
     /// What the blocks are made of (device memory unless a measurement asks for host memory).
     kind: BlockKind,
+    /// The first block is `block_bytes` (the load's whole size, known up front) and any carve past it gets a block of exactly its size:
+    /// no block is ever bigger than what is carved from it ([`Arena::exact`]).
+    exact: bool,
     blocks: Mutex<Vec<Open>>,
 }
 
@@ -55,7 +58,14 @@ impl Arena {
 
     /// An arena of the given kind (measurement code picks host memory; the loader uses [`BlockKind::Device`]).
     pub fn with_kind(block_bytes: usize, kind: BlockKind) -> Arc<Self> {
-        Arc::new(Self { block_bytes: block_bytes.max(ALIGN), kind, blocks: Mutex::new(Vec::new()) })
+        Arc::new(Self { block_bytes: block_bytes.max(ALIGN), kind, exact: false, blocks: Mutex::new(Vec::new()) })
+    }
+
+    /// A device arena for a load whose size is known before its first carve (`bytes`: the sum of its carves, each rounded up to [`ALIGN`]): one
+    /// block of `bytes`, and a carve that does not fit what is left gets a block of exactly its own size. A fixed-size arena strands the unused
+    /// tail of its last block for the process's life (a 1 GiB block under a 0.8 GiB drafter kept 0.22 GiB nobody could use).
+    pub fn exact(bytes: usize) -> Arc<Self> {
+        Arc::new(Self { block_bytes: bytes.max(ALIGN), kind: BlockKind::Device, exact: true, blocks: Mutex::new(Vec::new()) })
     }
 
     /// A view of `bytes` bytes (one byte for an empty request, as `DevBuf::alloc` does). Contents are uninitialised.
@@ -67,8 +77,19 @@ impl Arena {
             open.used += need;
             return Ok(DevBuf::view(&open.block, at, bytes));
         }
-        // a request over half a block would strand most of a shared block: give it exactly what it needs
-        let size = if need > self.block_bytes / 2 { need } else { self.block_bytes };
+        // a request over half a block would strand most of a shared block: give it exactly what it needs (an exact arena: its one block first, then
+        // exactly what each carve past it needs)
+        let size = if self.exact {
+            if blocks.is_empty() {
+                self.block_bytes.max(need)
+            } else {
+                need
+            }
+        } else if need > self.block_bytes / 2 {
+            need
+        } else {
+            self.block_bytes
+        };
         let block = Arc::new(match self.kind {
             BlockKind::Device => Block::alloc(size)?,
             BlockKind::MappedHost => Block::alloc_mapped_host(size)?,
@@ -133,5 +154,23 @@ mod tests {
         v.upload(&[7u8; 64]).unwrap();
         let back: Vec<u8> = v.to_vec().unwrap();
         assert_eq!(back, vec![7u8; 64]);
+    }
+
+    #[test]
+    fn an_exact_arena_allocates_what_it_is_asked_for_and_no_more() {
+        if !gpu() {
+            return;
+        }
+        let sizes = [1usize, 255, 256, 600_000, 4096, 0, 100_000];
+        let total: usize = sizes.iter().map(|&n| round_up(n.max(1), ALIGN)).sum();
+        let a = Arena::exact(total);
+        let bufs: Vec<DevBuf> = sizes.iter().map(|&n| a.alloc(n).unwrap()).collect();
+        assert_eq!((a.block_count(), a.reserved_bytes(), a.used_bytes()), (1, total, total), "one block, all of it carved");
+        // past the size it was given: a block of exactly the carve
+        let extra = a.alloc(1000).unwrap();
+        assert_eq!((a.block_count(), a.reserved_bytes()), (2, total + round_up(1000, ALIGN)));
+        for b in bufs.iter().chain([&extra]) {
+            assert_eq!(b.ptr() as usize % ALIGN, 0);
+        }
     }
 }
