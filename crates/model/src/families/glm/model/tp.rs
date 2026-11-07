@@ -692,7 +692,8 @@ pub(in crate::families::glm::model) struct KdaSeg<'a> {
 /// Which KDA path a split layer runs.
 pub(super) enum KdaPath<'a, 'b> {
     /// A decode / verify window, or a prompt chunk of at most `MAX_ROWS` rows (`commit`: every row accepted, the prefill chunk's way).
-    Window { batch: &'a kda::Batch<'b>, rec: &'a mut kda::Record, commit: bool },
+    /// `side`: a graphed window's branches with [`super::graphs::PART_KDA`]: the projections run beside the qkv strips.
+    Window { batch: &'a kda::Batch<'b>, rec: &'a mut kda::Record, commit: bool, side: Option<&'a super::graphs::Side> },
     /// A large prompt forward (P1): of one sequence, or of several, each `KdaSeg` its own rows, slot and descriptor.
     Prefill { segs: &'a [KdaSeg<'b>], rec: &'a mut kda::Record },
 }
@@ -816,26 +817,29 @@ impl GlmTp {
         let KdaIo { hidden, qkv, out, mixer_out, ws, kws } = io;
         let c = dims.v_dim();
         match path {
-            KdaPath::Window { batch, rec, commit } => {
+            KdaPath::Window { batch, rec, commit, side } => {
                 let kr =
                     self.kda_rank(ord).ok_or_else(|| ModelError::Config(format!("no KDA head split for KDA layer {ord}")))?;
-                kr.qkv.forward(hidden, qkv, rows, Dtype::F16, Dtype::F32, ws, st)?;
-                kda::forward_window(
-                    st,
-                    dims,
-                    &kr.w.view(),
-                    params,
-                    hidden,
-                    Dtype::F16,
-                    qkv,
-                    Dtype::F32,
-                    pool,
-                    batch,
-                    rec,
-                    kws,
-                    out,
-                    true,
-                )?;
+                let w = kr.w.view();
+                match side.filter(|sd| sd.parts & super::graphs::PART_KDA != 0) {
+                    Some(sd) => {
+                        // the low-rank projections and gates read only the layer's input (ready: the side forks after everything the
+                        // main stream was given) and write the record's g / beta and the workspace's gate, which the qkv strips and the
+                        // conv prep never touch; the recurrence (their first reader) waits for them. The same launches on the same inputs.
+                        gb_cuda::graph::fork(st, &sd.s1, &sd.fin)?;
+                        kda::project(&sd.s1, dims, &w, params, hidden, Dtype::F16, rows, rec, kws)?;
+                        sd.done1.record(&sd.s1)?;
+                        kr.qkv.forward(hidden, qkv, rows, Dtype::F16, Dtype::F32, ws, st)?;
+                        kda::prep(st, dims, &w, qkv, Dtype::F32, pool, batch, rec, kws)?;
+                        gb_cuda::graph::wait(st, &sd.done1)?;
+                        kda::window(st, dims, params, pool, batch, rec, kws, true)?;
+                        kda::norm(st, dims, &w, params, rows, kws, out)?;
+                    }
+                    None => {
+                        kr.qkv.forward(hidden, qkv, rows, Dtype::F16, Dtype::F32, ws, st)?;
+                        kda::forward_window(st, dims, &w, params, hidden, Dtype::F16, qkv, Dtype::F32, pool, batch, rec, kws, out, true)?;
+                    }
+                }
                 if commit {
                     kda::commit(st, dims, &kr.w.view(), params, pool, batch, rec, kws, None, true)?;
                 }

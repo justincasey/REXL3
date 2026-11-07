@@ -341,6 +341,8 @@ pub struct GlmModel {
     last_window: Option<PendingWindow>,
     /// `commit(slot, keep)` calls waiting to be applied together.
     pending: BTreeMap<usize, usize>,
+    /// The last flush's KDA commits run on the side's commit stream (`graphs::commit_side_on`): the next flush joins them first.
+    commits_on_side: bool,
     /// Per KDA layer / MLA layer: ordinal of layer `l` among its kind.
     kda_ord: Vec<usize>,
     mla_ord: Vec<usize>,
@@ -608,6 +610,7 @@ impl GlmModel {
             kda_params: kda::Params::glm(),
             last_window: None,
             pending: BTreeMap::new(),
+            commits_on_side: false,
             kda_ord,
             mla_ord,
             capture: None,
@@ -1037,15 +1040,37 @@ impl GlmModel {
 
     /// Apply the pending commits: per KDA layer, flip or replay the state of every sequence of the last window by its keep count (a
     /// sequence with no pending commit keeps 0: untouched). A failure leaves recurrent state that does not match the tokens committed, so
-    /// it is `StateLost` (fatal).
+    /// it is `StateLost` (fatal). Every reader of the KDA state, the window record or the row arrays calls this first: on return the main
+    /// stream is ordered after every commit (those [`GlmModel::flush_lazy`] left beside it too).
     pub fn flush(&mut self) -> Result<(), ModelError> {
-        self.flush_pending().map_err(|e| match e {
+        self.flush_as(false)
+    }
+
+    /// [`GlmModel::flush`] before a draft round (`DraftModel::flush`, on every rank of a group): the drafters' absorbs on the main stream,
+    /// the KDA commits on the side's commit stream (`graphs::commit_side_on`), so they run beside the round, which reads none of their
+    /// buffers; the next flush (a forward's first) joins them before anything else. The same kernels on the same inputs in the same order.
+    pub fn flush_lazy(&mut self) -> Result<(), ModelError> {
+        self.flush_as(true)
+    }
+
+    fn flush_as(&mut self, beside: bool) -> Result<(), ModelError> {
+        self.join_commits().and_then(|()| self.flush_pending(beside)).map_err(|e| match e {
             ModelError::StateLost(m) => ModelError::StateLost(m),
             other => ModelError::StateLost(other.to_string()),
         })
     }
 
-    fn flush_pending(&mut self) -> Result<(), ModelError> {
+    /// The main stream waits for the KDA commits the last [`GlmModel::flush_lazy`] left on the side's commit stream (nothing when it left
+    /// none).
+    fn join_commits(&mut self) -> Result<(), ModelError> {
+        if std::mem::take(&mut self.commits_on_side) {
+            let sd = self.side.as_ref().expect("commits on the side need the side");
+            gb_cuda::graph::wait(&self.stream, &sd.cm_done)?;
+        }
+        Ok(())
+    }
+
+    fn flush_pending(&mut self, beside: bool) -> Result<(), ModelError> {
         if self.pending.is_empty() {
             return Ok(());
         }
@@ -1072,8 +1097,18 @@ impl GlmModel {
         if self.cfg.kda.rank.is_some() && self.tp.as_ref().is_none_or(|t| t.split_bits() & tp::SPLIT_KDA == 0) {
             return Err(kda_rank_without_split(&self.cfg));
         }
-        let GlmModel { s, pools, recs, stream, kda_dims, kda_params, dev, kda_ord, tp, .. } = self;
+        let GlmModel { s, pools, recs, stream, kda_dims, kda_params, dev, kda_ord, tp, side, commits_on_side, .. } = self;
         let batch = kda::Batch { seq_start: &s.seq_start, slot: &s.seq_slot, n_seq: w.win.n_seq(), rows: w.win.rows };
+        // a lazy flush's commits beside what the main stream runs next (after everything it was given: the absorbs above, the `keep`
+        // upload), joined by the next flush (`join_commits`)
+        let sd = side.as_ref().filter(|_| beside && graphs::commit_side_on());
+        let st = match sd {
+            Some(sd) => {
+                gb_cuda::graph::fork(stream, &sd.cm, &sd.cm_go)?;
+                &sd.cm
+            }
+            None => &*stream,
+        };
         for (l, layer) in dev.layers.iter().enumerate() {
             let MixerDevice::Kda(k) = &layer.mixer else { continue };
             let ord = kda_ord[l];
@@ -1083,7 +1118,7 @@ impl GlmModel {
                 None => k.view(),
             };
             kda::commit(
-                stream,
+                st,
                 *kda_dims,
                 &view,
                 kda_params,
@@ -1094,6 +1129,10 @@ impl GlmModel {
                 (!all_whole).then_some(&s.keep),
                 true,
             )?;
+        }
+        if let Some(sd) = sd {
+            sd.cm_done.record(&sd.cm)?;
+            *commits_on_side = true;
         }
         Ok(())
     }
@@ -1606,7 +1645,7 @@ impl GlmModel {
                                 t.sp_gather_join(st)?;
                                 let batch = kda::Batch { seq_start: &s.seq_start, slot: &s.seq_slot, n_seq: b.n_seq(), rows };
                                 let rec = if mode == Mode::Window { &mut recs[ord] } else { &mut s.kda_prefill_rec };
-                                let path = tp::KdaPath::Window { batch: &batch, rec, commit: mode == Mode::Prefill };
+                                let path = tp::KdaPath::Window { batch: &batch, rec, commit: mode == Mode::Prefill, side };
                                 t.kda_split_layer(ord, (!core).then_some(&w.o), *kda_dims, &params, &mut pools[ord], io, path, rows, st)?;
                             }
                             mark!("kda: a rank's heads (qkv strips, core, split o_proj)");

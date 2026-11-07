@@ -741,8 +741,10 @@ impl LockstepRuntime for GlmRank {
         self.m.commit(slot, keep);
     }
 
+    /// The group's flush is a draft round's (`DraftModel::flush`, the only sender of `Msg::Flush` here): lazy on every rank
+    /// (`GlmModel::flush_lazy`), the next forward joins its KDA commits.
     fn flush(&mut self) -> Result<(), ModelError> {
-        self.m.flush()
+        self.m.flush_lazy()
     }
 
     fn apply_call(&mut self, seq: u64, call: GlmCall) -> Result<CallReply, ModelError> {

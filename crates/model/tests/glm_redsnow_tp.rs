@@ -1602,6 +1602,104 @@ fn p2_a_split_drafter_agrees_on_both_ranks_repeats_and_tracks_the_whole_drafter(
     eprintln!("MemAvailable min {:.1} GiB", gib(guard.finish()));
 }
 
+/// Draft rounds as the serving loop runs them, on one model with the drafter (graphs on): two prompts, then eight rounds of the flush,
+/// each slot's greedy drafts (slot 0 three, slot 1 one to three) and a verify window of both, each slot keeping its drafts up to the first
+/// that differs from the greedy pick (partial accepts: the KDA commits replay). `lazy`: the round's flush is `GlmModel::flush_lazy` (the
+/// KDA commits beside the draft round, joined by the window's flush); otherwise `GlmModel::flush`. `(digests, drafts, partial rounds)`:
+/// the prompts' and the windows' answers then every layer's state of both slots; every round's drafts; the rounds that kept fewer rows
+/// than a window held.
+fn draft_rounds(m: &mut GlmModel, layers: usize, lazy: bool) -> (Vec<u64>, Vec<Vec<u32>>, usize) {
+    let mut r = Rng(0x1f83_d9ab_fb41_bd6b);
+    let prompts = [r.tokens(300), r.tokens(90)];
+    let mut sq = Seqs::new();
+    let mut out = Vec::new();
+    let mut drafts = Vec::new();
+    let mut partial = 0;
+    for (s, p) in prompts.iter().enumerate() {
+        m.begin_slot(s).unwrap();
+        let c = m.prefill_chunk(s, 0, p, Some(COUNT)).unwrap().expect("the prompt's candidates");
+        out.push(digest_call(m, &c, 1));
+        sq.prompt(s, p, Some((&c, 0)));
+    }
+    let greedy = gb_sampling::Sampling { temperature: 0.0, ..Default::default() };
+    for round in 0..8 {
+        if lazy {
+            m.flush_lazy().unwrap();
+        } else {
+            m.flush().unwrap();
+        }
+        let mut reqs = Vec::new();
+        for s in 0..2 {
+            let toks: Vec<u32> = sq.fed[s].iter().copied().chain(std::iter::once(sq.next[s])).collect();
+            let want = if s == 0 { 3 } else { 1 + round % 3 };
+            let ask = gb_model::families::glm::model::DflashAsk { slot: s, tokens: &toks, sampling: &greedy, want };
+            let d = m.dflash_draft(&[ask]).unwrap().remove(0).tokens;
+            let tokens = std::iter::once(sq.next[s]).chain(d.iter().copied()).collect();
+            reqs.push(gb_engine::RowRequest { slot: s, tokens, first_position: sq.fed[s].len() as u64 });
+            drafts.push(d);
+        }
+        let b = RowBatch::from_requests(&reqs);
+        let c = m.window_candidates(&b, COUNT).unwrap();
+        out.push(digest_call(m, &c, b.rows));
+        let pick = |row: usize| c.ids[row * COUNT] as u32;
+        for (i, q) in reqs.iter().enumerate() {
+            let st = b.seq_rows(i).start;
+            let mut keep = 1;
+            while keep < q.tokens.len() && pick(st + keep - 1) == q.tokens[keep] {
+                keep += 1;
+            }
+            partial += usize::from(keep < q.tokens.len());
+            m.commit(q.slot, keep);
+            sq.fed[q.slot].extend_from_slice(&q.tokens[..keep]);
+            sq.next[q.slot] = pick(st + keep - 1);
+        }
+    }
+    m.flush().unwrap();
+    for s in 0..2 {
+        out.extend(slot_state(m, layers, s, sq.fed[s].len()));
+    }
+    for s in 0..SLOTS {
+        m.end_slot(s);
+    }
+    (out, drafts, partial)
+}
+
+/// A draft round's lazy flush (`GlmModel::flush_lazy`: the window's KDA commits on the side's commit stream, beside the draft round,
+/// joined by the next flush) against the joined flush: [`draft_rounds`] gives every answer, every draft and every layer's state alike,
+/// with partial accepts (replays) among its rounds. The joined run twice is the control.
+///
+///     flock -x /tmp/rexl3-gpu.lock env REXL3_REDSNOW_DIR=... REXL3_DFLASH_DIR=... REXL3_GLM_KV=fp8 cargo test --release -p gb-model \
+///         --test glm_redsnow_tp a_draft_rounds_lazy_flush -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+fn a_draft_rounds_lazy_flush_equals_the_joined_flush() {
+    let Some(dir) = redsnow_dir() else { return };
+    let (layers, draft, taps) = prefix_setup();
+    let Some(draft) = draft else {
+        eprintln!("REXL3_DFLASH_DIR not set: not run");
+        return;
+    };
+    require_available(if layers <= 8 { 60 } else { 80 } * GIB);
+    let guard = Guard::start(20 * GIB);
+    let mut m = one_model(PrefillContract::P2, &dir, layers, Some(&draft), &taps, 0);
+    m.set_graphs(true);
+    let joined = draft_rounds(&mut m, layers, false);
+    let lazy = draft_rounds(&mut m, layers, true);
+    let again = draft_rounds(&mut m, layers, false);
+    assert_eq!(again, joined, "the control: the joined run twice");
+    assert!(joined.2 > 0, "no round kept fewer rows than its window held (no replay ran)");
+    assert_eq!(lazy.1, joined.1, "a draft differs after a lazy flush");
+    assert_eq!(lazy.0, joined.0, "an answer or a layer's state differs after a lazy flush");
+    eprintln!(
+        "LAZY FLUSH: {} answers and layer states, {} drafts, {} partial rounds equal to the joined flush's",
+        joined.0.len(),
+        joined.1.len(),
+        joined.2
+    );
+    drop(m);
+    eprintln!("MemAvailable min {:.1} GiB", gib(guard.finish()));
+}
+
 /// Every layer's state of `slot` after its first `n` prompt rows, one digest a layer: a KDA layer's current state and conv history (its
 /// other buffer and the parity carry what earlier runs on the model left); an MLA layer's latent rows (through the slot's pages) and DSA
 /// pool rows.
