@@ -326,7 +326,10 @@ pub const ENV_OVERLAP: &str = "REXL3_GLM_OVERLAP";
 pub const PART_SHARED: u8 = 1;
 /// An MLA layer's latent and indexer chains beside its query chain.
 pub const PART_MLA: u8 = 2;
-pub const PART_ALL: u8 = PART_SHARED | PART_MLA;
+/// A KDA layer's low-rank projections and gates (`kda::project`, which read only the layer's input) beside its qkv projection, on a
+/// rank of the KDA head split (`GlmTp::kda_split_layer`'s window path).
+pub const PART_KDA: u8 = 4;
+pub const PART_ALL: u8 = PART_SHARED | PART_MLA | PART_KDA;
 
 pub(super) struct GraphCache {
     pub on: bool,
@@ -386,7 +389,7 @@ impl GlmModel {
         self.set_overlap_parts(if on { PART_ALL } else { 0 })
     }
 
-    /// [`GlmModel::set_overlap`] for some parts only (`PART_SHARED | PART_MLA`).
+    /// [`GlmModel::set_overlap`] for some parts only (`PART_SHARED | PART_MLA | PART_KDA`).
     pub fn set_overlap_parts(&mut self, parts: u8) -> Result<(), ModelError> {
         self.clear_graphs()?;
         if let Some(s) = self.side.as_mut() {

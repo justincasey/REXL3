@@ -1634,7 +1634,7 @@ impl GlmModel {
                                 t.sp_gather_join(st)?;
                                 let batch = kda::Batch { seq_start: &s.seq_start, slot: &s.seq_slot, n_seq: b.n_seq(), rows };
                                 let rec = if mode == Mode::Window { &mut recs[ord] } else { &mut s.kda_prefill_rec };
-                                let path = tp::KdaPath::Window { batch: &batch, rec, commit: mode == Mode::Prefill };
+                                let path = tp::KdaPath::Window { batch: &batch, rec, commit: mode == Mode::Prefill, side };
                                 t.kda_split_layer(ord, (!core).then_some(&w.o), *kda_dims, &params, &mut pools[ord], io, path, rows, st)?;
                             }
                             mark!("kda: a rank's heads (qkv strips, core, split o_proj)");
