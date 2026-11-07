@@ -95,6 +95,29 @@ pub(super) fn gated(
     Ok(())
 }
 
+/// [`gated`]'s P2 path in two parts (`glm_p2::gated_part`: the gate linear, then the rest on the gate output it left), one piece of
+/// `rows` rows of whichever scratch [`gated`] would take: the same launches in the same order, with room for other work between them.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn gated_part(
+    m: &moe::SharedExpert,
+    x: &DevBuf,
+    rows: usize,
+    out: &mut DevBuf,
+    small: Option<&mut moe::SharedScratch>,
+    big: Option<&mut moe_prefill::SharedScratchBig>,
+    st: &Stream,
+    part: gb_cuda::glm_p2::GatedPart,
+) -> Result<(), ModelError> {
+    let bufs = match (big, small) {
+        (Some(b), _) if rows > MAX_ROWS => b.p2_bufs(),
+        (_, Some(s)) if rows <= s.max_rows => s.p2_bufs(),
+        (Some(b), _) => b.p2_bufs(),
+        _ => return Err(ModelError::Config("no gated-MLP scratch for this chunk".into())),
+    };
+    gb_cuda::glm_p2::gated_part(m, x, Dtype::F16, rows, out, bufs, part, st)?;
+    Ok(())
+}
+
 /// Called after each slab's `dsa::append` of a large chunk with the slab's first row, its rows and the layer's planes (see [`mla_dsa_mixer`]).
 pub(super) type AfterAppend<'a> = &'a mut dyn FnMut(usize, usize, &dsa::Planes) -> Result<(), ModelError>;
 

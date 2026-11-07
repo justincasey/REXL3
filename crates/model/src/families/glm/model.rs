@@ -170,7 +170,8 @@ pub struct Profile {
 /// the layer's shared expert when it is owed (`owed`: deferred by `MoeShared` to overlap the swap), then the parts' sum with the shared
 /// expert last into `mixer_out`. A chunk of two slabs or more is row-split (`tp::RowSplit`): the shared expert and the sum run on this
 /// rank's rows, the output rows are swapped with the peer's, unless the residual is sequence-parallel (`sp_res`: the rank needs only its
-/// own rows).
+/// own rows). `gated`: the owed shared expert's gate linear already ran on this rank's rows (`MoeRoute` under the sequence-parallel
+/// residual, beside the hidden rows' gather): only the rest of it runs here (`layers::gated_part`, the same launches).
 #[allow(clippy::too_many_arguments)]
 fn p2_rank_layer(
     t: &mut tp::GlmTp,
@@ -182,6 +183,7 @@ fn p2_rank_layer(
     st: &Stream,
     path: layers::LinPath,
     sp_res: bool,
+    gated: bool,
     mark: &mut dyn FnMut(&'static str) -> Result<(), gb_cuda::CudaError>,
 ) -> Result<(), ModelError> {
     let split = t.p2_row_split(rows);
@@ -194,8 +196,14 @@ fn p2_rank_layer(
                 let h = sh.hidden;
                 let x = s.hidden.subview(sp.lo * h * 2, sp.rows() * h * 2);
                 let mut y = s.moe_shared_out.subview(sp.lo * h * 4, sp.rows() * h * 4);
-                layers::gated(sh, &x, sp.rows(), &mut y, s.shared.as_mut(), Some(sh_sc), st, path)?;
+                if gated {
+                    let rest = gb_cuda::glm_p2::GatedPart::Rest;
+                    layers::gated_part(sh, &x, sp.rows(), &mut y, s.shared.as_mut(), Some(sh_sc), st, rest)?;
+                } else {
+                    layers::gated(sh, &x, sp.rows(), &mut y, s.shared.as_mut(), Some(sh_sc), st, path)?;
+                }
             }
+            None if gated => return Err(ModelError::Config("a shared expert gated on a row split the layer does not have".into())),
             None => layers::gated(sh, &s.hidden, rows, &mut s.moe_shared_out, s.shared.as_mut(), Some(sh_sc), st, path)?,
         }
     }
@@ -1413,6 +1421,8 @@ impl GlmModel {
         // under P2 on a tensor-parallel rank the shared expert is computed between the rank's part and the parts' sum, beside the swap
         // (`model/tp/p2.rs`): `MoeShared` only records that it is owed
         let mut shared_deferred = false;
+        // under `sp`: the owed shared expert's gate linear already ran beside the hidden rows' gather (`MoeRoute`)
+        let mut shared_gated = false;
         // lane E, E2.6: a rank of the shared-expert split (`sh`) runs its half of every trunk MoE layer's shared expert in this window, the
         // down partials riding in the routed experts' exchange (`model/tp.rs` `ShSplit`); prefill chunks keep it replicated
         let sh_split = mode == Mode::Window && tp.as_ref().is_some_and(|t| t.shared_split_on(true, rows));
@@ -2247,6 +2257,15 @@ impl GlmModel {
                         let mut wt = pf.moe.wts.subview(sp.lo * k * 2, sp.rows() * k * 2);
                         router.logits(&xr, Dtype::F16, sp.rows(), &mut lg, st)?;
                         router.select(sig, &lg, sp.rows(), &mut pk, &mut wt, st)?;
+                        // the owed shared expert's gate linear on this rank's rows too, while the gather crosses (its rest runs beside the
+                        // part swap, `p2_rank_layer`): the same launches, one piece of the prefill scratch's rows
+                        let (FfnDevice::Moe { shared: sh, .. } | FfnDevice::MoeSubbanks { shared: sh, .. }) = ffn else { unreachable!() };
+                        if shared_deferred && sp.rows() <= pf.shared.max_rows {
+                            let mut so = s.moe_shared_out.subview(sp.lo * h * 4, sp.rows() * h * 4);
+                            let gate = gb_cuda::glm_p2::GatedPart::Gate;
+                            layers::gated_part(sh, &xr, sp.rows(), &mut so, s.shared.as_mut(), Some(&mut pf.shared), st, gate)?;
+                            shared_gated = true;
+                        }
                         let t = tp.as_mut().expect("sp is a rank's");
                         t.sp_gather_join(st)?;
                         gather_pending = false;
@@ -2308,7 +2327,8 @@ impl GlmModel {
                             Some(t) => {
                                 let owed = std::mem::take(&mut shared_deferred).then_some(&**shared);
                                 let ex = tp::P2Routed::Subbanks(&m.experts);
-                                p2_rank_layer(t, ex, owed, with_shared, s, rows, st, path, sp.is_some(), &mut |_| Ok(()))?;
+                                let gated = std::mem::take(&mut shared_gated);
+                                p2_rank_layer(t, ex, owed, with_shared, s, rows, st, path, sp.is_some(), gated, &mut |_| Ok(()))?;
                             }
                             // a mixed-width layer on one node: the pairs stage once per subbank, then the one combine
                             // (`glm_p2_moe::run_subbanks`); the layer's shared expert ran first (on the side stream, when it is on, joined
@@ -2448,7 +2468,8 @@ impl GlmModel {
                         let FfnDevice::Moe { shared, .. } = &layer_of(layer).ffn else { unreachable!() };
                         let owed = std::mem::take(&mut shared_deferred).then_some(&**shared);
                         let ex = tp::P2Routed::Bank(&m.experts);
-                        p2_rank_layer(t, ex, owed, with_shared, s, rows, st, path, sp.is_some(), &mut |_| Ok(()))?;
+                        let gated = std::mem::take(&mut shared_gated);
+                        p2_rank_layer(t, ex, owed, with_shared, s, rows, st, path, sp.is_some(), gated, &mut |_| Ok(()))?;
                         break 'p2arm;
                     }
                     let sh = with_shared.then_some(&s.moe_shared_out);
