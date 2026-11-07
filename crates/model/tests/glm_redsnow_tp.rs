@@ -23,6 +23,14 @@
 //! before the group forms): the 6-bit experts on the P2 expert GEMMs, every rank's several subbanks a MoE layer through the P2 rank path
 //! (`glm_p2_moe::pairs_subbanks_rank`, its part, the part swap), layer 13's split gate/up subbank through the decode pairs stage. Both
 //! ranks' answers must equal the one P2 model's, byte for byte, and differ from P1's somewhere (P2 ran).
+//!
+//! `p2_several_prompts_in_one_forward_equal_each_prompts_solo_forward` and
+//! `p2_a_forward_paused_with_windows_and_a_prompt_between_its_parts_equals_the_whole_forward` (`families/glm/model/part.rs`): the
+//! slices of three prompts (one a continuation) in ONE P2 prompt forward give each prompt the answer, the state (the windows after) and
+//! the drafter context (the drafts after) of its own forward; a prompt forward paused at layer bounds, with a verify window, another
+//! slot's whole prompt and a window of two slots run between its parts, gives every call the bits of the run with the forward whole.
+//! Both on one P2 model and on the two P2 ranks of the serving split (`kda,lm,mla,sh`, sequence-parallel residual), whose answers must
+//! equal the one model's.
 
 mod glm_support;
 
@@ -878,6 +886,348 @@ fn p2_redsnow_sequence_parallel_two_ranks_equal_one_p2_model_and_relay_the_taps(
         a.sp_chunks(),
         t0r.exchanges,
         t0r.exchanged_bytes as f64 / 1048576.0
+    );
+    drop((a, b));
+    eprintln!("MemAvailable min {:.1} GiB", gib(guard.finish()));
+}
+
+/// The digest of row `i` of a prompt forward's candidates and of its fp16 logits (a forward of several prompts answers one row each).
+fn digest_row(m: &GlmModel, c: &gb_model::forward::Candidates, i: usize) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let k = c.count;
+    for &x in &c.ids[i * k..(i + 1) * k] {
+        fnv(&mut h, &x.to_le_bytes());
+    }
+    for &v in &c.vals[i * k..(i + 1) * k] {
+        fnv(&mut h, &v.to_bits().to_le_bytes());
+    }
+    for x in m.logits_host(i, 1).unwrap() {
+        fnv(&mut h, &x.to_le_bytes());
+    }
+    h
+}
+
+/// The slots' sequences while a script runs: the tokens fed so far and the next one (the greedy pick of the last answer).
+struct Seqs {
+    fed: Vec<Vec<u32>>,
+    next: Vec<u32>,
+}
+
+impl Seqs {
+    fn new() -> Self {
+        Seqs { fed: vec![Vec::new(); SLOTS], next: vec![0; SLOTS] }
+    }
+
+    /// A prompt slice of `slot` ran; with `c`, it ended the prompt and row `i` of `c` is its answer.
+    fn prompt(&mut self, slot: usize, tokens: &[u32], c: Option<(&gb_model::forward::Candidates, usize)>) {
+        self.fed[slot].extend_from_slice(tokens);
+        if let Some((c, i)) = c {
+            self.next[slot] = c.ids[i * c.count] as u32;
+        }
+    }
+}
+
+/// One window of `rows` (each `(slot, drafts, keep)`: the slot fed its next token then `drafts`, its first `keep` rows committed, the
+/// next token the pick after the last kept row): the window's digest.
+fn window(m: &mut GlmModel, sq: &mut Seqs, rows: &[(usize, Vec<u32>, usize)]) -> u64 {
+    let reqs: Vec<gb_engine::RowRequest> = rows
+        .iter()
+        .map(|(s, drafts, _)| {
+            let tokens = std::iter::once(sq.next[*s]).chain(drafts.iter().copied()).collect();
+            gb_engine::RowRequest { slot: *s, tokens, first_position: sq.fed[*s].len() as u64 }
+        })
+        .collect();
+    let b = RowBatch::from_requests(&reqs);
+    let c = m.window_candidates(&b, COUNT).unwrap();
+    let d = digest_call(m, &c, b.rows);
+    for (i, (s, _, keep)) in rows.iter().enumerate() {
+        m.commit(*s, *keep);
+        sq.fed[*s].extend_from_slice(&reqs[i].tokens[..*keep]);
+        sq.next[*s] = c.ids[(b.seq_rows(i).start + keep - 1) * COUNT] as u32;
+    }
+    d
+}
+
+/// `n` greedy one-row windows of every slot.
+fn greedy_windows(m: &mut GlmModel, sq: &mut Seqs, n: usize) -> Vec<u64> {
+    (0..n).map(|_| window(m, sq, &(0..SLOTS).map(|s| (s, Vec::new(), 1)).collect::<Vec<_>>())).collect()
+}
+
+/// Each slot's seven greedy DFlash2 drafts from where it stands, its last window's commits applied first (`dflash_draft` reads the
+/// committed context; none without a drafter, or when `with` is off: a rank of a group drafts through the group's calls, not alone).
+fn slot_drafts(m: &mut GlmModel, sq: &Seqs, with: bool) -> Vec<Vec<u32>> {
+    if !with || !m.has_dflash() {
+        return Vec::new();
+    }
+    m.flush().unwrap();
+    let s = gb_sampling::Sampling { temperature: 0.0, ..Default::default() };
+    (0..SLOTS)
+        .map(|slot| {
+            let toks: Vec<u32> = sq.fed[slot].iter().copied().chain(std::iter::once(sq.next[slot])).collect();
+            let ask = gb_model::families::glm::model::DflashAsk { slot, tokens: &toks, sampling: &s, want: 7 };
+            m.dflash_draft(&[ask]).unwrap().remove(0).tokens
+        })
+        .collect()
+}
+
+/// One prompt slice of `slot`: `tokens` at positions from `at`.
+fn slice_of(slot: usize, at: usize, tokens: &[u32]) -> RowBatch {
+    RowBatch::from_requests(&[gb_engine::RowRequest { slot, tokens: tokens.to_vec(), first_position: at as u64 }])
+}
+
+/// [`batch_script`]'s prompts: slot 0's 230 tokens and slot 1's 37, slot 2's 600 (a 400-row slice alone, then its last 200 rows).
+fn batch_prompts() -> Vec<Vec<u32>> {
+    let mut r = Rng(0x2545_f491_4f6c_dd1d);
+    vec![r.tokens(230), r.tokens(37), r.tokens(600)]
+}
+
+/// Slot 2's first 400 rows alone, then the last slices of the three prompts (467 rows: slot 2's a continuation of the segment its first
+/// slice opened) `together` in ONE prompt forward (`GlmModel::prefill_rows` of the three sequences), or each in its own forward; then four
+/// greedy windows of the three. One digest per prompt's answer (its row of the candidates and of the logits) and per window, in call
+/// order, and (with `drafts`) each slot's drafts after.
+fn batch_script(m: &mut GlmModel, together: bool, drafts: bool) -> (Vec<u64>, Vec<Vec<u32>>) {
+    let p = batch_prompts();
+    let mut sq = Seqs::new();
+    let mut out = Vec::new();
+    for s in 0..SLOTS {
+        m.begin_slot(s).unwrap();
+    }
+    assert!(m.prefill_chunk(2, 0, &p[2][..400], None).unwrap().is_none());
+    sq.prompt(2, &p[2][..400], None);
+    let tails = [(0usize, 0usize), (1, 0), (2, 400)];
+    if together {
+        let reqs: Vec<gb_engine::RowRequest> = tails
+            .iter()
+            .map(|&(s, at)| gb_engine::RowRequest { slot: s, tokens: p[s][at..].to_vec(), first_position: at as u64 })
+            .collect();
+        let b = RowBatch::from_requests(&reqs);
+        let c = m.prefill_rows(&b, Some(COUNT), usize::MAX).unwrap().expect("the forward's candidates");
+        assert_eq!(c.rows, tails.len(), "one answer per prompt");
+        for (i, &(s, at)) in tails.iter().enumerate() {
+            out.push(digest_row(m, &c, i));
+            sq.prompt(s, &p[s][at..], Some((&c, i)));
+        }
+    } else {
+        for &(s, at) in &tails {
+            let c = m.prefill_chunk(s, at, &p[s][at..], Some(COUNT)).unwrap().expect("the slice's candidates");
+            out.push(digest_row(m, &c, 0));
+            sq.prompt(s, &p[s][at..], Some((&c, 0)));
+        }
+    }
+    out.extend(greedy_windows(m, &mut sq, 4));
+    let d = slot_drafts(m, &sq, drafts);
+    m.flush().unwrap();
+    for s in 0..SLOTS {
+        m.end_slot(s);
+    }
+    (out, d)
+}
+
+/// The rows of the stash of [`pause_script`]'s models: a quarter of the 512-row slice paused, so the slice has rows past the stash.
+const PART_ROOM: usize = 128;
+
+/// [`pause_script`]'s prompts: slot 0's 200 tokens, slot 1's 900 (its first 512-row slice the forward that pauses), slot 2's 100.
+fn pause_prompts() -> Vec<Vec<u32>> {
+    let mut r = Rng(0x6a09_e667_f3bc_c908);
+    vec![r.tokens(200), r.tokens(900), r.tokens(100)]
+}
+
+/// Slot 0's prompt; slot 1's first 512-row slice, paused at the first of `parts` (layer bounds, ascending; none: the slice whole); a
+/// verify window of slot 0 (4 rows, 2 kept); resumed to the next bound; slot 2's whole prompt; resumed to the next; a window of slots 0
+/// and 2; the slice's remaining parts; then the rest of slot 1's prompt and three greedy windows of the three. Every answering call's
+/// digest in call order (the slice does not end its prompt: it answers nothing wherever it pauses), and (with `drafts`) each slot's
+/// drafts after. While paused, a forward of more rows than the stash, one on the paused slot and a second forward in parts are refused.
+fn pause_script(m: &mut GlmModel, parts: &[usize], drafts: bool) -> (Vec<u64>, Vec<Vec<u32>>) {
+    let p = pause_prompts();
+    let mut sq = Seqs::new();
+    let mut out = Vec::new();
+    m.begin_slot(0).unwrap();
+    let c = m.prefill_chunk(0, 0, &p[0], Some(COUNT)).unwrap().expect("slot 0's candidates");
+    out.push(digest_row(m, &c, 0));
+    sq.prompt(0, &p[0], Some((&c, 0)));
+    m.begin_slot(1).unwrap();
+    let mut bounds = parts.iter().copied();
+    let until = bounds.next().unwrap_or(usize::MAX);
+    assert!(m.prefill_rows(&slice_of(1, 0, &p[1][..CHUNK]), None, until).unwrap().is_none());
+    sq.prompt(1, &p[1][..CHUNK], None);
+    if !parts.is_empty() {
+        assert_eq!(m.prefill_paused().map(|b| b.seq_slot.clone()), Some(vec![1]), "the slice is paused");
+        let room = m.prefill_part_rows();
+        assert!(m.prefill_rows(&slice_of(2, 0, &p[1][..room + 1]), None, usize::MAX).is_err(), "a forward past the stash");
+        assert!(m.prefill_rows(&slice_of(1, CHUNK, &p[1][CHUNK..CHUNK + 16]), None, usize::MAX).is_err(), "a forward on the paused slot");
+        assert!(m.prefill_rows(&slice_of(2, 0, &p[2]), None, 1).is_err(), "a second forward in parts");
+    }
+    out.push(window(m, &mut sq, &[(0, vec![11, 12, 13], 2)]));
+    if let Some(k) = bounds.next() {
+        assert!(m.prefill_resume(k).unwrap().is_none());
+    }
+    m.begin_slot(2).unwrap();
+    let c = m.prefill_chunk(2, 0, &p[2], Some(COUNT)).unwrap().expect("slot 2's candidates");
+    out.push(digest_row(m, &c, 0));
+    sq.prompt(2, &p[2], Some((&c, 0)));
+    if let Some(k) = bounds.next() {
+        assert!(m.prefill_resume(k).unwrap().is_none());
+    }
+    out.push(window(m, &mut sq, &[(0, vec![21], 1), (2, vec![31, 32], 2)]));
+    for k in bounds {
+        assert!(m.prefill_resume(k).unwrap().is_none());
+    }
+    if !parts.is_empty() {
+        assert!(m.prefill_resume(usize::MAX).unwrap().is_none(), "the slice's last part answers nothing (it does not end the prompt)");
+        assert!(m.prefill_paused().is_none());
+    }
+    let c = m.prefill_chunk(1, CHUNK, &p[1][CHUNK..], Some(COUNT)).unwrap().expect("slot 1's candidates");
+    out.push(digest_row(m, &c, 0));
+    sq.prompt(1, &p[1][CHUNK..], Some((&c, 0)));
+    out.extend(greedy_windows(m, &mut sq, 3));
+    let d = slot_drafts(m, &sq, drafts);
+    m.flush().unwrap();
+    for s in 0..SLOTS {
+        m.end_slot(s);
+    }
+    (out, d)
+}
+
+/// The layers of the prefix (`REXL3_REDSNOW_TP_LAYERS`, default 8), the DFlash2 drafter's directory (`REXL3_DFLASH_DIR`, optional) and
+/// the layers it taps (five of the prefix, as the sequence-parallel test).
+fn prefix_setup() -> (usize, Option<PathBuf>, Vec<usize>) {
+    let layers: usize = std::env::var("REXL3_REDSNOW_TP_LAYERS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    let draft = std::env::var("REXL3_DFLASH_DIR").ok().map(PathBuf::from).filter(|p| p.join("config.json").exists());
+    let taps = [1, 3, 4, 5, 7].iter().map(|&l: &usize| l.min(layers - 1)).collect();
+    (layers, draft, taps)
+}
+
+/// One P2 model of every expert of the prefix, drafting with `draft` when given, with the stash of `room` rows (0: none).
+fn p2_one_model(dir: &Path, layers: usize, draft: Option<&Path>, taps: &[usize], room: usize) -> GlmModel {
+    let (mut m, _) = load(dir, layers, None, |_| {});
+    m.set_prefill_contract(PrefillContract::P2).unwrap();
+    if let Some(d) = draft {
+        attach_drafter(&mut m, d, taps);
+    }
+    if room > 0 {
+        assert_eq!(m.enable_prefill_parts(room).map(|_| m.prefill_part_rows()).unwrap(), room);
+    }
+    m
+}
+
+/// The two P2 ranks of the prefix under the serving split (`kda,lm,mla,sh`: the sequence-parallel residual of a long prompt forward) on a
+/// loopback group, rank 0 drafting with `draft` when given (both ranks relaying its taps), each with the stash of `room` rows (0: none).
+fn p2_sp_ranks(dir: &Path, layers: usize, draft: Option<&Path>, taps: &[usize], room: usize) -> (GlmModel, GlmModel) {
+    use gb_model::families::glm::model::tp::split_from_vars;
+    assert!(gb_model::families::glm::contract::p2_sp_on(), "REXL3_GLM_P2_SP is off: the serving split's residual would not be tested");
+    let bits = split_from_vars(|_| Some("kda,lm,mla,sh".into())).unwrap();
+    let owns = [ExpertOwnership::range(E, 0, 2).unwrap(), ExpertOwnership::range(E, 1, 2).unwrap()];
+    let mut ms: Vec<GlmModel> = owns
+        .iter()
+        .map(|o| {
+            let (mut m, _) = load(dir, layers, Some(o), |_| {});
+            m.set_prefill_contract(PrefillContract::P2).unwrap();
+            m
+        })
+        .collect();
+    let mut comms = LoopbackGroup::with_timeout(2, Duration::from_secs(120)).into_iter();
+    for (m, o) in ms.iter_mut().zip(&owns) {
+        m.enable_tp(Arc::new(comms.next().unwrap()), o.clone()).unwrap();
+        m.enable_head_split(bits).unwrap();
+    }
+    if let Some(d) = draft {
+        attach_drafter(&mut ms[0], d, taps);
+        for m in ms.iter_mut() {
+            m.enable_tap_relay(taps).unwrap();
+        }
+    }
+    if room > 0 {
+        for m in ms.iter_mut() {
+            m.enable_prefill_parts(room).unwrap();
+        }
+    }
+    let b = ms.pop().unwrap();
+    (ms.pop().unwrap(), b)
+}
+
+/// `f` on both ranks at once, each on its own thread: the two results and the ranks back.
+fn on_ranks<T: Send>(a: GlmModel, b: GlmModel, f: impl Fn(&mut GlmModel) -> T + Sync) -> (T, T, GlmModel, GlmModel) {
+    let f = &f;
+    std::thread::scope(|sc| {
+        let h0 = sc.spawn(move || {
+            let mut a = a;
+            (f(&mut a), a)
+        });
+        let h1 = sc.spawn(move || {
+            let mut b = b;
+            (f(&mut b), b)
+        });
+        let (r0, a) = h0.join().expect("rank 0");
+        let (r1, b) = h1.join().expect("rank 1");
+        (r0, r1, a, b)
+    })
+}
+
+/// Several prompts in ONE P2 prompt forward (`model/part.rs`): three prompts' last slices (one continuing its segment) give each prompt
+/// the answer, the state (the windows after) and, with a drafter (`REXL3_DFLASH_DIR`), the drafter context (the drafts after) of its own
+/// forward, on one P2 model (twice alike) and on the two ranks of the serving split, where the 467-row forward is row-split across the
+/// ranks (slot 1's 37 rows straddle the split).
+#[test]
+#[ignore]
+fn p2_several_prompts_in_one_forward_equal_each_prompts_solo_forward() {
+    let Some(dir) = redsnow_dir() else { return };
+    let (layers, draft, taps) = prefix_setup();
+    require_available(if layers <= 8 { 60 } else { 80 } * GIB);
+    let guard = Guard::start(20 * GIB);
+    let mut a = p2_one_model(&dir, layers, draft.as_deref(), &taps, 0);
+    let solo = batch_script(&mut a, false, true);
+    let together = batch_script(&mut a, true, true);
+    assert_eq!(batch_script(&mut a, true, true), together, "one P2 model: the forward of three prompts twice");
+    assert_eq!(together.0, solo.0, "one P2 model: an answer (or a window after) differs from the prompt's own forward");
+    assert_eq!(together.1, solo.1, "one P2 model: the drafts after differ from the prompts' own forwards'");
+    eprintln!("one P2 model: {} answering calls and {} slots' drafts equal to each prompt's own forward", solo.0.len(), solo.1.len());
+    drop(a);
+
+    let (a, b) = p2_sp_ranks(&dir, layers, draft.as_deref(), &taps, 0);
+    let (r0, r1, a, b) = on_ranks(a, b, |m| batch_script(m, true, false).0);
+    assert!(a.sp_chunks() > 0 && a.sp_chunks() == b.sp_chunks(), "sp chunks {} / {}", a.sp_chunks(), b.sp_chunks());
+    assert_eq!((&r0, &r1), (&solo.0, &solo.0), "two P2 ranks: the forward of three prompts differs from each prompt's own forward");
+    eprintln!(
+        "SEVERAL PROMPTS IN ONE FORWARD BYTE-IDENTICAL: {} answering calls on one P2 model and on two P2 ranks ({} sp forwards)",
+        solo.0.len(),
+        a.sp_chunks()
+    );
+    drop((a, b));
+    eprintln!("MemAvailable min {:.1} GiB", gib(guard.finish()));
+}
+
+/// A P2 prompt forward in parts (`model/part.rs`): slot 1's 512-row slice paused at one, two and three layer bounds, with a verify window
+/// of slot 0, slot 2's whole 100-row prompt and a window of slots 0 and 2 run between its parts (the stash holds 128 rows: the slice's
+/// later rows are kept where they are), gives every call the bits of the run with the slice whole, and the same drafts after, on one P2
+/// model and on the two ranks of the serving split (the slice row-split across them).
+#[test]
+#[ignore]
+fn p2_a_forward_paused_with_windows_and_a_prompt_between_its_parts_equals_the_whole_forward() {
+    let Some(dir) = redsnow_dir() else { return };
+    let (layers, draft, taps) = prefix_setup();
+    assert!(layers >= 4, "parts need a few layers");
+    require_available(if layers <= 8 { 60 } else { 80 } * GIB);
+    let guard = Guard::start(20 * GIB);
+    let bounds: Vec<Vec<usize>> = vec![vec![layers / 2], vec![2, layers - 3], vec![1, layers / 2, layers - 1]];
+    let mut a = p2_one_model(&dir, layers, draft.as_deref(), &taps, PART_ROOM);
+    let whole = pause_script(&mut a, &[], true);
+    for parts in &bounds {
+        assert_eq!(pause_script(&mut a, parts, true), whole, "one P2 model: the slice paused at {parts:?} differs from the slice whole");
+    }
+    eprintln!("one P2 model: the slice paused at {bounds:?} == whole ({} answering calls, {} slots' drafts)", whole.0.len(), whole.1.len());
+    drop(a);
+
+    let (a, b) = p2_sp_ranks(&dir, layers, draft.as_deref(), &taps, PART_ROOM);
+    let (r0, r1, a, b) =
+        on_ranks(a, b, |m| std::iter::once(&Vec::new()).chain(&bounds).map(|p| pause_script(m, p, false).0).collect::<Vec<_>>());
+    assert!(a.sp_chunks() > 0 && a.sp_chunks() == b.sp_chunks(), "sp chunks {} / {}", a.sp_chunks(), b.sp_chunks());
+    for (i, parts) in std::iter::once(&Vec::new()).chain(&bounds).enumerate() {
+        assert_eq!((&r0[i], &r1[i]), (&whole.0, &whole.0), "two P2 ranks: the slice paused at {parts:?} differs from the one model's whole");
+    }
+    eprintln!(
+        "A FORWARD IN PARTS BYTE-IDENTICAL: paused at {bounds:?} with windows and a prompt between == whole, one P2 model and two P2 ranks \
+         ({} sp forwards)",
+        a.sp_chunks()
     );
     drop((a, b));
     eprintln!("MemAvailable min {:.1} GiB", gib(guard.finish()));
