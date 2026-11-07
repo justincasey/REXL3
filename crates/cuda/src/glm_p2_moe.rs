@@ -24,9 +24,19 @@
 //! tensor-parallel rank's remap), each subbank writing its own pairs' y into the one pair buffer; then ONE [`combine`] over all pairs
 //! groups them by GLOBAL expert id as before. No bit of a single-bank layer moves, and a subbank split of a uniform layer equals the
 //! single bank bit for bit (a test).
+//!
+//! **Split gate/up subbanks** (gate and up of different widths: one subbank of RED-SNOW 4.91bpw's layer 13). No P2 GEMM takes two widths
+//! in one block, so such a subbank's pairs run the decode path's pairs stage in windows of the decode scratch's rows
+//! (`MoeExperts::subbank_prefill_pairs_windowed`, P1's route for it on the batched path): each such pair's y is the decode path's, a
+//! function of its row and its expert's weights alone (batched == solo, any window, any rank), so row and chunk independence, chunked ==
+//! whole, determinism and TP == one node hold for it as for every other pair. Its bits are P1's, named in the tag by [`SPLIT_GU_ID`].
+//! The other subbanks of the layer and the combine are unchanged.
+//!
+//! **A tensor-parallel rank's subbanks** ([`pairs_subbanks_rank`]): the same loop over the rank's subbanks (its share of the experts, by
+//! width), then the rank's own combine group (`CombineMode::Own`), whose pairs are exactly the ones its subbanks wrote.
 
 use crate::exl3_linear::Dtype;
-use crate::moe::{MoeDims, MoeExperts};
+use crate::moe::{MoeDims, MoeExperts, MoeScratch};
 use crate::moe_owned::OwnScratch;
 use crate::moe_prefill::PrefillScratch;
 use crate::moe_subbanks::MoeSubbanks;
@@ -61,6 +71,10 @@ pub const DEFAULT_ORDER: Order = Order::Fold128;
 /// The version of the P2 expert arithmetic (the K order, the rounding points, the combine's grouping): GLM's prefix namespace and its TP
 /// Hello carry it, so any change that moves a P2 bit must change this string.
 pub const ARITH_ID: &str = DEFAULT_ORDER.id();
+
+/// The arithmetic of a split gate/up subbank's pairs under P2 (no P2 GEMM takes gate != up widths): the decode path's pairs stage, P1's
+/// bits per pair. P2's prefix namespace and its TP Hello carry it beside [`ARITH_ID`].
+pub const SPLIT_GU_ID: &str = "p1";
 
 /// How [`combine`] sums a row's slots.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -282,11 +296,12 @@ fn pairs_bank(
     pairs_on(ex, x, x_dtype, rows, s, pick, ex.experts_local(), order, count, st, mark)
 }
 
-/// Whether the P2 expert GEMMs take every subbank of a layer ([`supported_bank`]; a split gate/up width has no P2 kernel). The refusal
+/// Whether a P2 prefill takes every subbank of a layer: a bank of one gate/up width on the P2 expert GEMMs ([`supported_bank`]), a split
+/// gate/up bank through the decode path's pairs stage in windows (any width the decode kernels take: the loader built it). The refusal
 /// names the first subbank that fails. Whether the subbanks hold every expert (one node) is [`run_subbanks`]'s check.
 pub fn supported_subbanks(sb: &MoeSubbanks) -> Result<(), String> {
     for (i, b) in sb.banks().iter().enumerate() {
-        if !supported_bank(b) {
+        if b.fused_gate_up() && !supported_bank(b) {
             let k = b.subbank_key();
             return Err(format!(
                 "subbank {i} ({}/{}/{} bits for gate/up/down, {:?}) is not a format the P2 expert GEMMs take",
@@ -299,7 +314,8 @@ pub fn supported_subbanks(sb: &MoeSubbanks) -> Result<(), String> {
 
 /// The routed experts of a mixed-width layer (homogeneous subbanks holding every expert) under P2: the pairs stage once per subbank
 /// ([`pairs_subbanks_with`]), then the one two-group [`combine`] over the GLOBAL picks with `shared` added last into `out`. Fills
-/// `s.y_pairs`. `os` is the subbank path's pick table (`OwnScratch`, at least `rows` rows).
+/// `s.y_pairs`. `os` is the subbank path's pick table (`OwnScratch`, at least `rows` rows); `sd` the decode scratch a split gate/up
+/// subbank's windows run through (of the layer's dims; untouched when the layer has none).
 #[allow(clippy::too_many_arguments)]
 pub fn run_subbanks(
     sb: &MoeSubbanks,
@@ -310,21 +326,23 @@ pub fn run_subbanks(
     out: &mut DevBuf,
     s: &mut PrefillScratch,
     os: &mut OwnScratch,
+    sd: &mut MoeScratch,
     st: &Stream,
 ) -> Result<(), CudaError> {
     let d = sb.dims;
     if out.bytes() < rows * d.hidden * 4 || shared.is_some_and(|b| b.bytes() < rows * d.hidden * 4) {
         return Err(INVALID);
     }
-    pairs_subbanks_with(sb, x, x_dtype, rows, s, os, DEFAULT_ORDER, st, &mut |_| Ok(()))?;
+    pairs_subbanks_with(sb, x, x_dtype, rows, s, os, sd, DEFAULT_ORDER, st, &mut |_| Ok(()))?;
     combine_dims(CombineMode::Both, &s.y_pairs, &s.pick, &s.wts, shared, None, out, rows, &d, st)
 }
 
 /// The pairs stage of a mixed-width layer: for each subbank in order, the global picks in `s.pick` remapped to its local ids (-1 for the
-/// experts of the other subbanks), then plan, rotation, gate/up and down over its pairs only. A (row, expert) pair's bits depend on its
-/// row and its expert's weights alone, so every valid pair gets in `s.y_pairs`, at its pair index, the y the expert gives in a bank of its
-/// own width, whatever the other subbanks hold; a pair whose pick is not a valid expert id is not written (the combine skips it). One
-/// P2 expert block in [`runs`] a layer, not one a subbank. `mark` sees each subbank's stages in turn.
+/// experts of the other subbanks), then plan, rotation, gate/up and down over its pairs only (a split gate/up subbank: the decode pairs
+/// stage in windows of `sd`'s rows). A (row, expert) pair's bits depend on its row and its expert's weights alone, so every valid pair
+/// gets in `s.y_pairs`, at its pair index, the y the expert gives in a bank of its own width, whatever the other subbanks hold; a pair
+/// whose pick is not a valid expert id is not written (the combine skips it). One P2 expert block in [`runs`] a layer, not one a subbank.
+/// `mark` sees each subbank's stages in turn.
 #[allow(clippy::too_many_arguments)]
 pub fn pairs_subbanks_with(
     sb: &MoeSubbanks,
@@ -333,16 +351,62 @@ pub fn pairs_subbanks_with(
     rows: usize,
     s: &mut PrefillScratch,
     os: &mut OwnScratch,
+    sd: &mut MoeScratch,
     order: Order,
     st: &Stream,
     mark: &mut dyn FnMut(&'static str) -> Result<(), CudaError>,
 ) -> Result<(), CudaError> {
     // every expert on this node: a pair whose expert no subbank held would keep a stale y for the combine to read
-    if !sb.ownership().is_all() || supported_subbanks(sb).is_err() {
+    if !sb.ownership().is_all() {
         return Err(INVALID);
     }
-    for (i, b) in sb.banks().iter().enumerate() {
-        pairs_bank(b, x, x_dtype, rows, s, os, order, i == 0, st, mark)?;
+    pairs_subbanks_on(sb, x, x_dtype, rows, s, os, sd, order, st, mark)
+}
+
+/// The pairs stage of a tensor-parallel RANK whose share of a layer is several subbanks (a mixed-width layer at TP=2): the loop of
+/// [`pairs_subbanks_with`] over the rank's subbanks. Every pair whose expert the rank owns gets its y, the others are not written: the
+/// rank's combine (`CombineMode::Own(rank)`, the ownership being the combine group's: the caller's check) reads exactly the former.
+#[allow(clippy::too_many_arguments)]
+pub fn pairs_subbanks_rank(
+    sb: &MoeSubbanks,
+    x: &DevBuf,
+    x_dtype: Dtype,
+    rows: usize,
+    s: &mut PrefillScratch,
+    os: &mut OwnScratch,
+    sd: &mut MoeScratch,
+    order: Order,
+    st: &Stream,
+    mark: &mut dyn FnMut(&'static str) -> Result<(), CudaError>,
+) -> Result<(), CudaError> {
+    pairs_subbanks_on(sb, x, x_dtype, rows, s, os, sd, order, st, mark)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pairs_subbanks_on(
+    sb: &MoeSubbanks,
+    x: &DevBuf,
+    x_dtype: Dtype,
+    rows: usize,
+    s: &mut PrefillScratch,
+    os: &mut OwnScratch,
+    sd: &mut MoeScratch,
+    order: Order,
+    st: &Stream,
+    mark: &mut dyn FnMut(&'static str) -> Result<(), CudaError>,
+) -> Result<(), CudaError> {
+    if supported_subbanks(sb).is_err() || (sb.has_split_gate_up() && sd.dims != sb.dims) {
+        return Err(INVALID);
+    }
+    RUNS.fetch_add(1, Ordering::Relaxed);
+    RUNS_HERE.with(|c| c.set(c.get() + 1));
+    for b in sb.banks() {
+        if b.fused_gate_up() {
+            pairs_bank(b, x, x_dtype, rows, s, os, order, false, st, mark)?;
+        } else {
+            b.subbank_prefill_pairs_windowed(x, x_dtype, rows, s, sd, os, false, st)?;
+            mark("split_gu_windows")?;
+        }
     }
     Ok(())
 }

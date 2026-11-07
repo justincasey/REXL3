@@ -18,12 +18,18 @@
 //! uniform 6/6/6 layer 3 and the mixed layers 4..7; 14 adds layer 13 and its gate != up expert). Under the GPU lock, alone:
 //!
 //!     flock -x /tmp/rexl3-gpu.lock env REXL3_REDSNOW_DIR=... cargo test --release -p gb-model --test glm_redsnow_tp -- --ignored --nocapture --test-threads=1
+//!
+//! `p2_redsnow_prefix_two_ranks_equal_one_p2_model_byte_for_byte`: the same script under the P2 prefill contract (switched per model
+//! before the group forms): the 6-bit experts on the P2 expert GEMMs, every rank's several subbanks a MoE layer through the P2 rank path
+//! (`glm_p2_moe::pairs_subbanks_rank`, its part, the part swap), layer 13's split gate/up subbank through the decode pairs stage. Both
+//! ranks' answers must equal the one P2 model's, byte for byte, and differ from P1's somewhere (P2 ran).
 
 mod glm_support;
 
 use gb_cuda::moe::ExpertOwnership;
 use gb_cuda::DevBuf;
 use gb_exl3::f16::{f16_to_f64, f64_to_f16};
+use gb_model::families::glm::contract::PrefillContract;
 use gb_model::families::glm::device::{FfnDevice, GlmDevice, MixerDevice, WqBDevice};
 use gb_model::families::glm::load::{boot_mapped, LoadOptions};
 use gb_model::families::glm::model::{GlmModel, ModelOptions};
@@ -335,6 +341,65 @@ fn redsnow_prefix_two_ranks_equal_one_model_byte_for_byte() {
     let differ = n0.iter().zip(&ref_graphs).filter(|(x, y)| x != y).count();
     assert!(differ > 0, "an ownership that does not partition the experts went unnoticed");
     eprintln!("negative control (both ranks own 0..144): {differ} of {} answering calls differ from the one model", n0.len());
+    drop((a, b));
+    eprintln!("MemAvailable min {:.1} GiB", gib(guard.finish()));
+}
+
+#[test]
+#[ignore]
+fn p2_redsnow_prefix_two_ranks_equal_one_p2_model_byte_for_byte() {
+    let Some(dir) = redsnow_dir() else { return };
+    let layers: usize = std::env::var("REXL3_REDSNOW_TP_LAYERS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    require_available(if layers <= 8 { 60 } else { 80 } * GIB);
+    let guard = Guard::start(20 * GIB);
+    let (mut a, _) = load(&dir, layers, None, |_| {});
+    a.set_prefill_contract(PrefillContract::P1).unwrap();
+    a.set_graphs(false);
+    let p1_ref = script(&mut a);
+    a.set_prefill_contract(PrefillContract::P2).unwrap();
+    a.set_graphs(true);
+    let ref_graphs = script(&mut a);
+    a.set_graphs(false);
+    let ref_eager = script(&mut a);
+    assert_eq!(ref_graphs, ref_eager, "one P2 model: graphs and eager differ on this prefix");
+    let moved = ref_eager.iter().zip(&p1_ref).filter(|(x, y)| x != y).count();
+    assert!(moved > 0, "P2 left every answer at P1's bits: the P2 path did not run");
+    eprintln!("one P2 model: {} answering calls, graphs == eager, {moved} differ from P1's (P2 ran)", ref_eager.len());
+    drop(a);
+
+    let owns = [ExpertOwnership::range(E, 0, 2).unwrap(), ExpertOwnership::range(E, 1, 2).unwrap()];
+    let mut models = Vec::new();
+    for o in &owns {
+        let (mut m, _) = load(&dir, layers, Some(o), |_| {});
+        m.set_prefill_contract(PrefillContract::P2).unwrap();
+        models.push(m);
+    }
+    let mut b = models.pop().unwrap();
+    let mut a = models.pop().unwrap();
+    let mut comms = LoopbackGroup::with_timeout(2, Duration::from_secs(120)).into_iter();
+    a.enable_tp(Arc::new(comms.next().unwrap()), owns[0].clone()).unwrap();
+    b.enable_tp(Arc::new(comms.next().unwrap()), owns[1].clone()).unwrap();
+    let t = std::time::Instant::now();
+    let (d0, d1, a, b) = std::thread::scope(|sc| {
+        let h0 = sc.spawn(move || (script(&mut a), a));
+        let h1 = sc.spawn(move || (script(&mut b), b));
+        let (d0, a) = h0.join().expect("rank 0");
+        let (d1, b) = h1.join().expect("rank 1");
+        (d0, d1, a, b)
+    });
+    eprintln!("two P2 ranks ran the script in {:.1?}", t.elapsed());
+    assert_eq!(d0, d1, "the two P2 ranks' answers differ");
+    assert_eq!(d0, ref_eager, "the P2 group's answers differ from the one P2 model's");
+    let (t0r, t1r) = (a.tp().unwrap(), b.tp().unwrap());
+    assert!(t0r.p2_swaps() > 0 && t0r.p2_swaps() == t1r.p2_swaps(), "part swaps {} / {}", t0r.p2_swaps(), t1r.p2_swaps());
+    assert_eq!((t0r.exchanges, t0r.exchanged_bytes), (t1r.exchanges, t1r.exchanged_bytes), "the ranks exchanged alike");
+    eprintln!(
+        "P2 BYTE-IDENTICAL: {} answering calls == the one P2 model; {} part swaps, {} exchanges of {:.1} MiB in all per rank",
+        d0.len(),
+        t0r.p2_swaps(),
+        t0r.exchanges,
+        t0r.exchanged_bytes as f64 / 1048576.0
+    );
     drop((a, b));
     eprintln!("MemAvailable min {:.1} GiB", gib(guard.finish()));
 }

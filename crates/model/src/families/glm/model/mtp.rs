@@ -767,7 +767,7 @@ impl GlmModel {
         // writes its picks into the prefill scratch whatever the rows, then `glm_p2_moe::run` (the two-group combine, the shared expert last)
         if p2 {
             // one bank: the whole bank on one node, a rank's (whole and masked, or its share as one subbank) on a tensor-parallel rank;
-            // on one node a mixed-width layer's subbanks run one pairs stage each (`glm_p2_moe::run_subbanks`)
+            // a mixed-width layer's subbanks run one pairs stage each (`glm_p2_moe::run_subbanks`, a rank's: `model/tp/p2.rs`)
             let router = match &w.moe {
                 MtpMoe::Single(wm) => &wm.router,
                 MtpMoe::Subbanks(wm) => &wm.router,
@@ -793,25 +793,18 @@ impl GlmModel {
                         &mut s.mixer_out,
                         &mut pf.moe,
                         os,
+                        &mut s.moe,
                         st,
                     )?
                 }
                 // the rank path (`model/tp/p2.rs`): its pairs and part, the swap, the parts' sum (the shared expert ran above)
                 (moe, Some(t)) => {
                     let ex = match moe {
-                        MtpMoe::Single(wm) => &wm.experts,
-                        MtpMoe::Subbanks(wm) => match wm.experts.banks() {
-                            [b] => b,
-                            _ => {
-                                return Err(ModelError::Config(
-                                    "P2 routed experts of the NextN layer bound as several subbanks on a tensor-parallel rank: not built"
-                                        .into(),
-                                ))
-                            }
-                        },
+                        MtpMoe::Single(wm) => super::tp::P2Routed::Bank(&wm.experts),
+                        MtpMoe::Subbanks(wm) => super::tp::P2Routed::Subbanks(&wm.experts),
                     };
-                    t.p2_begin(ex, &s.hidden, rows, &mut pf.moe, st, &mut |_| Ok(()))?;
-                    t.p2_finish(ex, &pf.moe, shared, &mut s.mixer_out, st)?;
+                    t.p2_begin(ex, &s.hidden, rows, &mut pf.moe, &mut s.moe, st, &mut |_| Ok(()))?;
+                    t.p2_finish(&ex.dims(), &pf.moe, shared, &mut s.mixer_out, st)?;
                 }
             }
         } else {

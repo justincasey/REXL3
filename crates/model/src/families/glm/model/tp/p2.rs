@@ -8,15 +8,38 @@
 //! for bit. The swap runs on its own stream, ordered after the rank's part by an event, while the main stream computes the layer's shared
 //! expert (deferred to that point by the caller: it is replicated and only the final sum reads it); the sum waits on the swap's event.
 //! A group of one rank (`SingleRank`) holds every expert: its pairs, then the one-node combine.
+//!
+//! A mixed-width layer's share on a rank is several subbanks ([`P2Routed::Subbanks`]): the rank's pairs are the P2 pairs stage once per
+//! subbank (`glm_p2_moe::pairs_subbanks_rank`; a split gate/up subbank through the decode pairs stage in windows of the decode scratch),
+//! into the one pair buffer, then the same `Own(r)` part, swap and `Parts` sum: each pair's bits are its row's and its expert's alone, so
+//! the rank's part is the one node's group-r part bit for bit.
 
 use super::GlmTp;
 use crate::error::ModelError;
 use gb_cuda::exl3_linear::Dtype;
 use gb_cuda::glm_p2_moe::{self, CombineMode};
-use gb_cuda::moe::MoeExperts;
+use gb_cuda::moe::{MoeDims, MoeExperts, MoeScratch};
 use gb_cuda::moe_prefill::PrefillScratch;
+use gb_cuda::moe_subbanks::MoeSubbanks;
 use gb_cuda::rt::Event;
 use gb_cuda::{CudaError, DevBuf, Stream};
+
+/// The routed experts of a P2 MoE layer on a rank: one bank (the whole bank, masked to the share, or the share bound as one subbank), or
+/// the share's several subbanks (a mixed-width layer).
+#[derive(Clone, Copy)]
+pub(in crate::families::glm) enum P2Routed<'a> {
+    Bank(&'a MoeExperts),
+    Subbanks(&'a MoeSubbanks),
+}
+
+impl P2Routed<'_> {
+    pub(in crate::families::glm) fn dims(&self) -> MoeDims {
+        match self {
+            P2Routed::Bank(b) => b.dims,
+            P2Routed::Subbanks(sb) => sb.dims,
+        }
+    }
+}
 
 /// The P2 exchange's buffers and ordering: the two groups' parts (`parts[g]`: group g's rows, the rank's own written by its combine, the
 /// peer's by the swap), the swap's stream and its two events.
@@ -79,16 +102,18 @@ impl GlmTp {
         self.p2.as_ref().map_or(0, |p| p.zero_copy_swaps)
     }
 
-    /// The first half of a P2 MoE layer on this rank: the rank's pairs (`glm_p2_moe::pairs_rank` on the global picks in `s`), its part
+    /// The first half of a P2 MoE layer on this rank: the rank's pairs (`glm_p2_moe::pairs_rank` on the global picks in `s`, or
+    /// `pairs_subbanks_rank` for a share of several subbanks, whose split gate/up subbank runs through the decode scratch `sd`), its part
     /// (`Own(rank)`), and the swap of the parts queued on the exchange stream. The caller may queue replicated work on `st` (the shared
     /// expert) before [`GlmTp::p2_finish`].
     #[allow(clippy::too_many_arguments)]
     pub(in crate::families::glm::model) fn p2_begin(
         &mut self,
-        ex: &MoeExperts,
+        ex: P2Routed<'_>,
         x: &DevBuf,
         rows: usize,
         s: &mut PrefillScratch,
+        sd: &mut MoeScratch,
         st: &Stream,
         mark: &mut dyn FnMut(&'static str) -> Result<(), CudaError>,
     ) -> Result<(), ModelError> {
@@ -97,19 +122,26 @@ impl GlmTp {
             .p2
             .as_mut()
             .ok_or_else(|| ModelError::Config("a P2 MoE layer on a rank built without the P2 exchange".into()))?;
-        if p2.pending.is_some() || rows == 0 || rows > p2.max_rows || ex.dims.hidden != p2.hidden {
+        let d = ex.dims();
+        if p2.pending.is_some() || rows == 0 || rows > p2.max_rows || d.hidden != p2.hidden {
             return Err(ModelError::Config(format!(
                 "a P2 exchange of {rows} rows (pending {:?}, at most {})",
                 p2.pending, p2.max_rows
             )));
         }
-        glm_p2_moe::pairs_rank(ex, x, Dtype::F16, rows, s, &mut self.os, glm_p2_moe::DEFAULT_ORDER, st, mark)?;
+        let order = glm_p2_moe::DEFAULT_ORDER;
+        match ex {
+            P2Routed::Bank(b) => glm_p2_moe::pairs_rank(b, x, Dtype::F16, rows, s, &mut self.os, order, st, mark)?,
+            P2Routed::Subbanks(sb) => {
+                glm_p2_moe::pairs_subbanks_rank(sb, x, Dtype::F16, rows, s, &mut self.os, sd, order, st, mark)?
+            }
+        }
         // lane T: over REXL3's RoCE transport the part goes straight into the transport site's own half (the same combine, another
         // output buffer) and the swap only publishes it: no staging copy, no copy-out (the same bytes on the wire, so the same bits)
         let zc = if t.ranks == 2 { self.comm.roce_tp().and_then(|rt| rt.zero_copy_swap(rows * p2.hidden * 4)) } else { None };
         if let Some(mut z) = zc {
             let r = t.rank;
-            glm_p2_moe::combine(CombineMode::Own(r), &s.y_pairs, &s.pick, &s.wts, None, None, &mut z.halves[r], rows, ex, st)?;
+            glm_p2_moe::combine_dims(CombineMode::Own(r), &s.y_pairs, &s.pick, &s.wts, None, None, &mut z.halves[r], rows, &d, st)?;
             mark("combine")?;
             gb_cuda::graph::fork(st, &p2.stream, &p2.ready)?;
             self.comm.roce_tp().expect("checked").publish_swap(&z, &p2.stream)?;
@@ -121,7 +153,7 @@ impl GlmTp {
             p2.zero_copy = Some(z);
         } else if t.ranks == 2 {
             let r = t.rank;
-            glm_p2_moe::combine(CombineMode::Own(r), &s.y_pairs, &s.pick, &s.wts, None, None, &mut p2.parts[r], rows, ex, st)?;
+            glm_p2_moe::combine_dims(CombineMode::Own(r), &s.y_pairs, &s.pick, &s.wts, None, None, &mut p2.parts[r], rows, &d, st)?;
             mark("combine")?;
             // the swap on its own stream, after the part
             gb_cuda::graph::fork(st, &p2.stream, &p2.ready)?;
@@ -151,7 +183,7 @@ impl GlmTp {
     /// The second half: wait for the swap, then `out = (part_0 + part_1) + shared` (a group of one rank: the one-node combine of its pairs).
     pub(in crate::families::glm::model) fn p2_finish(
         &mut self,
-        ex: &MoeExperts,
+        d: &MoeDims,
         s: &PrefillScratch,
         shared: Option<&DevBuf>,
         out: &mut DevBuf,
@@ -170,9 +202,9 @@ impl GlmTp {
                 Some(z) => (&z.halves[0], &z.halves[1]),
                 None => (&p2.parts[0], &p2.parts[1]),
             };
-            glm_p2_moe::combine(CombineMode::Parts, &s.y_pairs, &s.pick, &s.wts, shared, Some(parts), out, rows, ex, st)?;
+            glm_p2_moe::combine_dims(CombineMode::Parts, &s.y_pairs, &s.pick, &s.wts, shared, Some(parts), out, rows, d, st)?;
         } else {
-            glm_p2_moe::combine(CombineMode::Both, &s.y_pairs, &s.pick, &s.wts, shared, None, out, rows, ex, st)?;
+            glm_p2_moe::combine_dims(CombineMode::Both, &s.y_pairs, &s.pick, &s.wts, shared, None, out, rows, d, st)?;
         }
         Ok(())
     }
@@ -181,8 +213,8 @@ impl GlmTp {
 impl super::GlmModel {
     /// What a P2 rank needs before it joins (refused by name otherwise): at most two ranks; at two, the range ownership (rank r owns
     /// combine group r: `ExpertOwnership::range(E, r, 2)`) and a communicator with the byte swap; at one, every expert; every MoE layer's
-    /// routed experts (and the NextN layer's) one bank the P2 expert GEMMs take (a rank's share bound as one subbank included; a mixed-width
-    /// layer's several subbanks run under P2 on one node only (`glm_p2_moe::run_subbanks`); at TP=2 they are not built).
+    /// routed experts (and the NextN layer's) one bank the P2 expert GEMMs take, or subbanks a P2 prefill takes
+    /// (`glm_p2_moe::supported_subbanks`: a mixed-width share, its split gate/up subbank through the decode pairs stage).
     pub(super) fn check_p2_tp(
         &self,
         comm: &dyn crate::families::nemotron_h_omni::tp::TpComm,
@@ -213,27 +245,30 @@ impl super::GlmModel {
             }
             r => return Err(bad(format!("{r} ranks (the P2 combine has two groups: one or two ranks)"))),
         }
-        let one = |name: String, banks: &[MoeExperts]| -> Result<(), ModelError> {
-            match banks {
-                [b] if glm_p2_moe::supported_bank(b) => Ok(()),
-                [b] => Err(bad(format!(
+        let one = |name: String, b: &MoeExperts| -> Result<(), ModelError> {
+            if glm_p2_moe::supported_bank(b) {
+                Ok(())
+            } else {
+                Err(bad(format!(
                     "{name} ({} / {} bits, {:?}) are not a format the P2 expert GEMMs take",
                     b.bits_gu, b.bits_d, b.codebook
-                ))),
-                _ => Err(bad(format!("{name} are {} subbanks (a mixed-width layer): not built under P2", banks.len()))),
+                )))
             }
+        };
+        let sub = |name: String, sb: &MoeSubbanks| -> Result<(), ModelError> {
+            glm_p2_moe::supported_subbanks(sb).map_err(|why| bad(format!("{name} (subbanks): {why}")))
         };
         for (l, d) in self.dev.layers.iter().enumerate() {
             match &d.ffn {
-                FfnDevice::Moe { layer: m, .. } => one(format!("layer {l}'s routed experts"), std::slice::from_ref(&m.experts))?,
-                FfnDevice::MoeSubbanks { layer: m, .. } => one(format!("layer {l}'s routed experts"), m.experts.banks())?,
+                FfnDevice::Moe { layer: m, .. } => one(format!("layer {l}'s routed experts"), &m.experts)?,
+                FfnDevice::MoeSubbanks { layer: m, .. } => sub(format!("layer {l}'s routed experts"), &m.experts)?,
                 FfnDevice::Dense(_) => {}
             }
         }
         if let Some(w) = self.dev.mtp.as_ref() {
             match &w.moe {
-                MtpMoe::Single(m) => one("the NextN layer's routed experts".into(), std::slice::from_ref(&m.experts))?,
-                MtpMoe::Subbanks(m) => one("the NextN layer's routed experts".into(), m.experts.banks())?,
+                MtpMoe::Single(m) => one("the NextN layer's routed experts".into(), &m.experts)?,
+                MtpMoe::Subbanks(m) => sub("the NextN layer's routed experts".into(), &m.experts)?,
             }
         }
         Ok(())

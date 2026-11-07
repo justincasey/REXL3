@@ -4,10 +4,11 @@
 //! (pairs per subbank into one buffer, the `-0.0` filler from the first, one combine with global picks) must equal the single bank
 //! BYTE FOR BYTE: `out` of every row and `y` of every valid pair, decode and batched, at 1, 2, 5, 22 and 64 rows.
 //!
-//! `real_mixed_layers_run_p2_per_subbank` (the 2.49bpw pack): REAL mixed layers under the P2 prefill contract (`glm_p2_moe::run_subbanks`:
-//! the P2 pairs stage once per subbank, one combine): row independence, chunked == whole, determinism, and the error against an f64
-//! reference of the exact dequantized experts beside P1's, within the tolerances `docs/GLM_PREFILL_P2.md` section 6 states. A pack with a
-//! width the P2 expert GEMMs do not take (the 4.91bpw pack's 6-bit experts) is checked to be refused by name.
+//! `real_mixed_layers_run_p2_per_subbank` (the 2.49bpw or the 4.91bpw pack): REAL mixed layers under the P2 prefill contract
+//! (`glm_p2_moe::run_subbanks`: the P2 pairs stage once per subbank, a split gate/up subbank through the decode pairs stage in windows,
+//! one combine): row independence, chunked == whole, determinism, two ranks of the range ownership (`pairs_subbanks_rank`, `Own(r)`,
+//! `Parts`) == one node, and the error against an f64 reference of the exact dequantized experts beside P1's, within the tolerances
+//! `docs/GLM_PREFILL_P2.md` section 6 states.
 //!
 //! With `REXL3_REDSNOW_DIR` (a mixed-width pack, default `~/models/vcruz305/RED-SNOW-5.3-FLASH-EXL3-SAGE-4.91bpw`), the second test
 //! loads REAL mixed layers (4 and 7) and checks the subbank path against every expert run alone in a one-expert bank.
@@ -639,9 +640,10 @@ fn real_layers_batched_pairs_equal_the_decode_pairs_past_one_window() {
     }
 }
 
-/// REAL mixed-width layers of the RED-SNOW pack under P2 (`REXL3_REDSNOW_DIR` should be the 2.49bpw pack: its widths are 2 to 4 bits, which
-/// the P2 expert GEMMs take; layers 4, 16 and 44 have 3, 7 and 9 subbanks, singletons among them, every singleton routed in several rows).
-/// A layer the P2 GEMMs do not take (the 4.91bpw pack's 6-bit experts) is checked to be refused by name, a uniform layer is skipped.
+/// REAL mixed-width layers of the RED-SNOW pack under P2 (`REXL3_REDSNOW_DIR`: the 2.49bpw pack's widths are 2 to 4 bits, the 4.91bpw
+/// pack's 4 to 6 with layer 13's split gate/up subbank; layers `REXL3_REDSNOW_P2_LAYERS`, default 4, 13, 16 and 44; singleton and split
+/// subbanks' experts routed in several rows). A layer a P2 prefill does not take is checked to be refused by name, a uniform layer is
+/// skipped.
 #[test]
 fn real_mixed_layers_run_p2_per_subbank() {
     use gb_cuda::glm_p2_moe;
@@ -654,7 +656,11 @@ fn real_mixed_layers_run_p2_per_subbank() {
     let d = MoeDims::GLM53;
     let st = Stream::new().unwrap();
     let rows = 300usize;
-    for l in [4usize, 16, 44] {
+    let layers: Vec<usize> = std::env::var("REXL3_REDSNOW_P2_LAYERS")
+        .ok()
+        .map(|s| s.split(',').map(|x| x.trim().parse().unwrap()).collect())
+        .unwrap_or_else(|| vec![4, 13, 16, 44]);
+    for l in layers {
         let lg = load_layer(&ck, l, d.experts);
         let whole = MoeSubbanks::from_groups(&lg.gate, &lg.up, &lg.down, d, ExpertOwnership::all(d.experts)).unwrap();
         let keys: Vec<String> = whole
@@ -675,11 +681,17 @@ fn real_mixed_layers_run_p2_per_subbank() {
             eprintln!("layer {l} is uniform on this pack: not a mixed-width case");
             continue;
         }
+        // singleton subbanks' experts and every split subbank's experts, routed in several rows
         let singletons: Vec<usize> = whole
             .banks()
             .iter()
-            .filter(|b| b.experts_local() <= 2)
+            .filter(|b| b.experts_local() <= 2 || !b.subbank_key().fused_gate_up())
             .flat_map(|b| b.ownership().unwrap().owned().iter().map(|&e| e as usize))
+            .collect();
+        let ranks: Vec<MoeSubbanks> = (0..2)
+            .map(|k| {
+                MoeSubbanks::from_groups(&lg.gate, &lg.up, &lg.down, d, ExpertOwnership::range(d.experts, k, 2).unwrap()).unwrap()
+            })
             .collect();
         if singletons.is_empty() {
             eprintln!(
@@ -703,6 +715,7 @@ fn real_mixed_layers_run_p2_per_subbank() {
         let (shared, pk, w) = (up(&sh), up(&pick), up(&wts));
         let mut ps = PrefillScratch::new(&d, rows).unwrap();
         let mut os = OwnScratch::new(&d, rows).unwrap();
+        let mut sd = MoeScratch::new(&d, 128).unwrap();
         // P2 on the given rows (calls of `chunk` rows, scratch poisoned first): (out, y of every pair)
         let mut p2 = |sel: &[usize], chunk: usize, ps: &mut PrefillScratch| -> (Vec<f32>, Vec<f32>) {
             let (mut out, mut y) = (Vec::new(), Vec::new());
@@ -715,7 +728,8 @@ fn real_mixed_layers_run_p2_per_subbank() {
                 ps.poison(0x7f, &st).unwrap();
                 ps.set_picks(&gp, &gw).unwrap();
                 let mut o = DevBuf::zeroed(n * h * 4).unwrap();
-                glm_p2_moe::run_subbanks(&whole, &up(&gx), Dtype::F16, n, Some(&up(&gs)), &mut o, ps, &mut os, &st).unwrap();
+                glm_p2_moe::run_subbanks(&whole, &up(&gx), Dtype::F16, n, Some(&up(&gs)), &mut o, ps, &mut os, &mut sd, &st)
+                    .unwrap();
                 out.extend(dl::<f32>(&o, &st));
                 y.extend_from_slice(&dl::<f32>(&ps.y_pairs, &st)[..n * d.topk * h]);
             }
@@ -760,10 +774,34 @@ fn real_mixed_layers_run_p2_per_subbank() {
         check("one row a call", &lone, &o, &y);
         let (o, y) = p2(&lone, lone.len(), &mut ps);
         check("only the sampled rows in one call", &lone, &o, &y);
-        // closeness: P1's subbank path (the decode path's bits) and P2, each against the f64 reference of the exact dequantized experts
+        // two ranks of the range ownership: each its share's subbanks and its own group's part, then the parts' sum == one node
+        {
+            let x = up(&xh);
+            let mut parts = [DevBuf::zeroed(rows * h * 4).unwrap(), DevBuf::zeroed(rows * h * 4).unwrap()];
+            for (k, sb) in ranks.iter().enumerate() {
+                ps.poison(0x33 + k as u8, &st).unwrap();
+                ps.set_picks(&pick, &wts).unwrap();
+                let ord = glm_p2_moe::DEFAULT_ORDER;
+                glm_p2_moe::pairs_subbanks_rank(sb, &x, Dtype::F16, rows, &mut ps, &mut os, &mut sd, ord, &st, &mut |_| Ok(()))
+                    .unwrap();
+                let mode = glm_p2_moe::CombineMode::Own(k);
+                glm_p2_moe::combine_dims(mode, &ps.y_pairs, &pk, &w, None, None, &mut parts[k], rows, &d, &st).unwrap();
+                let yr: Vec<f32> = dl::<f32>(&ps.y_pairs, &st)[..p * h].to_vec();
+                for q in (0..p).filter(|&q| valid(q) && sb.ownership().owns(pick[q] as usize)) {
+                    assert_eq!(bits(&yr[q * h..(q + 1) * h]), bits(&y0[q * h..(q + 1) * h]), "layer {l} rank {k}: y of pair {q}");
+                }
+            }
+            let mut o = DevBuf::zeroed(rows * h * 4).unwrap();
+            let pp = Some((&parts[0], &parts[1]));
+            let mode = glm_p2_moe::CombineMode::Parts;
+            glm_p2_moe::combine_dims(mode, &ps.y_pairs, &pk, &w, Some(&shared), pp, &mut o, rows, &d, &st).unwrap();
+            assert_eq!(bits(&dl::<f32>(&o, &st)), bits(&out0), "layer {l}: two ranks' P2 out != one node's");
+        }
+        // closeness: P1's subbank path (the decode path's bits; a split subbank through its decode windows) and P2, each against the f64
+        // reference of the exact dequantized experts
         ps.poison(0x7f, &st).unwrap();
         ps.set_picks(&pick, &wts).unwrap();
-        whole.run_prefill_pairs(&up(&xh), Dtype::F16, rows, &mut ps, &mut os, &st).unwrap();
+        whole.run_prefill_pairs_windowed(&up(&xh), Dtype::F16, rows, &mut ps, &mut sd, &mut os, &st).unwrap();
         let y_p1: Vec<f32> = dl::<f32>(&ps.y_pairs, &st)[..p * h].to_vec();
         let mut o_p1 = DevBuf::zeroed(rows * h * 4).unwrap();
         combine_pairs(&ps.y_pairs, &pk, &w, Some(&shared), &mut o_p1, rows, &d, &st).unwrap();
@@ -822,8 +860,9 @@ fn real_mixed_layers_run_p2_per_subbank() {
         assert!(r2 <= 1.5 * r1 + 1e-7 && r2 < 1e-3, "layer {l}: P2 y rms {r2:e} against P1's {r1:e}");
         assert!(or2 <= 1.5 * or1 + 1e-7, "layer {l}: P2 out rms {or2:e} against P1's {or1:e}");
         eprintln!(
-            "RED-SNOW layer {l}: P2 per subbank ({} subbanks): deterministic, chunked (7/16/129 rows) == whole, reversed rows == whole, one row a call == whole, bit for bit; within the P2 fp64 gate",
-            whole.banks().len()
+            "RED-SNOW layer {l}: P2 per subbank ({} subbanks{}): deterministic, chunked (7/16/129 rows) == whole, reversed rows == whole, one row a call == whole, two ranks == one node, bit for bit; within the P2 fp64 gate",
+            whole.banks().len(),
+            if whole.has_split_gate_up() { ", a split gate/up one on the decode pairs" } else { "" }
         );
     }
 }

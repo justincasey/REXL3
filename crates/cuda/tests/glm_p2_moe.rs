@@ -17,6 +17,9 @@
 //!   `glm_p2_moe::run_subbanks`): a layer split into artificial subbanks of one width runs P2 bit for bit as the single bank does, at 1,
 //!   16, 129 and 300 rows and in calls of other widths; a layer whose subbanks have different widths gives every pair the y of a
 //!   uniform bank of that pair's widths.
+//! * `p2_split_gate_up_subbank_is_the_decode_pairs_and_two_ranks_equal_one_node`: a layer with a split gate/up subbank (gate 2 bits, up 3)
+//!   beside fused ones: the split pairs' y is the decode pairs stage's, the fused pairs' the uniform P2 bank's, in calls of any width and
+//!   run to run; two ranks of the range ownership (`pairs_subbanks_rank`, `Own(r)`, `Parts`) equal one node bit for bit.
 //!
 //! Timing (ignored, `bench` in the name): ms a layer and TFLOP/s of P1's large-row path against P2 at 512 to 4,096 rows, 288 experts,
 //! uniform routing, a 256 MiB memset before each call, median of 5; the stages of P2 separately.
@@ -33,7 +36,7 @@ use common::Rng;
 use exl3_ref::{err, linear_ref, weights};
 use gb_cuda::exl3_linear::Dtype;
 use gb_cuda::glm_p2_moe::{self, CombineMode, Order};
-use gb_cuda::moe::{MoeDims, MoeExperts};
+use gb_cuda::moe::{MoeDims, MoeExperts, MoeScratch};
 use gb_cuda::moe_owned::{ExpertOwnership, OwnScratch};
 use gb_cuda::moe_prefill::PrefillScratch;
 use gb_cuda::moe_subbanks::MoeSubbanks;
@@ -508,12 +511,13 @@ fn subbanks_of(d: MoeDims, parts: &[(Vec<u32>, &[Vec<LoadedGroup>; 3])]) -> MoeS
     MoeSubbanks::new(d, ExpertOwnership::all(d.experts), banks).unwrap()
 }
 
-/// [`run`] for a layer of subbanks (always P2).
+/// [`run`] for a layer of subbanks (always P2; `sd` the decode scratch a split gate/up subbank's windows run through).
 fn run_sub(
     sb: &MoeSubbanks,
     st: &Stream,
     s: &mut PrefillScratch,
     os: &mut OwnScratch,
+    sd: &mut MoeScratch,
     xh: &[u16],
     pick: &[i32],
     wts: &[u16],
@@ -530,7 +534,7 @@ fn run_sub(
         let x = up(&xh[at * d.hidden..(at + n) * d.hidden]);
         let sh = up(&shared[at * d.hidden..(at + n) * d.hidden]);
         let mut o = DevBuf::zeroed(n * d.hidden * 4).unwrap();
-        glm_p2_moe::run_subbanks(sb, &x, Dtype::F16, n, Some(&sh), &mut o, s, os, st).unwrap();
+        glm_p2_moe::run_subbanks(sb, &x, Dtype::F16, n, Some(&sh), &mut o, s, os, sd, st).unwrap();
         st.sync().unwrap();
         out.extend(o.to_vec::<f32>().unwrap());
         let mut yy = vec![0f32; n * d.topk * d.hidden];
@@ -569,6 +573,7 @@ fn p2_per_subbank_equals_p2_single_bank() {
     let max = 300;
     let mut s = PrefillScratch::new(&d, max).unwrap();
     let mut os = OwnScratch::new(&d, max).unwrap();
+    let mut sd = MoeScratch::new(&d, 128).unwrap();
     for (name, parts) in partitions(d.experts) {
         let sb = subbanks_of(d, &parts.iter().map(|ids| (ids.clone(), groups)).collect::<Vec<_>>());
         assert_eq!(sb.banks().len(), parts.len());
@@ -582,7 +587,7 @@ fn p2_per_subbank_equals_p2_single_bank() {
                 let want = run(&lay.ex, &st, &mut s, &xh, &pick, &wts, &shared, rows, rows, Some(glm_p2_moe::DEFAULT_ORDER));
                 s.poison(0xa5, &st).unwrap();
                 let r0 = glm_p2_moe::runs();
-                let got = run_sub(&sb, &st, &mut s, &mut os, &xh, &pick, &wts, &shared, rows, rows);
+                let got = run_sub(&sb, &st, &mut s, &mut os, &mut sd, &xh, &pick, &wts, &shared, rows, rows);
                 // the audit counts one P2 expert block a call, not one a subbank
                 assert_eq!(glm_p2_moe::runs() - r0, 1, "{name}: P2 expert blocks counted for one layer call");
                 assert_same(&format!("{name} {style:?} {rows} rows, one call"), &got, &want, &d, &pick);
@@ -592,7 +597,7 @@ fn p2_per_subbank_equals_p2_single_bank() {
                     if chunk >= rows || (chunk == 1 && rows > 16) {
                         continue;
                     }
-                    let got = run_sub(&sb, &st, &mut s, &mut os, &xh, &pick, &wts, &shared, rows, chunk);
+                    let got = run_sub(&sb, &st, &mut s, &mut os, &mut sd, &xh, &pick, &wts, &shared, rows, chunk);
                     assert_same(&format!("{name} {style:?} {rows} rows in calls of {chunk}"), &got, &want, &d, &pick);
                     cases += 1;
                 }
@@ -627,6 +632,7 @@ fn p2_mixed_width_subbanks_equal_the_uniform_banks_they_are_made_of() {
     let max = 300;
     let mut s = PrefillScratch::new(&d, max).unwrap();
     let mut os = OwnScratch::new(&d, max).unwrap();
+    let mut sd = MoeScratch::new(&d, 128).unwrap();
     for (si, &style) in [Style::Uniform, Style::Holes, Style::Skewed, Style::Sparse].iter().enumerate() {
         for rows in [1usize, 16, 129, 300] {
             let mut r = Rng(1500 + 17 * si as u64 + rows as u64);
@@ -660,17 +666,158 @@ fn p2_mixed_width_subbanks_equal_the_uniform_banks_they_are_made_of() {
             st.sync().unwrap();
             let want = Run { out: o.to_vec::<f32>().unwrap(), y };
             s.poison(0x5a, &st).unwrap();
-            let got = run_sub(&sb, &st, &mut s, &mut os, &xh, &pick, &wts, &shared, rows, rows);
+            let got = run_sub(&sb, &st, &mut s, &mut os, &mut sd, &xh, &pick, &wts, &shared, rows, rows);
             assert_same(&format!("mixed widths {style:?} {rows} rows"), &got, &want, &d, &pick);
             for chunk in [16usize, 129] {
                 if chunk < rows {
-                    let got = run_sub(&sb, &st, &mut s, &mut os, &xh, &pick, &wts, &shared, rows, chunk);
+                    let got = run_sub(&sb, &st, &mut s, &mut os, &mut sd, &xh, &pick, &wts, &shared, rows, chunk);
                     assert_same(&format!("mixed widths {style:?} {rows} rows in calls of {chunk}"), &got, &want, &d, &pick);
                 }
             }
         }
     }
     eprintln!("mixed-width subbanks (gate/up 2/3/4 bits, down 3/2/4): every pair is the uniform bank's, the out is the one combine, bit for bit");
+}
+
+/// A layer with a SPLIT gate/up subbank (gate 2 bits, up 3: no P2 GEMM takes it) beside fused subbanks of 2/2/2 and 4/4/4 bits, every
+/// expert in exactly one. Under P2 the split subbank's pairs run the decode pairs stage in windows of the decode scratch: each split pair's
+/// y must be the decode path's (the whole layer's `run_pairs` in 64-row windows), each fused pair's the uniform P2 bank's, the out the one
+/// combine over those pairs; in calls of 16 and 129 rows, with decode windows of 128 and 7 rows, run to run (poisoned scratches). Then two
+/// ranks of the range ownership (each its subbanks of its share: `pairs_subbanks_rank`, its `Own(r)` part, the `Parts` sum): every
+/// owned pair's y and every row's out equal the one node's, bit for bit.
+#[test]
+fn p2_split_gate_up_subbank_is_the_decode_pairs_and_two_ranks_equal_one_node() {
+    gpu!();
+    let st = Stream::new().unwrap();
+    let d = glm_dims(288);
+    let base = synth_layer(d, 2, 2, 61, true);
+    let wide = synth_layer(d, 4, 4, 62, true);
+    let (bg, wg) = (base.groups.as_ref().unwrap(), wide.groups.as_ref().unwrap());
+    // which experts are split (2/3/2), which 4/4/4, the rest 2/2/2; experts on both sides of the 144 cut in each
+    let split = |e: usize| e % 5 == 2 || (140..148).contains(&e);
+    let four = |e: usize| !split(e) && e % 7 == 3;
+    let up3: Vec<LoadedGroup> =
+        (0..d.experts).map(|e| synth_group(d.hidden, d.inter, 3, Codebook::Mul1, 63_000 + e as u64)).collect();
+    let sel = |i: usize| -> Vec<LoadedGroup> {
+        (0..d.experts)
+            .map(|e| match (four(e), split(e), i) {
+                (true, _, _) => wg[i][e].clone(),
+                (_, true, 1) => up3[e].clone(),
+                _ => bg[i][e].clone(),
+            })
+            .collect()
+    };
+    let (gate, upg, down) = (sel(0), sel(1), sel(2));
+    let of = |own: ExpertOwnership| MoeSubbanks::from_groups(&gate, &upg, &down, d, own).unwrap();
+    let whole = of(ExpertOwnership::all(d.experts));
+    let ranks = [of(ExpertOwnership::range(d.experts, 0, 2).unwrap()), of(ExpertOwnership::range(d.experts, 1, 2).unwrap())];
+    let keys: Vec<_> = whole.banks().iter().map(|b| b.subbank_key()).collect();
+    assert_eq!(keys.len(), 3, "{keys:?}");
+    assert!(whole.has_split_gate_up() && ranks.iter().all(|r| r.has_split_gate_up()), "{keys:?}");
+    assert!(glm_p2_moe::supported_subbanks(&whole).is_ok());
+    let max = 300;
+    let mut s = PrefillScratch::new(&d, max).unwrap();
+    let mut os = OwnScratch::new(&d, max).unwrap();
+    for (si, &style) in [Style::Uniform, Style::Holes, Style::Skewed].iter().enumerate() {
+        for rows in [16usize, 129, 300] {
+            let mut r = Rng(2500 + 17 * si as u64 + rows as u64);
+            let xh = activations(&mut r, rows, d.hidden, 1.5);
+            let (mut pick, wts) = make_picks(&mut r, style, rows, d.experts, d.topk);
+            // a split expert of each side of the cut in every 5th row (every window of 7 rows sees one)
+            for row in (0..rows).step_by(5) {
+                let sl = &mut pick[row * d.topk..(row + 1) * d.topk];
+                for (k, e) in [(1usize, 142i32), (6, 147)] {
+                    if !sl.contains(&e) {
+                        sl[k] = e;
+                    }
+                }
+            }
+            let shared: Vec<f32> = (0..rows * d.hidden).map(|_| 0.1 * normal(&mut r) as f32).collect();
+            let ord = Some(glm_p2_moe::DEFAULT_ORDER);
+            let p2_base = run(&base.ex, &st, &mut s, &xh, &pick, &wts, &shared, rows, rows, ord);
+            let p2_wide = run(&wide.ex, &st, &mut s, &xh, &pick, &wts, &shared, rows, rows, ord);
+            // the decode pairs stage of the whole layer in 64-row windows (the split pairs' reference)
+            let mut y_dec = vec![0f32; rows * d.topk * d.hidden];
+            {
+                let mut sw = MoeScratch::new(&d, 64).unwrap();
+                let mut a = 0;
+                while a < rows {
+                    let n = (rows - a).min(64);
+                    sw.set_picks(&pick[a * d.topk..(a + n) * d.topk], &wts[a * d.topk..(a + n) * d.topk]).unwrap();
+                    whole.run_pairs(&up(&xh[a * d.hidden..(a + n) * d.hidden]), Dtype::F16, n, &mut sw, &mut os, &st).unwrap();
+                    st.sync().unwrap();
+                    let yw: Vec<f32> = sw.y_pairs.to_vec().unwrap();
+                    y_dec[a * d.topk * d.hidden..(a + n) * d.topk * d.hidden].copy_from_slice(&yw[..n * d.topk * d.hidden]);
+                    a += n;
+                }
+            }
+            let mut y = vec![f32::NAN; rows * d.topk * d.hidden];
+            for (p, &e) in pick.iter().enumerate().filter(|(_, &e)| valid(e, &d)) {
+                let rg = p * d.hidden..(p + 1) * d.hidden;
+                let src = if split(e as usize) {
+                    &y_dec
+                } else if four(e as usize) {
+                    &p2_wide.y
+                } else {
+                    &p2_base.y
+                };
+                y[rg.clone()].copy_from_slice(&src[rg]);
+            }
+            let (pk, w, sh) = (up(&pick), up(&wts), up(&shared));
+            let mut o = DevBuf::zeroed(rows * d.hidden * 4).unwrap();
+            glm_p2_moe::combine_dims(CombineMode::Both, &up(&y), &pk, &w, Some(&sh), None, &mut o, rows, &d, &st).unwrap();
+            st.sync().unwrap();
+            let want = Run { out: o.to_vec::<f32>().unwrap(), y };
+            for window in [128usize, 7] {
+                let mut sd = MoeScratch::new(&d, window).unwrap();
+                sd.poison(0x7f, &st).unwrap();
+                s.poison(0x5a, &st).unwrap();
+                let r0 = glm_p2_moe::runs();
+                let got = run_sub(&whole, &st, &mut s, &mut os, &mut sd, &xh, &pick, &wts, &shared, rows, rows);
+                assert_eq!(glm_p2_moe::runs() - r0, 1, "one P2 expert block counted for one layer call");
+                let tag = format!("split {style:?} {rows} rows, decode windows of {window}");
+                assert_same(&tag, &got, &want, &d, &pick);
+                for chunk in [16usize, 129] {
+                    if chunk < rows {
+                        let got = run_sub(&whole, &st, &mut s, &mut os, &mut sd, &xh, &pick, &wts, &shared, rows, chunk);
+                        assert_same(&format!("{tag} in calls of {chunk}"), &got, &want, &d, &pick);
+                    }
+                }
+                // two ranks: each its share's subbanks, its own group's part; the parts' sum with the shared expert last
+                let x = up(&xh);
+                let mut parts = [DevBuf::zeroed(rows * d.hidden * 4).unwrap(), DevBuf::zeroed(rows * d.hidden * 4).unwrap()];
+                for (k, sb) in ranks.iter().enumerate() {
+                    s.poison(0x33 + k as u8, &st).unwrap();
+                    sd.poison(0x7f, &st).unwrap();
+                    s.set_picks(&pick, &wts).unwrap();
+                    let order = glm_p2_moe::DEFAULT_ORDER;
+                    glm_p2_moe::pairs_subbanks_rank(sb, &x, Dtype::F16, rows, &mut s, &mut os, &mut sd, order, &st, &mut |_| Ok(()))
+                        .unwrap();
+                    let mode = CombineMode::Own(k);
+                    glm_p2_moe::combine_dims(mode, &s.y_pairs, &s.pick, &s.wts, None, None, &mut parts[k], rows, &d, &st).unwrap();
+                    st.sync().unwrap();
+                    let yr: Vec<f32> = s.y_pairs.to_vec().unwrap();
+                    for (p, &e) in pick.iter().enumerate().filter(|(_, &e)| valid(e, &d) && sb.ownership().owns(e as usize)) {
+                        let rg = p * d.hidden..(p + 1) * d.hidden;
+                        assert!(
+                            yr[rg.clone()].iter().zip(&want.y[rg]).all(|(a, b)| a.to_bits() == b.to_bits()),
+                            "{tag}: rank {k}'s y of pair {p} (expert {e})"
+                        );
+                    }
+                }
+                let mut o = DevBuf::zeroed(rows * d.hidden * 4).unwrap();
+                let pp = Some((&parts[0], &parts[1]));
+                glm_p2_moe::combine_dims(CombineMode::Parts, &s.y_pairs, &pk, &w, Some(&sh), pp, &mut o, rows, &d, &st).unwrap();
+                st.sync().unwrap();
+                let tp: Vec<f32> = o.to_vec().unwrap();
+                assert!(tp.iter().zip(&want.out).all(|(a, b)| a.to_bits() == b.to_bits()), "{tag}: two ranks' out != one node's");
+            }
+        }
+    }
+    eprintln!(
+        "split gate/up subbank (2/3/2) beside 2/2/2 and 4/4/4: split pairs == the decode pairs, fused pairs == the uniform P2 banks, out == \
+         the one combine, in calls of 16 / 129 rows and decode windows of 128 / 7, run to run; two ranks == one node, bit for bit"
+    );
 }
 
 #[test]
@@ -689,9 +836,10 @@ fn a_layer_of_subbanks_the_p2_gemms_do_not_take_is_refused_by_name() {
     let st = Stream::new().unwrap();
     let mut s = PrefillScratch::new(&d, 16).unwrap();
     let mut os = OwnScratch::new(&d, 16).unwrap();
+    let mut sd = MoeScratch::new(&d, 16).unwrap();
     let x = DevBuf::zeroed(16 * d.hidden * 2).unwrap();
     let mut o = DevBuf::zeroed(16 * d.hidden * 4).unwrap();
-    assert!(glm_p2_moe::run_subbanks(&sb, &x, Dtype::F16, 16, None, &mut o, &mut s, &mut os, &st).is_err());
+    assert!(glm_p2_moe::run_subbanks(&sb, &x, Dtype::F16, 16, None, &mut o, &mut s, &mut os, &mut sd, &st).is_err());
     // a rank's share (not every expert) is the tensor-parallel path's, not this one
     let c = mk(2, 3);
     let own = ExpertOwnership::from_ids(16, (0..8).collect()).unwrap();
@@ -705,7 +853,7 @@ fn a_layer_of_subbanks_the_p2_gemms_do_not_take_is_refused_by_name() {
     )
     .unwrap();
     assert!(glm_p2_moe::supported_subbanks(&half).is_ok());
-    assert!(glm_p2_moe::run_subbanks(&half, &x, Dtype::F16, 16, None, &mut o, &mut s, &mut os, &st).is_err());
+    assert!(glm_p2_moe::run_subbanks(&half, &x, Dtype::F16, 16, None, &mut o, &mut s, &mut os, &mut sd, &st).is_err());
     eprintln!("refused by name: {why}");
 }
 

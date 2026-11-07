@@ -435,7 +435,7 @@ impl MoeExperts {
     /// weights, and writing the window's pair rows of `ps.y_pairs` in place (the decode down epilogue writes only this subbank's pairs;
     /// with `fill` the window's other pair rows get the `-0.0` filler). A pair's `y` is the decode path's, which is the batched path's
     /// bit for bit (`tests/moe_prefill.rs`, and `tests/moe_subbanks.rs` per pair on the RED-SNOW layers). Clobbers `s` (not its picks).
-    fn subbank_prefill_pairs_windowed(
+    pub(crate) fn subbank_prefill_pairs_windowed(
         &self,
         x: &DevBuf,
         x_dtype: Dtype,

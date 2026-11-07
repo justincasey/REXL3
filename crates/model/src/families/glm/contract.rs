@@ -56,6 +56,10 @@ pub const P2_DENSE: &str = gb_cuda::glm_p2::ARITH_ID;
 /// the prefix namespace and of the Hello fact. Bump it with any change that moves a P2 expert bit.
 pub const P2_EXPERTS: &str = gb_cuda::glm_p2_moe::ARITH_ID;
 
+/// What a split gate/up subbank's pairs run inside a P2 prefill (`gb_cuda::glm_p2_moe::SPLIT_GU_ID`: the decode pairs stage, P1's bits;
+/// no P2 GEMM takes gate != up widths): part of the prefix namespace and of the Hello fact.
+pub const P2_SPLIT_GU: &str = gb_cuda::glm_p2_moe::SPLIT_GU_ID;
+
 /// The version of P2's KDA arithmetic for prompt rows (Lane P step (e), `gb_cuda::kda::prefill_chunked`: chunks of 16 rows anchored per
 /// prefill segment): part of the prefix namespace and of the Hello fact.
 pub const P2_KDA: &str = gb_cuda::kda::P2_ARITH_ID;
@@ -91,7 +95,7 @@ impl PrefillContract {
             PrefillContract::P1 => String::new(),
             PrefillContract::P2 => {
                 format!(
-                    "+prefill=p2(dense={P2_DENSE},experts={P2_EXPERTS},kda={P2_KDA},mla-ae={P2_MLA},mla-attn=p1,router=p1,indexer=p1,lm_head=p1)"
+                    "+prefill=p2(dense={P2_DENSE},experts={P2_EXPERTS},split-gu={P2_SPLIT_GU},kda={P2_KDA},mla-ae={P2_MLA},mla-attn=p1,router=p1,indexer=p1,lm_head=p1)"
                 )
             }
         }
@@ -125,7 +129,7 @@ fn selection() -> &'static Result<PrefillContract, String> {
                 c.id(),
                 (*c == DEFAULT_CONTRACT) as u8,
                 if *c == PrefillContract::P2 {
-                    format!(" dense={P2_DENSE} experts={P2_EXPERTS} kda={P2_KDA} mla-ae={P2_MLA}")
+                    format!(" dense={P2_DENSE} experts={P2_EXPERTS} split-gu={P2_SPLIT_GU} kda={P2_KDA} mla-ae={P2_MLA}")
                 } else {
                     String::new()
                 }
@@ -169,7 +173,9 @@ pub fn prefill_fingerprint_for(c: PrefillContract) -> String {
     match c {
         PrefillContract::P1 => "contract=p1".into(),
         PrefillContract::P2 => {
-            format!("contract=p2,dense={P2_DENSE},experts={P2_EXPERTS},kda={P2_KDA},mla-ae={P2_MLA},p2x={P2_EXCHANGE}")
+            format!(
+                "contract=p2,dense={P2_DENSE},experts={P2_EXPERTS},split-gu={P2_SPLIT_GU},kda={P2_KDA},mla-ae={P2_MLA},p2x={P2_EXCHANGE}"
+            )
         }
     }
 }
@@ -224,14 +230,16 @@ mod tests {
         assert_eq!(prefill_fingerprint_for(PrefillContract::P1), "contract=p1");
         // P2 is another namespace, names its dense kernel's version and every block that stays P1 inside it
         let t = PrefillContract::P2.arith_tag();
-        for want in [P2_DENSE, P2_EXPERTS, P2_KDA, P2_MLA, "router=p1", "indexer=p1", "lm_head=p1", "mla-attn=p1"] {
+        for want in [P2_DENSE, P2_EXPERTS, "split-gu=p1", P2_KDA, P2_MLA, "router=p1", "indexer=p1", "lm_head=p1", "mla-attn=p1"] {
             assert!(t.contains(want), "{want} not in {t}");
         }
         assert_eq!(suffix_for(PrefillContract::P2), None, "the default adds nothing to the fingerprint");
         assert!(!t.contains("experts=p1"), "the routed experts run P2 (step 3): {t}");
         assert_eq!(
             prefill_fingerprint_for(PrefillContract::P2),
-            format!("contract=p2,dense={P2_DENSE},experts={P2_EXPERTS},kda={P2_KDA},mla-ae={P2_MLA},p2x={P2_EXCHANGE}")
+            format!(
+                "contract=p2,dense={P2_DENSE},experts={P2_EXPERTS},split-gu={P2_SPLIT_GU},kda={P2_KDA},mla-ae={P2_MLA},p2x={P2_EXCHANGE}"
+            )
         );
         assert_ne!(prefill_fingerprint_for(PrefillContract::P1), prefill_fingerprint_for(PrefillContract::P2));
     }

@@ -171,7 +171,7 @@ pub struct Profile {
 #[allow(clippy::too_many_arguments)]
 fn p2_rank_layer(
     t: &mut tp::GlmTp,
-    ex: &gb_cuda::moe::MoeExperts,
+    ex: tp::P2Routed<'_>,
     owed: Option<&gb_cuda::moe::SharedExpert>,
     with_shared: bool,
     s: &mut Scratch,
@@ -182,12 +182,12 @@ fn p2_rank_layer(
 ) -> Result<(), ModelError> {
     let pf = s.pf.as_mut().ok_or_else(|| ModelError::Config("P2 needs the prefill scratch (a chunk above 128 rows)".into()))?;
     let PfScratch { moe: moe_sc, shared: sh_sc, .. } = pf;
-    t.p2_begin(ex, &s.hidden, rows, moe_sc, st, mark)?;
+    t.p2_begin(ex, &s.hidden, rows, moe_sc, &mut s.moe, st, mark)?;
     if let Some(sh) = owed {
         layers::gated(sh, &s.hidden, rows, &mut s.moe_shared_out, s.shared.as_mut(), Some(sh_sc), st, path)?;
     }
     let shared = with_shared.then_some(&s.moe_shared_out);
-    t.p2_finish(ex, moe_sc, shared, &mut s.mixer_out, st)?;
+    t.p2_finish(&ex.dims(), moe_sc, shared, &mut s.mixer_out, st)?;
     Ok(())
 }
 
@@ -745,8 +745,8 @@ impl GlmModel {
                 alloc::MAX_ROWS
             )));
         }
-        // a layer bound as subbanks (a mixed-width layer) is checked bank by bank: every subbank on the P2 expert GEMMs, the pairs stage run
-        // once per subbank (`glm_p2_moe::run_subbanks`)
+        // a layer bound as subbanks (a mixed-width layer, or a rank's share) is checked bank by bank: every subbank of one gate/up width on
+        // the P2 expert GEMMs, a split gate/up subbank through the decode pairs stage (`glm_p2_moe::supported_subbanks`)
         let mut banks: Vec<(String, &gb_cuda::moe::MoeExperts)> = Vec::new();
         let mut subbanked: Vec<(String, &gb_cuda::moe::MoeSubbanks)> = Vec::new();
         for (l, d) in self.dev.layers.iter().enumerate() {
@@ -771,7 +771,7 @@ impl GlmModel {
             }
         }
         for (name, sb) in &subbanked {
-            // whether a tensor-parallel rank may hold several subbanks is the TP check's (`check_p2_tp`); the formats are checked here
+            // on one node and on a rank alike (`glm_p2_moe::pairs_subbanks_with` / `pairs_subbanks_rank`)
             gb_cuda::glm_p2_moe::supported_subbanks(sb).map_err(|why| bad(format!("{name} (subbanks): {why}")))?;
         }
         let rows = self.s.rows;
@@ -1866,21 +1866,23 @@ impl GlmModel {
                 }
                 // routed experts bound as subbanks (a mixed-width pack, or a rank's share): every subbank's pairs into one pair buffer, on a rank
                 // the exchange of that buffer (`model/tp.rs`), then the slot combine with the global picks and the shared expert added last.
-                // Under P2 on one node: the P2 pairs stage once per subbank, then the one two-group combine (`glm_p2_moe::run_subbanks`).
+                // Under P2 on one node: the P2 pairs stage once per subbank, then the one two-group combine (`glm_p2_moe::run_subbanks`); on a
+                // rank: the same pairs stage over the rank's subbanks, its part, the swap, the parts' sum (`model/tp/p2.rs`).
                 Op::MoeExperts { layer, with_shared } if matches!(layer_of(layer).ffn, FfnDevice::MoeSubbanks { .. }) => 'p2arm: {
                     let FfnDevice::MoeSubbanks { layer: m, .. } = &layer_of(layer).ffn else { unreachable!() };
                     if p2 {
                         let FfnDevice::MoeSubbanks { shared, .. } = &layer_of(layer).ffn else { unreachable!() };
-                        match (tp.as_mut(), m.experts.banks()) {
-                            // a tensor-parallel rank's share bound as one subbank: the P2 rank path (`model/tp/p2.rs`)
-                            (Some(t), [bank]) => {
+                        match tp.as_mut() {
+                            // a tensor-parallel rank's share (one subbank or several): the P2 rank path (`model/tp/p2.rs`)
+                            Some(t) => {
                                 let owed = std::mem::take(&mut shared_deferred).then_some(&**shared);
-                                p2_rank_layer(t, bank, owed, with_shared, s, rows, st, path, &mut |_| Ok(()))?;
+                                let ex = tp::P2Routed::Subbanks(&m.experts);
+                                p2_rank_layer(t, ex, owed, with_shared, s, rows, st, path, &mut |_| Ok(()))?;
                             }
                             // a mixed-width layer on one node: the pairs stage once per subbank, then the one combine
                             // (`glm_p2_moe::run_subbanks`); the layer's shared expert ran first (on the side stream, when it is on, joined
                             // right before the combine: its one reader)
-                            (None, _) => {
+                            None => {
                                 let join = shared_forked.then_some(p2_side).flatten();
                                 shared_forked = false;
                                 let sh = with_shared.then_some(&s.moe_shared_out);
@@ -1893,6 +1895,7 @@ impl GlmModel {
                                     rows,
                                     &mut pf.moe,
                                     os,
+                                    &mut s.moe,
                                     gb_cuda::glm_p2_moe::DEFAULT_ORDER,
                                     st,
                                     &mut |_| Ok(()),
@@ -1912,11 +1915,6 @@ impl GlmModel {
                                     &m.dims,
                                     st,
                                 )?;
-                            }
-                            // a rank with several subbanks (a mixed-width layer at TP=2) is refused at boot (`check_p2_tp`)
-                            (Some(_), _) => {
-                                let why = "P2 routed experts bound as several subbanks on a tensor-parallel rank: not built";
-                                return Err(ModelError::Config(format!("layer {layer}: {why}")));
                             }
                         }
                         break 'p2arm;
@@ -2018,7 +2016,7 @@ impl GlmModel {
                     if p2 {
                         let FfnDevice::Moe { shared, .. } = &layer_of(layer).ffn else { unreachable!() };
                         let owed = std::mem::take(&mut shared_deferred).then_some(&**shared);
-                        p2_rank_layer(t, &m.experts, owed, with_shared, s, rows, st, path, &mut |_| Ok(()))?;
+                        p2_rank_layer(t, tp::P2Routed::Bank(&m.experts), owed, with_shared, s, rows, st, path, &mut |_| Ok(()))?;
                         break 'p2arm;
                     }
                     let sh = with_shared.then_some(&s.moe_shared_out);
