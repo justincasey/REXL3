@@ -48,12 +48,14 @@ impl GlmTp {
     /// `io.mixer_out`; with `sp`, the gather and the o_proj of this rank's rows `[sp.lo, sp.hi)` alone (the other rows of `io.mixer_out` are
     /// left as they were). With `join` (and `sp`) the peer's hidden rows are still crossing (`GlmTp::sp_gather_begin`): the qkv strips of
     /// this rank's rows run first, then the join, then the peer's rows (every P2 GEMM row is its own row's arithmetic, so the two launches
-    /// leave the one launch's bits; so does a forward of several prompts, whose recurrences never read each other's rows).
+    /// leave the one launch's bits; so does a forward of several prompts, whose recurrences never read each other's rows). Without `o`
+    /// (the last layer of a forward whose tail runs on the head rows, `ops::plan_forward_head_rows`) it stops at the core output, this
+    /// rank's columns of every row ([`GlmTp::kda_head_rows_p2`] gathers the head rows').
     #[allow(clippy::too_many_arguments)]
     pub(in crate::families::glm::model) fn kda_split_layer_p2(
         &mut self,
         ord: usize,
-        o: &Exl3Weights,
+        o: Option<&Exl3Weights>,
         dims: kda::Dims,
         params: &kda::Params,
         pool: &mut kda::Pool,
@@ -120,6 +122,7 @@ impl GlmTp {
                 )?;
             }
         }
+        let Some(o) = o else { return Ok(()) };
         match sp {
             None => {
                 self.gather_cols_f16_prefill(&own, out, rows, c, st)?;
@@ -141,6 +144,60 @@ impl GlmTp {
                 let mut y = mixer_out.subview(sp.lo * o.n * 4, n * o.n * 4);
                 gb_cuda::glm_p2::linear(o, &x, &mut y, n, Dtype::F16, Dtype::F32, ws, st)?;
             }
+        }
+        Ok(())
+    }
+
+    /// [`Op::HeadRows`](crate::families::glm::ops::Op::HeadRows) of a P2 forward on this rank's KDA heads, after the last layer's core
+    /// ([`GlmTp::kda_split_layer_p2`] without `o`): each `(i, last)` of `moves` (sequence order, `last >= i`) moves row `last` of this rank's
+    /// core columns to row `i`, then rows `[0, moves.len())` are gathered with the peer's columns into `out` `[rows, 2 c]` (`c`: this rank's
+    /// columns), the full row the P2 o_proj reads. Byte copies.
+    pub(in crate::families::glm::model) fn kda_head_rows_p2(
+        &mut self,
+        out: &mut DevBuf,
+        moves: &[(usize, usize)],
+        c: usize,
+        st: &Stream,
+    ) -> Result<(), ModelError> {
+        let sp = self.split.as_mut().ok_or_else(|| ModelError::Config("no head split".into()))?;
+        for &(i, last) in moves.iter().filter(|(i, last)| i != last) {
+            sp.own.copy_within(i * c * 2, last * c * 2, c * 2, st)?;
+        }
+        let n = moves.len();
+        let own = sp.own.subview(0, n * c * 2);
+        self.gather_cols_f16_prefill(&own, out, n, c, st)
+    }
+
+    /// Under the sequence-parallel residual, the head rows of a residual buffer `buf` (`row_bytes` a row) on both ranks: each rank has
+    /// moved the head rows it owns (`mine[i]`) to row `i`; the rows `[0, mine.len())` are swapped through the head split's gather buffer
+    /// (in pieces it holds) and each rank keeps the peer's copy of the rows it does not own. Both ranks make the same exchanges; byte
+    /// copies.
+    pub(in crate::families::glm::model) fn sp_head_rows(
+        &mut self,
+        buf: &mut DevBuf,
+        row_bytes: usize,
+        mine: &[bool],
+        st: &Stream,
+    ) -> Result<(), ModelError> {
+        let stage_bytes = self.split.as_ref().ok_or_else(|| ModelError::Config("no head split".into()))?.peer.bytes();
+        let per = stage_bytes / row_bytes;
+        if per == 0 {
+            return Err(ModelError::Config(format!("the head split's gather buffer ({stage_bytes} B) holds no {row_bytes}-byte row")));
+        }
+        let n = mine.len();
+        let mut a = 0;
+        while a < n {
+            let k = (n - a).min(per);
+            let bytes = k * row_bytes;
+            let mut stage = self.split.as_ref().unwrap().peer.subview(0, bytes);
+            // (the residual buffers are not views of a block: the rows go by offset)
+            self.comm.swap_bytes_for(SiteUser::PrefillGather, buf, a * row_bytes, bytes, &mut stage, 0, bytes, st)?;
+            self.exchanged_bytes += bytes as u64;
+            self.exchanges += 1;
+            for i in (a..a + k).filter(|&i| !mine[i]) {
+                buf.copy_range_from(i * row_bytes, &stage, (i - a) * row_bytes, row_bytes, st)?;
+            }
+            a += k;
         }
         Ok(())
     }

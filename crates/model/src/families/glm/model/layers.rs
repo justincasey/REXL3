@@ -95,6 +95,29 @@ pub(super) fn gated(
     Ok(())
 }
 
+/// [`gated`]'s P2 path in two parts (`glm_p2::gated_part`: the gate linear, then the rest on the gate output it left), one piece of
+/// `rows` rows of whichever scratch [`gated`] would take: the same launches in the same order, with room for other work between them.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn gated_part(
+    m: &moe::SharedExpert,
+    x: &DevBuf,
+    rows: usize,
+    out: &mut DevBuf,
+    small: Option<&mut moe::SharedScratch>,
+    big: Option<&mut moe_prefill::SharedScratchBig>,
+    st: &Stream,
+    part: gb_cuda::glm_p2::GatedPart,
+) -> Result<(), ModelError> {
+    let bufs = match (big, small) {
+        (Some(b), _) if rows > MAX_ROWS => b.p2_bufs(),
+        (_, Some(s)) if rows <= s.max_rows => s.p2_bufs(),
+        (Some(b), _) => b.p2_bufs(),
+        _ => return Err(ModelError::Config("no gated-MLP scratch for this chunk".into())),
+    };
+    gb_cuda::glm_p2::gated_part(m, x, Dtype::F16, rows, out, bufs, part, st)?;
+    Ok(())
+}
+
 /// Called after each slab's `dsa::append` of a large chunk with the slab's first row, its rows and the layer's planes (see [`mla_dsa_mixer`]).
 pub(super) type AfterAppend<'a> = &'a mut dyn FnMut(usize, usize, &dsa::Planes) -> Result<(), ModelError>;
 
@@ -134,6 +157,10 @@ fn slab_index(ri: &RowIndex, a: usize, n: usize) -> RowIndex {
 /// slab's `dsa::append` run over all the rows (the layer's state), the per-row rest (q_a, q_b, the indexer's query and weights, the selection,
 /// the attention and o_proj) over this rank's rows only; `s.mixer_out` then holds this rank's rows, which the caller swaps with the peer's. Every
 /// op is row-independent, so each row's bits are the full call's.
+///
+/// `join` (with `own`, under the sequence-parallel residual): the peer's rows of `s.hidden` are still crossing; it is called once this rank's
+/// rows' query chain (and, in the sparse regime, the indexer's query and weights) are queued, before anything reads the peer's rows. Without
+/// `own` it is called first. Only what overlaps in time changes: every launch reads and writes what it did.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn mla_dsa_mixer(
     c: &MlaCtx<'_>,
@@ -146,6 +173,7 @@ pub(super) fn mla_dsa_mixer(
     max_pos: usize,
     positions: Option<&[i32]>,
     own: Option<(usize, usize)>,
+    mut join: Option<&mut dyn FnMut() -> Result<(), ModelError>>,
     mut after_append: Option<AfterAppend<'_>>,
     mark: &mut dyn FnMut(&'static str) -> Result<(), ModelError>,
 ) -> Result<(), ModelError> {
@@ -165,6 +193,8 @@ pub(super) fn mla_dsa_mixer(
     // rows [lo, hi) of a scratch buffer of `width` elements of `es` bytes a row
     let part = |b: &DevBuf, width: usize, es: usize| b.subview(lo * width * es, n_own * width * es);
     let (qa_w, qd) = (cfg.mla.q_lora_rank, cfg.mla.heads * cfg.mla.qk_head_dim());
+    // a large chunk's indexer query and weights on this rank's rows run before the join (they read only those rows)
+    let early_ix = big && any_sparse && own.is_some();
     if own.is_some() {
         let x = part(&s.hidden, h, 2);
         let mut qa = part(&s.q_a, qa_w, 2);
@@ -173,7 +203,20 @@ pub(super) fn mla_dsa_mixer(
         glm_glue::rmsnorm_f16(&qa, &w.q_a_norm, &mut qr, n_own, qa_w, RMS_EPS, st)?;
         let mut q = part(&s.q, qd, 2);
         lin(&w.q_b, &qr, &mut q, n_own, Dtype::F16, Dtype::F16, &mut s.ws, st, path)?;
+        if early_ix {
+            let (x, qr) = (part(&s.hidden, h, 2), part(&s.q_resid, qa_w, 2));
+            let mut wp = part(&s.wproj, cfg.indexer.heads, 2);
+            let mut iq = part(&s.iq, cfg.indexer.heads * cfg.indexer.head_dim, 2);
+            moe::linear_f16(&x, Dtype::F16, &ix.weights_proj, &mut wp, n_own, h, cfg.indexer.heads, st)?;
+            ix.wq_b.forward(&qr, &mut iq, n_own, &mut s.ws, st, true)?;
+        }
+        if let Some(j) = join.take() {
+            j()?;
+        }
     } else {
+        if let Some(j) = join.take() {
+            j()?;
+        }
         lin(&w.q_a, &s.hidden, &mut s.q_a, rows, Dtype::F16, Dtype::F16, &mut s.ws, st, path)?;
         glm_glue::rmsnorm_f16(&s.q_a, &w.q_a_norm, &mut s.q_resid, rows, cfg.mla.q_lora_rank, RMS_EPS, st)?;
         lin(&w.q_b, &s.q_resid, &mut s.q, rows, Dtype::F16, Dtype::F16, &mut s.ws, st, path)?;
@@ -220,17 +263,9 @@ pub(super) fn mla_dsa_mixer(
 
     // a large chunk: the indexer's two remaining projections over the rows that select (only when some slab selects), then the slabs in
     // order (every slab's append, this rank's slabs' selection and attention)
-    if any_sparse {
-        if own.is_some() {
-            let (x, qr) = (part(&s.hidden, h, 2), part(&s.q_resid, qa_w, 2));
-            let mut wp = part(&s.wproj, cfg.indexer.heads, 2);
-            let mut iq = part(&s.iq, cfg.indexer.heads * cfg.indexer.head_dim, 2);
-            moe::linear_f16(&x, Dtype::F16, &ix.weights_proj, &mut wp, n_own, h, cfg.indexer.heads, st)?;
-            ix.wq_b.forward(&qr, &mut iq, n_own, &mut s.ws, st, true)?;
-        } else {
-            moe::linear_f16(&s.hidden, Dtype::F16, &ix.weights_proj, &mut s.wproj, rows, h, cfg.indexer.heads, st)?;
-            ix.wq_b.forward(&s.q_resid, &mut s.iq, rows, &mut s.ws, st, true)?;
-        }
+    if any_sparse && !early_ix {
+        moe::linear_f16(&s.hidden, Dtype::F16, &ix.weights_proj, &mut s.wproj, rows, h, cfg.indexer.heads, st)?;
+        ix.wq_b.forward(&s.q_resid, &mut s.iq, rows, &mut s.ws, st, true)?;
         mark("mla: indexer weights_proj and wq_b")?;
     }
     let (qd, ihd, ihs) = (cfg.mla.heads * cfg.mla.qk_head_dim(), cfg.indexer.head_dim, cfg.indexer.heads);

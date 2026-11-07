@@ -909,8 +909,8 @@ fn timed(
     t.elapsed().as_secs_f64() * 1e3
 }
 
-/// ms a layer, P1's large-row path against P2 (both orders), 288 experts, uniform routing (REXL3_P2M_BITS, REXL3_P2M_ROWS override the
-/// widths and row counts), median of 5 after a warm-up; the P2 stages from a separate staged run.
+/// ms a layer, P1's large-row path against P2 (both orders), 288 experts, uniform routing (REXL3_P2M_BITS, REXL3_P2M_ROWS and
+/// REXL3_P2M_INTER override the widths, row counts and expert width), median of 5 after a warm-up; the P2 stages from a separate staged run.
 #[test]
 #[ignore]
 fn bench_p2_experts_against_p1() {
@@ -925,7 +925,8 @@ fn bench_p2_experts_against_p1() {
         Ok(v) => v.split(',').map(|b| b.parse().unwrap()).collect(),
         Err(_) => vec![512, 1024, 2048, 4096],
     };
-    let d = glm_dims(288);
+    // REXL3_P2M_INTER: the expert width (1,024: a rank's half of GLM's 2,048 under the width split)
+    let d = MoeDims { inter: std::env::var("REXL3_P2M_INTER").map_or(2048, |v| v.parse().unwrap()), ..glm_dims(288) };
     for &bits in &widths {
         let lay = synth_layer(d, bits, bits, 9 + bits as u64, false);
         let ex = &lay.ex;
@@ -974,6 +975,90 @@ fn bench_p2_experts_against_p1() {
             eprintln!("{line}");
         }
     }
+}
+
+/// ms a layer of a rank under the width split as RED-SNOW 4.91bpw binds it: 288 experts at an expert width of 1,024
+/// (REXL3_P2M_INTER), five interleaved subbanks of gate/up / down bits 6/4, 6/6, 5/4, 5/5 and 4/4, uniform routing over REXL3_P2M_ROWS
+/// rows (default 4,096): the P2 pairs stage (fold) and the combine, median of 5 after a warm-up, and each stage's time summed over the
+/// subbanks from a separate staged run. Also checks that the staged and unstaged runs give the same bits.
+#[test]
+#[ignore]
+fn bench_p2_subbanks() {
+    gpu!();
+    let st = Stream::new().unwrap();
+    let mut flush = DevBuf::alloc(256 << 20).unwrap();
+    let d = MoeDims { inter: std::env::var("REXL3_P2M_INTER").map_or(1024, |v| v.parse().unwrap()), ..glm_dims(288) };
+    let rows: usize = std::env::var("REXL3_P2M_ROWS").map_or(4096, |v| v.parse().unwrap());
+    let widths = [(6usize, 4usize), (6, 6), (5, 4), (5, 5), (4, 4)];
+    let mut banks = Vec::new();
+    for (i, &(bg, bd)) in widths.iter().enumerate() {
+        let ids: Vec<u32> = (0..d.experts as u32).filter(|e| *e as usize % widths.len() == i).collect();
+        let mk = |k, n, bits, tag: u64| -> Vec<LoadedGroup> {
+            ids.iter().map(|&x| synth_group(k, n, bits, Codebook::Mul1, 77_000 + tag * 1000 + x as u64)).collect()
+        };
+        let (g, u, dn) = (mk(d.hidden, d.inter, bg, 1), mk(d.hidden, d.inter, bg, 2), mk(d.inter, d.hidden, bd, 3));
+        let o = ExpertOwnership::from_ids(d.experts, ids.clone()).unwrap();
+        banks.push(MoeExperts::from_groups_owned(&g, &u, &dn, d, o).unwrap());
+    }
+    let sb = MoeSubbanks::new(d, ExpertOwnership::all(d.experts), banks).unwrap();
+    let mut s = PrefillScratch::new(&d, rows).unwrap();
+    let mut os = OwnScratch::new(&d, rows).unwrap();
+    let mut sd = MoeScratch::new(&d, 128).unwrap();
+    let mut r = Rng(rows as u64 + 5);
+    let xh = activations(&mut r, rows, d.hidden, 1.5);
+    let (pick, wts) = make_picks(&mut r, Style::Uniform, rows, d.experts, d.topk);
+    let x = up(&xh);
+    let sh = DevBuf::zeroed(rows * d.hidden * 4).unwrap();
+    let mut out = DevBuf::zeroed(rows * d.hidden * 4).unwrap();
+    s.set_picks(&pick, &wts).unwrap();
+    let flop = 2.0 * 3.0 * (d.hidden * d.inter) as f64 * (rows * d.topk) as f64;
+    let ord = glm_p2_moe::DEFAULT_ORDER;
+    let mut call = |per: Option<&mut std::collections::BTreeMap<&'static str, f64>>,
+                    s: &mut PrefillScratch,
+                    out: &mut DevBuf,
+                    it: usize|
+     -> f64 {
+        flush.memset_async(it as u8, &st).unwrap();
+        st.sync().unwrap();
+        let t = std::time::Instant::now();
+        let mut last = t;
+        let mut per = per;
+        glm_p2_moe::pairs_subbanks_with(&sb, &x, Dtype::F16, rows, s, &mut os, &mut sd, ord, &st, &mut |name| {
+            if let Some(p) = per.as_deref_mut() {
+                st.sync()?;
+                let now = std::time::Instant::now();
+                *p.entry(name).or_default() += now.duration_since(last).as_secs_f64() * 1e3;
+                last = now;
+            }
+            Ok(())
+        })
+        .unwrap();
+        glm_p2_moe::combine_dims(CombineMode::Both, &s.y_pairs, &s.pick, &s.wts, Some(&sh), None, out, rows, &d, &st).unwrap();
+        st.sync().unwrap();
+        if let Some(p) = per {
+            *p.entry("combine").or_default() += last.elapsed().as_secs_f64() * 1e3;
+        }
+        t.elapsed().as_secs_f64() * 1e3
+    };
+    let tp = median((0..6).map(|it| call(None, &mut s, &mut out, it)).skip(1).collect());
+    let want: Vec<u32> = out.to_vec::<f32>().unwrap().iter().map(|v| v.to_bits()).collect();
+    let mut stages = Vec::new();
+    for it in 0..4 {
+        let mut per = std::collections::BTreeMap::new();
+        call(Some(&mut per), &mut s, &mut out, it);
+        stages.push(per);
+    }
+    let got: Vec<u32> = out.to_vec::<f32>().unwrap().iter().map(|v| v.to_bits()).collect();
+    assert!(want == got, "the staged run gave other bits");
+    let names: Vec<&'static str> = stages[0].keys().copied().collect();
+    let st_txt: Vec<String> = names.iter().map(|k| format!("{k} {:.2}", median(stages.iter().map(|p| p[k]).collect()))).collect();
+    eprintln!(
+        "5 subbanks, inter {}, rows {rows}: P2 {tp:7.2} ms {:5.1} TF [{}] out {:016x}",
+        d.inter,
+        flop / tp / 1e9,
+        st_txt.join(", "),
+        gb_exl3::fnv1a(want.iter().flat_map(|v| v.to_le_bytes()))
+    );
 }
 
 /// The golden of the P2 experts (`testdata/gpu/golden_glm_p2_moe.txt`, scripts/gpu_gate.sh): hashes of y and out in both K orders on

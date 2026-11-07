@@ -331,3 +331,56 @@ pub fn gated(
     }
     Ok(())
 }
+
+/// A part of [`gated`] for a call of at most the buffers' `max_rows` rows (one piece).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatedPart {
+    /// The gate linear into the buffers' `g`.
+    Gate,
+    /// The up linear, the activation and the down linear into `out`, on the `g` that [`GatedPart::Gate`] left.
+    Rest,
+}
+
+/// [`gated`] in two calls (`Gate`, then `Rest` on the same buffers, nothing else writing them between): the same launches on the same
+/// values in the same order, so the same bits, with room for the caller's own work between the two. One piece: `rows` at most the
+/// buffers' `max_rows`. Asynchronous on `st`.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_part(
+    m: &SharedExpert,
+    x: &DevBuf,
+    x_dtype: Dtype,
+    rows: usize,
+    out: &mut DevBuf,
+    b: GatedBufs<'_>,
+    part: GatedPart,
+    st: &Stream,
+) -> Result<(), CudaError> {
+    if rows == 0
+        || rows > b.max_rows
+        || b.inter != m.inter
+        || x.bytes() < rows * m.hidden * x_dtype.size()
+        || out.bytes() < rows * m.hidden * 4
+        || !gated_supported(m)
+    {
+        return Err(INVALID);
+    }
+    let GatedBufs { g, u, a, ws, .. } = b;
+    match part {
+        GatedPart::Gate => linear(&m.gate, x, g, rows, x_dtype, Dtype::F32, ws, st),
+        GatedPart::Rest => {
+            linear(&m.up, x, u, rows, x_dtype, Dtype::F32, ws, st)?;
+            // SAFETY: g, u hold rows * inter f32 and a rows * inter fp16 (rows <= max_rows); asynchronous on `st`
+            unsafe {
+                CudaError::check(ffi::gb_moe_swiglu_limit(
+                    g.ptr() as *const c_void,
+                    u.ptr() as *const c_void,
+                    a.ptr(),
+                    (rows * m.inter) as i64,
+                    m.limit,
+                    st.raw(),
+                ))?;
+            }
+            linear(&m.down, a, out, rows, Dtype::F16, Dtype::F32, ws, st)
+        }
+    }
+}

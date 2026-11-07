@@ -752,7 +752,7 @@ impl GlmModel {
             Ok(())
         };
         let hook: Option<layers::AfterAppend<'_>> = if cuts_here.is_empty() { None } else { Some(&mut ring_hook) };
-        layers::mla_dsa_mixer(&ctx, a, latent, planes, s, Some(&rowidx[step]), rows, max_pos, None, None, hook, &mut |_| Ok(()))?;
+        layers::mla_dsa_mixer(&ctx, a, latent, planes, s, Some(&rowidx[step]), rows, max_pos, None, None, None, hook, &mut |_| Ok(()))?;
         mark(2)?;
 
         // x += attention output, norm for the feed-forward block (one pass), the shared expert, the router and the routed experts

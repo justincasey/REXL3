@@ -2065,7 +2065,24 @@ fn router_blocking_shapes_give_the_same_bits() {
                 "rows {rows}: rb {rb} eb {eb} warps {warps} unroll {un} changes the logits"
             );
         }
+        // the prefill tiling with 16-byte loads (a chain's 32 lanes on 8)
+        for (rb, eb, warps) in v4_shapes() {
+            let mut got = DevBuf::zeroed(rows * 288 * 2).unwrap();
+            router.logits_blocked_v4(&x, Dtype::F16, rows, &mut got, rb, eb, warps, &st).unwrap();
+            assert!(sync_dl::<u16>(&got, &st) == want, "rows {rows}: v4 rb {rb} eb {eb} warps {warps} changes the logits");
+        }
     }
+}
+
+/// Every blocking the 16-byte prefill tiling (`router_logits_v4_kernel`: rows and experts an 8-lane group, warps a block) is built for.
+fn v4_shapes() -> Vec<(usize, usize, usize)> {
+    let mut v = Vec::new();
+    for (rb, eb) in [(2usize, 2usize), (2, 4), (2, 8), (4, 2), (4, 4), (4, 8), (8, 2), (8, 4)] {
+        for warps in [2usize, 4, 8] {
+            v.push((rb, eb, warps));
+        }
+    }
+    v
 }
 
 /// Every blocking the prefill tiling (`router_logits_eb_kernel`: rows a warp, experts a warp, warps a block, loads in flight) is built for.
@@ -2148,6 +2165,20 @@ fn router_gemv_matches_the_host_mirror_for_other_hidden_sizes_and_expert_counts(
                     assert!(
                         sync_dl::<u16>(&got, &st) == want,
                         "hidden {hidden} experts {experts} {dt:?} rows {rows}: rb {rb} eb {eb} warps {warps} unroll {un}"
+                    );
+                }
+                // the 16-byte prefill tiling: fp16 activations and hidden sizes in whole 64-element steps (refused otherwise)
+                for (rb, eb, warps) in v4_shapes() {
+                    let mut got = DevBuf::zeroed(rows * experts * 2).unwrap();
+                    let r4 = router.logits_blocked_v4(&x, dt, rows, &mut got, rb, eb, warps, &st);
+                    if dt != Dtype::F16 || hidden % 64 != 0 {
+                        assert!(r4.is_err(), "hidden {hidden} {dt:?}: the 16-byte tiling must refuse");
+                        continue;
+                    }
+                    r4.unwrap();
+                    assert!(
+                        sync_dl::<u16>(&got, &st) == want,
+                        "hidden {hidden} experts {experts} {dt:?} rows {rows}: v4 rb {rb} eb {eb} warps {warps}"
                     );
                 }
             }

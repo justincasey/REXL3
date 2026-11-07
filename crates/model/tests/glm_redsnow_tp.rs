@@ -36,6 +36,10 @@
 //! the P1 prompt forwards run with that layer's tail on the head rows alone and with it on every row (`GlmModel::set_head_rows`) give
 //! every answer, every layer's state after every prompt chunk and the windows after byte for byte (chunked, several prompts in one
 //! forward, a forward paused at layer bounds), on one model and on the two ranks of the serving split.
+//!
+//! `p2_the_last_layers_tail_on_the_head_rows_equals_every_rows`: the same under P2, on one P2 model and on the two serving ranks (the
+//! width split, the sequence-parallel residual, the drafter's taps relayed when `REXL3_DFLASH_DIR` is set), whose last chunk and
+//! batched forward are row-split so that head rows live on either rank.
 
 mod glm_support;
 
@@ -1510,9 +1514,14 @@ fn slot_state(m: &mut GlmModel, layers: usize, slot: usize, n: usize) -> Vec<u64
 /// prompts in one forward and [`pause_script`]'s slice whole and paused at three bounds. `(answers, states)`: the answering calls'
 /// digests in call order, the state digests.
 fn head_rows_script(m: &mut GlmModel, layers: usize) -> (Vec<u64>, Vec<u64>) {
+    head_rows_script_with(m, layers, 2300)
+}
+
+/// [`head_rows_script`] with a first prompt of `first` rows (in 512-row chunks).
+fn head_rows_script_with(m: &mut GlmModel, layers: usize, first: usize) -> (Vec<u64>, Vec<u64>) {
     let (mut answers, mut states) = (Vec::new(), Vec::new());
     let mut r = Rng(0x3c6e_f372_fe94_f82b);
-    for (slot, n, chunk) in [(0usize, 2300usize, CHUNK), (1, 200, 128), (2, 37, 128)] {
+    for (slot, n, chunk) in [(0usize, first, CHUNK), (1, 200, 128), (2, 37, 128)] {
         let p = r.tokens(n);
         m.begin_slot(slot).unwrap();
         let mut at = 0;
@@ -1589,6 +1598,69 @@ fn p1_the_last_layers_tail_on_the_head_rows_equals_every_rows() {
         every.0.len(),
         every.1.len(),
         a.head_rows_runs()
+    );
+    drop((a, b));
+    eprintln!("MemAvailable min {:.1} GiB", gib(guard.finish()));
+}
+
+/// [`p1_the_last_layers_tail_on_the_head_rows_equals_every_rows`] under P2: [`head_rows_script_with`] with a first prompt of 2,400 rows
+/// (its last chunk of 352 rows row-split, the head row on rank 1; [`batch_script`]'s 467-row forward puts a head row on each rank) with
+/// the tail on the head rows and on every row, on one P2 model and on the two serving ranks ([`serving_ranks`]: the width split, the
+/// sequence-parallel residual, the drafter of `REXL3_DFLASH_DIR` with its taps relayed when set, none on the last layer). Each run is
+/// checked against its own run with the tail on every row (the width ranks' P2 bits are not one model's), the ranks against each other.
+#[test]
+#[ignore]
+fn p2_the_last_layers_tail_on_the_head_rows_equals_every_rows() {
+    let Some(dir) = redsnow_dir() else { return };
+    let (layers, draft, _) = prefix_setup();
+    let layers = if layers % 4 == 0 { layers - 1 } else { layers };
+    assert!(layers >= 4, "parts need a few layers");
+    // the drafter taps five layers of the prefix, never the last (a tap of it keeps every row's tail)
+    let taps: Vec<usize> = [1, 3, 4, 5, 7].iter().map(|&l: &usize| l.min(layers - 2)).collect();
+    require_available(if layers <= 8 { 60 } else { 80 } * GIB);
+    let guard = Guard::start(20 * GIB);
+    let first = 2400;
+    let mut a = one_model(PrefillContract::P2, &dir, layers, draft.as_deref(), &taps, PART_ROOM);
+    a.set_head_rows(false);
+    let every = head_rows_script_with(&mut a, layers, first);
+    assert_eq!(a.head_rows_runs(), 0, "the head rows' tail is off");
+    a.set_head_rows(true);
+    let head = head_rows_script_with(&mut a, layers, first);
+    assert!(a.head_rows_runs() > 0, "the head rows' tail ran");
+    a.set_head_rows(false);
+    assert_eq!(head_rows_script_with(&mut a, layers, first), every, "one P2 model: the script without the head rows' tail twice");
+    let first_diff = |x: &[u64], y: &[u64]| x.iter().zip(y).position(|(p, q)| p != q).map(|i| (i / layers, i % layers));
+    assert_eq!(head.0, every.0, "one P2 model: an answer differs with the last layer's tail on the head rows");
+    assert_eq!(first_diff(&head.1, &every.1), None, "one P2 model: a layer's state differs with the tail on the head rows (chunk, layer)");
+    eprintln!(
+        "one P2 model ({layers} layers): {} answering calls and {} layer states equal with the tail on the head rows ({} forwards)",
+        every.0.len(),
+        every.1.len(),
+        a.head_rows_runs()
+    );
+    drop(a);
+
+    let (a, b) = serving_ranks(&dir, layers, draft.as_deref(), &taps, PART_ROOM);
+    let (h0, h1, a, b) = on_ranks(a, b, |m| head_rows_script_with(m, layers, first));
+    let runs = (a.head_rows_runs(), b.head_rows_runs(), a.sp_chunks());
+    let (e0, e1, a, b) = on_ranks(a, b, |m| {
+        m.set_head_rows(false);
+        head_rows_script_with(m, layers, first)
+    });
+    assert!(runs.0 > 0 && runs.0 == runs.1, "both ranks ran the head rows' tail alike: {runs:?}");
+    assert!(runs.2 > 0, "the serving ranks ran no forward under the sequence-parallel residual");
+    assert_eq!(h0.0, h1.0, "two P2 ranks with the tail on the head rows: their answers differ");
+    assert_eq!((&h0.0, &h1.0), (&e0.0, &e1.0), "two P2 ranks: an answer differs with the tail on the head rows");
+    assert_eq!(first_diff(&h0.1, &e0.1), None, "rank 0: a layer's state differs with the tail on the head rows (chunk, layer)");
+    assert_eq!(first_diff(&h1.1, &e1.1), None, "rank 1: a layer's state differs with the tail on the head rows (chunk, layer)");
+    eprintln!(
+        "HEAD ROWS' TAIL BYTE-IDENTICAL (P2, {layers} layers, the drafter {}): {} answering calls and {} layer states, one model and two \
+         serving ranks ({} forwards a rank, {} sp forwards)",
+        if draft.is_some() { "on" } else { "off" },
+        every.0.len(),
+        every.1.len(),
+        runs.0,
+        runs.2
     );
     drop((a, b));
     eprintln!("MemAvailable min {:.1} GiB", gib(guard.finish()));

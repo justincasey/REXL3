@@ -117,6 +117,8 @@ mod ffi {
         pub fn cudaMemsetAsync(p: *mut c_void, v: i32, bytes: usize, stream: *mut c_void) -> i32;
         pub fn cudaStreamCreate(s: *mut *mut c_void) -> i32;
         pub fn cudaStreamCreateWithFlags(s: *mut *mut c_void, flags: u32) -> i32;
+        pub fn cudaStreamCreateWithPriority(s: *mut *mut c_void, flags: u32, priority: i32) -> i32;
+        pub fn cudaDeviceGetStreamPriorityRange(least: *mut i32, greatest: *mut i32) -> i32;
         pub fn cudaEventCreateWithFlags(e: *mut *mut c_void, flags: u32) -> i32;
         pub fn cudaEventRecord(e: *mut c_void, stream: *mut c_void) -> i32;
         pub fn cudaEventCreate(e: *mut *mut c_void) -> i32;
@@ -939,6 +941,21 @@ impl Stream {
         unsafe {
             let mut s = core::ptr::null_mut();
             CudaError::check(ffi::cudaStreamCreateWithFlags(&mut s, 1))?;
+            Ok(Self(s))
+        }
+        #[cfg(gb_no_cuda)]
+        Err(CudaError(-1))
+    }
+    /// [`Stream::new_nonblocking`] at the device's greatest stream priority: when blocks of its kernels and of a normal stream's
+    /// wait for the same SMs, the block scheduler starts this stream's first. For short exchange kernels that must not queue behind a
+    /// whole grid of compute (a TP rank's swaps beside the main stream); the order of the work inside each stream is unchanged.
+    pub fn new_nonblocking_high_priority() -> Result<Self, CudaError> {
+        #[cfg(not(gb_no_cuda))]
+        unsafe {
+            let (mut least, mut greatest) = (0i32, 0i32);
+            CudaError::check(ffi::cudaDeviceGetStreamPriorityRange(&mut least, &mut greatest))?;
+            let mut s = core::ptr::null_mut();
+            CudaError::check(ffi::cudaStreamCreateWithPriority(&mut s, 1, greatest))?;
             Ok(Self(s))
         }
         #[cfg(gb_no_cuda)]
