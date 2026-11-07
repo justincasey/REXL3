@@ -615,14 +615,22 @@ impl Draft {
     /// Device bytes [`Draft::declare_bf16`] allocates for these settings (weights, context rings and scratch; the restricted
     /// head and the lattice buffer are extra): what a memory plan holds back for the draft before it is loaded.
     pub fn planned_bf16_bytes(dims: &DraftDims, vocab: usize, slots: usize, max_ctx_rows: usize, block: usize) -> u64 {
+        let ring = DraftCtxLayout::qwen38(slots).total_bytes();
+        (Self::bf16_weight_bytes(dims, vocab) + ring + Self::scratch_bytes(dims, vocab, slots, max_ctx_rows, block, Format::Bf16)) as u64
+    }
+
+    /// The weight bytes [`Draft::declare_bf16`] carves from its load context, alignment included (one carve per tensor, each rounded up to
+    /// `gb_cuda::arena::ALIGN`): the size of the drafter's exact arena (`LoadCtx::exact_from_env`).
+    pub fn bf16_weight_bytes(dims: &DraftDims, vocab: usize) -> usize {
         let (h, f, kv, q) = (dims.hidden, dims.intermediate, KV_HEADS * HEAD_DIM, Q_HEADS * HEAD_DIM);
         let lin = |n: usize, k: usize| q4_linear::bytes(n, k);
         let per_layer = lin(q, h) + 2 * lin(kv, h) + lin(h, q) + 2 * lin(f, h) + lin(h, f)
             + 2 * (2 * 2 * h + dims.dyn_width() * h) * 2
             + (2 * h + 2 * HEAD_DIM) * 4;
-        let weights = lin(h, dims.fc_in()) + 2 * h * 4 + LAYERS * per_layer + SELECTOR_RANK * h * 2 + 2 * vocab * SELECTOR_RANK * 2;
-        let ring = DraftCtxLayout::qwen38(slots).total_bytes();
-        (weights + ring + Self::scratch_bytes(dims, vocab, slots, max_ctx_rows, block, Format::Bf16)) as u64
+        // the carves: per layer the qkv and gate/up groups, o, down, four norms and two conv pairs; then fc, two norms and the selector's three
+        const CARVES: usize = LAYERS * 12 + 6;
+        lin(h, dims.fc_in()) + 2 * h * 4 + LAYERS * per_layer + SELECTOR_RANK * h * 2 + 2 * vocab * SELECTOR_RANK * 2
+            + CARVES * gb_cuda::arena::ALIGN
     }
 
     /// Sequences a batched round carries at this many slots and this block.
