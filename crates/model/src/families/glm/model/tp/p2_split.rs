@@ -42,12 +42,13 @@ impl GlmTp {
         Ok(())
     }
 
-    /// One KDA layer of a P2 prompt chunk on this rank's heads (see the module): the qkv strips through the P2 GEMM, the chunked
-    /// recurrence on the rank's pool (pieces of `piece` rows, `desc` from `kda::prefill_descriptor_pieces`), the gathered core output
-    /// (`io.out` `[rows, 64 * 128]`) and the full P2 o_proj into `io.mixer_out`; with `sp`, the gather and the o_proj of this rank's rows
-    /// `[sp.lo, sp.hi)` alone (the other rows of `io.mixer_out` are left as they were). With `join` (and `sp`) the peer's hidden rows are
-    /// still crossing (`GlmTp::sp_gather_begin`): the qkv strips of this rank's rows run first, then the join, then the peer's rows (every
-    /// P2 GEMM row is its own row's arithmetic, so the two launches leave the one launch's bits).
+    /// One KDA layer of a P2 prompt forward on this rank's heads (see the module): the qkv strips through the P2 GEMM over every row, the
+    /// chunked recurrence of each sequence of `segs` on its own slot of the rank's pool (pieces of `piece` rows, each segment's `desc` from
+    /// `kda::prefill_descriptor_pieces`), the gathered core output (`io.out` `[rows, 64 * 128]`) and the full P2 o_proj into
+    /// `io.mixer_out`; with `sp`, the gather and the o_proj of this rank's rows `[sp.lo, sp.hi)` alone (the other rows of `io.mixer_out` are
+    /// left as they were). With `join` (and `sp`) the peer's hidden rows are still crossing (`GlmTp::sp_gather_begin`): the qkv strips of
+    /// this rank's rows run first, then the join, then the peer's rows (every P2 GEMM row is its own row's arithmetic, so the two launches
+    /// leave the one launch's bits; so does a forward of several prompts, whose recurrences never read each other's rows).
     #[allow(clippy::too_many_arguments)]
     pub(in crate::families::glm::model) fn kda_split_layer_p2(
         &mut self,
@@ -57,10 +58,9 @@ impl GlmTp {
         params: &kda::Params,
         pool: &mut kda::Pool,
         io: KdaIo<'_>,
-        slot: usize,
+        segs: &[super::KdaSeg<'_>],
         rows: usize,
         rec: &mut kda::Record,
-        desc: &DevBuf,
         piece: usize,
         st: &Stream,
         sp: Option<super::RowSplit>,
@@ -68,7 +68,7 @@ impl GlmTp {
     ) -> Result<(), ModelError> {
         let KdaIo { hidden, qkv, out, mixer_out, ws, kws } = io;
         let c = dims.v_dim();
-        let mut own = self.split.as_ref().ok_or_else(|| ModelError::Config("no head split".into()))?.own.subview(0, rows * c * 2);
+        let own = self.split.as_ref().ok_or_else(|| ModelError::Config("no head split".into()))?.own.subview(0, rows * c * 2);
         let no_rank = || ModelError::Config(format!("no KDA head split for KDA layer {ord}"));
         match sp.filter(|_| join) {
             Some(sp) => {
@@ -95,24 +95,30 @@ impl GlmTp {
         }
         {
             let kr = self.kda_rank(ord).ok_or_else(no_rank)?;
-            kda::prefill_chunked(
-                st,
-                dims,
-                &kr.w.view(),
-                params,
-                hidden,
-                Dtype::F16,
-                qkv,
-                Dtype::F32,
-                pool,
-                slot,
-                rows,
-                rec,
-                kws,
-                &mut own,
-                desc,
-                piece,
-            )?;
+            let (h, cd) = (dims.hidden, dims.conv_dim());
+            for g in segs {
+                let x = hidden.subview(g.row0 * h * 2, g.rows * h * 2);
+                let q = qkv.subview(g.row0 * cd * 4, g.rows * cd * 4);
+                let mut y = own.subview(g.row0 * c * 2, g.rows * c * 2);
+                kda::prefill_chunked(
+                    st,
+                    dims,
+                    &kr.w.view(),
+                    params,
+                    &x,
+                    Dtype::F16,
+                    &q,
+                    Dtype::F32,
+                    pool,
+                    g.slot,
+                    g.rows,
+                    rec,
+                    kws,
+                    &mut y,
+                    g.desc,
+                    piece,
+                )?;
+            }
         }
         match sp {
             None => {

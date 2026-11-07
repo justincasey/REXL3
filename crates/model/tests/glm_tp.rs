@@ -1039,6 +1039,24 @@ impl gb_model::lockstep::LockstepRuntime for StaleRank {
     }
 }
 
+impl gb_model::families::glm::tp_part::PartRuntime for StaleRank {
+    fn prefill_batches(&self) -> bool {
+        self.r.prefill_batches()
+    }
+    fn prefill_part_rows(&self) -> usize {
+        self.r.prefill_part_rows()
+    }
+    fn prefill_layers(&self) -> usize {
+        self.r.prefill_layers()
+    }
+    fn prefill_part(
+        &mut self,
+        call: &gb_model::families::glm::tp_part::PrefillPart,
+    ) -> Result<Option<gb_model::forward::Candidates>, gb_model::error::ModelError> {
+        self.r.prefill_part(call)
+    }
+}
+
 impl gb_model::families::glm::tp::PrefixRuntime for StaleRank {
     fn enable_snapshots(&mut self, slots: usize) -> Result<u64, gb_model::error::ModelError> {
         self.r.enable_snapshots(slots)

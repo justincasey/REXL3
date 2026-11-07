@@ -581,6 +581,15 @@ pub(super) struct KdaIo<'a> {
     pub kws: &'a mut kda::Workspace,
 }
 
+/// One sequence's rows of a P2 prompt forward (`GlmModel::run`): the KDA recurrence runs per sequence, on its own slot's state, over its
+/// own rows `[row0, row0 + rows)` of the forward, with its own descriptor (`kda::prefill_descriptor_pieces`).
+pub(in crate::families::glm::model) struct KdaSeg<'a> {
+    pub slot: usize,
+    pub row0: usize,
+    pub rows: usize,
+    pub desc: &'a DevBuf,
+}
+
 /// Which KDA path a split layer runs.
 pub(super) enum KdaPath<'a, 'b> {
     /// A decode / verify window, or a prompt chunk of at most `MAX_ROWS` rows (`commit`: every row accepted, the prefill chunk's way).

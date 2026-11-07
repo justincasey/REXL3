@@ -570,9 +570,10 @@ impl GlmModel {
         Ok(())
     }
 
-    /// After a prefill chunk of `slot` ran through the trunk (its taps are in the tap buffer): build the MTP entries of the chunk's positions
-    /// from the carry and the taps, and keep the chunk's last tap as the new carry. Positions are `start .. start + tokens.len()`.
-    pub(super) fn mtp_prefill_chunk(&mut self, slot: usize, start: usize, tokens: &[u32]) -> Result<(), ModelError> {
+    /// After a prompt forward ran through the trunk (its taps are in the tap buffer): build the MTP entries of `slot`'s positions
+    /// `start .. start + tokens.len()`, whose taps are the tap buffer's rows from `row0`, from the carry and the taps, and keep the last of
+    /// them as the new carry.
+    pub(super) fn mtp_prefill_rows(&mut self, slot: usize, start: usize, tokens: &[u32], row0: usize) -> Result<(), ModelError> {
         let n = tokens.len();
         let Some(m) = self.mtp.as_mut() else { return Ok(()) };
         let h = self.cfg.hidden;
@@ -598,12 +599,12 @@ impl GlmModel {
         }
         if m.mutant == Some(MtpMutant::NoShift) {
             // the dropped shift: every row reads the tap of its own position
-            copy_h(&m.tap, 0, &m.h_in, 0, n, h, st)?;
+            copy_h(&m.tap, row0, &m.h_in, 0, n, h, st)?;
         } else {
-            copy_h(&m.tap, 0, &m.h_in, 1, n - 1, h, st)?;
+            copy_h(&m.tap, row0, &m.h_in, 1, n - 1, h, st)?;
         }
         // the new carry: this chunk's last tap
-        copy_h(&m.tap, n - 1, &m.store, slot * MTP_TAP_CAP, 1, h, st)?;
+        copy_h(&m.tap, row0 + n - 1, &m.store, slot * MTP_TAP_CAP, 1, h, st)?;
         self.ensure_positions(&[(slot, start + n - 1)])?;
         // an image in this chunk (the trunk's splice, still set: this runs inside the chunk's call): its rows enter the drafter's cache from the
         // features as well. The oracle's drafter does the same (`indexed_embeddings` of its prefill); a placeholder's own embedding would be a
@@ -751,7 +752,7 @@ impl GlmModel {
             Ok(())
         };
         let hook: Option<layers::AfterAppend<'_>> = if cuts_here.is_empty() { None } else { Some(&mut ring_hook) };
-        layers::mla_dsa_mixer(&ctx, a, latent, planes, s, Some(&rowidx[step]), rows, max_pos, None, hook, &mut |_| Ok(()))?;
+        layers::mla_dsa_mixer(&ctx, a, latent, planes, s, Some(&rowidx[step]), rows, max_pos, None, None, hook, &mut |_| Ok(()))?;
         mark(2)?;
 
         // x += attention output, norm for the feed-forward block (one pass), the shared expert, the router and the routed experts

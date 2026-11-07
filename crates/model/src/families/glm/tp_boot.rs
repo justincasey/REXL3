@@ -43,7 +43,7 @@ use crate::plan::plan_memory_cached_windowed;
 use crate::serve::{gib, interactive_prefix_config_from_env, memory_options, ServeOptions, TpOptions};
 use gb_cuda::moe::ExpertOwnership;
 use gb_cuda::nccl::{NcclComm, NcclUniqueId};
-use gb_engine::{boot, Drafter, Engine, EngineConfig, NoDrafts, ServeEngine};
+use gb_engine::{boot, Drafter, Engine, EngineConfig, NoDrafts, PrefillPolicy, ServeEngine};
 use gb_exl3::checkpoint::Checkpoint;
 use gb_sched::{Admission, CostModel, ModelMemory};
 use gb_spec::CopyDrafter;
@@ -831,6 +831,8 @@ pub fn build_leader(
             if p.relay_bytes > 0 {
                 rank.m.enable_tap_relay(&p.taps)?;
             }
+            // after the drafter: the stash of a paused prompt forward keeps its tap rows too
+            super::tp_part::enable(&mut rank.m)?;
             tower = tp_vision::load_leader_tower(o, &p.pack)?;
             Ok(rank)
         },
@@ -848,9 +850,12 @@ pub fn build_leader(
     if small != 0 {
         backend = backend.with_adaptive(small);
     }
+    // long slices in parts while a sequence decodes (`tp_part`; every rank holds the stash under P2): replaces the adaptive slice
+    let part_ms = super::tp_part::part_ms_from_env()?;
+    backend = backend.with_parts(part_ms);
     eprintln!(
-        "rexl3 event=tp_glm_levers graphs={} overlap={} graph_at_first={} prefill_rows={} prefill_small={} (REXL3_GLM_TP_GRAPHS, REXL3_GLM_OVERLAP, REXL3_GLM_GRAPH_AT, --prefill-chunk, REXL3_GLM_ADAPTIVE_PREFILL)",
-        gate.family.graphs, gate.family.overlap, gate.family.graph_at_first, p.chunk, small
+        "rexl3 event=tp_glm_levers graphs={} overlap={} graph_at_first={} prefill_rows={} prefill_small={} part_ms={} (REXL3_GLM_TP_GRAPHS, REXL3_GLM_OVERLAP, REXL3_GLM_GRAPH_AT, --prefill-chunk, REXL3_GLM_ADAPTIVE_PREFILL, {})",
+        gate.family.graphs, gate.family.overlap, gate.family.graph_at_first, p.chunk, small, part_ms, super::tp_part::PART_MS_ENV
     );
     if tower.is_some() {
         backend = backend.with_vision(TpVision::device(p.cfg.vision.as_ref().map(|v| v.image_token_id)));
@@ -886,7 +891,18 @@ pub fn build_leader(
     }
     let own_budget =
         backend.spec.as_ref().is_some_and(|s| matches!(s.cfg.mode, gb_spec::SpecMode::Auto | gb_spec::SpecMode::Mtp));
+    let batches = backend.batches();
     let engine = engine_over_budget(backend, p.admission, o.drafting, own_budget);
+    // under P2 the backend puts the slices of several waiting prompts through one forward: every waiting prompt gets a slice a step
+    // (the fewest rows left first), so prompts that arrive together are filled together (`REXL3_PREFILL_BURST` overrides)
+    let engine = if batches {
+        let policy = crate::costs::prefill_policy_from_env(PrefillPolicy::Burst { div: 1, cap: p.mo.slots.max(1) })?;
+        let batching = crate::costs::prefill_batching_from_env()?;
+        eprintln!("rexl3 event=prefill_policy policy={} batching={batching}", format!("{policy:?}").to_lowercase());
+        engine.with_prefill_policy(policy).with_prefill_batching(batching)
+    } else {
+        engine
+    };
     let engine = if p.cache.enabled() { engine.with_prefix_cache(interactive_prefix_config_from_env()?) } else { engine };
     // the encoder is published only now that the engine exists: a request that carries an image cannot arrive before
     if let Some(t) = tower {
@@ -978,6 +994,7 @@ pub fn follow(ctx: &BuildCtx<'_>) -> Result<(), ModelError> {
             if p.relay_bytes > 0 {
                 rank.m.enable_tap_relay(&p.taps)?;
             }
+            super::tp_part::enable(&mut rank.m)?;
             Ok(rank)
         },
     )?;

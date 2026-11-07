@@ -123,8 +123,9 @@ fn slab_index(ri: &RowIndex, a: usize, n: usize) -> RowIndex {
     RowIndex { slot: ri.slot.subview(a * 4, n * 4), pos: ri.pos.subview(a * 4, n * 4), rows: n }
 }
 
-/// One MLA layer with the DSA indexer on `rows` rows of `s.hidden` (the final-normed input) at consecutive positions ending at `max_pos`:
-/// writes the sublayer output to `s.mixer_out` (fp32). `ri`: the rows' (slot, position) index, `None` for `s.rowidx`. `mark(name)` is called after
+/// One MLA layer with the DSA indexer on `rows` rows of `s.hidden` (the final-normed input) at consecutive positions ending at `max_pos`
+/// (or, with `positions`, at those host positions: the rows of several prompts in one forward): writes the sublayer output to `s.mixer_out`
+/// (fp32). `ri`: the rows' (slot, position) index, `None` for `s.rowidx`. `mark(name)` is called after
 /// each step (profiling). Above [`MAX_ROWS`] rows (`big`) the projections run over all the rows, the attention in slabs. `after_append`, for a large
 /// chunk only: called after each slab's `dsa::append` with the slab's first row, its rows and the layer's planes (the prefix cache copies the ring tail
 /// of a snapshot taken inside the chunk there: the ring holds the last 256 raw rows, a slab is at most 128).
@@ -143,6 +144,7 @@ pub(super) fn mla_dsa_mixer(
     ri: Option<&RowIndex>,
     rows: usize,
     max_pos: usize,
+    positions: Option<&[i32]>,
     own: Option<(usize, usize)>,
     mut after_append: Option<AfterAppend<'_>>,
     mark: &mut dyn FnMut(&'static str) -> Result<(), ModelError>,
@@ -236,7 +238,10 @@ pub(super) fn mla_dsa_mixer(
     let mut a = 0usize;
     while a < rows {
         let n = (rows - a).min(MAX_ROWS);
-        let slab_max = max_pos - (rows - (a + n));
+        let slab_max = match positions {
+            Some(p) => p[a..a + n].iter().copied().max().unwrap_or(0) as usize,
+            None => max_pos - (rows - (a + n)),
+        };
         let ri_s = slab_index(ri, a, n);
         let (kraw, gate) = (s.k_raw.subview(a * ihd * 2, n * ihd * 2), s.gate.subview(a * ihd * 2, n * ihd * 2));
         dsa::append(&ix.dsa, planes, &mut s.dsa, &kraw, &gate, &ri_s, n, table, st)?;
