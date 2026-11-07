@@ -21,6 +21,7 @@
 #include <type_traits>
 
 #include "common.cuh"
+#include "mla_kv8.cuh"
 
 namespace {
 
@@ -122,11 +123,16 @@ struct Soft {
 };
 
 // grid: rows x 2 (a pair of head tiles each); 256 threads: warp (mi, w) = head tile mi of the pair, d-quarter w.
-template <typename T>
+// Q8: the cache is the fp8 page (mla_kv8.cuh); a thread loads its pieces of tile t + 1 into registers after tile t's barrier and
+// dequantises them into the same T tile after tile t's arithmetic (mla.cu's MT = 2 path), so the output is the T kernel's on the
+// dequantised cache, bit for bit.
+template <typename T, bool Q8>
 __global__ void __launch_bounds__(NTHR, 1)
-mla_pf_kernel(const T* __restrict__ qlat, const T* __restrict__ lat, const int* __restrict__ table, int max_blocks,
+mla_pf_kernel(const T* __restrict__ qlat, const void* __restrict__ cache, const int* __restrict__ table, int max_blocks,
               const int* __restrict__ row_slot, const int* __restrict__ row_pos, int dense_limit,
               const int* __restrict__ sel_idx, int sel_stride, const int* __restrict__ sel_meta, T* __restrict__ out) {
+    const T* lat = static_cast<const T*>(cache);
+    const uint8_t* lat8 = static_cast<const uint8_t*>(cache);
     constexpr int NBS = KT / 8;
     constexpr int NKS = KT / 16;
     constexpr int TILE_U4 = KT * PQ;
@@ -200,8 +206,61 @@ mla_pf_kernel(const T* __restrict__ qlat, const T* __restrict__ lat, const int* 
             }
         }
     };
-    stage(0, 0);
-    commit();
+    // Q8: tile gt's pieces (and, lane j, the scale of key j) into registers, then dequantised into stage st. A masked key loads nothing
+    // and stores zeros, as cp16z does.
+    constexpr int NPC = KT * 64 / NTHR;
+    uint2 pv[Q8 ? NPC : 1];
+    float psk = 0.0f;
+    unsigned pvm = 0;
+    auto load8 = [&](int gt) {
+        const bool any = gt < total;
+        const int key0 = (gt / TPC) * CH + (gt % TPC) * KT;
+        const int p = tid & 63;
+        if (sparse) {
+            const int e = key0 + lane;
+            const int pl = (any && e < limit) ? sel_idx[(int64_t)row * sel_stride + e] : -1;
+            const int bl = pl >= 0 ? tbl[pl / PAGE] : 0;
+            pvm = __ballot_sync(0xffffffffu, pl >= 0);
+            psk = pl >= 0 ? mla8::scale(lat8, bl, pl % PAGE) : 0.0f;
+#pragma unroll
+            for (int it = 0; it < NPC; ++it) {
+                const int j = (tid >> 6) + (NTHR / 64) * it;
+                const int pj = __shfl_sync(0xffffffffu, pl, j), bj = __shfl_sync(0xffffffffu, bl, j);
+                pv[it] = pj >= 0 ? *reinterpret_cast<const uint2*>(mla8::row(lat8, bj, pj % PAGE) + p * 8) : make_uint2(0u, 0u);
+            }
+        } else {
+            const int blk = any ? tbl[key0 / PAGE] : 0, tok0 = key0 % PAGE;
+            psk = (any && key0 + lane < limit) ? mla8::scale(lat8, blk, tok0 + lane) : 0.0f;
+#pragma unroll
+            for (int it = 0; it < NPC; ++it) {
+                const int j = (tid >> 6) + (NTHR / 64) * it;
+                const bool in = any && key0 + j < limit;
+                pv[it] = in ? *reinterpret_cast<const uint2*>(mla8::row(lat8, blk, tok0 + j) + p * 8) : make_uint2(0u, 0u);
+            }
+        }
+    };
+    auto store8 = [&](int st) {
+        if (sparse) {
+            if (st == 0) {
+                vm0 = pvm;
+            } else {
+                vm1 = pvm;
+            }
+        }
+        const int p = tid & 63, q = p >> 4, c = p & 15;
+#pragma unroll
+        for (int it = 0; it < NPC; ++it) {
+            const int j = (tid >> 6) + (NTHR / 64) * it;
+            smem[(st * NWARP + q) * TILE_U4 + j * PQ + (c ^ (j & 7))] = mla8::dq8<T>(pv[it], __shfl_sync(0xffffffffu, psk, j));
+        }
+    };
+    if constexpr (Q8) {
+        load8(0);
+        store8(0);
+    } else {
+        stage(0, 0);
+        commit();
+    }
 
     // this warp's quarter of the 16 heads' q_lat as A fragments
     uint32_t qa[DQ / 16][4];
@@ -226,10 +285,14 @@ mla_pf_kernel(const T* __restrict__ qlat, const T* __restrict__ lat, const int* 
     float rm0 = -INFINITY, rm1 = -INFINITY, rl0 = 0.0f, rl1 = 0.0f;
 
     for (int t = 0; t < total; ++t) {
-        wait_group<0>();  // tile t has landed (it is the only group in flight)
+        if constexpr (!Q8) wait_group<0>();  // tile t has landed (it is the only group in flight)
         __syncthreads();  // every thread's pieces are visible, and every warp is past the last read of stage (t + 1) & 1
-        stage(t + 1, (t + 1) & 1);
-        commit();
+        if constexpr (Q8) {
+            load8(t + 1);  // stored after this tile's arithmetic
+        } else {
+            stage(t + 1, (t + 1) & 1);
+            commit();
+        }
         const int c = t / TPC, tc = t % TPC;
         const int cstart = c * CH;
         if (tc == 0) {  // a chunk starts from zero state, as in mla_partial_kernel
@@ -379,8 +442,9 @@ mla_pf_kernel(const T* __restrict__ qlat, const T* __restrict__ lat, const int* 
                 rm1 = nm;
             }
         }
+        if constexpr (Q8) store8((t + 1) & 1);  // tile t + 1: every warp was past its last read of that stage at this tile's barrier
     }
-    wait_group<0>();
+    if constexpr (!Q8) wait_group<0>();
     // ---- o / l, rounded to T (a row with no real key at all writes zeros)
 #pragma unroll
     for (int i = 0; i < DQ / 8; ++i) {
@@ -393,27 +457,29 @@ mla_pf_kernel(const T* __restrict__ qlat, const T* __restrict__ lat, const int* 
 
 constexpr int kSmem = 2 * NWARP * KT * PQ * 16 + 2 * MT * NWARP * (KT / 8) * 32 * 16;
 
-template <typename T>
+template <typename T, bool Q8>
 int launch(const void* q_lat, const void* cache, const int* table, int max_blocks, const int* row_slot, const int* row_pos, int dense_limit,
            const int* sel_idx, int sel_stride, const int* sel_meta, void* out, int rows, cudaStream_t s) {
     static const cudaError_t configured =
-        cudaFuncSetAttribute(mla_pf_kernel<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
+        cudaFuncSetAttribute(mla_pf_kernel<T, Q8>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
     if (configured != cudaSuccess) return (int)configured;
-    mla_pf_kernel<T><<<rows * 2, NTHR, kSmem, s>>>((const T*)q_lat, (const T*)cache, table, max_blocks, row_slot, row_pos, dense_limit, sel_idx,
-                                                   sel_stride, sel_meta, (T*)out);
+    mla_pf_kernel<T, Q8><<<rows * 2, NTHR, kSmem, s>>>((const T*)q_lat, cache, table, max_blocks, row_slot, row_pos, dense_limit, sel_idx,
+                                                       sel_stride, sel_meta, (T*)out);
     return GB_CHECK_LAUNCH();
 }
 
 }  // namespace
 
-// q_lat, out: T [rows][64][512]; cache: T [n_blocks][256][512]; row_slot, row_pos: i32 [rows]. A row with pos < dense_limit attends to keys
-// 0..=pos (a negative position writes zeros); a row at or past it, whose sel_meta flag is 1, attends to the keys its selection list names (the layout
-// of gb_mla_attend_sparse); any other row is left untouched. No workspace. rows 1..=128 (the slab).
+// q_lat, out: T [rows][64][512]; cache: kv 0, T [n_blocks][256][512]; kv 1, the fp8 page of mla_kv8.cuh; row_slot, row_pos: i32 [rows]. A row
+// with pos < dense_limit attends to keys 0..=pos (a negative position writes zeros); a row at or past it, whose sel_meta flag is 1, attends to the
+// keys its selection list names (the layout of gb_mla_attend_sparse); any other row is left untouched. No workspace. rows 1..=128 (the slab).
 GB_EXPORT int gb_mla_attend_pf(const void* q_lat, const void* cache, const int* block_table, int max_blocks, const int* row_slot,
                                const int* row_pos, int dense_limit, const int* sel_idx, int sel_stride, const int* sel_meta, void* out,
-                               int rows, int dtype, void* stream) {
-    if (rows < 1 || rows > 128 || max_blocks <= 0 || dtype < 0 || dtype > 1) return (int)cudaErrorInvalidValue;
+                               int rows, int dtype, int kv, void* stream) {
+    if (rows < 1 || rows > 128 || max_blocks <= 0 || dtype < 0 || dtype > 1 || kv < 0 || kv > 1) return (int)cudaErrorInvalidValue;
     cudaStream_t s = gb_stream(stream);
-    return dtype == 1 ? launch<bf16>(q_lat, cache, block_table, max_blocks, row_slot, row_pos, dense_limit, sel_idx, sel_stride, sel_meta, out, rows, s)
-                      : launch<f16>(q_lat, cache, block_table, max_blocks, row_slot, row_pos, dense_limit, sel_idx, sel_stride, sel_meta, out, rows, s);
+#define PF_ARGS q_lat, cache, block_table, max_blocks, row_slot, row_pos, dense_limit, sel_idx, sel_stride, sel_meta, out, rows, s
+    if (dtype == 1) return kv ? launch<bf16, true>(PF_ARGS) : launch<bf16, false>(PF_ARGS);
+    return kv ? launch<f16, true>(PF_ARGS) : launch<f16, false>(PF_ARGS);
+#undef PF_ARGS
 }

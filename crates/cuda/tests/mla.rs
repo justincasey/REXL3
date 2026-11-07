@@ -2,7 +2,8 @@
 //! references with the kernels' rounding points, bit-exact row invariance (1..128 rows, window offsets, mixed slots,
 //! padding rows, grid padding, block placement, stale data), the cache layout contract, golden hashes, and (ignored)
 //! benchmarks. Every check runs for fp16 and bf16. GPU tests skip when there is no device. The comparison with the
-//! ExLlamaV3 fork on real layer weights is in `mla_oracle.rs`.
+//! ExLlamaV3 fork on real layer weights is in `mla_oracle.rs`. The fp8 latent page (`--kv-dtype fp8`, `csrc/mla_kv8.cuh`): the host
+//! quantiser, the device write against it, every attention entry point against the T path on the dequantised cache, determinism.
 #![cfg(not(gb_no_cuda))]
 
 mod common;
@@ -124,11 +125,16 @@ fn shuffle<T>(v: &mut [T], r: &mut Rng) {
 /// Fills the cache with NaN bits, places each sequence's pages at shuffled blocks (`placement` seeds the shuffle),
 /// poisons the unused table entries and writes all latents through `latent_write` in one launch.
 fn make_world(dt: Dtype, seqs: Vec<Seq>, placement: u64, spare_blocks: usize) -> World {
+    make_world_kv(dt, seqs, placement, spare_blocks, LatentKv::Plain)
+}
+
+/// [`make_world`] over a cache of format `kv` (the fp8 page: `latent_write` quantises).
+fn make_world_kv(dt: Dtype, seqs: Vec<Seq>, placement: u64, spare_blocks: usize, kv: LatentKv) -> World {
     let f = Fmt(dt);
     let stream = Stream::new().unwrap();
     let need: usize = seqs.iter().map(|s| s.len.div_ceil(BLOCK_TOKENS)).sum();
     let n_blocks = need + spare_blocks;
-    let mut cache = LatentCache::new(n_blocks, dt).unwrap();
+    let mut cache = LatentCache::new(n_blocks, dt, kv).unwrap();
     cache.lat.memset_async(0xFF, &stream).unwrap();
     let mut pool: Vec<u32> = (0..n_blocks as u32).collect();
     shuffle(&mut pool, &mut Rng(placement));
@@ -1370,12 +1376,14 @@ fn time_ms(stream: &Stream, iters: usize, mut f: impl FnMut()) -> f64 {
     t0.elapsed().as_secs_f64() * 1e3 / iters as f64
 }
 
-/// A cache of `ctx` tokens of repeated random latents in one sequence (contiguous blocks), for timing.
+/// A cache of `ctx` tokens of repeated random latents in one sequence (contiguous blocks), for timing. `REXL3_BENCH_KV=fp8` times the fp8
+/// page (default: the T cache).
 fn bench_world(dt: Dtype, ctx: usize) -> (LatentCache, BlockTable, Stream) {
     let f = Fmt(dt);
     let stream = Stream::new().unwrap();
     let nb = ctx.div_ceil(BLOCK_TOKENS);
-    let mut cache = LatentCache::new(nb, dt).unwrap();
+    let kv = std::env::var("REXL3_BENCH_KV").map(|v| LatentKv::parse(&v).unwrap()).unwrap_or_default();
+    let mut cache = LatentCache::new(nb, dt, kv).unwrap();
     let table = BlockTable::from_host(&[(0..nb as u32).collect()], nb).unwrap();
     let lat = gen_latent(f, 42, 4096.min(ctx));
     let ld = DevBuf::from_slice(&lat).unwrap();
@@ -1872,5 +1880,212 @@ fn bench_attend_pf() {
             t_pf * 1e3,
             t_two / t_pf
         );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------- the fp8 latent page (--kv-dtype fp8)
+
+/// The CPU mirror of `csrc/mla_kv8.cuh` (`kv8`): the page's size, the flag, the E4M3 encoder (every code to itself, every midpoint to the
+/// even neighbour, saturation at +-448), a zero row (scale 0, zero bytes), and a row's round trip within half an E4M3 step of its value.
+#[test]
+fn fp8_host_quantiser_and_flag() {
+    use gb_cuda::fp8_linear::e4m3_to_f32;
+    assert_eq!(kv8::PAGE_BYTES, 132_096);
+    assert_eq!(kv8::PAGE_BYTES % 16, 0);
+    assert_eq!(LatentKv::Fp8.token_bytes(Dtype::F16), 516);
+    assert_eq!(LatentKv::Plain.token_bytes(Dtype::F16), 1024);
+    assert_eq!(LatentKv::parse("FP8"), Ok(LatentKv::Fp8));
+    assert_eq!(LatentKv::parse("e4m3"), Ok(LatentKv::Fp8));
+    assert_eq!(LatentKv::parse(" fp16 "), Ok(LatentKv::Plain));
+    assert!(LatentKv::parse("int8").is_err() && LatentKv::parse("bf16").is_err());
+    assert_eq!((LatentKv::Plain.name(), LatentKv::Fp8.name()), ("fp16", "fp8"));
+    for b in 0u8..=0x7E {
+        let v = e4m3_to_f32(b);
+        assert_eq!(kv8::e4m3_rne(v), b, "code {b:#04x}");
+        assert_eq!(kv8::e4m3_rne(-v), b | 0x80, "code -{b:#04x}");
+        if b < 0x7E {
+            let mid = (v + e4m3_to_f32(b + 1)) / 2.0; // exact: one more bit than E4M3 has
+            let even = if b & 1 == 0 { b } else { b + 1 };
+            assert_eq!(kv8::e4m3_rne(mid), even, "midpoint above {b:#04x}");
+            assert_eq!(kv8::e4m3_rne(f32::from_bits(mid.to_bits() + 1)), b + 1, "just above the midpoint above {b:#04x}");
+            assert_eq!(kv8::e4m3_rne(f32::from_bits(mid.to_bits() - 1)), b, "just below the midpoint above {b:#04x}");
+        }
+    }
+    for x in [448.0f32, 463.9, 464.0, 1e9, f32::INFINITY] {
+        assert_eq!(kv8::e4m3_rne(x), 0x7E, "{x}");
+        assert_eq!(kv8::e4m3_rne(-x), 0xFE, "-{x}");
+    }
+    assert_eq!(kv8::quantise_row(&[0.0; LATENT_DIM]), (vec![0u8; LATENT_DIM], 0.0));
+    let mut r = Rng(0xF8);
+    for dt in DTYPES {
+        let f = Fmt(dt);
+        for amp in [1e-3f32, 0.7, 3.0, 40.0] {
+            let row: Vec<u16> = (0..LATENT_DIM).map(|_| f.enc(r.uniform(-1.0, 1.0) * amp)).collect();
+            let x = f.decs(&row);
+            let (q, s) = kv8::quantise_row(&x);
+            let amax = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            assert_eq!(s, amax / 448.0);
+            assert!(q.iter().any(|&b| b & 0x7F == 0x7E), "the largest value takes the largest code");
+            let back = f.decs(&kv8::round_trip(&row, dt));
+            for (i, (&a, &b)) in x.iter().zip(&back).enumerate() {
+                // half an E4M3 step (2^-4 relative, 2^-10 s in the subnormals), then one T rounding
+                let tol = a.abs() / 16.0 + s / 1024.0 + a.abs() / 128.0;
+                assert!((a - b).abs() <= tol, "{dt:?} amp {amp} [{i}]: {a} -> {b}");
+            }
+        }
+    }
+}
+
+/// The two-cache comparison: the same sequences written to an fp8 cache, and as their host round trip to a T cache.
+fn fp8_and_dequantised(dt: Dtype, lens: &[usize], placement: u64) -> (World, World) {
+    let f = Fmt(dt);
+    let w8 = make_world_kv(dt, seqs_of(f, lens), placement, 3, LatentKv::Fp8);
+    let deq: Vec<Seq> = w8
+        .seqs
+        .iter()
+        .map(|s| Seq { sid: s.sid, len: s.len, lat: s.lat.chunks(LATENT_DIM).flat_map(|r| kv8::round_trip(r, dt)).collect() })
+        .collect();
+    let w16 = make_world_kv(dt, deq, placement, 3, LatentKv::Plain);
+    (w8, w16)
+}
+
+/// The device quantiser is the host mirror byte for byte (every row's E4M3 bytes and scale bits, a zero row and a row with an outlier
+/// included, over shuffled pages of a NaN-filled pool), `read_rows` gives what the kernels stage (the host round trip), and a cache
+/// written in windows of 7 rows (decode, verify) holds exactly the bytes one launch of every row (a prefill chunk) wrote.
+#[test]
+fn fp8_latent_write_is_the_host_quantiser() {
+    let Some(stream) = gpu() else { return };
+    for dt in DTYPES {
+        let f = Fmt(dt);
+        let mut seqs = seqs_of(f, &[700, 300]);
+        seqs[0].lat[5 * LATENT_DIM..6 * LATENT_DIM].fill(0);
+        seqs[1].lat[7 * LATENT_DIM + 3] = f.enc(300.0);
+        let lats: Vec<Vec<u16>> = seqs.iter().map(|s| s.lat.clone()).collect();
+        let w = make_world_kv(dt, seqs, 4, 2, LatentKv::Fp8);
+        let raw: Vec<u8> = w.cache.lat.to_vec().unwrap();
+        let flat: Vec<i32> = w.table.buf.to_vec().unwrap();
+        for (si, s) in w.seqs.iter().enumerate() {
+            let blocks: Vec<u32> = flat[si * w.table.max_blocks..][..s.len.div_ceil(BLOCK_TOKENS)].iter().map(|&b| b as u32).collect();
+            for p in 0..s.len {
+                let base = blocks[p / BLOCK_TOKENS] as usize * kv8::PAGE_BYTES;
+                let (q, sc) = kv8::quantise_row(&f.decs(&lats[si][p * LATENT_DIM..(p + 1) * LATENT_DIM]));
+                assert_eq!(&raw[base + (p % BLOCK_TOKENS) * LATENT_DIM..][..LATENT_DIM], &q[..], "{dt:?} seq {si} pos {p}: bytes");
+                let got = f32::from_le_bytes(raw[base + kv8::SCALE_OFF + (p % BLOCK_TOKENS) * 4..][..4].try_into().unwrap());
+                assert_eq!(got.to_bits(), sc.to_bits(), "{dt:?} seq {si} pos {p}: scale");
+            }
+            let want: Vec<u16> = lats[si].chunks(LATENT_DIM).flat_map(|r| kv8::round_trip(r, dt)).collect();
+            assert_eq!(w.cache.read_rows(&blocks, s.len).unwrap(), want, "{dt:?} seq {si}: read_rows");
+        }
+        let mut c = LatentCache::new(w.cache.n_blocks, dt, LatentKv::Fp8).unwrap();
+        c.lat.memset_async(0xFF, &stream).unwrap();
+        for (si, s) in w.seqs.iter().enumerate() {
+            for p0 in (0..s.len).step_by(7) {
+                let n = 7.min(s.len - p0);
+                let ld = DevBuf::from_slice(&lats[si][p0 * LATENT_DIM..(p0 + n) * LATENT_DIM]).unwrap();
+                let ri = RowIndex::from_host(&vec![si as i32; n], &(p0 as i32..(p0 + n) as i32).collect::<Vec<_>>()).unwrap();
+                latent_write(&ld, &ri, &w.table, &mut c, n, &stream).unwrap();
+            }
+        }
+        stream.sync().unwrap();
+        assert!(c.lat.to_vec::<u8>().unwrap() == raw, "{dt:?}: windows of 7 rows wrote other bytes than one launch");
+    }
+}
+
+/// The fp8 path's output is the T path's on the dequantised cache, bit for bit, at every attention entry point: the dense pipeline,
+/// every tuning variant (one and two head tiles a CTA), the per-row regime across 2,048 with DSA selections, the sparse kernel alone
+/// with holes and an unordered list, the fused prefill slab, and the head-split launches (32 heads, both regimes).
+#[test]
+fn fp8_attention_is_the_t_attention_on_the_dequantised_cache() {
+    let Some(stream) = gpu() else { return };
+    for dt in DTYPES {
+        let (w8, w16) = fp8_and_dequantised(dt, &[3000, 600, 2100], 5);
+        let eq = |what: &str, a: &[u16], b: &[u16]| assert_bits_eq(&format!("{dt:?} fp8 {what}"), a, b, LATENT_DIM);
+        // dense pipeline
+        let rows = [(0usize, 0i32), (0, 255), (0, 256), (0, 2047), (1, 599), (1, 300), (2, 1000), (0, -1)];
+        let (a, b) = (run_pipeline(&w8, &rows), run_pipeline(&w16, &rows));
+        eq("dense o_lat", &a.o_lat, &b.o_lat);
+        eq("dense out", &a.out, &b.out);
+        // tuning variants
+        let n = rows.len();
+        let ri = RowIndex::from_host(&rows.iter().map(|r| r.0 as i32).collect::<Vec<_>>(), &rows.iter().map(|r| r.1).collect::<Vec<_>>())
+            .unwrap();
+        let q_lat = DevBuf::from_slice(&a.q_lat).unwrap();
+        let mut ws = DevBuf::alloc(attend_workspace_bytes(n, 2048) * 2).unwrap();
+        for variant in 1..=VARIANTS {
+            let mut outs = Vec::new();
+            for w in [&w8, &w16] {
+                let mut o = DevBuf::zeroed(n * ROW_Q * 2).unwrap();
+                attend_variant(&q_lat, &w.cache, &w.table, &ri, n, &mut o, 2048, &mut ws, variant, &stream).unwrap();
+                stream.sync().unwrap();
+                outs.push(o.to_vec::<u16>().unwrap());
+            }
+            eq(&format!("variant {variant}"), &outs[0], &outs[1]);
+        }
+        // the per-row regime and the fused slab
+        let mut rows: Vec<(usize, i32)> = (0..40).map(|k| (0usize, 2030 + 20 * k)).collect();
+        rows.extend([(2, 2099), (1, 599), (0, -1), (2, 2048)]);
+        let lists: Vec<Option<Vec<i32>>> =
+            rows.iter().map(|&(_, p)| if p < DENSE_MAX_KEYS as i32 { None } else { Some(dsa_list(p as usize, 7)) }).collect();
+        let (a, b) = (run_auto(&w8, &rows, &lists, None), run_auto(&w16, &rows, &lists, None));
+        eq("auto o_lat", &a.o_lat, &b.o_lat);
+        eq("auto out", &a.out, &b.out);
+        eq("fused slab", &run_pf(&w8, &rows, &lists).o_lat, &run_pf(&w16, &rows, &lists).o_lat);
+        // the sparse kernel alone: holes, an unordered list, a list of holes only
+        let base = rand_list(2999, 900, 3);
+        let mut holes = base.clone();
+        for i in (5..holes.len()).step_by(11) {
+            holes[i] = -1;
+        }
+        let mut unordered = base.clone();
+        shuffle(&mut unordered, &mut Rng(9));
+        let sl = vec![Some(holes), Some(unordered), Some(vec![-1; 40]), Some(rand_list(2099, 2051, 4))];
+        let srows = [(0usize, 2999), (0, 2999), (0, 2999), (2, 2099)];
+        eq("sparse only", &run_sparse_only(&w8, &srows, &sl).o_lat, &run_sparse_only(&w16, &srows, &sl).o_lat);
+        // the head split (lane E): heads 32..64 of the auto rows, both regimes
+        let nh = 32;
+        let n = rows.len();
+        let q32: Vec<u16> = a.q_lat.chunks(ROW_Q).flat_map(|r| r[32 * LATENT_DIM..].to_vec()).collect();
+        let q32 = DevBuf::from_slice(&q32).unwrap();
+        let ri = RowIndex::from_host(&rows.iter().map(|r| r.0 as i32).collect::<Vec<_>>(), &rows.iter().map(|r| r.1).collect::<Vec<_>>())
+            .unwrap();
+        let sel = make_sel(&lists);
+        let mut ws = DevBuf::alloc(attend_auto_workspace_bytes(n, 2900)).unwrap();
+        let mut outs = Vec::new();
+        for w in [&w8, &w16] {
+            let mut o = DevBuf::from_slice(&vec![0xABCDu16; n * nh * LATENT_DIM]).unwrap();
+            attend_below_heads(&q32, &w.cache, &w.table, &ri, n, &mut o, DENSE_MAX_KEYS, 2900, &mut ws, nh, &stream).unwrap();
+            attend_sparse_heads(&q32, &w.cache, &w.table, &ri, n, &sel.view(), &mut o, &mut ws, nh, &stream).unwrap();
+            stream.sync().unwrap();
+            outs.push(o.to_vec::<u16>().unwrap());
+        }
+        eq("head split", &outs[0], &outs[1]);
+        // and fp8 is not a no-op: the dequantised cache differs from the T values the sequences hold
+        assert_ne!(w8.seqs[0].lat[..LATENT_DIM], w16.seqs[0].lat[..LATENT_DIM]);
+    }
+}
+
+/// fp8 keeps the exactness contract: a run repeats bit for bit, a verify window's rows equal the same rows decoded alone, and the fused
+/// prefill slab equals the decode path, across the 2,048 boundary.
+#[test]
+fn fp8_is_deterministic_and_every_path_gives_the_same_bits() {
+    if gpu().is_none() {
+        return;
+    }
+    for dt in DTYPES {
+        let f = Fmt(dt);
+        let w = make_world_kv(dt, seqs_of(f, &[2600, 900]), 6, 2, LatentKv::Fp8);
+        let rows: Vec<(usize, i32)> = (0..9).map(|k| (0usize, 2040 + k)).chain([(1, 899), (0, 2599), (1, 17)]).collect();
+        let lists: Vec<Option<Vec<i32>>> =
+            rows.iter().map(|&(_, p)| if p < DENSE_MAX_KEYS as i32 { None } else { Some(dsa_list(p as usize, 11)) }).collect();
+        let a = run_auto(&w, &rows, &lists, None);
+        let again = run_auto(&w, &rows, &lists, None);
+        assert_bits_eq(&format!("{dt:?} repeat o_lat"), &a.o_lat, &again.o_lat, LATENT_DIM);
+        assert_bits_eq(&format!("{dt:?} repeat out"), &a.out, &again.out, NOPE_DIM);
+        for k in 0..rows.len() {
+            let one = run_auto(&w, &[rows[k]], &[lists[k].clone()], None);
+            assert_bits_eq(&format!("{dt:?} row {k} alone"), &a.o_lat[k * ROW_Q..(k + 1) * ROW_Q], &one.o_lat, LATENT_DIM);
+            assert_bits_eq(&format!("{dt:?} row {k} alone, out"), &a.out[k * ROW_OUT..(k + 1) * ROW_OUT], &one.out, NOPE_DIM);
+        }
+        assert_bits_eq(&format!("{dt:?} fused slab"), &run_pf(&w, &rows, &lists).o_lat, &a.o_lat, LATENT_DIM);
     }
 }

@@ -30,11 +30,10 @@ use crate::families::glm::device::MtpMoe;
 /// The drafter's refusal of a NextN layer that holds only a share of its routed experts (a tensor-parallel rank's map).
 pub const MTP_SHARE: &str = "the drafter does not run on a share of the NextN layer's experts";
 use crate::families::glm::vision_serve::{GlmImageFeatures, SpliceOp};
-use crate::kvtables::BLOCK_TOKENS;
 use crate::rows::RowBatch;
 use gb_cuda::attention::RowIndex;
 use gb_cuda::exl3_linear::Dtype;
-use gb_cuda::mla::{self, LatentCache};
+use gb_cuda::mla::LatentCache;
 use gb_cuda::{dsa, glm_glue, glm_mtp, glue, moe, DevBuf, Stream};
 use gb_sampling::Sampling;
 
@@ -352,7 +351,7 @@ impl MtpState {
             cand_ids,
             cand_vals,
             keyed: zeroed(r * std::mem::size_of::<glm_mtp::KeyedRow>())?,
-            latent: LatentCache::new(kv_blocks, Dtype::F16)?,
+            latent: LatentCache::new(kv_blocks, Dtype::F16, cfg.latent_kv)?,
             planes: dsa::Planes::new(kv_blocks, slots, RING_LEN)?,
             book: vec![TapBook::new(); slots],
             mutant: None,
@@ -1488,18 +1487,12 @@ impl GlmModel {
         Ok(all[..rows * self.cfg.hidden].to_vec())
     }
 
-    /// The NextN layer's latent rows `0..n` for `slot` (fp16 bits, `[n][512]`), through the slot's page table (a debug path).
+    /// The NextN layer's latent rows `0..n` for `slot` (fp16 bits, `[n][512]`, dequantised from an fp8 cache), through the slot's page table
+    /// (a debug path).
     pub fn mtp_latent_rows(&mut self, slot: usize, n: usize) -> Result<Vec<u16>, ModelError> {
         self.stream.sync()?;
         let m = self.mtp.as_ref().ok_or_else(|| ModelError::Config("the model has no NextN layer".into()))?;
-        let all: Vec<u16> = m.latent.lat.to_vec()?;
-        let blocks = self.kv_tab.blocks_of(slot);
-        let mut out = Vec::with_capacity(n * mla::LATENT_DIM);
-        for p in 0..n {
-            let at = (blocks[p / BLOCK_TOKENS] as usize * BLOCK_TOKENS + p % BLOCK_TOKENS) * mla::LATENT_DIM;
-            out.extend_from_slice(&all[at..at + mla::LATENT_DIM]);
-        }
-        Ok(out)
+        Ok(m.latent.read_rows(self.kv_tab.blocks_of(slot), n)?)
     }
 
     /// The NextN layer's DSA pool rows of pools `0..n_pools` for `slot` (fp16 bits, `[n_pools][128]`).

@@ -12,6 +12,7 @@
 //! attention (which would cost zero KV bytes per token).
 
 use crate::family::{Ffn, IndexerMode, LayerSpec, Mixer, Residual};
+use gb_cuda::mla::LatentKv;
 use gb_sched::{KvLayerClass, KvLayout, KvPlane};
 use serde_json::Value;
 use std::path::Path;
@@ -276,6 +277,10 @@ pub struct GlmConfig {
     pub vision: Option<GlmVisionConfig>,
     /// `None` when the pack ships no processor config (the vision pipeline must then refuse to start).
     pub processor: Option<GlmProcessorConfig>,
+    /// The MLA latent cache's format: a serving setting, not the pack's (`--kv-dtype`, `gb_cuda::mla::KV_ENV`), applied by
+    /// [`GlmConfig::from_dir`] from the process's configuration (fp16 from [`GlmConfig::from_json`]). The planner prices and the model
+    /// allocates this format, so the two cannot disagree.
+    pub latent_kv: LatentKv,
 }
 
 // ---------------------------------------------------------------------------------------------------------------- parsing
@@ -574,6 +579,7 @@ impl GlmConfig {
             pad_token_id,
             vision,
             processor: None,
+            latent_kv: LatentKv::Plain,
         })
     }
 
@@ -722,6 +728,7 @@ impl GlmConfig {
             }
         }
         c.processor = processor;
+        c.latent_kv = gb_cuda::mla::configured_kv()?;
         Ok(c)
     }
 
@@ -793,7 +800,8 @@ impl GlmConfig {
         Ok(c)
     }
 
-    /// The KV layout of the MLA layers: per token a latent of `kv_lora_rank` fp16 values and, on a layer with its own indexer, the pooled
+    /// The KV layout of the MLA layers: per token a latent of `kv_lora_rank` fp16 values (with [`LatentKv::Fp8`]: as many E4M3 bytes and
+    /// one fp32 scale, `gb_cuda::mla::kv8`) and, on a layer with its own indexer, the pooled
     /// key plane of `index_head_dim` values per `kpool` tokens. A shared-indexer layer caches the latent only. With pooling there is NO
     /// per-token indexer plane: the raw `[LayerNorm(k) | gate]` rows the pools are built from live in a ring of `ring_len` rows per slot
     /// (`alloc.rs`: per-slot state, not per-token cost), because a pool is complete four tokens after its first member and the raw rows
@@ -808,8 +816,14 @@ impl GlmConfig {
         if with_mtp {
             full += self.mtp.len() as u64;
         }
-        let latent = KvPlane::per_token("latent", self.mla.kv_lora_rank as u64, KV_ELEM_BYTES);
-        let mut with_indexer = vec![latent];
+        let latent: Vec<KvPlane> = match self.latent_kv {
+            LatentKv::Plain => vec![KvPlane::per_token("latent", self.mla.kv_lora_rank as u64, KV_ELEM_BYTES)],
+            LatentKv::Fp8 => vec![
+                KvPlane::per_token("latent", self.mla.kv_lora_rank as u64, 1),
+                KvPlane::per_token("latent_scale", 1, 4),
+            ],
+        };
+        let mut with_indexer = latent.clone();
         if self.indexer.kpool > 0 {
             with_indexer.push(KvPlane::pooled(
                 "indexer_pool",
@@ -826,7 +840,7 @@ impl GlmConfig {
             layout = layout.with(KvLayerClass { name: "mla_dsa_full_indexer", layers: full, planes: with_indexer });
         }
         if shared > 0 {
-            layout = layout.with(KvLayerClass { name: "mla_dsa_shared_indexer", layers: shared, planes: vec![latent] });
+            layout = layout.with(KvLayerClass { name: "mla_dsa_shared_indexer", layers: shared, planes: latent });
         }
         layout
     }

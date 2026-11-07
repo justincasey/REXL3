@@ -102,7 +102,7 @@ fn cache_with(r: &Ref, extra: &[u16]) -> (LatentCache, BlockTable) {
 fn cache_from(r: &Ref, prefix: &[u16], extra: &[u16]) -> (LatentCache, BlockTable) {
     let n = prefix.len() / LATENT_DIM + extra.len() / LATENT_DIM;
     let nb = n.div_ceil(BLOCK_TOKENS) + 1;
-    let mut cache = LatentCache::new(nb, Dtype::F16).unwrap();
+    let mut cache = LatentCache::new(nb, Dtype::F16, gb_cuda::mla::LatentKv::Plain).unwrap();
     cache.lat.memset_async(0xFF, &r.stream).unwrap(); // NaN fill: nothing past the context may be read
     let table = BlockTable::from_host(&[(0..nb as u32).collect()], nb).unwrap();
     let mut all = prefix.to_vec();

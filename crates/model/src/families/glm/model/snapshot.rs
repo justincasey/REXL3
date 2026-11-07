@@ -18,7 +18,6 @@ use crate::families::glm::config::GlmConfig;
 use crate::families::glm::prefix::{self, SnapLayout, MAX_TAIL_ROWS, RING_ROW_BYTES};
 use crate::forward::Candidates;
 use crate::kvtables::BLOCK_TOKENS;
-use gb_cuda::mla::LatentCache;
 use gb_cuda::{dsa, kda, Stream};
 
 /// What a snapshot slot says about itself.
@@ -400,18 +399,22 @@ impl GlmModel {
         }
     }
 
-    /// Copy page `src` over page `dst`: the latent cache and the pool plane of every layer, the NextN layer's included.
+    /// Copy page `src` over page `dst`: the latent cache (its values, and an fp8 cache's scales: the whole page) and the pool plane of every
+    /// layer, the NextN layer's included.
     fn copy_page(&mut self, src: usize, dst: usize) -> Result<(), ModelError> {
         let GlmModel { latent, planes, mtp, stream, .. } = self;
-        let (lb, pb) = (LatentCache::block_bytes(gb_cuda::exl3_linear::Dtype::F16), dsa::POOLS_PER_PAGE * dsa::D * 2);
+        let pb = dsa::POOLS_PER_PAGE * dsa::D * 2;
         for l in latent.iter_mut() {
+            let lb = l.page_bytes();
             l.lat.copy_within(dst * lb, src * lb, lb, stream)?;
         }
         for p in planes.iter_mut() {
             p.pool.copy_within(dst * pb, src * pb, pb, stream)?;
         }
         if let Some(m) = mtp.as_mut() {
-            m.latent_mut().lat.copy_within(dst * lb, src * lb, lb, stream)?;
+            let l = m.latent_mut();
+            let lb = l.page_bytes();
+            l.lat.copy_within(dst * lb, src * lb, lb, stream)?;
             m.planes_mut().pool.copy_within(dst * pb, src * pb, pb, stream)?;
         }
         Ok(())
@@ -584,13 +587,18 @@ impl GlmModel {
             return Err(ModelError::Request(format!("{} pages for a prefix of {len} tokens", pages.len())));
         }
         let page = partial.then(|| pages[full] as usize);
-        let lb = LatentCache::block_bytes(gb_cuda::exl3_linear::Dtype::F16);
-        let (rows, row_bytes) = (len % BLOCK_TOKENS, lb / BLOCK_TOKENS);
+        let rows = len % BLOCK_TOKENS;
         let pb = dsa::POOLS_PER_PAGE * dsa::D * 2;
         let pool_rows = (len / dsa::P).saturating_sub(full * dsa::POOLS_PER_PAGE);
         let none = (std::ptr::null(), 0usize);
         for l in self.latent.iter().chain(self.mtp.as_ref().map(|m| m.latent())) {
-            ranges.push(page.map_or(none, |p| (l.lat.ptr_at(p * lb) as *const _, rows * row_bytes)));
+            // the rows' values, then (fp8) their scales; a whole prefix (no partial page) keeps one empty range per layer
+            match page {
+                Some(p) => {
+                    ranges.extend(l.row_ranges(p, rows).into_iter().map(|(off, n)| (l.lat.ptr_at(off) as *const _, n)))
+                }
+                None => ranges.push(none),
+            }
         }
         for pl in self.planes.iter().chain(self.mtp.as_ref().map(|m| m.planes())) {
             ranges.push(page.map_or(none, |p| (pl.pool.ptr_at(p * pb) as *const _, pool_rows * dsa::D * 2)));
@@ -635,12 +643,8 @@ impl GlmModel {
         }
         if let Some(m) = self.mtp.as_ref() {
             let blocks = self.kv_tab.blocks_of(slot).to_vec();
-            let lat: Vec<u16> = m.latent().lat.to_vec()?;
+            d.mtp_latent = m.latent().read_rows(&blocks, len)?;
             let pool: Vec<u16> = m.planes().pool.to_vec()?;
-            for p in 0..len {
-                let at = (blocks[p / BLOCK_TOKENS] as usize * BLOCK_TOKENS + p % BLOCK_TOKENS) * gb_cuda::mla::LATENT_DIM;
-                d.mtp_latent.extend_from_slice(&lat[at..at + gb_cuda::mla::LATENT_DIM]);
-            }
             for p in 0..len / dsa::P {
                 let at = (blocks[p / dsa::POOLS_PER_PAGE] as usize * dsa::POOLS_PER_PAGE + p % dsa::POOLS_PER_PAGE) * dsa::D;
                 d.mtp_pools.extend_from_slice(&pool[at..at + dsa::D]);

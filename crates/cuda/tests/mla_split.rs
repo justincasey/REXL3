@@ -30,7 +30,7 @@ fn kv_b_host() -> Vec<u16> {
 /// A latent cache holding `lens` sequences (sequence i in slot i), their pages placed in order.
 fn world(dt: Dtype, lens: &[usize], st: &Stream) -> (LatentCache, BlockTable) {
     let n_blocks: usize = lens.iter().map(|l| l.div_ceil(BLOCK_TOKENS)).sum::<usize>() + 2;
-    let mut cache = LatentCache::new(n_blocks, dt).unwrap();
+    let mut cache = LatentCache::new(n_blocks, dt, gb_cuda::mla::LatentKv::Plain).unwrap();
     let max_blocks = lens.iter().map(|l| l.div_ceil(BLOCK_TOKENS)).max().unwrap() + 2;
     let mut tables = Vec::new();
     let mut next = 0u32;

@@ -50,6 +50,7 @@
 // per-chunk fp32 partials merged in chunk order, absorb/expand as per-row fixed-order sums) and the REXL3 GQA decode
 // kernel in attention.cu (mma/ldmatrix/cp.async helpers, log2-domain fold). See THIRD_PARTY_NOTICES.md.
 #include "common.cuh"
+#include "mla_kv8.cuh"
 #include <type_traits>
 
 namespace {
@@ -179,6 +180,39 @@ __global__ void __launch_bounds__(64) latent_write_kernel(const uint4* __restric
     cache[dst + threadIdx.x] = lat[(int64_t)r * (DC / 8) + threadIdx.x];
 }
 
+// The fp8 page (mla_kv8.cuh): 64 threads x 8 values; the row's maximum magnitude over both warps (fmaxf: the order does not matter), the
+// scale amax / 448, then every value rounded once to E4M3 at it. A row of zeros (scale 0) writes zero bytes.
+template <typename T>
+__global__ void __launch_bounds__(64) latent_write8_kernel(const uint4* __restrict__ lat, const int* __restrict__ row_slot,
+                                                           const int* __restrict__ row_pos, const int* __restrict__ table,
+                                                           int max_blocks, uint8_t* __restrict__ cache) {
+    __shared__ float wmax[2];
+    const int r = blockIdx.x;
+    const int pos = row_pos[r];
+    if (pos < 0) return;  // block-uniform
+    const int blk = table[(int64_t)row_slot[r] * max_blocks + pos / PAGE], tok = pos % PAGE;
+    const uint4 u = lat[(int64_t)r * (DC / 8) + threadIdx.x];
+    const uint32_t uw[4] = {u.x, u.y, u.z, u.w};
+    float v[8];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) unpack2<T>(uw[e], v[2 * e], v[2 * e + 1]);
+    float a = 0.0f;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) a = fmaxf(a, fabsf(v[e]));
+#pragma unroll
+    for (int x = 16; x > 0; x >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, x));
+    if ((threadIdx.x & 31) == 0) wmax[threadIdx.x >> 5] = a;
+    __syncthreads();
+    const float s = __fdiv_rn(fmaxf(wmax[0], wmax[1]), mla8::E4M3_MAX);
+    uint2 q = make_uint2(0u, 0u);
+    if (s > 0.0f) {
+        q.x = mla8::q2(v[0], v[1], s) | (mla8::q2(v[2], v[3], s) << 16);
+        q.y = mla8::q2(v[4], v[5], s) | (mla8::q2(v[6], v[7], s) << 16);
+    }
+    *reinterpret_cast<uint2*>(mla8::row_mut(cache, blk, tok) + threadIdx.x * 8) = q;
+    if (threadIdx.x == 0) *mla8::scale_mut(cache, blk, tok) = s;
+}
+
 // ---------------------------------------------------------------- absorb / expand: per-head skinny GEMM, fixed-order fp32 chains
 
 // y[r][h][j] = round_T( sum_{k = 0..K-1} x[r][h][k] * W[h][k][j] ), k ascending, one __fmaf_rn chain per output element.
@@ -299,12 +333,17 @@ struct Soft {
 // every warp of the head tile, so all four hold identical scores and run identical softmax arithmetic), and accumulates
 // the output columns of its quarter (64 fp32 registers). K and V are the same tile, shared by the MT head tiles.
 // A pair's arithmetic does not depend on MT, so every MT gives identical bits (tested).
-template <typename T, int KT, int CH, int MT, bool SPARSE>
+// Q8: the cache is the fp8 page (mla_kv8.cuh). A thread loads its pieces of a tile into registers one tile ahead (the loads in
+// flight under the current tile's arithmetic), then dequantises them into the same T tile the cp.async path fills: everything
+// after the stage is unchanged, so the output is the T kernel's on the dequantised cache, bit for bit.
+template <typename T, int KT, int CH, int MT, bool SPARSE, bool Q8>
 __global__ void __launch_bounds__(128 * MT)
-mla_partial_kernel(const T* __restrict__ qlat, const T* __restrict__ lat, const int* __restrict__ table, int max_blocks,
+mla_partial_kernel(const T* __restrict__ qlat, const void* __restrict__ cache, const int* __restrict__ table, int max_blocks,
                    const int* __restrict__ row_slot, const int* __restrict__ row_pos, int dense_limit,
                    const int* __restrict__ sel_idx, int sel_stride, const int* __restrict__ sel_meta, int nch_max,
                    float* __restrict__ part_o, float* __restrict__ part_m, float* __restrict__ part_l, int nh) {
+    const T* lat = static_cast<const T*>(cache);
+    const uint8_t* lat8 = static_cast<const uint8_t*>(cache);
     constexpr int NBS = KT / 8;           // n8 blocks of scores per tile
     constexpr int NKS = KT / 16;          // k16 steps of the PV product per tile
     constexpr int TILE_U4 = KT * PQ;      // uint4 per quarter-stage
@@ -387,11 +426,89 @@ mla_partial_kernel(const T* __restrict__ qlat, const T* __restrict__ lat, const 
             }
         }
     };
-    stage(0, 0);
-    commit();
-    if constexpr (MT == 1) {
-        stage(1, 1);
+    // ---- Q8: load8 takes tile t's pieces (and, lane j, the scale of key j) into registers; store8 dequantises them into stage st.
+    // A masked key (past the row's last, past the list's end, a hole) loads nothing and stores zeros, as cp16z does.
+    constexpr int NPC = MT == 1 ? KT * PQ / 32 : KT * 64 / NTHR;  // pieces of 8 values a thread stages per tile
+    uint2 pv[Q8 ? NPC : 1];
+    float psk = 0.0f;  // lane j: the scale of the tile's key j
+    unsigned pvm = 0;  // sparse: the tile's ballot
+    auto load8 = [&](int t) {
+        const int key0 = cstart + t * KT;
+        const bool any = t < nt;
+        if constexpr (SPARSE) {
+            const int e = key0 + lane;
+            const int pl = (any && e < limit) ? sel_idx[(int64_t)row * sel_stride + e] : -1;
+            const int bl = pl >= 0 ? tbl[pl / PAGE] : 0;
+            pvm = __ballot_sync(0xffffffffu, pl >= 0);
+            psk = pl >= 0 ? mla8::scale(lat8, bl, pl % PAGE) : 0.0f;
+            const int jb = lane / PQ, c = lane % PQ;
+#pragma unroll
+            for (int it = 0; it < NPC; ++it) {
+                const int j = jb + 2 * it;
+                const int pj = __shfl_sync(0xffffffffu, pl, j), bj = __shfl_sync(0xffffffffu, bl, j);
+                pv[it] = pj >= 0 ? *reinterpret_cast<const uint2*>(mla8::row(lat8, bj, pj % PAGE) + w * DQ + c * 8) : make_uint2(0u, 0u);
+            }
+            return;
+        }
+        const int blk = any ? tbl[key0 / PAGE] : 0, tok0 = key0 % PAGE;
+        psk = (any && lane < KT && key0 + lane < limit) ? mla8::scale(lat8, blk, tok0 + lane) : 0.0f;
+        if constexpr (MT == 1) {
+            const int jb = lane / PQ, c = lane % PQ;
+#pragma unroll
+            for (int it = 0; it < NPC; ++it) {
+                const int j = jb + 2 * it;
+                const bool in = any && key0 + j < limit;
+                pv[it] = in ? *reinterpret_cast<const uint2*>(mla8::row(lat8, blk, tok0 + j) + w * DQ + c * 8) : make_uint2(0u, 0u);
+            }
+        } else {
+            const int p = tid & 63;
+#pragma unroll
+            for (int it = 0; it < NPC; ++it) {
+                const int j = (tid >> 6) + (NTHR / 64) * it;
+                const bool in = any && key0 + j < limit;
+                pv[it] = in ? *reinterpret_cast<const uint2*>(mla8::row(lat8, blk, tok0 + j) + p * 8) : make_uint2(0u, 0u);
+            }
+        }
+    };
+    auto store8 = [&](int st) {
+        if constexpr (SPARSE) {
+            if (st == 0) {
+                vm0 = pvm;
+            } else {
+                vm1 = pvm;
+            }
+        }
+        if constexpr (MT == 1) {
+            const int jb = lane / PQ, c = lane % PQ;
+            uint4* dst = smem + (st * NWARP + w) * TILE_U4;
+#pragma unroll
+            for (int it = 0; it < NPC; ++it) {
+                const int j = jb + 2 * it;
+                dst[j * PQ + (c ^ (j & 7))] = mla8::dq8<T>(pv[it], __shfl_sync(0xffffffffu, psk, j));
+            }
+        } else {
+            const int p = tid & 63, q = p >> 4, c = p & 15;
+#pragma unroll
+            for (int it = 0; it < NPC; ++it) {
+                const int j = (tid >> 6) + (NTHR / 64) * it;
+                smem[(st * NWARP + q) * TILE_U4 + j * PQ + (c ^ (j & 7))] = mla8::dq8<T>(pv[it], __shfl_sync(0xffffffffu, psk, j));
+            }
+        }
+    };
+    if constexpr (Q8) {
+        load8(0);
+        store8(0);
+        if constexpr (MT == 1) {
+            load8(1);
+            store8(1);
+        }
+    } else {
+        stage(0, 0);
         commit();
+        if constexpr (MT == 1) {
+            stage(1, 1);
+            commit();
+        }
     }
 
     // ---- this warp's quarter of the 16 heads' q_lat as A fragments (k16 steps 0..7 of its 128 columns)
@@ -413,13 +530,18 @@ mla_partial_kernel(const T* __restrict__ qlat, const T* __restrict__ lat, const 
 
     for (int t = 0; t < nt; ++t) {
         if constexpr (MT == 1) {
-            wait_group<1>();  // tile t has landed (tile t + 1 may still be in flight)
+            if constexpr (!Q8) wait_group<1>();  // tile t has landed (tile t + 1 may still be in flight)
             __syncwarp();
+            if constexpr (Q8) load8(t + 2);  // in flight under tile t's arithmetic
         } else {
-            wait_group<0>();   // tile t has landed (it is the only group in flight)
+            if constexpr (!Q8) wait_group<0>();  // tile t has landed (it is the only group in flight)
             __syncthreads();   // every thread's pieces are visible, and every warp is past the last read of stage (t + 1) & 1
-            stage(t + 1, (t + 1) & 1);
-            commit();
+            if constexpr (Q8) {
+                load8(t + 1);  // stored after tile t's arithmetic
+            } else {
+                stage(t + 1, (t + 1) & 1);
+                commit();
+            }
         }
         const uint4* tile = smem + ((t & 1) * NWARP + w) * TILE_U4;
         // ---- this quarter's score chain: 8 k16 steps from zero
@@ -544,11 +666,17 @@ mla_partial_kernel(const T* __restrict__ qlat, const T* __restrict__ lat, const 
         }
         if constexpr (MT == 1) {
             __syncwarp();  // every lane's ldmatrix of this stage is done before it is restaged
-            stage(t + 2, t & 1);
-            commit();
+            if constexpr (Q8) {
+                store8(t & 1);  // tile t + 2
+            } else {
+                stage(t + 2, t & 1);
+                commit();
+            }
+        } else if constexpr (Q8) {
+            store8((t + 1) & 1);  // tile t + 1: every warp was past its last read of that stage at this tile's barrier
         }
     }
-    wait_group<0>();
+    if constexpr (!Q8) wait_group<0>();
     // ---- write the chunk partial: o columns of this quarter, and (m, l) once
     const float l0 = quad_sum(st.l0), l1 = quad_sum(st.l1);
     const int h0 = hb * HT + g, h1 = h0 + 8;
@@ -620,14 +748,14 @@ template <int CH> size_t workspace_bytes_ch(int rows, int max_context) {
     return align256(pairs * DC * 4) + 2 * align256(pairs * 4);
 }
 
-template <typename T, int KT, int CH, int MT, bool SPARSE>
+template <typename T, int KT, int CH, int MT, bool SPARSE, bool Q8>
 int attend_t(const void* q_lat, const void* cache, const int* table, int max_blocks, const int* row_slot,
              const int* row_pos, int dense_limit, const int* sel_idx, int sel_stride, const int* sel_meta, void* out,
              int rows, int max_context, void* workspace, size_t workspace_bytes, cudaStream_t s, int nh = NH) {
     // two stages of KT keys x 1 KiB, and per head tile two buffers of the four warps' partial scores
     constexpr int SMEM = 2 * NWARP * KT * PQ * 16 + 2 * MT * NWARP * (KT / 8) * 32 * 16;
     if (workspace_bytes < workspace_bytes_ch<CH>(rows, max_context) || !workspace) return (int)cudaErrorInvalidValue;
-    static const cudaError_t configured = cudaFuncSetAttribute(mla_partial_kernel<T, KT, CH, MT, SPARSE>,
+    static const cudaError_t configured = cudaFuncSetAttribute(mla_partial_kernel<T, KT, CH, MT, SPARSE, Q8>,
                                                                 cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
     if (configured != cudaSuccess) return (int)configured;
     const int nch = (max_context + CH - 1) / CH;
@@ -637,8 +765,8 @@ int attend_t(const void* q_lat, const void* cache, const int* table, int max_blo
     float* po = (float*)workspace;
     float* pm = (float*)((char*)workspace + align256(pairs * DC * 4));
     float* pl = (float*)((char*)workspace + align256(pairs * DC * 4) + align256(pairs * 4));
-    mla_partial_kernel<T, KT, CH, MT, SPARSE><<<dim3(rows * ((nh / HT) / MT), nch), 128 * MT, SMEM, s>>>(
-        (const T*)q_lat, (const T*)cache, table, max_blocks, row_slot, row_pos, dense_limit, sel_idx, sel_stride, sel_meta,
+    mla_partial_kernel<T, KT, CH, MT, SPARSE, Q8><<<dim3(rows * ((nh / HT) / MT), nch), 128 * MT, SMEM, s>>>(
+        (const T*)q_lat, cache, table, max_blocks, row_slot, row_pos, dense_limit, sel_idx, sel_stride, sel_meta,
         nch, po, pm, pl, nh);
     int rc = GB_CHECK_LAUNCH();
     if (rc) return rc;
@@ -646,25 +774,31 @@ int attend_t(const void* q_lat, const void* cache, const int* table, int max_blo
     return GB_CHECK_LAUNCH();
 }
 
+// `f(T{}, std::bool_constant<Q8>{})` for dtype (0 fp16, 1 bf16) and kv (0: the cache holds T, 1: the fp8 page of mla_kv8.cuh).
+template <typename F> int by_format(int dtype, int kv, F&& f) {
+    if (dtype == 1) return kv ? f(bf16{}, std::true_type{}) : f(bf16{}, std::false_type{});
+    return kv ? f(f16{}, std::true_type{}) : f(f16{}, std::false_type{});
+}
+
 // default tiling: 32-key tiles, 256-key chunks (= one page), one 16-head tile per CTA
 constexpr int DEF_KT = 32, DEF_CH = 256, DEF_MT = 1;
 
 #define MLA_ARGS q_lat, cache, table, max_blocks, row_slot, row_pos, dense_limit, nullptr, 0, nullptr, out, rows, max_context, ws, wsb, s
 
-template <typename T>
+template <typename T, bool Q8>
 int attend_variant_t(int variant, const void* q_lat, const void* cache, const int* table, int max_blocks,
                      const int* row_slot, const int* row_pos, int dense_limit, void* out, int rows, int max_context,
                      void* ws, size_t wsb, cudaStream_t s) {
     switch (variant) {
-        case 1: return attend_t<T, 32, 128, 1, false>(MLA_ARGS);
-        case 2: return attend_t<T, 32, 512, 1, false>(MLA_ARGS);
-        case 3: return attend_t<T, 16, 256, 1, false>(MLA_ARGS);
-        case 4: return attend_t<T, 16, 128, 1, false>(MLA_ARGS);
-        case 5: return attend_t<T, 32, 256, 2, false>(MLA_ARGS);
-        case 6: return attend_t<T, 32, 512, 2, false>(MLA_ARGS);
-        case 7: return attend_t<T, 32, 128, 2, false>(MLA_ARGS);
-        case 8: return attend_t<T, 16, 256, 2, false>(MLA_ARGS);
-        default: return attend_t<T, DEF_KT, DEF_CH, DEF_MT, false>(MLA_ARGS);
+        case 1: return attend_t<T, 32, 128, 1, false, Q8>(MLA_ARGS);
+        case 2: return attend_t<T, 32, 512, 1, false, Q8>(MLA_ARGS);
+        case 3: return attend_t<T, 16, 256, 1, false, Q8>(MLA_ARGS);
+        case 4: return attend_t<T, 16, 128, 1, false, Q8>(MLA_ARGS);
+        case 5: return attend_t<T, 32, 256, 2, false, Q8>(MLA_ARGS);
+        case 6: return attend_t<T, 32, 512, 2, false, Q8>(MLA_ARGS);
+        case 7: return attend_t<T, 32, 128, 2, false, Q8>(MLA_ARGS);
+        case 8: return attend_t<T, 16, 256, 2, false, Q8>(MLA_ARGS);
+        default: return attend_t<T, DEF_KT, DEF_CH, DEF_MT, false, Q8>(MLA_ARGS);
     }
 }
 
@@ -681,14 +815,21 @@ size_t variant_workspace(int variant, int rows, int max_context) {
 
 }  // namespace
 
-// ---------------------------------------------------------------- exported launchers (dtype: 0 = fp16, 1 = bf16)
+// ---------------------------------------------------------------- exported launchers (dtype: 0 = fp16, 1 = bf16; kv: 0 = the cache holds
+// dtype values, T [n_blocks][256][512]; 1 = the fp8 page of mla_kv8.cuh, E4M3 [n_blocks][256][512] then fp32 [n_blocks][256] scales)
 
 GB_EXPORT int gb_mla_latent_write(const void* lat, const int* row_slot, const int* row_pos, const int* block_table,
-                                  int max_blocks, void* cache, int rows, void* stream) {
-    if (rows < 0 || max_blocks <= 0) return (int)cudaErrorInvalidValue;
+                                  int max_blocks, void* cache, int rows, int dtype, int kv, void* stream) {
+    if (rows < 0 || max_blocks <= 0 || dtype < 0 || dtype > 1 || kv < 0 || kv > 1) return (int)cudaErrorInvalidValue;
     if (rows == 0) return 0;
-    latent_write_kernel<<<rows, DC / 8, 0, gb_stream(stream)>>>((const uint4*)lat, row_slot, row_pos, block_table,
-                                                                max_blocks, (uint4*)cache);
+    cudaStream_t s = gb_stream(stream);
+    if (kv == 0) {
+        latent_write_kernel<<<rows, DC / 8, 0, s>>>((const uint4*)lat, row_slot, row_pos, block_table, max_blocks, (uint4*)cache);
+    } else if (dtype == 1) {
+        latent_write8_kernel<bf16><<<rows, DC / 8, 0, s>>>((const uint4*)lat, row_slot, row_pos, block_table, max_blocks, (uint8_t*)cache);
+    } else {
+        latent_write8_kernel<f16><<<rows, DC / 8, 0, s>>>((const uint4*)lat, row_slot, row_pos, block_table, max_blocks, (uint8_t*)cache);
+    }
     return GB_CHECK_LAUNCH();
 }
 
@@ -717,22 +858,22 @@ GB_EXPORT size_t gb_mla_attend_workspace_bytes_variant(int variant, int rows, in
     return variant_workspace(variant, rows, max_context);
 }
 
-// q_lat, out: T [rows][64][512]; cache: T [n_blocks][256][512]; row_slot, row_pos: i32 [rows] (device). Row r attends to
+// q_lat, out: T [rows][64][512]; cache: kv's layout; row_slot, row_pos: i32 [rows] (device). Row r attends to
 // keys 0..=row_pos[r] of slot row_slot[r] (already written); a negative position is a padding row (output zeros). Every
 // position must be < max_context, which sizes the grid and the workspace; rows <= 128 (a verify window or several
 // streams' rows). Rows with row_pos >= dense_limit are left untouched (the sparse kernel serves them; INT_MAX = all rows are
 // dense). `variant` selects a tuning tile/chunk shape (0 = the default; the others change bits, tuning only).
 GB_EXPORT int gb_mla_attend_variant(const void* q_lat, const void* cache, const int* block_table, int max_blocks,
                                     const int* row_slot, const int* row_pos, int dense_limit, void* out, int rows,
-                                    int max_context, void* workspace, size_t workspace_bytes, int dtype, int variant,
+                                    int max_context, void* workspace, size_t workspace_bytes, int dtype, int kv, int variant,
                                     void* stream) {
-    if (rows < 1 || rows > MAX_ROWS || max_context < 1 || max_blocks <= 0 || dtype < 0 || dtype > 1)
+    if (rows < 1 || rows > MAX_ROWS || max_context < 1 || max_blocks <= 0 || dtype < 0 || dtype > 1 || kv < 0 || kv > 1)
         return (int)cudaErrorInvalidValue;
     cudaStream_t s = gb_stream(stream);
-    return dtype == 1 ? attend_variant_t<bf16>(variant, q_lat, cache, block_table, max_blocks, row_slot, row_pos, dense_limit,
-                                               out, rows, max_context, workspace, workspace_bytes, s)
-                      : attend_variant_t<f16>(variant, q_lat, cache, block_table, max_blocks, row_slot, row_pos, dense_limit,
-                                              out, rows, max_context, workspace, workspace_bytes, s);
+    return by_format(dtype, kv, [&](auto t, auto q) {
+        return attend_variant_t<decltype(t), decltype(q)::value>(variant, q_lat, cache, block_table, max_blocks, row_slot, row_pos,
+                                                                 dense_limit, out, rows, max_context, workspace, workspace_bytes, s);
+    });
 }
 
 // Sparse (DSA) regime: row r attends to the keys at positions sel_idx[r * sel_stride + 0 .. sel_meta[2 r + 1]) of its slot
@@ -742,16 +883,16 @@ GB_EXPORT int gb_mla_attend_variant(const void* q_lat, const void* cache, const 
 GB_EXPORT int gb_mla_attend_sparse(const void* q_lat, const void* cache, const int* block_table, int max_blocks,
                                    const int* row_slot, const int* row_pos, const int* sel_idx, int sel_stride,
                                    const int* sel_meta, void* out, int rows, int max_sel, void* workspace,
-                                   size_t workspace_bytes, int dtype, void* stream) {
-    if (rows < 1 || rows > MAX_ROWS || max_sel < 1 || sel_stride < max_sel || max_blocks <= 0 || dtype < 0 || dtype > 1)
+                                   size_t workspace_bytes, int dtype, int kv, void* stream) {
+    if (rows < 1 || rows > MAX_ROWS || max_sel < 1 || sel_stride < max_sel || max_blocks <= 0 || dtype < 0 || dtype > 1 || kv < 0 ||
+        kv > 1)
         return (int)cudaErrorInvalidValue;
     cudaStream_t s = gb_stream(stream);
-    return dtype == 1 ? attend_t<bf16, DEF_KT, DEF_CH, 1, true>(q_lat, cache, block_table, max_blocks, row_slot, row_pos, 0,
-                                                                 sel_idx, sel_stride, sel_meta, out, rows, max_sel, workspace,
-                                                                 workspace_bytes, s)
-                      : attend_t<f16, DEF_KT, DEF_CH, 1, true>(q_lat, cache, block_table, max_blocks, row_slot, row_pos, 0,
-                                                                sel_idx, sel_stride, sel_meta, out, rows, max_sel, workspace,
-                                                                workspace_bytes, s);
+    return by_format(dtype, kv, [&](auto t, auto q) {
+        return attend_t<decltype(t), DEF_KT, DEF_CH, 1, true, decltype(q)::value>(q_lat, cache, block_table, max_blocks, row_slot, row_pos,
+                                                                                  0, sel_idx, sel_stride, sel_meta, out, rows, max_sel,
+                                                                                  workspace, workspace_bytes, s);
+    });
 }
 
 // ---------------------------------------------------------------- a rank's heads (lane E, the TP head split)
@@ -778,28 +919,29 @@ GB_EXPORT int gb_mla_expand_nh(const void* o_lat, const void* w_uvt, void* out, 
 // The default tiling (variant 0) and the sparse regime of gb_mla_attend_variant / gb_mla_attend_sparse on nh heads.
 GB_EXPORT int gb_mla_attend_nh(const void* q_lat, const void* cache, const int* block_table, int max_blocks, const int* row_slot,
                                const int* row_pos, int dense_limit, void* out, int rows, int max_context, void* workspace,
-                               size_t workspace_bytes, int dtype, int nh, void* stream) {
-    if (rows < 1 || rows > MAX_ROWS || max_context < 1 || max_blocks <= 0 || dtype < 0 || dtype > 1) return (int)cudaErrorInvalidValue;
+                               size_t workspace_bytes, int dtype, int kv, int nh, void* stream) {
+    if (rows < 1 || rows > MAX_ROWS || max_context < 1 || max_blocks <= 0 || dtype < 0 || dtype > 1 || kv < 0 || kv > 1)
+        return (int)cudaErrorInvalidValue;
     cudaStream_t s = gb_stream(stream);
-    return dtype == 1 ? attend_t<bf16, DEF_KT, DEF_CH, DEF_MT, false>(q_lat, cache, block_table, max_blocks, row_slot, row_pos, dense_limit,
-                                                                       nullptr, 0, nullptr, out, rows, max_context, workspace,
-                                                                       workspace_bytes, s, nh)
-                      : attend_t<f16, DEF_KT, DEF_CH, DEF_MT, false>(q_lat, cache, block_table, max_blocks, row_slot, row_pos, dense_limit,
-                                                                      nullptr, 0, nullptr, out, rows, max_context, workspace,
-                                                                      workspace_bytes, s, nh);
+    return by_format(dtype, kv, [&](auto t, auto q) {
+        return attend_t<decltype(t), DEF_KT, DEF_CH, DEF_MT, false, decltype(q)::value>(q_lat, cache, block_table, max_blocks, row_slot,
+                                                                                        row_pos, dense_limit, nullptr, 0, nullptr, out,
+                                                                                        rows, max_context, workspace, workspace_bytes,
+                                                                                        s, nh);
+    });
 }
 
 GB_EXPORT int gb_mla_attend_sparse_nh(const void* q_lat, const void* cache, const int* block_table, int max_blocks,
                                       const int* row_slot, const int* row_pos, const int* sel_idx, int sel_stride,
                                       const int* sel_meta, void* out, int rows, int max_sel, void* workspace,
-                                      size_t workspace_bytes, int dtype, int nh, void* stream) {
-    if (rows < 1 || rows > MAX_ROWS || max_sel < 1 || sel_stride < max_sel || max_blocks <= 0 || dtype < 0 || dtype > 1)
+                                      size_t workspace_bytes, int dtype, int kv, int nh, void* stream) {
+    if (rows < 1 || rows > MAX_ROWS || max_sel < 1 || sel_stride < max_sel || max_blocks <= 0 || dtype < 0 || dtype > 1 || kv < 0 ||
+        kv > 1)
         return (int)cudaErrorInvalidValue;
     cudaStream_t s = gb_stream(stream);
-    return dtype == 1 ? attend_t<bf16, DEF_KT, DEF_CH, 1, true>(q_lat, cache, block_table, max_blocks, row_slot, row_pos, 0,
-                                                                 sel_idx, sel_stride, sel_meta, out, rows, max_sel, workspace,
-                                                                 workspace_bytes, s, nh)
-                      : attend_t<f16, DEF_KT, DEF_CH, 1, true>(q_lat, cache, block_table, max_blocks, row_slot, row_pos, 0,
-                                                                sel_idx, sel_stride, sel_meta, out, rows, max_sel, workspace,
-                                                                workspace_bytes, s, nh);
+    return by_format(dtype, kv, [&](auto t, auto q) {
+        return attend_t<decltype(t), DEF_KT, DEF_CH, 1, true, decltype(q)::value>(q_lat, cache, block_table, max_blocks, row_slot, row_pos,
+                                                                                  0, sel_idx, sel_stride, sel_meta, out, rows, max_sel,
+                                                                                  workspace, workspace_bytes, s, nh);
+    });
 }
