@@ -27,6 +27,13 @@ pub const PART_ROOM: usize = 512;
 /// 53.6 s; 80 ms -> 28.5 s, 55.0 s).
 pub const PART_MS_ENV: &str = "REXL3_GLM_PREFILL_PART_MS";
 
+/// `REXL3_GLM_PREFILL_SHORT_PART_MS`: while a sequence decodes, a forward of one prompt's slice of at most [`PART_ROOM`] rows (a short
+/// prompt, beside a long one in parts or not) runs in parts of about this many milliseconds when it is modelled longer, a decode round
+/// between two (default 300; `0`/`off`: whole). It ends before anything else runs, so its prompt waits a round a part for its first
+/// token; the decoding streams wait a part instead of the whole forward (MEASURED on pair B, the bench's mixed phase: a 241-row chat
+/// prompt's forward is 500 ms, the largest gap between the decoding streams' tokens 623 ms whole). Rank 0's alone; never a bit.
+pub const SHORT_PART_MS_ENV: &str = "REXL3_GLM_PREFILL_SHORT_PART_MS";
+
 /// `REXL3_GLM_PREFILL_BATCH_ROWS`: while a sequence decodes, rank 0 puts at most this many rows of fresh short prompts (each at most
 /// [`PART_ROOM`] rows) through one forward, which the decoding streams wait for whole (default 2,048; with nothing decoding, the chunk's
 /// rows). Rank 0's alone; never a bit.
@@ -42,18 +49,23 @@ pub fn batch_rows_from_env() -> Result<usize, ModelError> {
 
 /// The part target of [`PART_MS_ENV`] (0: parts off), refused by name when malformed.
 pub fn part_ms_from_env() -> Result<f64, ModelError> {
-    parse_part_ms(std::env::var(PART_MS_ENV).ok().as_deref())
+    parse_ms(PART_MS_ENV, std::env::var(PART_MS_ENV).ok().as_deref(), 100.0)
 }
 
-fn parse_part_ms(v: Option<&str>) -> Result<f64, ModelError> {
+/// The part target of [`SHORT_PART_MS_ENV`] (0: short forwards whole), refused by name when malformed.
+pub fn short_part_ms_from_env() -> Result<f64, ModelError> {
+    parse_ms(SHORT_PART_MS_ENV, std::env::var(SHORT_PART_MS_ENV).ok().as_deref(), 300.0)
+}
+
+fn parse_ms(var: &str, v: Option<&str>, default: f64) -> Result<f64, ModelError> {
     match v.map(str::trim) {
-        None | Some("") => Ok(100.0),
+        None | Some("") => Ok(default),
         Some("off") => Ok(0.0),
         Some(s) => s
             .parse::<f64>()
             .ok()
             .filter(|x| x.is_finite() && *x >= 0.0)
-            .ok_or_else(|| ModelError::Config(format!("{PART_MS_ENV}={s:?}: expected milliseconds (0 or `off`: whole slices)"))),
+            .ok_or_else(|| ModelError::Config(format!("{var}={s:?}: expected milliseconds (0 or `off`: whole forwards)"))),
     }
 }
 
