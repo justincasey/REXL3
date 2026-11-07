@@ -860,7 +860,7 @@ pub fn build_leader(
     if small != 0 {
         backend = backend.with_adaptive(small);
     }
-    // long slices in parts while a sequence decodes (`tp_part`; every rank holds the stash under P2): replaces the adaptive slice; and
+    // long slices in parts while a sequence decodes (`tp_part`; every rank holds the stash): replaces the adaptive slice; and
     // the rows of fresh short prompts one forward takes meanwhile
     let part_ms = super::tp_part::part_ms_from_env()?;
     let batch_rows = super::tp_part::batch_rows_from_env()?;
@@ -913,7 +913,7 @@ pub fn build_leader(
         backend.spec.as_ref().is_some_and(|s| matches!(s.cfg.mode, gb_spec::SpecMode::Auto | gb_spec::SpecMode::Mtp));
     let batches = backend.batches();
     let engine = engine_over_budget(backend, p.admission, o.drafting, own_budget);
-    // under P2 the backend puts the slices of several waiting prompts through one forward: every waiting prompt gets a slice a step
+    // the backend puts the slices of several waiting prompts through one forward: every waiting prompt gets a slice a step
     // (the fewest rows left first), so prompts that arrive together are filled together (`REXL3_PREFILL_BURST` overrides), and a request
     // that wakes the idle engine waits a few milliseconds for the ones sent with it (`REXL3_PREFILL_GATHER_MS`)
     let engine = if batches {

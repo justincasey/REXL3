@@ -24,13 +24,13 @@
 //! (`glm_p2_moe::pairs_subbanks_rank`, its part, the part swap), layer 13's split gate/up subbank through the decode pairs stage. Both
 //! ranks' answers must equal the one P2 model's, byte for byte, and differ from P1's somewhere (P2 ran).
 //!
-//! `p2_several_prompts_in_one_forward_equal_each_prompts_solo_forward` and
-//! `p2_a_forward_paused_with_windows_and_a_prompt_between_its_parts_equals_the_whole_forward` (`families/glm/model/part.rs`): the
-//! slices of three prompts (one a continuation) in ONE P2 prompt forward give each prompt the answer, the state (the windows after) and
-//! the drafter context (the drafts after) of its own forward; a prompt forward paused at layer bounds, with a verify window, another
-//! slot's whole prompt and a window of two slots run between its parts, gives every call the bits of the run with the forward whole.
-//! Both on one P2 model and on the two P2 ranks of the serving split (`kda,lm,mla,sh`, sequence-parallel residual), whose answers must
-//! equal the one model's.
+//! `p1_` / `p2_several_prompts_in_one_forward_equal_each_prompts_solo_forward` and
+//! `p1_` / `p2_a_forward_paused_with_windows_and_a_prompt_between_its_parts_equals_the_whole_forward` (`families/glm/model/part.rs`),
+//! under each prefill contract: the slices of three prompts (one a continuation) in ONE prompt forward give each prompt the answer, the
+//! state (the windows after) and the drafter context (the drafts after) of its own forward; a prompt forward paused at layer bounds, with
+//! a verify window, another slot's whole prompt and a window of two slots run between its parts, gives every call the bits of the run
+//! with the forward whole. Both on one model and on the two ranks of the serving split (`kda,lm,mla,sh`; under P2 the
+//! sequence-parallel residual), whose answers must equal the one model's.
 
 mod glm_support;
 
@@ -1097,10 +1097,10 @@ fn prefix_setup() -> (usize, Option<PathBuf>, Vec<usize>) {
     (layers, draft, taps)
 }
 
-/// One P2 model of every expert of the prefix, drafting with `draft` when given, with the stash of `room` rows (0: none).
-fn p2_one_model(dir: &Path, layers: usize, draft: Option<&Path>, taps: &[usize], room: usize) -> GlmModel {
+/// One model of every expert of the prefix under `contract`, drafting with `draft` when given, with the stash of `room` rows (0: none).
+fn one_model(contract: PrefillContract, dir: &Path, layers: usize, draft: Option<&Path>, taps: &[usize], room: usize) -> GlmModel {
     let (mut m, _) = load(dir, layers, None, |_| {});
-    m.set_prefill_contract(PrefillContract::P2).unwrap();
+    m.set_prefill_contract(contract).unwrap();
     if let Some(d) = draft {
         attach_drafter(&mut m, d, taps);
     }
@@ -1110,18 +1110,27 @@ fn p2_one_model(dir: &Path, layers: usize, draft: Option<&Path>, taps: &[usize],
     m
 }
 
-/// The two P2 ranks of the prefix under the serving split (`kda,lm,mla,sh`: the sequence-parallel residual of a long prompt forward) on a
-/// loopback group, rank 0 drafting with `draft` when given (both ranks relaying its taps), each with the stash of `room` rows (0: none).
-fn p2_sp_ranks(dir: &Path, layers: usize, draft: Option<&Path>, taps: &[usize], room: usize) -> (GlmModel, GlmModel) {
+/// The two ranks of the prefix under `contract` and the serving split (`kda,lm,mla,sh`; under P2 the sequence-parallel residual of a
+/// long prompt forward) on a loopback group, rank 0 drafting with `draft` when given (both ranks relaying its taps), each with the stash
+/// of `room` rows (0: none).
+fn two_ranks(
+    contract: PrefillContract,
+    dir: &Path,
+    layers: usize,
+    draft: Option<&Path>,
+    taps: &[usize],
+    room: usize,
+) -> (GlmModel, GlmModel) {
     use gb_model::families::glm::model::tp::split_from_vars;
-    assert!(gb_model::families::glm::contract::p2_sp_on(), "REXL3_GLM_P2_SP is off: the serving split's residual would not be tested");
+    let p2 = contract == PrefillContract::P2;
+    assert!(!p2 || gb_model::families::glm::contract::p2_sp_on(), "REXL3_GLM_P2_SP is off: the serving split's residual would not be tested");
     let bits = split_from_vars(|_| Some("kda,lm,mla,sh".into())).unwrap();
     let owns = [ExpertOwnership::range(E, 0, 2).unwrap(), ExpertOwnership::range(E, 1, 2).unwrap()];
     let mut ms: Vec<GlmModel> = owns
         .iter()
         .map(|o| {
             let (mut m, _) = load(dir, layers, Some(o), |_| {});
-            m.set_prefill_contract(PrefillContract::P2).unwrap();
+            m.set_prefill_contract(contract).unwrap();
             m
         })
         .collect();
@@ -1163,32 +1172,31 @@ fn on_ranks<T: Send>(a: GlmModel, b: GlmModel, f: impl Fn(&mut GlmModel) -> T + 
     })
 }
 
-/// Several prompts in ONE P2 prompt forward (`model/part.rs`): three prompts' last slices (one continuing its segment) give each prompt
-/// the answer, the state (the windows after) and, with a drafter (`REXL3_DFLASH_DIR`), the drafter context (the drafts after) of its own
-/// forward, on one P2 model (twice alike) and on the two ranks of the serving split, where the 467-row forward is row-split across the
-/// ranks (slot 1's 37 rows straddle the split).
-#[test]
-#[ignore]
-fn p2_several_prompts_in_one_forward_equal_each_prompts_solo_forward() {
+/// Several prompts in ONE prompt forward under `contract` (`model/part.rs`): three prompts' last slices (one continuing its prompt) give
+/// each prompt the answer, the state (the windows after) and, with a drafter (`REXL3_DFLASH_DIR`), the drafter context (the drafts after)
+/// of its own forward, on one model (twice alike) and on the two ranks of the serving split (under P2 the 467-row forward is row-split
+/// across the ranks: slot 1's 37 rows straddle the split).
+fn several_prompts_in_one_forward(contract: PrefillContract) {
     let Some(dir) = redsnow_dir() else { return };
     let (layers, draft, taps) = prefix_setup();
     require_available(if layers <= 8 { 60 } else { 80 } * GIB);
     let guard = Guard::start(20 * GIB);
-    let mut a = p2_one_model(&dir, layers, draft.as_deref(), &taps, 0);
+    let mut a = one_model(contract, &dir, layers, draft.as_deref(), &taps, 0);
     let solo = batch_script(&mut a, false, true);
     let together = batch_script(&mut a, true, true);
-    assert_eq!(batch_script(&mut a, true, true), together, "one P2 model: the forward of three prompts twice");
-    assert_eq!(together.0, solo.0, "one P2 model: an answer (or a window after) differs from the prompt's own forward");
-    assert_eq!(together.1, solo.1, "one P2 model: the drafts after differ from the prompts' own forwards'");
-    eprintln!("one P2 model: {} answering calls and {} slots' drafts equal to each prompt's own forward", solo.0.len(), solo.1.len());
+    assert_eq!(batch_script(&mut a, true, true), together, "one {contract:?} model: the forward of three prompts twice");
+    assert_eq!(together.0, solo.0, "one {contract:?} model: an answer (or a window after) differs from the prompt's own forward");
+    assert_eq!(together.1, solo.1, "one {contract:?} model: the drafts after differ from the prompts' own forwards'");
+    eprintln!("one {contract:?} model: {} answering calls and {} slots' drafts equal to each prompt's own forward", solo.0.len(), solo.1.len());
     drop(a);
 
-    let (a, b) = p2_sp_ranks(&dir, layers, draft.as_deref(), &taps, 0);
+    let (a, b) = two_ranks(contract, &dir, layers, draft.as_deref(), &taps, 0);
     let (r0, r1, a, b) = on_ranks(a, b, |m| batch_script(m, true, false).0);
-    assert!(a.sp_chunks() > 0 && a.sp_chunks() == b.sp_chunks(), "sp chunks {} / {}", a.sp_chunks(), b.sp_chunks());
-    assert_eq!((&r0, &r1), (&solo.0, &solo.0), "two P2 ranks: the forward of three prompts differs from each prompt's own forward");
+    assert_eq!(a.sp_chunks(), b.sp_chunks());
+    assert_eq!(a.sp_chunks() > 0, contract == PrefillContract::P2, "sp chunks {} (P2's alone)", a.sp_chunks());
+    assert_eq!((&r0, &r1), (&solo.0, &solo.0), "two {contract:?} ranks: the forward of three prompts differs from each prompt's own forward");
     eprintln!(
-        "SEVERAL PROMPTS IN ONE FORWARD BYTE-IDENTICAL: {} answering calls on one P2 model and on two P2 ranks ({} sp forwards)",
+        "SEVERAL PROMPTS IN ONE FORWARD BYTE-IDENTICAL ({contract:?}): {} answering calls on one model and on two ranks ({} sp forwards)",
         solo.0.len(),
         a.sp_chunks()
     );
@@ -1196,39 +1204,62 @@ fn p2_several_prompts_in_one_forward_equal_each_prompts_solo_forward() {
     eprintln!("MemAvailable min {:.1} GiB", gib(guard.finish()));
 }
 
-/// A P2 prompt forward in parts (`model/part.rs`): slot 1's 512-row slice paused at one, two and three layer bounds, with a verify window
-/// of slot 0, slot 2's whole 100-row prompt and a window of slots 0 and 2 run between its parts (the stash holds 128 rows: the slice's
-/// later rows are kept where they are), gives every call the bits of the run with the slice whole, and the same drafts after, on one P2
-/// model and on the two ranks of the serving split (the slice row-split across them).
 #[test]
 #[ignore]
-fn p2_a_forward_paused_with_windows_and_a_prompt_between_its_parts_equals_the_whole_forward() {
+fn p2_several_prompts_in_one_forward_equal_each_prompts_solo_forward() {
+    several_prompts_in_one_forward(PrefillContract::P2);
+}
+
+#[test]
+#[ignore]
+fn p1_several_prompts_in_one_forward_equal_each_prompts_solo_forward() {
+    several_prompts_in_one_forward(PrefillContract::P1);
+}
+
+/// A prompt forward in parts under `contract` (`model/part.rs`): slot 1's 512-row slice paused at one, two and three layer bounds, with
+/// a verify window of slot 0, slot 2's whole 100-row prompt and a window of slots 0 and 2 run between its parts (the stash holds 128 rows:
+/// the slice's later rows are kept where they are), gives every call the bits of the run with the slice whole, and the same drafts after,
+/// on one model and on the two ranks of the serving split (under P2 the slice row-split across them).
+fn a_forward_paused_equals_the_whole_forward(contract: PrefillContract) {
     let Some(dir) = redsnow_dir() else { return };
     let (layers, draft, taps) = prefix_setup();
     assert!(layers >= 4, "parts need a few layers");
     require_available(if layers <= 8 { 60 } else { 80 } * GIB);
     let guard = Guard::start(20 * GIB);
     let bounds: Vec<Vec<usize>> = vec![vec![layers / 2], vec![2, layers - 3], vec![1, layers / 2, layers - 1]];
-    let mut a = p2_one_model(&dir, layers, draft.as_deref(), &taps, PART_ROOM);
+    let mut a = one_model(contract, &dir, layers, draft.as_deref(), &taps, PART_ROOM);
     let whole = pause_script(&mut a, &[], true);
     for parts in &bounds {
-        assert_eq!(pause_script(&mut a, parts, true), whole, "one P2 model: the slice paused at {parts:?} differs from the slice whole");
+        assert_eq!(pause_script(&mut a, parts, true), whole, "one {contract:?} model: the slice paused at {parts:?} differs from the slice whole");
     }
-    eprintln!("one P2 model: the slice paused at {bounds:?} == whole ({} answering calls, {} slots' drafts)", whole.0.len(), whole.1.len());
+    eprintln!("one {contract:?} model: the slice paused at {bounds:?} == whole ({} answering calls, {} slots' drafts)", whole.0.len(), whole.1.len());
     drop(a);
 
-    let (a, b) = p2_sp_ranks(&dir, layers, draft.as_deref(), &taps, PART_ROOM);
+    let (a, b) = two_ranks(contract, &dir, layers, draft.as_deref(), &taps, PART_ROOM);
     let (r0, r1, a, b) =
         on_ranks(a, b, |m| std::iter::once(&Vec::new()).chain(&bounds).map(|p| pause_script(m, p, false).0).collect::<Vec<_>>());
-    assert!(a.sp_chunks() > 0 && a.sp_chunks() == b.sp_chunks(), "sp chunks {} / {}", a.sp_chunks(), b.sp_chunks());
+    assert_eq!(a.sp_chunks(), b.sp_chunks());
+    assert_eq!(a.sp_chunks() > 0, contract == PrefillContract::P2, "sp chunks {} (P2's alone)", a.sp_chunks());
     for (i, parts) in std::iter::once(&Vec::new()).chain(&bounds).enumerate() {
-        assert_eq!((&r0[i], &r1[i]), (&whole.0, &whole.0), "two P2 ranks: the slice paused at {parts:?} differs from the one model's whole");
+        assert_eq!((&r0[i], &r1[i]), (&whole.0, &whole.0), "two {contract:?} ranks: the slice paused at {parts:?} differs from the one model's whole");
     }
     eprintln!(
-        "A FORWARD IN PARTS BYTE-IDENTICAL: paused at {bounds:?} with windows and a prompt between == whole, one P2 model and two P2 ranks \
-         ({} sp forwards)",
+        "A FORWARD IN PARTS BYTE-IDENTICAL ({contract:?}): paused at {bounds:?} with windows and a prompt between == whole, one model and two \
+         ranks ({} sp forwards)",
         a.sp_chunks()
     );
     drop((a, b));
     eprintln!("MemAvailable min {:.1} GiB", gib(guard.finish()));
+}
+
+#[test]
+#[ignore]
+fn p2_a_forward_paused_with_windows_and_a_prompt_between_its_parts_equals_the_whole_forward() {
+    a_forward_paused_equals_the_whole_forward(PrefillContract::P2);
+}
+
+#[test]
+#[ignore]
+fn p1_a_forward_paused_with_windows_and_a_prompt_between_its_parts_equals_the_whole_forward() {
+    a_forward_paused_equals_the_whole_forward(PrefillContract::P1);
 }

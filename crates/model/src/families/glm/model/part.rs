@@ -1,11 +1,12 @@
 //! Prompt forwards of several prompts, and prompt forwards run in parts.
 //!
-//! **Several prompts in one forward** (P2 only). Every op of a P2 prompt forward is row-independent (`contract.rs`: batched == solo,
-//! chunk independence) except the ones that read a sequence's own earlier rows: the KDA recurrence and its conv history (run per sequence
-//! on its own slot and rows, `model.rs`'s `kda_segs`), the MLA latents, the DSA rings and the attention (indexed per row by its
-//! `(slot, position)`), the drafters' contexts (absorbed per sequence from its own tap rows) and the head (each sequence's last row).
-//! So a forward of the consecutive prompt rows of several sequences gives each row the bits of its own prompt's forward alone, and reads
-//! the weights once for all of them. Each sequence joins (or opens) its own P2 segment, as it would alone.
+//! **Several prompts in one forward** (P1 and P2). Every op of a prompt forward is row-independent (P1: every row its serial decode
+//! step's bits, chunk-grid independent; P2: `contract.rs`, batched == solo, chunk independence) except the ones that read a sequence's
+//! own earlier rows: the KDA recurrence and its conv history (run per sequence on its own slot and rows, `model.rs`'s `kda_segs`: P1's
+//! row-by-row path, P2's chunked one), the MLA latents, the DSA rings and the attention (indexed per row by its `(slot, position)`), the
+//! drafters' contexts (absorbed per sequence from its own tap rows) and the head (each sequence's last row). So a forward of the
+//! consecutive prompt rows of several sequences gives each row the bits of its own prompt's forward alone, and reads the weights once
+//! for all of them. Under P2 each sequence joins (or opens) its own P2 segment, as it would alone.
 //!
 //! **A forward in parts.** [`GlmModel::prefill_rows`] with a layer bound runs the layers before it and PAUSES at that layer's start;
 //! [`GlmModel::prefill_resume`] runs the next layers. Between two layers a prompt forward's whole state is its rows of the mHC streams,
@@ -22,7 +23,6 @@ use crate::forward::Candidates;
 use crate::rows::RowBatch;
 use gb_cuda::{mhc, DevBuf};
 
-use super::super::contract::PrefillContract;
 use super::super::ops::{Op, Site, SiteKind};
 
 /// A prompt forward paused at the start of a layer.
@@ -84,12 +84,10 @@ impl GlmModel {
         }
     }
 
-    /// A forward of several prompts (see the module): P2 with the chunked KDA, no snapshot inside it, no image, no forced routing, no
-    /// capture, every sequence in its own slot.
+    /// A forward of several prompts (see the module): KDA through the row-by-row (P1) or chunked (P2) prompt path, no snapshot inside it,
+    /// no image, no forced routing, no capture, every sequence in its own slot.
     pub(super) fn check_prompts(&self, b: &RowBatch) -> Result<(), ModelError> {
-        let why = if self.prefill != PrefillContract::P2 || !self.p2_kda_chunked {
-            Some("runs under the P2 contract only")
-        } else if !self.snap_cuts.is_empty() {
+        let why = if !self.snap_cuts.is_empty() {
             Some("takes no snapshot inside itself")
         } else if !self.splice.is_empty() {
             Some("carries no image")

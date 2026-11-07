@@ -594,8 +594,8 @@ pub(in crate::families::glm::model) struct KdaSeg<'a> {
 pub(super) enum KdaPath<'a, 'b> {
     /// A decode / verify window, or a prompt chunk of at most `MAX_ROWS` rows (`commit`: every row accepted, the prefill chunk's way).
     Window { batch: &'a kda::Batch<'b>, rec: &'a mut kda::Record, commit: bool },
-    /// A large prompt chunk of one sequence.
-    Prefill { slot: usize, rec: &'a mut kda::Record, desc: &'a DevBuf },
+    /// A large prompt forward (P1): of one sequence, or of several, each `KdaSeg` its own rows, slot and descriptor.
+    Prefill { segs: &'a [KdaSeg<'b>], rec: &'a mut kda::Record },
 }
 
 impl GlmTp {
@@ -742,29 +742,36 @@ impl GlmTp {
                 let x = out.subview(0, rows * c * 2);
                 self.split_o(o, &x, rows, mixer_out, ws, st)
             }
-            KdaPath::Prefill { slot, rec, desc } => {
-                let mut own = self.split.as_ref().unwrap().own.subview(0, rows * c * 2);
+            KdaPath::Prefill { segs, rec } => {
+                let own = self.split.as_ref().unwrap().own.subview(0, rows * c * 2);
                 {
                     let kr =
                         self.kda_rank(ord).ok_or_else(|| ModelError::Config(format!("no KDA head split for KDA layer {ord}")))?;
                     kr.qkv.forward_big(hidden, qkv, rows, Dtype::F16, Dtype::F32, ws, st)?;
-                    kda::prefill_with(
-                        st,
-                        dims,
-                        &kr.w.view(),
-                        params,
-                        hidden,
-                        Dtype::F16,
-                        qkv,
-                        Dtype::F32,
-                        pool,
-                        slot,
-                        rows,
-                        rec,
-                        kws,
-                        &mut own,
-                        desc,
-                    )?;
+                    // each sequence's recurrence on its own rows and slot (the row-by-row path: every row its serial step's bits)
+                    let (h, cd) = (dims.hidden, dims.conv_dim());
+                    for g in segs {
+                        let x = hidden.subview(g.row0 * h * 2, g.rows * h * 2);
+                        let q = qkv.subview(g.row0 * cd * 4, g.rows * cd * 4);
+                        let mut y = own.subview(g.row0 * c * 2, g.rows * c * 2);
+                        kda::prefill_with(
+                            st,
+                            dims,
+                            &kr.w.view(),
+                            params,
+                            &x,
+                            Dtype::F16,
+                            &q,
+                            Dtype::F32,
+                            pool,
+                            g.slot,
+                            g.rows,
+                            rec,
+                            kws,
+                            &mut y,
+                            g.desc,
+                        )?;
+                    }
                 }
                 self.gather_cols_f16(&own, out, rows, c, st)?;
                 o.forward_big(out, mixer_out, rows, Dtype::F16, Dtype::F32, ws, st)?;

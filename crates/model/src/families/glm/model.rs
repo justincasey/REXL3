@@ -243,6 +243,12 @@ fn kda_segs<'a>(b: &RowBatch, descs: &'a [DevBuf]) -> Vec<tp::KdaSeg<'a>> {
         .collect()
 }
 
+/// The row-by-row KDA recurrence's descriptors of a P1 prompt forward: one per sequence of `b` (`kda::prefill_descriptor` of its slot
+/// and rows), uploaded by the forward's first KDA layer and kept for the others.
+fn kda_p1_descs(b: &RowBatch) -> Result<Vec<DevBuf>, ModelError> {
+    (0..b.n_seq()).map(|i| Ok(kda::prefill_descriptor(b.seq_slot[i] as usize, b.seq_rows(i).len())?)).collect()
+}
+
 fn moe_stage_name(stage: &'static str) -> &'static str {
     match stage {
         "group" => "experts: group",
@@ -1281,8 +1287,7 @@ impl GlmModel {
             Some(sh) => (sh.n_pools_max, sh.any_sparse, sh.mla_ctx),
             None => ((max_pos + 1) / dsa::P, dsa::is_sparse(max_pos), max_pos + 1),
         };
-        // the KDA layers' prefill descriptor, uploaded by the first one and kept for the forward (P2: one per sequence of the forward)
-        let mut kda_desc: Option<DevBuf> = None;
+        // the KDA layers' prefill descriptors, one per sequence of the forward, uploaded by the first one and kept for the forward
         let mut kda_descs: Vec<DevBuf> = Vec::new();
         // under `sp`: a gather of the peer's hidden rows is in flight on the exchange stream (`GlmTp::sp_gather_begin`); the first op that
         // reads the peer's rows (or exchanges anything) joins it first
@@ -1420,15 +1425,13 @@ impl GlmModel {
                                     kda_join,
                                 )?;
                             } else if big {
+                                // P1: each prompt's row-by-row recurrence on its own slot and rows (one or several prompts)
                                 t.sp_gather_join(st)?;
-                                if kda_desc.is_none() {
-                                    kda_desc = Some(kda::prefill_descriptor(b.seq_slot[0] as usize, rows)?);
+                                if kda_descs.is_empty() {
+                                    kda_descs = kda_p1_descs(b)?;
                                 }
-                                let path = tp::KdaPath::Prefill {
-                                    slot: b.seq_slot[0] as usize,
-                                    rec: &mut s.kda_prefill_rec,
-                                    desc: kda_desc.as_ref().unwrap(),
-                                };
+                                let segs = kda_segs(b, &kda_descs);
+                                let path = tp::KdaPath::Prefill { segs: &segs, rec: &mut s.kda_prefill_rec };
                                 t.kda_split_layer(ord, &w.o, *kda_dims, &params, &mut pools[ord], io, path, rows, st)?;
                             } else {
                                 t.sp_gather_join(st)?;
@@ -1523,30 +1526,33 @@ impl GlmModel {
                             mark!("kda: qkv_proj");
                             // the exact row-by-row path in pieces of 128 rows, every row's bits the serial step's, the state committed piece by piece
                             if snap_cuts.is_empty() {
-                                let desc = match kda_desc.as_ref() {
-                                    Some(d) => d,
-                                    None => {
-                                        kda_desc = Some(kda::prefill_descriptor(b.seq_slot[0] as usize, rows)?);
-                                        kda_desc.as_ref().unwrap()
-                                    }
-                                };
-                                kda::prefill_with(
-                                    st,
-                                    *kda_dims,
-                                    &w.view(),
-                                    &params,
-                                    &s.hidden,
-                                    Dtype::F16,
-                                    &s.kda_qkv,
-                                    Dtype::F32,
-                                    &mut pools[ord],
-                                    b.seq_slot[0] as usize,
-                                    rows,
-                                    &mut s.kda_prefill_rec,
-                                    &mut s.kda_ws,
-                                    &mut s.kda_out,
-                                    desc,
-                                )?;
+                                // each prompt's recurrence on its own slot and rows (one or several prompts: `part.rs`)
+                                if kda_descs.is_empty() {
+                                    kda_descs = kda_p1_descs(b)?;
+                                }
+                                let (h, ch) = (cfg.hidden, cfg.kda.heads * cfg.kda.head_dim);
+                                for g in kda_segs(b, &kda_descs) {
+                                    let hv = s.hidden.subview(g.row0 * h * 2, g.rows * h * 2);
+                                    let qv = s.kda_qkv.subview(g.row0 * 3 * ch * 4, g.rows * 3 * ch * 4);
+                                    let mut ov = s.kda_out.subview(g.row0 * ch * 2, g.rows * ch * 2);
+                                    kda::prefill_with(
+                                        st,
+                                        *kda_dims,
+                                        &w.view(),
+                                        &params,
+                                        &hv,
+                                        Dtype::F16,
+                                        &qv,
+                                        Dtype::F32,
+                                        &mut pools[ord],
+                                        g.slot,
+                                        g.rows,
+                                        &mut s.kda_prefill_rec,
+                                        &mut s.kda_ws,
+                                        &mut ov,
+                                        g.desc,
+                                    )?;
+                                }
                             } else {
                                 // snapshots inside the chunk: the same path in segments that end at each cut (the pieces start again at a cut, which
                                 // changes no row's bits), the layer's state copied out between two segments

@@ -16,7 +16,7 @@ pub const K_PREFILL_PART: u8 = 41;
 /// The layer bound of a part that runs the forward to its end.
 pub const TO_END: u32 = u32::MAX;
 
-/// Rows a forward may have while a prompt forward is paused (the stash every P2 rank holds, `GlmModel::enable_prefill_parts`): fresh
+/// Rows a forward may have while a prompt forward is paused (the stash every rank holds, `GlmModel::enable_prefill_parts`): fresh
 /// short prompts (and windows) run meanwhile up to these rows.
 pub const PART_ROOM: usize = 512;
 
@@ -57,12 +57,9 @@ fn parse_part_ms(v: Option<&str>) -> Result<f64, ModelError> {
     }
 }
 
-/// A rank's stash of [`PART_ROOM`] rows, under the P2 contract (the only one whose forwards run several prompts or in parts). Called
-/// after the drafter is attached (the stash keeps its tap rows).
+/// A rank's stash of [`PART_ROOM`] rows (under P1 and P2 alike: `model/part.rs`). Called after the drafter is attached (the stash keeps
+/// its tap rows).
 pub fn enable(m: &mut super::model::GlmModel) -> Result<(), ModelError> {
-    if m.prefill_contract() != super::contract::PrefillContract::P2 {
-        return Ok(());
-    }
     let bytes = m.enable_prefill_parts(PART_ROOM)?;
     eprintln!("rexl3 event=glm_prefill_parts room_rows={} stash_mib={:.1}", m.prefill_part_rows(), bytes as f64 / (1u64 << 20) as f64);
     Ok(())
@@ -120,7 +117,7 @@ impl PrefillPart {
 /// A runtime that can run [`PrefillPart`]s (every rank of a group that serves them). The defaults are a runtime that cannot: rank 0's
 /// backend then prefills one prompt a call, whole.
 pub trait PartRuntime: LockstepRuntime<Call = GlmCall> {
-    /// Whether forwards of several prompts run (the P2 contract: `model/part.rs`).
+    /// Whether forwards of several prompts run (`model/part.rs`).
     fn prefill_batches(&self) -> bool {
         false
     }
@@ -139,7 +136,7 @@ pub trait PartRuntime: LockstepRuntime<Call = GlmCall> {
 
 impl PartRuntime for GlmRank {
     fn prefill_batches(&self) -> bool {
-        self.m.prefill_contract() == super::contract::PrefillContract::P2
+        true
     }
 
     fn prefill_part_rows(&self) -> usize {

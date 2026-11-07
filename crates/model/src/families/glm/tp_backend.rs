@@ -87,7 +87,7 @@ pub struct GlmTpBackend<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRu
     /// Snapshots taken at a slice end whose drafter book was not sound (`SnapMeta::mtp_ok` false): a warm turn from one of them would not
     /// draft. 0 is the expected count (the book is built chunk by chunk up to the slice's end).
     snaps_without_drafts: u64,
-    /// Under P2 the slices of several waiting prompts go through ONE forward (`tp_part`): every rank runs them.
+    /// The slices of several waiting prompts go through ONE forward (`tp_part`, P1 and P2): every rank runs them.
     batches: bool,
     /// The rows a forward may have while a prompt forward is paused (every rank's stash: `tp_part::PART_ROOM`; 0: no parts).
     part_room: usize,
@@ -744,7 +744,7 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> Backend for 
         self.inflight.map(|f| (f.slot, self.part_room))
     }
 
-    /// Under P2 the fresh short text slices of several waiting prompts go through ONE forward (`tp_part`: each prompt's rows the bits of
+    /// The fresh short text slices of several waiting prompts go through ONE forward (`tp_part`, P1 and P2: each prompt's rows the bits of
     /// its own slice alone; [`GlmTpBackend::plan_call`] picks them). A call runs ONE forward: that group, or the first job that goes alone
     /// (the slice in parts, a long slice, one with images), the two taking turns while both wait; every job it does not run is not served
     /// (`done` unchanged and no row: the engine asks again at its next step, after a decode round). So the decoding streams wait for one
