@@ -399,7 +399,8 @@ __global__ void __launch_bounds__(2 * kWK * 32, 1) gateup_kernel(const uint32_t*
 }
 
 // Block (128 columns n block, item): the item's tiles of xd rows times the expert's down matrix, the sums in shared memory, then per row (one
-// warp a row) H and * svh_down: y of the pair that sorted row belongs to, fp32.
+// warp a row) H and * svh_down: y of the pair that sorted row belongs to, fp32. svh_d null (RAW): the sums alone (the K splits added in
+// split order, no H, no scale), the K-split partial a TP rank of the width split exchanges before its epilogue.
 template <int K2, int CB, int NT, int H, int PD, int AP>
 __global__ void __launch_bounds__(kWK * 32, 1) down_kernel(const uint32_t* __restrict__ XS, const uint64_t* __restrict__ TP,
                                                            const int4* __restrict__ items, const int* __restrict__ nitems,
@@ -428,14 +429,16 @@ __global__ void __launch_bounds__(kWK * 32, 1) down_kernel(const uint32_t* __res
                                            threadIdx.x);
 
     const int n = nb * 128 + 4 * lane;
-    float sv[4];
-    load4h(svh_d + (size_t)e * N + n, sv);
+    float sv[4] = {1.f, 1.f, 1.f, 1.f};
+    if (svh_d) load4h(svh_d + (size_t)e * N + n, sv);
     for (int r = threadIdx.x >> 5; r < vrows; r += kWK) {
         const float4 u = *reinterpret_cast<const float4*>(stage + r * 128 + 4 * lane);
         float v[4] = {u.x, u.y, u.z, u.w};
-        fwht128(v, lane);
+        if (svh_d) {
+            fwht128(v, lane);
 #pragma unroll
-        for (int j = 0; j < 4; ++j) v[j] = v[j] * HAD_SCALE * sv[j];
+            for (int j = 0; j < 4; ++j) v[j] = v[j] * HAD_SCALE * sv[j];
+        }
         *reinterpret_cast<float4*>(y + (size_t)spair[tile0 * 16 + r] * N + n) = make_float4(v[0], v[1], v[2], v[3]);
     }
 }
@@ -742,11 +745,10 @@ GB_EXPORT int gb_moe_pf_gateup(const void* xs0, const void* xs1, const void* tp0
     return (int)cudaErrorInvalidValue;
 }
 
-// The down GEMM with the epilogue (K = the expert width I, N = the model width): y [P, N] fp32 = H(sum) * svh_down per pair, at the pair index each
-// sorted row belongs to (`spair`). The split `sk` is gb_moe_default_plan's for mats = 1.
-GB_EXPORT int gb_moe_pf_down(const void* xd, const void* tp, const void* items, const void* nitems, const void* svh_d, const void* spair,
-                             void* y, int K, int N, int bits, int codebook, int sk, int wk, int cap, void* stream) {
-    if (!gemm_args_ok(K, N, bits, codebook, sk, wk, cap) || !xd || !tp || !items || !nitems || !svh_d || !spair || !y)
+// The down GEMM (svh_d null: RAW, no epilogue) behind gb_moe_pf_down and gb_moe_pf_down_raw.
+static int pf_down(const void* xd, const void* tp, const void* items, const void* nitems, const void* svh_d, const void* spair, void* y, int K,
+                   int N, int bits, int codebook, int sk, int wk, int cap, void* stream) {
+    if (!gemm_args_ok(K, N, bits, codebook, sk, wk, cap) || !xd || !tp || !items || !nitems || !spair || !y)
         return (int)cudaErrorInvalidValue;
     const DnArgs a{static_cast<const uint32_t*>(xd), static_cast<const uint64_t*>(tp), static_cast<const int4*>(items),
                    static_cast<const int*>(nitems), static_cast<const half*>(svh_d), static_cast<const int*>(spair),
@@ -770,6 +772,21 @@ GB_EXPORT int gb_moe_pf_down(const void* xd, const void* tp, const void* items, 
     GB_PF_FOR_ALL(GB_G)
 #undef GB_G
     return (int)cudaErrorInvalidValue;
+}
+
+// The down GEMM with the epilogue (K = the expert width I, N = the model width): y [P, N] fp32 = H(sum) * svh_down per pair, at the pair index each
+// sorted row belongs to (`spair`). The split `sk` is gb_moe_default_plan's for mats = 1.
+GB_EXPORT int gb_moe_pf_down(const void* xd, const void* tp, const void* items, const void* nitems, const void* svh_d, const void* spair,
+                             void* y, int K, int N, int bits, int codebook, int sk, int wk, int cap, void* stream) {
+    if (!svh_d) return (int)cudaErrorInvalidValue;
+    return pf_down(xd, tp, items, nitems, svh_d, spair, y, K, N, bits, codebook, sk, wk, cap, stream);
+}
+
+// gb_moe_pf_down without the epilogue: y [P, N] fp32 = the K splits' sum in split order per pair (no H, no scale). A TP rank of the width
+// split (K = its half of the expert width, sk = 1: one split of the whole width's plan) writes the partial its exchange sums.
+GB_EXPORT int gb_moe_pf_down_raw(const void* xd, const void* tp, const void* items, const void* nitems, const void* spair, void* y, int K,
+                                 int N, int bits, int codebook, int sk, int wk, int cap, void* stream) {
+    return pf_down(xd, tp, items, nitems, nullptr, spair, y, K, N, bits, codebook, sk, wk, cap, stream);
 }
 
 // out [rows, D] fp32 = sum over slots in order of w * y, then + shared [rows, D] fp32 (null: nothing added). y [P, D] from gb_moe_pf_down.

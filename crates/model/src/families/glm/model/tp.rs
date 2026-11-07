@@ -1,5 +1,5 @@
-//! A GLM-5.3-Flash model as ONE RANK of a tensor-parallel group (`docs/GLM_TP.md`): whole-expert ownership of the routed experts
-//! (`docs/CLUSTER_FAMILY_PORTING.md` 3.5.1), everything else replicated.
+//! A GLM-5.3-Flash model as ONE RANK of a tensor-parallel group (`docs/GLM_TP.md`): the routed experts split between the ranks (by width
+//! by default, or as whole experts: `tp_boot::EXPERTS_ENV`), everything else replicated or head-split.
 //!
 //! **What changes on a rank.** Only the routed experts of a MoE layer. The router runs on every rank (replicated weights, identical picks
 //! and fp16 gate weights); each rank runs the pairs stage of the experts it owns (`MoeExperts::run_pairs` / `run_prefill_pairs`, `-0.0` in
@@ -8,6 +8,12 @@
 //! expert added last (`moe::combine_pairs`). With disjoint support the sum is the single-node pair buffer bit for bit, and the combine is
 //! the single-node combine (the batched path's kernel; the decode path fuses the same `fmaf` chain into `down_combine`), so every rank
 //! leaves the single-node `mixer_out` (proved per layer by `gb-cuda`'s `tests/moe_owned.rs`).
+//!
+//! **The width split** (`REXL3_GLM_TP_EXPERTS=width`, the default; `gb_cuda::moe_width`). Every rank holds EVERY expert at its half of
+//! the intermediate width (gate/up columns, down K rows) as subbanks of a width share (`MoeSubbanks::width_share`): its pairs stage
+//! leaves each valid pair's down K-split partial (the single node's split r, bit for bit), the same all-reduce sums the two partials
+//! (the single node's split sum), and `MoeSubbanks::finish` runs the single node's down epilogue and slot combine on it. Same bytes
+//! exchanged, same bits, and each rank reads half of every routed pair's weights (whole experts leave the slower rank ~5 of a token's 8).
 //!
 //! **What does not change.** The dense MLPs, the KDA and MLA/DSA mixers, the shared expert, the router and the head run as on one node. The
 //! NextN layer's routed experts (lane L12) are owned and exchanged like a trunk layer's, in every forward of that layer (`mtp::mtp_block`,
@@ -63,6 +69,8 @@ pub(in crate::families::glm) use p2::{P2Routed, RowSplit};
 pub struct GlmTp {
     comm: Arc<dyn TpComm>,
     own: ExpertOwnership,
+    /// The expert WIDTH split's share of this rank (`None`: whole experts, `own`): every MoE layer's subbanks hold it.
+    width: Option<gb_cuda::moe::WidthShare>,
     os: OwnScratch,
     /// The windows of this rank may be captured ([`rank_graphs`] of the communicator, at `enable_tp`).
     graphs: bool,
@@ -127,8 +135,9 @@ impl GlmTp {
     }
 
     /// A layer whose routed experts are subbanks (a mixed-width pack, or this rank's share loaded alone): every subbank's pairs into
-    /// one pair buffer (`-0.0` in every pair row no subbank of this rank holds), the exchange, `join` (as [`GlmTp::experts`]), the
-    /// combine. Decode window.
+    /// one pair buffer (`-0.0` in every pair row no subbank of this rank holds; a width share: its K-split partial of every pair), the
+    /// exchange, `join` (as [`GlmTp::experts`]), the finish (`MoeSubbanks::finish`: the combine, after a width share's down epilogue).
+    /// Decode window.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn subbanks(
         &mut self,
@@ -145,7 +154,7 @@ impl GlmTp {
         m.experts.run_pairs(x, Dtype::F16, rows, s, &mut self.os, st)?;
         self.exchange(&mut s.y_pairs, rows * d.topk * d.hidden, st)?;
         join()?;
-        moe::combine_pairs(&s.y_pairs, &s.pick, &s.wts, shared, out, rows, &d, st)?;
+        m.experts.finish(&s.y_pairs, &s.pick, &s.wts, shared, out, rows, st)?;
         Ok(())
     }
 
@@ -165,7 +174,7 @@ impl GlmTp {
         let d = m.dims;
         m.experts.run_prefill_pairs_windowed(x, Dtype::F16, rows, s, sd, &mut self.os, st)?;
         self.exchange(&mut s.y_pairs, rows * d.topk * d.hidden, st)?;
-        moe::combine_pairs(&s.y_pairs, &s.pick, &s.wts, shared, out, rows, &d, st)?;
+        m.experts.finish(&s.y_pairs, &s.pick, &s.wts, shared, out, rows, st)?;
         Ok(())
     }
 
@@ -244,7 +253,7 @@ impl GlmTp {
         let d = m.dims;
         m.experts.run_pairs(x, Dtype::F16, rows, s, &mut self.os, st)?;
         self.exchange_sh(&d, shared, rows, &mut s.y_pairs, shared_out, st, join)?;
-        moe::combine_pairs(&s.y_pairs, &s.pick, &s.wts, add_shared.then_some(&*shared_out), out, rows, &d, st)?;
+        m.experts.finish(&s.y_pairs, &s.pick, &s.wts, add_shared.then_some(&*shared_out), out, rows, st)?;
         Ok(())
     }
 
@@ -285,10 +294,23 @@ impl GlmTp {
         &self.own
     }
 
+    /// This rank's share of every routed expert's width under the width split (`None`: whole experts).
+    pub fn width(&self) -> Option<gb_cuda::moe::WidthShare> {
+        self.width
+    }
+
     /// `(rank, ranks)` of the collective.
     pub fn place(&self) -> (usize, usize) {
         let t = self.comm.topology();
         (t.rank, t.ranks)
+    }
+}
+
+/// How a bank holds the routed experts, for a refusal.
+fn share_name(w: Option<gb_cuda::moe::WidthShare>) -> String {
+    match w {
+        Some(w) => format!("the width share of rank {} of {}", w.rank, w.ranks),
+        None => "whole experts".into(),
     }
 }
 
@@ -298,6 +320,9 @@ impl GlmModel {
     /// layer's too, when loaded (its draft calls are forwarded: `tp_mtp`). Graphs stay on only when [`rank_graphs`] says so for this
     /// communicator (the exchange is then captured inside the window's graph; otherwise they are switched off for good), and the prefix
     /// cache must be absent (its calls are not forwarded). Call it before the rank serves (a slot's state is not touched: the next `begin_slot` starts it as on one node).
+    ///
+    /// Under the expert WIDTH split (`cfg.ffn.width`, `gb_cuda::moe_width`) `own` is every expert, every MoE layer's routed experts
+    /// (the NextN layer's too) are subbanks of this rank's width share, which must be the communicator's place.
     pub fn enable_tp(&mut self, comm: Arc<dyn TpComm>, own: ExpertOwnership) -> Result<(), ModelError> {
         if self.tp.is_some() {
             return Err(ModelError::Config("this model is already a rank of a tensor-parallel group".into()));
@@ -316,6 +341,41 @@ impl GlmModel {
                 own.local(),
                 dims.experts
             )));
+        }
+        let width = self.cfg.ffn.width;
+        if let Some(w) = width {
+            let t = comm.topology();
+            if (w.rank, w.ranks) != (t.rank, t.ranks) || !own.is_all() {
+                return Err(ModelError::Config(format!(
+                    "the expert width share of rank {} of {} on rank {} of {} (owning {} experts of {}): the width split holds every \
+                     expert at the communicator's place",
+                    w.rank,
+                    w.ranks,
+                    t.rank,
+                    t.ranks,
+                    own.local(),
+                    own.experts
+                )));
+            }
+        }
+        // a bank of whole experts under the width split (or a width share without it) would count an expert twice (or never) in the sum
+        let width_of = |what: String, sb: Option<gb_cuda::moe::WidthShare>| -> Result<(), ModelError> {
+            if sb == width {
+                return Ok(());
+            }
+            Err(ModelError::Config(format!("{what} are {}, but this rank runs {}", share_name(sb), share_name(width))))
+        };
+        for (l, layer) in self.dev.layers.iter().enumerate() {
+            match &layer.ffn {
+                FfnDevice::MoeSubbanks { layer: m, .. } => width_of(format!("layer {l}'s routed experts"), m.experts.width_share())?,
+                FfnDevice::Moe { .. } => width_of(format!("layer {l}'s routed experts (one bank)"), None)?,
+                FfnDevice::Dense(_) => {}
+            }
+        }
+        match self.dev.mtp.as_ref().map(|w| &w.moe) {
+            Some(MtpMoe::Subbanks(m)) => width_of("the NextN layer's routed experts".into(), m.experts.width_share())?,
+            Some(MtpMoe::Single(_)) => width_of("the NextN layer's routed experts (one bank)".into(), None)?,
+            None => {}
         }
         for (l, layer) in self.dev.layers.iter().enumerate() {
             // subbanks hold exactly the experts they were cut for: those must be this rank's share (a mixed layer loaded whole at one
@@ -378,7 +438,18 @@ impl GlmModel {
         }
         self.clear_graphs()?;
         let p2 = if p2 { Some(p2::P2Exchange::new(self.s.rows, dims.hidden)?) } else { None };
-        self.tp = Some(GlmTp { comm, own, os, graphs, exchanged_bytes: 0, exchanges: 0, sh_exchanged_bytes: 0, p2, split: None });
+        self.tp = Some(GlmTp {
+            comm,
+            own,
+            width,
+            os,
+            graphs,
+            exchanged_bytes: 0,
+            exchanges: 0,
+            sh_exchanged_bytes: 0,
+            p2,
+            split: None,
+        });
         Ok(())
     }
 

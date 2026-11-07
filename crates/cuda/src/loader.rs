@@ -292,6 +292,57 @@ pub fn plan_spans(reqs: &[Req], span_bytes: usize, gap_bytes: u64) -> Vec<Span> 
     spans
 }
 
+/// The row shape of a strided job ([`Loader::copy_file_strided`]): its source span is rows of `width` bytes `src_pitch` apart (the
+/// last row ends the span), and they land densely, row `r` at `r * width` of the destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stride {
+    pub width: usize,
+    pub src_pitch: usize,
+}
+
+/// One host-to-device copy of a piece of a strided job: `rows` rows of `len` bytes, row `r` from `src + r * src_pitch` of the piece's
+/// bytes to `dst + r * width` of the job's destination (a partial row is one row of fewer than `width` bytes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowCopy {
+    pub src: usize,
+    pub dst: usize,
+    pub len: usize,
+    pub rows: usize,
+}
+
+/// The copies that move the row bytes of the piece `[job_off, job_off + len)` of a strided job's source span: at most a partial head
+/// row (the piece starts inside a row), ONE copy of every whole row inside the piece, and a partial tail row (it ends inside one). The
+/// gap bytes between rows are never copied. Pieces that tile the span move every row byte exactly once, byte `c` of row `r` to
+/// destination byte `r * width + c` (`plan_spans` may cut a span anywhere, so a row may straddle two pieces).
+pub fn strided_copies(job_off: usize, len: usize, s: Stride) -> [Option<RowCopy>; 3] {
+    let (w, p) = (s.width, s.src_pitch);
+    let mut out = [None; 3];
+    if len == 0 || w == 0 {
+        return out;
+    }
+    let (a, b) = (job_off, job_off + len);
+    // the row byte range of row `r` inside the piece, as one copy
+    let part = |r: usize| {
+        let (lo, hi) = ((r * p).max(a), (r * p + w).min(b));
+        (lo < hi).then(|| RowCopy { src: lo - a, dst: r * w + (lo - r * p), len: hi - lo, rows: 1 })
+    };
+    let mut r = a / p;
+    if a % p != 0 {
+        // the piece starts inside row r (in its bytes or in the gap after them): what of row r it holds, then the next row
+        out[0] = part(r);
+        r += 1;
+    }
+    // rows r..whole end inside the piece
+    let whole = if b >= w { ((b - w) / p + 1).max(r) } else { r };
+    if whole > r {
+        out[1] = Some(RowCopy { src: r * p - a, dst: r * w, len: w, rows: whole - r });
+    }
+    if whole * p < b {
+        out[2] = part(whole);
+    }
+    out
+}
+
 // ----------------------------------------------------------------------------------------------------------- the loader
 
 type ComputeFn<'a> = Box<dyn Fn() -> io::Result<Vec<u8>> + Send + Sync + 'a>;
@@ -301,6 +352,8 @@ enum Kind<'a> {
         file: usize,
         off: u64,
         xform: Xform,
+        /// `Some` for [`Loader::copy_file_strided`]: the job's `len` is its source span, only the rows' bytes are copied.
+        stride: Option<Stride>,
     },
     Compute(ComputeFn<'a>),
     /// Bytes of a file that must equal `want`: read with the spans around them and compared on the host, never copied.
@@ -369,7 +422,39 @@ impl<'a> Loader<'a> {
             dst: dst.ptr() as usize,
             len,
             comp: loadstats::component(),
-            kind: Kind::File { file, off, xform },
+            kind: Kind::File { file, off, xform, stride: None },
+            _keep: Some(keep),
+        });
+        Ok(())
+    }
+
+    /// Copy the rows of a strided source to the start of `dst`, densely and unchanged: `len` bytes of `file` from `off` are rows of
+    /// `width` bytes, `src_pitch` apart (`len = (rows - 1) * src_pitch + width`), and row `r` lands at `r * width` (a column cut of an
+    /// EXL3 trellis: the rank's tiles of every k-tile row). The read covers the whole span, gaps included (spans are planned on it as on
+    /// any range); each staged piece then goes over in at most three copies (`strided_copies`), never one a row.
+    pub fn copy_file_strided(
+        &mut self,
+        dst: &DevBuf,
+        file: usize,
+        off: u64,
+        len: usize,
+        width: usize,
+        src_pitch: usize,
+    ) -> Result<(), LoadError> {
+        if width == 0 || src_pitch < width || len < width || (len - width) % src_pitch != 0 {
+            return Err(LoadError::Plan(format!(
+                "a strided copy of {len} bytes in rows of {width} bytes {src_pitch} apart is not whole rows"
+            )));
+        }
+        let keep = Self::target(dst, ((len - width) / src_pitch + 1) * width)?;
+        if file >= self.files.len() {
+            return Err(LoadError::Plan(format!("unknown file id {file}")));
+        }
+        self.jobs.push(Job {
+            dst: dst.ptr() as usize,
+            len,
+            comp: loadstats::component(),
+            kind: Kind::File { file, off, xform: Xform::None, stride: Some(Stride { width, src_pitch }) },
             _keep: Some(keep),
         });
         Ok(())
@@ -410,7 +495,8 @@ impl<'a> Loader<'a> {
         Ok(())
     }
 
-    /// Bytes declared so far (the bytes to be copied: a [`Loader::check_file`] copies nothing).
+    /// Bytes declared so far (the bytes to be read for copies: a strided job counts its source span, a [`Loader::check_file`]
+    /// copies nothing).
     pub fn queued_bytes(&self) -> u64 {
         self.jobs.iter().filter(|j| !matches!(j.kind, Kind::Check { .. })).map(|j| j.len as u64).sum()
     }
@@ -839,6 +925,24 @@ impl Shared<'_, '_> {
                 loadstats::add_for(job.comp, Stage::Convert, t.elapsed(), it.len as u64);
             }
             let t = Instant::now();
+            if let Kind::File { stride: Some(s), .. } = job.kind {
+                for c in strided_copies(it.job_off, it.len, s).into_iter().flatten() {
+                    // SAFETY: a copy's rows are inside the piece (`region`, held until `slot.done` completes) and land inside the dense
+                    // destination of `rows x width` bytes that `_keep` keeps alive (checked at declaration)
+                    unsafe {
+                        stream.memcpy_h2d_2d_async(
+                            (job.dst + c.dst) as *mut c_void,
+                            s.width,
+                            region.as_ptr().add(c.src),
+                            s.src_pitch,
+                            c.len,
+                            c.rows,
+                        )?
+                    };
+                }
+                loadstats::add_for(job.comp, Stage::Memcpy, t.elapsed(), it.len as u64);
+                continue;
+            }
             // SAFETY: `job.dst + job_off` is inside the destination view `_keep` keeps alive (checked at declaration), and
             // `region` is `it.len` readable bytes of this slot, which is not reused before `slot.done` completes
             unsafe { stream.memcpy_h2d_async((job.dst + it.job_off) as *mut c_void, region.as_ptr(), it.len)? };
@@ -1067,5 +1171,56 @@ mod plan_tests {
         );
         assert_eq!(s[0].items.len(), 2);
         check(&reqs, span, 0);
+    }
+
+    /// Run the copies of every piece of a strided job's span into a dense destination: each row byte arrives once, at
+    /// `row * width + col`, no gap byte is copied, and a piece costs at most three copies.
+    fn check_strided(width: usize, pitch: usize, rows: usize, cuts: &[usize]) {
+        let s = Stride { width, src_pitch: pitch };
+        let span = (rows - 1) * pitch + width;
+        let src: Vec<u32> = (0..span as u32).collect();
+        let mut dst: Vec<Option<u32>> = vec![None; rows * width];
+        let mut at = 0;
+        for &end in cuts.iter().chain(std::iter::once(&span)) {
+            let piece = &src[at..end];
+            let copies = strided_copies(at, end - at, s);
+            assert!(copies.iter().flatten().all(|c| c.len > 0 && c.rows > 0 && (c.rows == 1 || c.len == width)));
+            for c in copies.into_iter().flatten() {
+                for r in 0..c.rows {
+                    for b in 0..c.len {
+                        let v = piece[c.src + r * pitch + b];
+                        let (row, col) = (v as usize / pitch, v as usize % pitch);
+                        assert!(col < width, "gap byte {v} copied");
+                        let d = c.dst + r * width + b;
+                        assert_eq!(d, row * width + col, "byte {v} lands at {d}");
+                        assert!(dst[d].replace(v).is_none(), "byte {v} copied twice");
+                    }
+                }
+            }
+            at = end;
+        }
+        assert!(dst.iter().all(|v| v.is_some()), "a row byte was not copied ({width} of {pitch}, {rows} rows, cuts {cuts:?})");
+    }
+
+    #[test]
+    fn strided_pieces_copy_every_row_byte_once_in_at_most_three_copies() {
+        check_strided(4, 8, 3, &[]);
+        check_strided(8, 8, 3, &[5, 13]);
+        check_strided(3, 10, 1, &[1]);
+        let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+        for _ in 0..2000 {
+            let pitch = 1 + rng.below(40) as usize;
+            let width = 1 + rng.below(pitch as u64) as usize;
+            let rows = 1 + rng.below(30) as usize;
+            let span = (rows - 1) * pitch + width;
+            let mut cuts: Vec<usize> = (0..rng.below(6)).map(|_| 1 + rng.below(span as u64) as usize).filter(|&c| c < span).collect();
+            cuts.sort();
+            cuts.dedup();
+            check_strided(width, pitch, rows, &cuts);
+        }
+        // a whole-span piece of a column half (the GLM gate/up cut) is one 2D copy
+        let s = Stride { width: 2048 * 3, src_pitch: 4096 * 3 };
+        let span = 255 * s.src_pitch + s.width;
+        assert_eq!(strided_copies(0, span, s), [None, Some(RowCopy { src: 0, dst: 0, len: s.width, rows: 256 }), None]);
     }
 }

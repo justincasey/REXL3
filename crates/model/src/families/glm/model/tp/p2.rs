@@ -14,6 +14,13 @@
 //! into the one pair buffer, then the same `Own(r)` part, swap and `Parts` sum: each pair's bits are its row's and its expert's alone, so
 //! the rank's part is the one node's group-r part bit for bit.
 //!
+//! **The expert width split** (`gb_cuda::moe_width`, `REXL3_GLM_TP_EXPERTS=width`, the default). A rank holds every expert at its half
+//! of the width, so its pairs are EVERY pair at that half (the P2 GEMMs on its gate/up columns and its down K rows, the down epilogue on
+//! that half's sum) and its part is every slot's (`CombineMode::All`); the swap and the `Parts` sum are unchanged. The parts are then the
+//! two halves of the width, not the two expert groups: every P2 invariant holds (a pair's bits are its row's and its expert's alone,
+//! nothing depends on the chunk), but P2 at TP=2 no longer equals P2 on one node bit for bit (`moe_width::P2_WIDTH_ID` names the
+//! arithmetic).
+//!
 //! **Row split** ([`RowSplit`], a trunk MoE layer of a chunk of at least two 128-row slabs). Every P2 op is row-independent, so the
 //! replicated per-row work after the part need not be replicated: rank r sends the peer only the peer's rows of its part, computes the
 //! shared expert and the parts' sum on its OWN rows (`glm_p2_moe::combine_parts_rows`), and the ranks swap those output rows (byte
@@ -215,9 +222,11 @@ impl GlmTp {
         } else {
             None
         };
+        // the rank's part: its own expert group's slots (whole experts), or every slot of its half of the width (the width split)
+        let own_part = if self.width.is_some() { CombineMode::All } else { CombineMode::Own(t.rank) };
         if let Some(mut z) = zc {
             let r = t.rank;
-            glm_p2_moe::combine_dims(CombineMode::Own(r), &s.y_pairs, &s.pick, &s.wts, None, None, &mut z.halves[r], rows, &d, st)?;
+            glm_p2_moe::combine_dims(own_part, &s.y_pairs, &s.pick, &s.wts, None, None, &mut z.halves[r], rows, &d, st)?;
             mark("combine")?;
             gb_cuda::graph::fork(st, &p2.stream, &p2.ready)?;
             self.comm.roce_tp().expect("checked").publish_swap(&z, &p2.stream)?;
@@ -229,7 +238,7 @@ impl GlmTp {
             p2.zero_copy = Some(z);
         } else if t.ranks == 2 {
             let r = t.rank;
-            glm_p2_moe::combine_dims(CombineMode::Own(r), &s.y_pairs, &s.pick, &s.wts, None, None, &mut p2.parts[r], rows, &d, st)?;
+            glm_p2_moe::combine_dims(own_part, &s.y_pairs, &s.pick, &s.wts, None, None, &mut p2.parts[r], rows, &d, st)?;
             mark("combine")?;
             // the swap on its own stream, after the part
             gb_cuda::graph::fork(st, &p2.stream, &p2.ready)?;
@@ -325,9 +334,10 @@ impl GlmTp {
 
 impl super::GlmModel {
     /// What a P2 rank needs before it joins (refused by name otherwise): at most two ranks; at two, the range ownership (rank r owns
-    /// combine group r: `ExpertOwnership::range(E, r, 2)`) and a communicator with the byte swap; at one, every expert; every MoE layer's
-    /// routed experts (and the NextN layer's) one bank the P2 expert GEMMs take, or subbanks a P2 prefill takes
-    /// (`glm_p2_moe::supported_subbanks`: a mixed-width share, its split gate/up subbank through the decode pairs stage).
+    /// combine group r: `ExpertOwnership::range(E, r, 2)`), or under the expert width split every expert at the rank's half of the width
+    /// (its part is every slot's), and a communicator with the byte swap; at one, every expert; every MoE layer's routed experts (and
+    /// the NextN layer's) one bank the P2 expert GEMMs take, or subbanks a P2 prefill takes (`glm_p2_moe::supported_subbanks`: a
+    /// mixed-width share, its split gate/up subbank through the decode pairs stage).
     pub(super) fn check_p2_tp(
         &self,
         comm: &dyn crate::families::nemotron_h_omni::tp::TpComm,
@@ -341,16 +351,28 @@ impl super::GlmModel {
             1 if own.is_all() => {}
             1 => return Err(bad("a group of one rank must own every expert".into())),
             2 => {
-                let want = gb_cuda::moe::ExpertOwnership::range(own.experts, t.rank, 2)
-                    .map_err(|e| bad(format!("no range ownership for rank {}: {e:?}", t.rank)))?;
-                if *own != want {
-                    return Err(bad(format!(
-                        "rank {} must own the experts of combine group {} (ExpertOwnership::range: {} experts), not this ownership of {}",
-                        t.rank,
-                        t.rank,
-                        want.local(),
-                        own.local()
-                    )));
+                if let Some(w) = self.cfg.ffn.width {
+                    if !own.is_all() || (w.rank, w.ranks) != (t.rank, 2) {
+                        return Err(bad(format!(
+                            "the width share of rank {} of {} on rank {} of 2 owning {} experts (the width split holds every expert)",
+                            w.rank,
+                            w.ranks,
+                            t.rank,
+                            own.local()
+                        )));
+                    }
+                } else {
+                    let want = gb_cuda::moe::ExpertOwnership::range(own.experts, t.rank, 2)
+                        .map_err(|e| bad(format!("no range ownership for rank {}: {e:?}", t.rank)))?;
+                    if *own != want {
+                        return Err(bad(format!(
+                            "rank {} must own the experts of combine group {} (ExpertOwnership::range: {} experts), not this ownership of {}",
+                            t.rank,
+                            t.rank,
+                            want.local(),
+                            own.local()
+                        )));
+                    }
                 }
                 if !comm.supports_swap() {
                     return Err(bad("the communicator has no byte swap (TpComm::swap_bytes) for the parts' exchange".into()));

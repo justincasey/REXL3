@@ -478,6 +478,210 @@ fn the_serving_rank_load_takes_only_its_share_and_equals_one_model() {
     eprintln!("MemAvailable min {:.1} GiB", gib(guard.finish()));
 }
 
+/// A model of the first `layers` layers of rank `rank` of two under the expert WIDTH split (every routed expert at the rank's columns:
+/// `GlmFamily::map_pack_width`), with the regions' bytes by kind.
+fn load_width(dir: &Path, layers: usize, rank: usize) -> (GlmModel, (u64, u64, u64)) {
+    gb_cuda::rt::init_context().unwrap();
+    let pack = GlmFamily::map_pack_width(dir, rank, 2).unwrap();
+    let b = boot_mapped(dir, pack, Some(layers), &LoadOptions::from_env(20 * GIB), 0.0).unwrap();
+    let rb = region_bytes(&b.plan);
+    let bind = moe_binding(&b.device);
+    assert!(bind.iter().all(|&(_, s, n)| s > 0 && n == E), "every MoE layer of a width rank is subbanks of every expert: {bind:?}");
+    eprintln!(
+        "width rank {rank}: {layers} layers, regions {:.3} GiB (global {:.3}, trunk {:.3}, experts {:.3}); MoE layers {bind:?}",
+        gib(rb.0 + rb.1 + rb.2),
+        gib(rb.0),
+        gib(rb.1),
+        gib(rb.2)
+    );
+    let m = GlmModel::new_chunked(
+        b.pack.config.clone(),
+        b.device,
+        &ModelOptions { slots: SLOTS, kv_blocks: 64, max_context: 8192, layers },
+        CHUNK,
+    )
+    .unwrap();
+    (m, rb)
+}
+
+/// The expert WIDTH split through the SERVING rank load (`tp_boot::plan_from_split` with the rank's width config and every expert ->
+/// `tp_boot::load_rank`, the ownership and width checks and `enable_tp` inside it): two ranks on a loopback group, each holding its half
+/// of every expert's width, must answer exactly as one model of every expert (P1: the decode windows' and the batched chunks' bits are
+/// the single node's). The two ranks' expert regions are about half the whole map's each (the replicated model-width scales aside), and
+/// a rank given its peer's width share is refused by name. A rank's contract is the process's: run with `REXL3_GLM_PREFILL_CONTRACT=p1`
+/// (under P2 the width ranks' prompt bits are not one node's: `p2_width_split_ranks_agree_repeat_and_are_chunk_invariant`).
+#[test]
+#[ignore]
+fn width_split_ranks_equal_one_model_byte_for_byte() {
+    use gb_model::families::glm::tp_boot::{load_rank, plan_from_split};
+    use gb_model::families::glm::GlmConfig;
+    use gb_model::serve::{PrefixCacheOption, ServeOptions};
+    let Some(dir) = redsnow_dir() else { return };
+    let contract = gb_model::families::glm::contract::current();
+    assert_eq!(contract, PrefillContract::P1, "run with REXL3_GLM_PREFILL_CONTRACT=p1: a rank's contract is the process's");
+    let layers: usize = std::env::var("REXL3_REDSNOW_TP_LAYERS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    require_available(if layers <= 8 { 60 } else { 80 } * GIB);
+    let guard = Guard::start(20 * GIB);
+    let (mut one, rb_all) = load(&dir, layers, None, |_| {});
+    one.set_graphs(true);
+    let reference = script(&mut one);
+    drop(one);
+
+    let cfg = GlmConfig::from_dir(&dir).unwrap();
+    let mut o = ServeOptions::new(dir.clone());
+    (o.slots, o.slots_auto, o.max_model_len, o.kv_tokens, o.prefill_chunk) = (SLOTS, false, 8192, Some(16384), CHUNK);
+    o.prefix_cache = PrefixCacheOption::Off;
+    o.vision = None;
+    let all = ExpertOwnership::all(E);
+    let cfgs: Vec<GlmConfig> = (0..2).map(|r| cfg.with_expert_width(r, 2).unwrap()).collect();
+    let plans: Vec<_> = cfgs
+        .iter()
+        .map(|c| {
+            let ck = gb_exl3::checkpoint::scan(&dir, false).unwrap();
+            plan_from_split(&o, c.clone(), ck, 117 * GIB, 0.0, Some(all.clone()), None).unwrap()
+        })
+        .collect();
+    // the planner refuses a width config with a whole-expert share
+    let ck = gb_exl3::checkpoint::scan(&dir, false).unwrap();
+    let e = plan_from_split(&o, cfgs[0].clone(), ck, 117 * GIB, 0.0, Some(ExpertOwnership::range(E, 0, 2).unwrap()), None)
+        .err()
+        .expect("a width rank with a range share must be refused")
+        .to_string();
+    assert!(e.contains("width"), "{e}");
+    eprintln!(
+        "planned weights: rank 0 {:.3} GiB, rank 1 {:.3} GiB (whole pack)",
+        gib(plans[0].weight_bytes),
+        gib(plans[1].weight_bytes)
+    );
+    let mo = ModelOptions { slots: SLOTS, kv_blocks: 64, max_context: 8192, layers };
+    let pcfgs: Vec<GlmConfig> = cfgs
+        .iter()
+        .map(|c| {
+            let mut p = c.clone();
+            p.layers.truncate(layers);
+            p
+        })
+        .collect();
+    // ranks 0 and 1 of a loopback group, each loading its width share through load_rank
+    let comms: Vec<_> = LoopbackGroup::with_timeout(2, Duration::from_secs(120)).into_iter().collect();
+    let t = std::time::Instant::now();
+    let digests: Vec<(Vec<u64>, (u64, u64))> = std::thread::scope(|sc| {
+        let hs: Vec<_> = plans
+            .iter()
+            .zip(&pcfgs)
+            .zip(comms)
+            .map(|((p, pc), c)| {
+                let (dir, mo) = (&dir, &mo);
+                sc.spawn(move || {
+                    let mut rank =
+                        load_rank(dir, pc, p.pack.clone(), p.own.as_ref(), mo, p.chunk, 20 * GIB, 0.0, Some(Arc::new(c)))
+                            .unwrap_or_else(|e| panic!("load_rank: {e}"));
+                    let tp = rank.m.tp().unwrap();
+                    assert!(tp.ownership().is_all() && tp.width() == pc.ffn.width);
+                    let d = script(&mut rank.m);
+                    let tp = rank.m.tp().unwrap();
+                    (d, (tp.exchanges, tp.exchanged_bytes))
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().expect("rank")).collect()
+    });
+    eprintln!("two width ranks loaded and ran the script in {:.1?}", t.elapsed());
+    assert_eq!(digests[0].1, digests[1].1, "the ranks exchanged alike");
+    assert_eq!(digests[0].0, digests[1].0, "the width ranks' answers differ");
+    assert_eq!(digests[0].0, reference, "the width ranks' answers differ from the one model's");
+    eprintln!(
+        "WIDTH SPLIT BYTE-IDENTICAL: {} answering calls == one model; {} exchanges of {:.1} MiB per rank",
+        reference.len(),
+        digests[0].1 .0,
+        digests[0].1 .1 as f64 / 1048576.0
+    );
+
+    // the regions of a width rank, and a rank given its peer's share
+    let (m0, rb0) = load_width(&dir, layers, 0);
+    let (mut m1, rb1) = load_width(&dir, layers, 0);
+    assert_eq!((rb0.0, rb0.1), (rb_all.0, rb_all.1), "the global and trunk regions are replicated");
+    eprintln!(
+        "expert regions: one model {:.3} GiB, a width rank {:.3} GiB ({:.1}% of the whole: half the trellises, the model-width scales whole)",
+        gib(rb_all.2),
+        gib(rb0.2),
+        100.0 * rb0.2 as f64 / rb_all.2 as f64
+    );
+    assert!(rb0.2 * 2 >= rb_all.2 && rb0.2 * 2 < rb_all.2 + rb_all.2 / 20, "a width rank holds about half the experts' bytes");
+    assert_eq!(rb1.2, rb0.2);
+    drop(m0);
+    let mut comms = LoopbackGroup::with_timeout(2, Duration::from_secs(120)).into_iter();
+    let _rank0 = comms.next().unwrap();
+    let e = m1.enable_tp(Arc::new(comms.next().unwrap()), all.clone()).unwrap_err().to_string();
+    assert!(e.contains("width share"), "{e}");
+    eprintln!("rank 1 holding rank 0's width share refuses: {e}");
+    drop(m1);
+    eprintln!("MemAvailable min {:.1} GiB", gib(guard.finish()));
+}
+
+/// The expert WIDTH split under the P2 prefill contract: each rank's P2 expert GEMMs on its half of every expert, its part over every
+/// slot (`CombineMode::All`), the part swap, the `Parts` sum. The parts are the width's halves (not the whole-expert split's groups), so
+/// the bits are not one P2 model's; the ranks must agree, run P2 (differ from P1), repeat bit for bit, and answer the first prompt
+/// alike in 512- and 336-row chunks whenever one P2 model does.
+#[test]
+#[ignore]
+fn p2_width_split_ranks_agree_repeat_and_are_chunk_invariant() {
+    let Some(dir) = redsnow_dir() else { return };
+    let layers: usize = std::env::var("REXL3_REDSNOW_TP_LAYERS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    require_available(if layers <= 8 { 60 } else { 80 } * GIB);
+    let guard = Guard::start(20 * GIB);
+    let (mut a, _) = load(&dir, layers, None, |_| {});
+    a.set_prefill_contract(PrefillContract::P1).unwrap();
+    a.set_graphs(false);
+    let p1_ref = script(&mut a);
+    a.set_prefill_contract(PrefillContract::P2).unwrap();
+    let p2_one = script(&mut a);
+    let p2_one_336 = script_chunk(&mut a, 336);
+    drop(a);
+    let one_invariant = p2_one == p2_one_336;
+    eprintln!("one P2 model: 512- and 336-row chunks {}", if one_invariant { "agree" } else { "differ" });
+
+    let mut models = Vec::new();
+    for r in 0..2 {
+        let (mut m, _) = load_width(&dir, layers, r);
+        m.set_prefill_contract(PrefillContract::P2).unwrap();
+        models.push(m);
+    }
+    let mut b = models.pop().unwrap();
+    let mut a = models.pop().unwrap();
+    let mut comms = LoopbackGroup::with_timeout(2, Duration::from_secs(120)).into_iter();
+    a.enable_tp(Arc::new(comms.next().unwrap()), ExpertOwnership::all(E)).unwrap();
+    b.enable_tp(Arc::new(comms.next().unwrap()), ExpertOwnership::all(E)).unwrap();
+    let t = std::time::Instant::now();
+    let run = |m: &mut GlmModel| (script(m), script(m), script_chunk(m, 336));
+    let ((d0, r0, c0), (d1, r1, c1), a, b) = std::thread::scope(|sc| {
+        let h0 = sc.spawn(move || (run(&mut a), a));
+        let h1 = sc.spawn(move || (run(&mut b), b));
+        let (x, a) = h0.join().expect("rank 0");
+        let (y, b) = h1.join().expect("rank 1");
+        (x, y, a, b)
+    });
+    eprintln!("two P2 width ranks ran the script three times in {:.1?}", t.elapsed());
+    assert_eq!((&d0, &c0), (&d1, &c1), "the two P2 width ranks' answers differ");
+    assert_eq!((&r0, &r1), (&d0, &d0), "a P2 width rank does not repeat its answers bit for bit");
+    let moved = d0.iter().zip(&p1_ref).filter(|(x, y)| x != y).count();
+    assert!(moved > 0, "the P2 width ranks left every answer at P1's bits: P2 did not run");
+    if one_invariant {
+        assert_eq!(c0, d0, "the P2 width ranks answer differently in 336-row chunks");
+    }
+    let vs_one = d0.iter().zip(&p2_one).filter(|(x, y)| x != y).count();
+    let (t0r, t1r) = (a.tp().unwrap(), b.tp().unwrap());
+    assert!(t0r.p2_swaps() > 0 && t0r.p2_swaps() == t1r.p2_swaps(), "part swaps {} / {}", t0r.p2_swaps(), t1r.p2_swaps());
+    eprintln!(
+        "P2 WIDTH: {} answering calls, ranks agree, repeat, {moved} differ from P1 (P2 ran), {vs_one} differ from one P2 model (the parts \
+         are the width's halves); {} part swaps a rank",
+        d0.len(),
+        t0r.p2_swaps()
+    );
+    drop((a, b));
+    eprintln!("MemAvailable min {:.1} GiB", gib(guard.finish()));
+}
+
 /// A rank's map of the pack WITH the NextN layer: the layer binds as subbanks of the rank's share; outside a group a prefill (which runs
 /// the NextN layer) refuses the share by name (`MTP_SHARE`) instead of computing half of it; `enable_tp` accepts it (lane L12: the layer's
 /// pairs are exchanged, `docs/GLM_TP.md` 9; the two-rank proof is `tests/glm_tp_mtp.rs`).

@@ -83,6 +83,9 @@ pub enum CombineMode {
     Both,
     /// `part_g` of one group alone (a TP=2 rank's own group: rank r owns group r).
     Own(usize),
+    /// One part over EVERY slot of the row (an fmaf chain in slot order from +0.0, no shared): a rank of the width split
+    /// ([`crate::moe_width`]), whose pairs are its half of every expert's width.
+    All,
     /// `(part0 + part1) + shared` from two given part buffers (the TP=2 exchange's rows).
     Parts,
 }
@@ -356,8 +359,9 @@ pub fn pairs_subbanks_with(
     st: &Stream,
     mark: &mut dyn FnMut(&'static str) -> Result<(), CudaError>,
 ) -> Result<(), CudaError> {
-    // every expert on this node: a pair whose expert no subbank held would keep a stale y for the combine to read
-    if !sb.ownership().is_all() {
+    // every expert on this node: a pair whose expert no subbank held would keep a stale y for the combine to read (a width share holds
+    // every expert at half its width: a rank's, never a node's)
+    if !sb.ownership().is_all() || sb.width_share().is_some() {
         return Err(INVALID);
     }
     pairs_subbanks_on(sb, x, x_dtype, rows, s, os, sd, order, st, mark)
@@ -366,6 +370,9 @@ pub fn pairs_subbanks_with(
 /// The pairs stage of a tensor-parallel RANK whose share of a layer is several subbanks (a mixed-width layer at TP=2): the loop of
 /// [`pairs_subbanks_with`] over the rank's subbanks. Every pair whose expert the rank owns gets its y, the others are not written: the
 /// rank's combine (`CombineMode::Own(rank)`, the ownership being the combine group's: the caller's check) reads exactly the former.
+/// A width share ([`crate::moe_width`]) holds every expert at its columns: every valid pair gets the y of the rank's half of the
+/// expert width (its gate/up columns, its down K rows, the down epilogue on that half's sum), and the rank's part is
+/// [`CombineMode::All`].
 #[allow(clippy::too_many_arguments)]
 pub fn pairs_subbanks_rank(
     sb: &MoeSubbanks,
@@ -404,7 +411,7 @@ fn pairs_subbanks_on(
         if b.fused_gate_up() {
             pairs_bank(b, x, x_dtype, rows, s, os, order, false, st, mark)?;
         } else {
-            b.subbank_prefill_pairs_windowed(x, x_dtype, rows, s, sd, os, false, st)?;
+            b.subbank_prefill_pairs_windowed(x, x_dtype, rows, s, sd, os, false, crate::moe_subbanks::DownOut::Y, st)?;
             mark("split_gu_windows")?;
         }
     }
@@ -595,11 +602,13 @@ pub fn combine_dims(
     st: &Stream,
 ) -> Result<(), CudaError> {
     let row_bytes = rows * d.hidden * 4;
-    let (m, only) = match mode {
-        CombineMode::Both => (0, 0),
-        CombineMode::Own(g) if g < 2 => (1, g as i32),
+    // `All` is the one-group part: every expert id below the cut (the cut at E), group 0 alone
+    let (m, only, gsplit) = match mode {
+        CombineMode::Both => (0, 0, group_split(d.experts)),
+        CombineMode::Own(g) if g < 2 => (1, g as i32, group_split(d.experts)),
         CombineMode::Own(_) => return Err(INVALID),
-        CombineMode::Parts => (2, 0),
+        CombineMode::All => (1, 0, d.experts),
+        CombineMode::Parts => (2, 0, group_split(d.experts)),
     };
     if rows == 0
         || out.bytes() < row_bytes
@@ -627,7 +636,7 @@ pub fn combine_dims(
             d.topk as i32,
             d.hidden as i32,
             d.experts as i32,
-            group_split(d.experts) as i32,
+            gsplit as i32,
             only,
             st.raw(),
         ))

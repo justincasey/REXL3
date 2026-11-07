@@ -31,6 +31,7 @@
 use crate::exl3_linear::{Dtype, Exl3Weights};
 pub use crate::moe_owned::{combine_pairs, ExpertOwnership, OwnScratch};
 pub use crate::moe_subbanks::{subbank_partition, MoeSubbankLayer, MoeSubbanks, SubbankKey, SubbankRegion};
+pub use crate::moe_width::WidthShare;
 use crate::rt::{CudaError, DevBuf, Stream};
 use gb_exl3::checkpoint::{Checkpoint, LoadedGroup};
 use gb_exl3::f16::{f16_to_f64, f64_to_f16};
@@ -2144,10 +2145,12 @@ impl MoeScratch {
         self.fits_plans(d, (ex.plan_gu, ex.plan_d))
     }
 
+    /// Whether `d`'s banks with these plans fit: the same layer shape, or a width share's banks (`d.inter` below the scratch's: every
+    /// buffer sized by the expert width is then larger than they need).
     pub(crate) fn fits_plans(&self, d: &MoeDims, plans: ((usize, usize), (usize, usize))) -> bool {
         let (sk_gu, sk_d) = (plans.0 .0, plans.1 .0);
         self.dims.hidden == d.hidden
-            && self.dims.inter == d.inter
+            && self.dims.inter >= d.inter
             && self.dims.experts == d.experts
             && self.dims.topk == d.topk
             && self.z.bytes() >= (2 * sk_gu * self.max_rows * d.topk * d.inter).max(sk_d * self.max_rows * d.topk * d.hidden) * 4

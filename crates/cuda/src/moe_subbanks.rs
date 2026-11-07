@@ -44,7 +44,7 @@ const INVALID: CudaError = CudaError(1);
 pub const SPLIT_PREFILL: CudaError = CudaError(-1101);
 
 #[allow(non_snake_case)]
-mod ffi_multi {
+pub(crate) mod ffi_multi {
     use core::ffi::c_void;
     crate::launchers! {
         pub fn gb_moe_rot_in_multi(
@@ -112,35 +112,83 @@ mod ffi_multi {
     }
 }
 
+#[allow(non_snake_case)]
+pub(crate) mod ffi_width {
+    use core::ffi::c_void;
+    crate::launchers! {
+        pub fn gb_moe_down_combine_multi(
+            z: *const c_void,
+            pick: *const c_void,
+            svh: *const c_void,
+            wts: *const c_void,
+            shared: *const c_void,
+            y_pairs: *mut c_void,
+            out: *mut c_void,
+            rows: i32,
+            topk: i32,
+            d: i32,
+            sk: i32,
+            e: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn gb_moe_pf_down_raw(
+            xd: *const c_void,
+            tp: *const c_void,
+            items: *const c_void,
+            nitems: *const c_void,
+            spair: *const c_void,
+            y: *mut c_void,
+            k: i32,
+            n: i32,
+            bits: i32,
+            codebook: i32,
+            sk: i32,
+            wk: i32,
+            cap: i32,
+            stream: *mut c_void,
+        ) -> i32;
+    }
+}
+
+/// What a subbank's down stage writes into a pair row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DownOut {
+    /// The pair's `y` (the down epilogue: the K splits summed in split order, H, `* svh_down`).
+    Y,
+    /// The bank's ONE K split's partial alone (a down plan of one split; no H, no scale): a rank of the width split
+    /// ([`crate::moe_width`]), whose exchange sums the ranks' partials before the epilogue.
+    Partial,
+}
+
 /// A rank's experts of every subbank as one set of per-expert tables indexed by GLOBAL id, so the decode pairs stage runs each of its
 /// seven stages as ONE launch over every subbank (the picks stay global ids; each block finds its expert's width, trellis and scales in
 /// the tables). A block's arithmetic is the one-bank launch's: the plans are the shape's alone and every block runs the same
 /// `gemv_block` at its expert's width (`csrc/moe_experts.cu`), so each pair's `y` is the per-subbank chain's bit for bit.
-struct MultiTables {
+pub(crate) struct MultiTables {
     /// i32 `[E]`: `g` where this rank holds expert `g`, `-1` elsewhere (the remap's table).
     owned_ids: DevBuf,
     /// u64 `[E]` each: the trellis addresses of gate, up and down.
-    tp: [DevBuf; 3],
+    pub(crate) tp: [DevBuf; 3],
     /// i32 `[E]` each: the widths of gate, up and down.
-    bits: [DevBuf; 3],
+    pub(crate) bits: [DevBuf; 3],
     /// u64 `[E]` each: the suh rows of gate and up.
-    suh: [DevBuf; 2],
+    pub(crate) suh: [DevBuf; 2],
     /// u64 `[3][E]`: the svh_g, svh_u and suh_d rows (the gate/up epilogue's).
-    epi: DevBuf,
+    pub(crate) epi: DevBuf,
     /// u64 `[E]`: the svh_down rows.
-    svh_d: DevBuf,
+    pub(crate) svh_d: DevBuf,
     /// The widths present (bit `b - 1` for `b` bits) among gate and up, and among down.
-    widths_gu: i32,
-    widths_d: i32,
-    codebook: i32,
-    plan_gu: (usize, usize),
-    plan_d: (usize, usize),
+    pub(crate) widths_gu: i32,
+    pub(crate) widths_d: i32,
+    pub(crate) codebook: i32,
+    pub(crate) plan_gu: (usize, usize),
+    pub(crate) plan_d: (usize, usize),
 }
 
 impl MultiTables {
     /// The tables of `banks` (disjoint, covering the rank's experts), or `None` when they cannot share launches: different codebooks or
     /// plans (a test's override).
-    fn of(dims: MoeDims, banks: &[MoeExperts]) -> Result<Option<Self>, CudaError> {
+    pub(crate) fn of(dims: MoeDims, banks: &[MoeExperts]) -> Result<Option<Self>, CudaError> {
         let first = &banks[0];
         if banks.iter().any(|b| b.codebook != first.codebook || b.plan_gu != first.plan_gu || b.plan_d != first.plan_d) {
             return Ok(None);
@@ -385,7 +433,7 @@ impl MoeExperts {
 
     #[allow(clippy::too_many_arguments)]
     /// The decode pairs stage of one subbank: L1's [`MoeExperts::run_pairs`] with the filler optional and the split gate/up launch.
-    fn subbank_pairs(
+    pub(crate) fn subbank_pairs(
         &self,
         x: &DevBuf,
         x_dtype: Dtype,
@@ -393,13 +441,14 @@ impl MoeExperts {
         s: &mut MoeScratch,
         os: &mut OwnScratch,
         fill: bool,
+        out: DownOut,
         st: &Stream,
     ) -> Result<(), CudaError> {
         if x.bytes() < rows * self.dims.hidden * x_dtype.size() {
             return Err(INVALID);
         }
         let (xp, pick, wts, y) = (x.ptr(), s.pick.ptr(), s.wts.ptr(), s.y_pairs.ptr());
-        self.subbank_pairs_at(xp, x_dtype, rows, pick, wts, y, s, os, fill, st)
+        self.subbank_pairs_at(xp, x_dtype, rows, pick, wts, y, s, os, fill, out, st)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -418,6 +467,7 @@ impl MoeExperts {
         s: &mut MoeScratch,
         os: &mut OwnScratch,
         fill: bool,
+        out: DownOut,
         st: &Stream,
     ) -> Result<(), CudaError> {
         let d = self.dims;
@@ -430,6 +480,7 @@ impl MoeExperts {
             || os.dims.experts != d.experts
             || os.dims.topk != d.topk
             || !s.fits_plans(&d, plans)
+            || (out == DownOut::Partial && plans.1 .0 != 1)
             || s.xg.bytes() < rows * d.hidden * 4
         {
             return Err(INVALID);
@@ -542,6 +593,9 @@ impl MoeExperts {
                 d.limit,
                 st.raw(),
             ))?;
+            // `Partial` (one K split: z [1][P][hidden] is the pair rows' layout): the GEMV writes this subbank's pairs' partials
+            // straight into `y`, and nothing follows
+            let z = if out == DownOut::Partial { y } else { s.z.ptr() };
             check(ffi::gb_moe_gemv(
                 s.xd.ptr(),
                 s.xd.ptr(),
@@ -551,7 +605,7 @@ impl MoeExperts {
                 s.ucount.ptr(),
                 s.mcount.ptr(),
                 s.members.ptr(),
-                s.z.ptr(),
+                z,
                 1,
                 d.inter as i32,
                 d.hidden as i32,
@@ -563,6 +617,9 @@ impl MoeExperts {
                 umax as i32,
                 st.raw(),
             ))?;
+            if out == DownOut::Partial {
+                return Ok(());
+            }
             // the single-node down epilogue: y of this subbank's pairs only; its combined rows (no shared) go to s.xg, unused
             check(ffi::gb_moe_down_combine(
                 s.z.ptr(),
@@ -586,8 +643,9 @@ impl MoeExperts {
     /// The batched pairs stage of a SPLIT-WIDTH subbank (gate and up of different widths; no batched kernel takes it): the decode pairs
     /// stage over consecutive windows of at most `s.max_rows` rows, reading the window's rows of `x` and of the prefill scratch's picks and
     /// weights, and writing the window's pair rows of `ps.y_pairs` in place (the decode down epilogue writes only this subbank's pairs;
-    /// with `fill` the window's other pair rows get the `-0.0` filler). A pair's `y` is the decode path's, which is the batched path's
-    /// bit for bit (`tests/moe_prefill.rs`, and `tests/moe_subbanks.rs` per pair on the RED-SNOW layers). Clobbers `s` (not its picks).
+    /// with `fill` the window's other pair rows get the `-0.0` filler; `out`: `y`, or a width share's K-split partial). A pair's `y` is
+    /// the decode path's, which is the batched path's bit for bit (`tests/moe_prefill.rs`, and `tests/moe_subbanks.rs` per pair on the
+    /// RED-SNOW layers). Clobbers `s` (not its picks).
     pub(crate) fn subbank_prefill_pairs_windowed(
         &self,
         x: &DevBuf,
@@ -597,6 +655,7 @@ impl MoeExperts {
         s: &mut MoeScratch,
         os: &mut OwnScratch,
         fill: bool,
+        out: DownOut,
         st: &Stream,
     ) -> Result<(), CudaError> {
         let d = self.dims;
@@ -625,6 +684,7 @@ impl MoeExperts {
                 s,
                 os,
                 fill,
+                out,
                 st,
             )?;
             a += n;
@@ -633,7 +693,8 @@ impl MoeExperts {
     }
 
     #[allow(clippy::too_many_arguments)]
-    /// The batched pairs stage of one subbank: L1's [`MoeExperts::run_prefill_pairs`] with the filler optional.
+    /// The batched pairs stage of one subbank: L1's [`MoeExperts::run_prefill_pairs`] with the filler optional (`out`: `y`, or a width
+    /// share's K-split partial).
     fn subbank_prefill_pairs(
         &self,
         x: &DevBuf,
@@ -642,6 +703,7 @@ impl MoeExperts {
         s: &mut PrefillScratch,
         os: &mut OwnScratch,
         fill: bool,
+        out: DownOut,
         st: &Stream,
     ) -> Result<(), CudaError> {
         let d = self.dims;
@@ -657,6 +719,7 @@ impl MoeExperts {
             || os.dims.experts != d.experts
             || os.dims.topk != d.topk
             || x.bytes() < rows * d.hidden * x_dtype.size()
+            || (out == DownOut::Partial && self.plan_d.0 != 1)
         {
             return Err(INVALID);
         }
@@ -724,6 +787,24 @@ impl MoeExperts {
                 d.limit,
                 st.raw(),
             ))?;
+            if out == DownOut::Partial {
+                return check(ffi_width::gb_moe_pf_down_raw(
+                    s.xd.ptr(),
+                    self.down_ptrs.ptr(),
+                    s.items.ptr(),
+                    s.nitems.ptr(),
+                    s.spair.ptr(),
+                    s.y_pairs.ptr(),
+                    d.inter as i32,
+                    d.hidden as i32,
+                    self.bits_d as i32,
+                    cb,
+                    sk_d as i32,
+                    wk_d as i32,
+                    s.cap as i32,
+                    st.raw(),
+                ));
+            }
             check(ffi::gb_moe_pf_down(
                 s.xd.ptr(),
                 self.down_ptrs.ptr(),
@@ -745,14 +826,20 @@ impl MoeExperts {
     }
 }
 
-/// One rank's routed experts of one MoE layer as homogeneous subbanks (see the module documentation).
+/// One rank's routed experts of one MoE layer as homogeneous subbanks (see the module documentation), or a rank's WIDTH SHARE of every
+/// expert ([`crate::moe_width`]: `width` set, every bank at the share's half of the expert width).
 pub struct MoeSubbanks {
-    /// `dims.experts` is the GLOBAL count.
+    /// `dims.experts` is the GLOBAL count; `dims.inter` the whole expert width (a width share's banks hold `dims.inter / ranks`).
     pub dims: MoeDims,
-    own: ExpertOwnership,
-    banks: Vec<MoeExperts>,
+    pub(crate) own: ExpertOwnership,
+    pub(crate) banks: Vec<MoeExperts>,
     /// The banks' experts as one set of tables (`None`: the banks differ in codebook or plan, and each runs its own chain).
-    multi: Option<MultiTables>,
+    pub(crate) multi: Option<MultiTables>,
+    /// `Some`: this rank holds its columns of every expert ([`crate::moe_width::WidthShare`]), and its pairs stage leaves K-split
+    /// partials that the exchange sums and [`MoeSubbanks::finish`] turns into the layer's output.
+    pub(crate) width: Option<crate::moe_width::WidthShare>,
+    /// A width share's u64 `[E]` svh_down row addresses by global id (the down epilogue after the exchange).
+    pub(crate) svh_tab: Option<DevBuf>,
 }
 
 impl MoeSubbanks {
@@ -787,7 +874,7 @@ impl MoeSubbanks {
             }
         }
         let multi = MultiTables::of(dims, &banks)?;
-        Ok(Self { dims, own, banks, multi })
+        Ok(Self { dims, own, banks, multi, width: None, svh_tab: None })
     }
 
     /// From every expert's loaded groups (global id order; only the owned ones are read): partitions `own` by key and uploads each
@@ -812,33 +899,15 @@ impl MoeSubbanks {
         let parts = subbank_partition(&keys, &own).map_err(|_| INVALID)?;
         let mut banks = Vec::with_capacity(parts.len());
         for (key, o) in parts {
-            let n = o.local();
-            let (lay, end) = SubbankRegion::stacked(key, n, dims.hidden, dims.inter, 0, 256);
-            let mut host = vec![0u8; end.div_ceil(256) * 256];
-            let put16 = |host: &mut Vec<u8>, off: usize, v: &[u16]| {
-                for (j, h) in v.iter().enumerate() {
-                    host[off + 2 * j..off + 2 * j + 2].copy_from_slice(&h.to_le_bytes());
-                }
-            };
-            for (l, &g) in o.owned().iter().enumerate() {
-                let g = g as usize;
-                for (grp, p) in [(&gate[g], &lay.gate), (&up[g], &lay.up), (&down[g], &lay.down)] {
-                    if grp.trellis.len() * 2 != p.trellis_stride || grp.group.k * grp.group.n == 0 {
-                        return Err(INVALID);
-                    }
-                    let t: Vec<u16> = grp.trellis.iter().map(|&v| v as u16).collect();
-                    put16(&mut host, p.trellis + l * p.trellis_stride, &t);
-                    let suh: Vec<u16> = grp.suh.iter().map(|&v| f64_to_f16(v)).collect();
-                    let svh: Vec<u16> = grp.svh.iter().map(|&v| f64_to_f16(v)).collect();
-                    put16(&mut host, p.suh + l * grp.group.k * 2, &suh);
-                    put16(&mut host, p.svh + l * grp.group.n * 2, &svh);
-                }
-            }
-            let mut region = DevBuf::zeroed_view(host.len())?;
-            region.upload(&host)?;
+            let (region, lay) = upload_subbank(gate, up, down, key, &o, dims.hidden, dims.inter)?;
             banks.push(MoeExperts::from_region_subbank(region, &lay, dims, o)?);
         }
         Self::new(dims, own, banks)
+    }
+
+    /// The width share of these subbanks (`None`: whole experts).
+    pub fn width_share(&self) -> Option<crate::moe_width::WidthShare> {
+        self.width
     }
 
     pub fn ownership(&self) -> &ExpertOwnership {
@@ -860,23 +929,26 @@ impl MoeSubbanks {
 
     /// The tables of one launch a stage, when every bank still runs the codebook and plans they were built for (a test may override a
     /// bank's plan after construction).
-    fn multi(&self) -> Option<&MultiTables> {
+    pub(crate) fn multi(&self) -> Option<&MultiTables> {
         self.multi.as_ref().filter(|m| {
             self.banks.iter().all(|b| codebook_code(b.codebook) == m.codebook && b.plan_gu == m.plan_gu && b.plan_d == m.plan_d)
         })
     }
 
-    /// Launches one decode call makes (the pairs stage: seven over every subbank at once, or each subbank's chain; then one combine).
+    /// Launches one decode call makes (the pairs stage: seven over every subbank at once, or each subbank's chain; then one combine; a
+    /// width share: five over every subbank at once, or each subbank's chain without its down epilogue, then the finish).
     pub fn decode_launches(&self) -> usize {
-        match self.multi() {
-            Some(_) => 7 + 1,
-            None => self.banks.iter().map(|b| if b.fused_gate_up() { 7 } else { 8 }).sum::<usize>() + 1,
+        match (self.multi(), self.width.is_some()) {
+            (Some(_), false) => 7 + 1,
+            (Some(_), true) => 5 + 1,
+            (None, w) => self.banks.iter().map(|b| (if b.fused_gate_up() { 7 } else { 8 }) - usize::from(w)).sum::<usize>() + 1,
         }
     }
 
     /// The decode pairs stage of this rank (1..=`s.max_rows` rows). `s.y_pairs` then holds, per pair, the `y` of the subbank that holds
     /// its pick, or `-0.0` when this rank holds none. Clobbers `s.xg`. Every stage runs as one launch over all the subbanks
-    /// ([`MultiTables`]); banks that cannot share launches run in order, the first one writing the `-0.0` filler.
+    /// ([`MultiTables`]); banks that cannot share launches run in order, the first one writing the `-0.0` filler. A width share leaves
+    /// instead its K-split partial of every valid pair ([`crate::moe_width`]; [`MoeSubbanks::finish`] after the exchange).
     pub fn run_pairs(
         &self,
         x: &DevBuf,
@@ -886,11 +958,14 @@ impl MoeSubbanks {
         os: &mut OwnScratch,
         st: &Stream,
     ) -> Result<(), CudaError> {
+        if self.width.is_some() {
+            return self.width_pairs(x, x_dtype, rows, s, os, st);
+        }
         if let Some(m) = self.multi() {
             return self.multi_pairs(m, x, x_dtype, rows, s, os, st);
         }
         for (i, b) in self.banks.iter().enumerate() {
-            b.subbank_pairs(x, x_dtype, rows, s, os, i == 0, st)?;
+            b.subbank_pairs(x, x_dtype, rows, s, os, i == 0, DownOut::Y, st)?;
         }
         Ok(())
     }
@@ -1031,8 +1106,9 @@ impl MoeSubbanks {
         if self.banks.iter().any(|b| !b.fused_gate_up()) {
             return Err(SPLIT_PREFILL);
         }
+        let out = self.down_out();
         for (i, b) in self.banks.iter().enumerate() {
-            b.subbank_prefill_pairs(x, x_dtype, rows, s, os, i == 0, st)?;
+            b.subbank_prefill_pairs(x, x_dtype, rows, s, os, i == 0 && out == DownOut::Y, out, st)?;
         }
         Ok(())
     }
@@ -1056,14 +1132,25 @@ impl MoeSubbanks {
         if s.dims != self.dims {
             return Err(INVALID);
         }
+        let out = self.down_out();
         for (i, b) in self.banks.iter().enumerate() {
+            let fill = i == 0 && out == DownOut::Y;
             if b.fused_gate_up() {
-                b.subbank_prefill_pairs(x, x_dtype, rows, ps, os, i == 0, st)?;
+                b.subbank_prefill_pairs(x, x_dtype, rows, ps, os, fill, out, st)?;
             } else {
-                b.subbank_prefill_pairs_windowed(x, x_dtype, rows, ps, s, os, i == 0, st)?;
+                b.subbank_prefill_pairs_windowed(x, x_dtype, rows, ps, s, os, fill, out, st)?;
             }
         }
         Ok(())
+    }
+
+    /// What the pairs stages leave in a pair row: `y`, or a width share's K-split partial.
+    fn down_out(&self) -> DownOut {
+        if self.width.is_some() {
+            DownOut::Partial
+        } else {
+            DownOut::Y
+        }
     }
 
     /// Whether some subbank has split gate/up widths (its batched stage runs through [`MoeSubbanks::run_prefill_pairs_windowed`]).
@@ -1085,7 +1172,7 @@ impl MoeSubbanks {
         os: &mut OwnScratch,
         st: &Stream,
     ) -> Result<(), CudaError> {
-        if !self.own.is_all() {
+        if !self.own.is_all() || self.width.is_some() {
             return Err(INVALID);
         }
         self.run_pairs(x, x_dtype, rows, s, os, st)?;
@@ -1105,12 +1192,49 @@ impl MoeSubbanks {
         os: &mut OwnScratch,
         st: &Stream,
     ) -> Result<(), CudaError> {
-        if !self.own.is_all() {
+        if !self.own.is_all() || self.width.is_some() {
             return Err(INVALID);
         }
         self.run_prefill_pairs(x, x_dtype, rows, s, os, st)?;
         combine_pairs(&s.y_pairs, &s.pick, &s.wts, shared, out, rows, &self.dims, st)
     }
+}
+
+/// One subbank's experts (`o`'s ids, of `gate` / `up` / `down` indexed by global id) uploaded into a region of its own, laid out by
+/// [`SubbankRegion::stacked`] at `hidden` x `inter` (the loader's layout: what [`MoeExperts::from_region_subbank`] reads).
+pub(crate) fn upload_subbank(
+    gate: &[LoadedGroup],
+    up: &[LoadedGroup],
+    down: &[LoadedGroup],
+    key: SubbankKey,
+    o: &ExpertOwnership,
+    hidden: usize,
+    inter: usize,
+) -> Result<(DevBuf, SubbankRegion), CudaError> {
+    let (lay, end) = SubbankRegion::stacked(key, o.local(), hidden, inter, 0, 256);
+    let mut host = vec![0u8; end.div_ceil(256) * 256];
+    let put16 = |host: &mut Vec<u8>, off: usize, v: &[u16]| {
+        for (j, h) in v.iter().enumerate() {
+            host[off + 2 * j..off + 2 * j + 2].copy_from_slice(&h.to_le_bytes());
+        }
+    };
+    for (l, &g) in o.owned().iter().enumerate() {
+        let g = g as usize;
+        for (grp, p) in [(&gate[g], &lay.gate), (&up[g], &lay.up), (&down[g], &lay.down)] {
+            if grp.trellis.len() * 2 != p.trellis_stride || grp.group.k * grp.group.n == 0 {
+                return Err(INVALID);
+            }
+            let t: Vec<u16> = grp.trellis.iter().map(|&v| v as u16).collect();
+            put16(&mut host, p.trellis + l * p.trellis_stride, &t);
+            let suh: Vec<u16> = grp.suh.iter().map(|&v| f64_to_f16(v)).collect();
+            let svh: Vec<u16> = grp.svh.iter().map(|&v| f64_to_f16(v)).collect();
+            put16(&mut host, p.suh + l * grp.group.k * 2, &suh);
+            put16(&mut host, p.svh + l * grp.group.n * 2, &svh);
+        }
+    }
+    let mut region = DevBuf::zeroed_view(host.len())?;
+    region.upload(&host)?;
+    Ok((region, lay))
 }
 
 /// Router plus subbanked routed experts of one layer (the loader's object for a mixed-width layer or a rank's partial bank; a uniform

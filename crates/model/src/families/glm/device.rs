@@ -267,9 +267,22 @@ impl Binder<'_> {
                 SubbankRegion { gate: off(&sb.layout.gate), up: off(&sb.layout.up), down: off(&sb.layout.down), key: sb.key };
             let own = ExpertOwnership::from_ids(self.moe.experts, sb.ids.clone())
                 .map_err(|e| cfg_err(format!("layer {} subbank {:?}: {e}", bank.layer, sb.key)))?;
-            banks.push(MoeExperts::from_region_subbank(region.subview(0, region.bytes()), &lay, self.moe, own).map_err(err)?);
+            let sub = region.subview(0, region.bytes());
+            banks.push(
+                match bank.width {
+                    // a width share: the subbank holds its experts' columns at the share's width, run with the whole width's plans
+                    Some(share) => MoeExperts::from_region_width(sub, &lay, self.moe, share, own),
+                    None => MoeExperts::from_region_subbank(sub, &lay, self.moe, own),
+                }
+                .map_err(err)?,
+            );
         }
-        MoeSubbanks::new(self.moe, bank.own.clone(), banks).map(BoundExperts::Subbanks).map_err(err)
+        match bank.width {
+            Some(share) => MoeSubbanks::new_width(self.moe, share, banks),
+            None => MoeSubbanks::new(self.moe, bank.own.clone(), banks),
+        }
+        .map(BoundExperts::Subbanks)
+        .map_err(err)
     }
 
     /// One MLA layer's tensors (`index`: the layer's checkpoint index, for the messages).
