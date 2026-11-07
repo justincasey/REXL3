@@ -184,6 +184,14 @@ pub(crate) struct MultiTables {
     pub(crate) codebook: i32,
     pub(crate) plan_gu: (usize, usize),
     pub(crate) plan_d: (usize, usize),
+    /// i32 `[E]`: `g` where this rank holds expert `g` in a bank of one gate/up width (`fused_gate_up`: the P2 prefill GEMMs take it), `-1`
+    /// elsewhere (a split gate/up bank's experts, the experts the rank does not hold): the remap of a P2 prefill's one launch a stage.
+    pub(crate) fused_ids: DevBuf,
+    /// `fused_ids` is the identity (every expert held, none in a split gate/up bank): the picks need no remap.
+    pub(crate) fused_all: bool,
+    /// The widest bits among the fused banks' gate/up and among their down (0: no fused bank).
+    pub(crate) wmax_gu: i32,
+    pub(crate) wmax_d: i32,
 }
 
 impl MultiTables {
@@ -202,6 +210,8 @@ impl MultiTables {
         let mut epi = vec![0u64; 3 * e];
         let mut svh_d = vec![0u64; e];
         let (mut widths_gu, mut widths_d) = (0i32, 0i32);
+        let mut fused_ids = vec![-1i32; e];
+        let (mut wmax_gu, mut wmax_d) = (0i32, 0i32);
         for b in banks {
             let o = b.own.as_ref().ok_or(INVALID)?;
             let el = o.own.local();
@@ -216,9 +226,17 @@ impl MultiTables {
             let widths = [b.bits_gu, b.bits_u, b.bits_d];
             widths_gu |= (1 << (widths[0] - 1)) | (1 << (widths[1] - 1));
             widths_d |= 1 << (widths[2] - 1);
+            let fused = b.fused_gate_up();
+            if fused {
+                wmax_gu = wmax_gu.max(b.bits_gu as i32);
+                wmax_d = wmax_d.max(b.bits_d as i32);
+            }
             for (l, &g) in o.own.owned().iter().enumerate() {
                 let (g, l64) = (g as usize, l as u64);
                 owned_ids[g] = g as i32;
+                if fused {
+                    fused_ids[g] = g as i32;
+                }
                 for m in 0..3 {
                     tp[m][g] = ptrs[m][l];
                     bits[m][g] = widths[m] as i32;
@@ -245,6 +263,10 @@ impl MultiTables {
             codebook: codebook_code(first.codebook),
             plan_gu: first.plan_gu,
             plan_d: first.plan_d,
+            fused_all: fused_ids.iter().enumerate().all(|(g, &v)| v == g as i32),
+            fused_ids: upi(&fused_ids)?,
+            wmax_gu,
+            wmax_d,
         }))
     }
 }
