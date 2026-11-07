@@ -161,4 +161,36 @@ __device__ __forceinline__ void fwht128(float (&v)[4], int lane) {
 
 constexpr float HAD_SCALE = 0.08838834764831845f;   // 1 / sqrt(128)
 
+// The decode GEMVs' cp.async rings (moe_experts.cu gemv_block_pipe, exl3_linear.cu linear_pipe_kernel): a warp streams its k steps
+// into ring_stages(K2) slots of shared memory, each a step's weights (its 8 contiguous 16 x 16 tiles: one 128-column block) and the
+// step's x words of a 16-row pass (16 halves of each row), ring_stages - 1 steps ahead of the step it multiplies. A warp's ring is at
+// most 6 KB: 4 slots at 3 and 4 bits, 3 at 5 and 6, 2 at 7 and 8 (two steps in flight at 6 bits: one leaves the step's latency exposed
+// behind its arithmetic). Four blocks of 4 warps (or two of 8) with no other shared memory fill an SM's 100 KB, 1 KB a block reserved.
+constexpr int kRingWarpBytes = 6144;
+
+// 32-bit words of a step's weights (8 tiles of tile_words<K2>() = 4 K2 words) and of a slot (and the x words of 16 rows)
+__host__ __device__ constexpr int ring_step_words(int k2) {
+    return 32 * k2;
+}
+
+__host__ __device__ constexpr int ring_slot_words(int k2) {
+    return ring_step_words(k2) + 16 * 8;
+}
+
+__host__ __device__ constexpr int ring_stages(int k2) {
+    return kRingWarpBytes / (4 * ring_slot_words(k2)) < 2 ? 2 : kRingWarpBytes / (4 * ring_slot_words(k2));
+}
+
+__device__ __forceinline__ void ring_cp16(void* dst, const void* src) {
+    const unsigned s = (unsigned)__cvta_generic_to_shared(dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(src) : "memory");
+}
+
+__device__ __forceinline__ void ring_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+
+template <int N>
+__device__ __forceinline__ void ring_wait() {
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory");
+}
+
 }  // namespace gbx

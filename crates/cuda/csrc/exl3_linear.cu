@@ -408,6 +408,143 @@ __global__ void __launch_bounds__(WK * 32, 1) linear_kernel(
     }
 }
 
+// linear_kernel's decode pass (M <= 16 rows: one 16-row pass, NT = 1, one sweep) at the unshuffled widths, with its loads ahead of the
+// arithmetic: each warp streams its k steps through a cp.async ring (exl3_linear_decode.cuh: ring_stages(K2) slots, each the step's 8
+// tiles of the block's 128 columns and the step's x words of the 16 row slots, row r of the pass min(r, M - 1) as linear_kernel clamps
+// it), ring_stages - 1 steps ahead; linear_kernel holds the next step's weights in registers and loads each step's x words at the step.
+// Every lane word and x word, the tile order, a warp's mma chain, the warp-order sums, the split partials and the finish are
+// linear_kernel<K2, CB, WK, 1, 1>'s, so every output is its bit for bit. The weights of the first steps are copied before the PDL wait
+// (they are the layer's; linear_kernel prefetches them into L2 there), the x words after it. Shared memory (dynamic): the warps' rings,
+// which red (WK * RH * 128 floats) reuses once every warp's loop is done. T, its strides and xh are 16-byte aligned (the dispatcher
+// checks T). At most 128 registers a thread: two 8-warp blocks or four 4-warp blocks an SM.
+template <int K2, int CB, int WK>
+__global__ void __launch_bounds__(WK * 32, 16 / WK) linear_pipe_kernel(
+    const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
+    const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype,
+    float* __restrict__ Z, int M, int K, int N, int SK, int ZM) {
+    static_assert(!step_shuffled<K2>(), "the shuffled widths keep linear_kernel");
+    constexpr int TW = tile_words<K2>(), LW = lane_words<K2>(), SW = ring_step_words(K2), LS = ring_slot_words(K2), S = ring_stages(K2);
+    constexpr int CH = SW / 4, RC = 128;
+    static_assert(SW == 8 * TW && SW % 4 == 0, "a step is its 8 tiles, whole 16-byte chunks");
+    extern __shared__ __align__(16) uint32_t lsm[];
+    float* red = reinterpret_cast<float*>(lsm);
+    const int RH = min(M, 8);
+
+    const int nb = blockIdx.x, split = blockIdx.y;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int per_warp = (K >> 4) / SK / WK;
+    const int kt0 = split * (per_warp * WK) + warp * per_warp;
+    const uint32_t* steps = T + nb * stride_nb + (size_t)kt0 * stride_k;
+    const int col0 = nb * 128;
+    uint32_t* wring = lsm + warp * S * LS;
+    int word, offset;
+    lane_start<K2>(lane, word, offset);
+    auto issue_w = [&](int i) {
+        const uint4* src = reinterpret_cast<const uint4*>(steps + (size_t)i * stride_k);
+        uint4* dst = reinterpret_cast<uint4*>(wring + (i % S) * LS);
+#pragma unroll
+        for (int q = 0; q < (CH + 31) / 32; ++q) {
+            const int c = lane + 32 * q;
+            if (CH % 32 == 0 || c < CH) ring_cp16(dst + c, src + c);
+        }
+    };
+    // lane l: the halves 8 (l & 1) .. 8 (l & 1) + 7 of a step's 16 of row slot l / 2
+    const half* xr = xh + (size_t)min(lane >> 1, M - 1) * K + kt0 * 16 + 8 * (lane & 1);
+    auto issue_x = [&](int i) { ring_cp16(wring + (i % S) * LS + SW + 4 * lane, xr + (size_t)i * 16); };
+
+#pragma unroll
+    for (int s = 0; s < S - 1; ++s)
+        if (s < per_warp) issue_w(s);
+    pdl_wait();                                              // the rotated input (xh) is the predecessor's output
+#pragma unroll
+    for (int s = 0; s < S - 1; ++s) {
+        if (s < per_warp) issue_x(s);
+        ring_commit();
+    }
+
+    float acc[8][2][4];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+#pragma unroll
+            for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
+    int slot = 0;
+#pragma unroll 1
+    for (int i = 0; i < per_warp; ++i) {
+        ring_wait<S - 2>();
+        __syncwarp();                                        // every lane's copies of step i landed; every lane is done with step i - 1's slot
+        if (i + S - 1 < per_warp) {
+            issue_w(i + S - 1);
+            issue_x(i + S - 1);
+        }
+        ring_commit();
+        const uint32_t* st = wring + slot * LS;
+        uint32_t a[4];
+        a[0] = st[SW + g * 8 + t];
+        a[1] = st[SW + (g + 8) * 8 + t];
+        a[2] = st[SW + g * 8 + 4 + t];
+        a[3] = st[SW + (g + 8) * 8 + 4 + t];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            uint32_t w[LW];
+#pragma unroll
+            for (int q = 0; q < LW; ++q) w[q] = st[j * TW + (word + q) % TW];
+            uint32_t b0[2], b1[2];
+            decode_lane<K2, CB>(w, lane, b0, b1);
+            mma16816(acc[j][0], a, b0);
+            mma16816(acc[j][1], a, b1);
+        }
+        slot = slot + 1 == S ? 0 : slot + 1;
+    }
+    ring_wait<0>();
+    pdl_trigger();                                           // xh is read: the successor may launch
+
+    // linear_kernel's sums: added in warp order, rows 0-7 and then rows 8-15 of the pass
+    const int R = min(16, M);
+    for (int rlo = 0; rlo < R; rlo += 8) {
+        const int rn = min(R - rlo, 8);
+        __syncthreads();                                     // every warp's ring is done; red is reused by the second half
+        if (g < RH) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int col = i * 16 + h * 8 + 2 * t;
+                    *reinterpret_cast<float2*>(red + (warp * RH + g) * RC + col) =
+                        rlo ? make_float2(acc[i][h][2], acc[i][h][3]) : make_float2(acc[i][h][0], acc[i][h][1]);
+                }
+        }
+        __syncthreads();
+        if (SK == 1 && !ZM) {
+            for (int r = warp; r < rn; r += WK) {
+                float v[4];
+                const float4 u = *reinterpret_cast<const float4*>(red + r * RC + 4 * lane);
+                v[0] = u.x; v[1] = u.y; v[2] = u.z; v[3] = u.w;
+#pragma unroll
+                for (int w = 1; w < WK; ++w) {
+                    const float4 q = *reinterpret_cast<const float4*>(red + (w * RH + r) * RC + 4 * lane);
+                    v[0] += q.x; v[1] += q.y; v[2] += q.z; v[3] += q.w;
+                }
+                finish(v, lane, svh, bias, col0 + 4 * lane);
+                store4(y, y_dtype, (size_t)(rlo + r) * N + col0 + 4 * lane, v);
+            }
+            continue;
+        }
+        for (int idx = threadIdx.x; idx < rn * (RC / 4); idx += WK * 32) {
+            const int r = idx / (RC / 4), c = 4 * (idx % (RC / 4));
+            float4 s = *reinterpret_cast<const float4*>(red + r * RC + c);
+#pragma unroll
+            for (int w = 1; w < WK; ++w) {
+                const float4 q = *reinterpret_cast<const float4*>(red + (w * RH + r) * RC + c);
+                s.x += q.x; s.y += q.y; s.z += q.z; s.w += q.w;
+            }
+            *reinterpret_cast<float4*>(Z + ((size_t)split * M + rlo + r) * N + col0 + c) = s;
+        }
+    }
+}
+
 // W_q [K, N] fp16 from the trellis words (tile (kt, nt) at kt * stride_k + (nt / 8) * stride_nb): one warp per tile.
 template <int K2, int CB>
 __global__ void __launch_bounds__(32) unpack_kernel(const uint32_t* __restrict__ T, half* __restrict__ W, int N,
@@ -512,6 +649,27 @@ void launch_linear_nt(const LinArgs& a, const dim3& grid, int rh, cudaStream_t s
     }
 }
 
+// The decode pass (one 16-row pass) through linear_pipe_kernel: false (nothing launched) at the shuffled widths or for a trellis that is
+// not 16-byte aligned, which linear_kernel runs.
+template <int K2, int CB>
+bool launch_linear_pipe(const LinArgs& a, const dim3& grid, int rh, cudaStream_t st) {
+    if constexpr (step_shuffled<K2>()) {
+        return false;
+    } else {
+        if ((reinterpret_cast<uintptr_t>(a.T) | (uintptr_t)a.stride_k * 4 | (uintptr_t)a.stride_nb * 4) & 15) return false;
+        const size_t ring = (size_t)ring_stages(K2) * ring_slot_words(K2) * 4, red = (size_t)rh * 128 * sizeof(float);
+        const size_t warp_bytes = ring > red ? ring : red;
+        if (a.plan.wk == 4) {
+            launch_k(a.pdl, linear_pipe_kernel<K2, CB, 4>, grid, dim3(128), 4 * warp_bytes, st, a.xh, a.T, a.stride_k, a.stride_nb, a.svh,
+                     a.bias, a.y, a.y_dtype, a.Z, a.M, a.K, a.N, a.plan.sk, a.zmode);
+        } else {
+            launch_k(a.pdl, linear_pipe_kernel<K2, CB, 8>, grid, dim3(256), 8 * warp_bytes, st, a.xh, a.T, a.stride_k, a.stride_nb, a.svh,
+                     a.bias, a.y, a.y_dtype, a.Z, a.M, a.K, a.N, a.plan.sk, a.zmode);
+        }
+        return true;
+    }
+}
+
 template <int K2, int CB>
 int launch_linear(const LinArgs& a, cudaStream_t st) {
     const dim3 grid((unsigned)(a.N / 128), (unsigned)a.plan.sk);
@@ -520,7 +678,9 @@ int launch_linear(const LinArgs& a, cudaStream_t st) {
         case 4: launch_linear_nt<K2, CB, 4, sweeps_of<K2, CB>(4)>(a, grid, rh, st); break;
         case 3: launch_linear_nt<K2, CB, 3, sweeps_of<K2, CB>(3)>(a, grid, rh, st); break;
         case 2: launch_linear_nt<K2, CB, 2, sweeps_of<K2, CB>(2)>(a, grid, rh, st); break;
-        default: launch_linear_nt<K2, CB, 1, sweeps_of<K2, CB>(1)>(a, grid, rh, st); break;
+        default:
+            if (!launch_linear_pipe<K2, CB>(a, grid, rh, st)) launch_linear_nt<K2, CB, 1, sweeps_of<K2, CB>(1)>(a, grid, rh, st);
+            break;
     }
     const int rc = GB_CHECK_LAUNCH();
     if (rc || a.plan.sk == 1 || a.zmode) return rc;
