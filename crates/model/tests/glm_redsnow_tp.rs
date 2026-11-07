@@ -1387,15 +1387,26 @@ fn cache_script(m: &mut GlmModel, cached: bool, bound: usize) -> (Vec<u64>, Vec<
     (out, drafts)
 }
 
-/// The two ranks of the serving group (`tp_boot::load_rank_with`'s moves on the test's load): the expert WIDTH split (every expert at the
-/// rank's columns), the head split of `REXL3_GLM_TP_SPLIT` (default all five), P2 with the sequence-parallel residual, rank 0 drafting
-/// with `draft` (both ranks relaying its taps), the stash of `room` rows and four snapshot slots on each rank.
+/// The two ranks of the serving group (`tp_boot::plan_from_split` and `load_rank_with`'s moves on the test's load): the expert WIDTH
+/// split (every expert at the rank's columns), the head split of `REXL3_GLM_TP_SPLIT` (default all five; under the KDA split the rank is
+/// built from its heads' strips, so its state and its snapshot slots are its heads'), P2 with the sequence-parallel residual, rank 0
+/// drafting with `draft` (both ranks relaying its taps), the stash of `room` rows and four snapshot slots on each rank.
 fn serving_ranks(dir: &Path, layers: usize, draft: Option<&Path>, taps: &[usize], room: usize) -> (GlmModel, GlmModel) {
+    use gb_model::families::glm::{GlmConfig, GlmPack};
     assert!(gb_model::families::glm::contract::p2_sp_on(), "REXL3_GLM_P2_SP is off: the serving residual would not be tested");
     let bits = gb_model::families::glm::model::tp::split_from_env().unwrap();
     let mut ms: Vec<GlmModel> = (0..2)
         .map(|r| {
-            let (mut m, _) = load_width(dir, layers, r);
+            gb_cuda::rt::init_context().unwrap();
+            let mut cfg = GlmConfig::from_dir(dir).unwrap().with_expert_width(r, 2).unwrap();
+            if bits & gb_model::families::glm::model::tp::SPLIT_KDA != 0 {
+                cfg = cfg.with_kda_rank(r, 2).unwrap();
+            }
+            let ck = gb_exl3::checkpoint::scan(dir, false).unwrap();
+            let pack = GlmPack::from_checkpoint_with(&ck, cfg, true).unwrap();
+            let b = boot_mapped(dir, pack, Some(layers), &LoadOptions::from_env(20 * GIB), 0.0).unwrap();
+            let mo = ModelOptions { slots: SLOTS, kv_blocks: 64, max_context: 8192, layers };
+            let mut m = GlmModel::new_chunked(b.pack.config.clone(), b.device, &mo, CHUNK).unwrap();
             m.set_prefill_contract(PrefillContract::P2).unwrap();
             m
         })
