@@ -10,7 +10,7 @@ use axum::{
 use std::{
     fmt::Write,
     sync::{
-        atomic::{AtomicU64, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
         Arc, Mutex,
     },
     time::Instant,
@@ -30,11 +30,45 @@ pub const ROUTES: &[&str] = &[
     "/v1/decisions",
     "other",
 ];
-#[derive(Clone, Copy)]
-pub struct Arrival(pub Instant);
+/// When a request entered the middleware, and for a generation request the mark that keeps it counted in
+/// [`Observability::arriving`] until the engine has answered its submit.
+#[derive(Clone)]
+pub struct Arrival(pub Instant, pub ArrivalMark);
+
+/// A generation request's place in [`Observability::arriving`]: settled once (the engine answered its submit, or the request ended
+/// before submitting), whichever comes first.
+#[derive(Clone, Default)]
+pub struct ArrivalMark(Option<Arc<AtomicBool>>);
+
+impl ArrivalMark {
+    fn counted(o: &Observability) -> Self {
+        o.arriving.fetch_add(1, Relaxed);
+        Self(Some(Arc::new(AtomicBool::new(true))))
+    }
+    /// The request no longer arrives: it is queued, refused, or gone.
+    pub fn settle(&self, o: &Observability) {
+        if self.0.as_ref().is_some_and(|f| f.swap(false, Relaxed)) {
+            o.arriving.fetch_sub(1, Relaxed);
+        }
+    }
+}
+
+/// Settles its mark when dropped (the middleware's future ended or was dropped).
+struct Settle<'a>(&'a Observability, ArrivalMark);
+
+impl Drop for Settle<'_> {
+    fn drop(&mut self) {
+        self.1.settle(self.0);
+    }
+}
+
 #[derive(Default)]
 pub struct Observability {
     pub http_entered: AtomicU64,
+    /// Generation requests (`/v1/chat/completions`, `/v1/completions`) that have entered the middleware and whose submit the engine
+    /// has not answered yet (parsing, templating, tokenizing, or their submit waiting in the engine's inbox). The serving loop waits
+    /// its gather window for these only (`runtime::run`): a request that wakes an idle engine alone starts at once.
+    pub arriving: AtomicU64,
     pub http_codes: [AtomicU64; 15],
     pub http_route_codes: [[AtomicU64; CODES.len() + 1]; ROUTES.len()],
     pub token_batches: AtomicU64,
@@ -218,7 +252,15 @@ pub async fn middleware(State(s): State<Arc<AppState>>, mut req: Request, next: 
     };
     let m = &s.handle.metrics.observability;
     m.http_entered.fetch_add(1, Relaxed);
-    req.extensions_mut().insert(Arrival(at));
+    // a generation request arrives until the engine answers its submit (`start`); a request that ends first (refused before it submits,
+    // or dropped with its connection) is settled here, when this future ends or is dropped
+    let mark = if method == "POST" && matches!(path, "/v1/chat/completions" | "/v1/completions") {
+        ArrivalMark::counted(m)
+    } else {
+        ArrivalMark::default()
+    };
+    let _settle = Settle(m, mark.clone());
+    req.extensions_mut().insert(Arrival(at, mark));
     let mut response = next.run(req).await;
     let status = response.status().as_u16().to_string();
     let i = CODES.iter().position(|c| *c == status).unwrap_or(CODES.len());

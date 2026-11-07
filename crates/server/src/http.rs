@@ -918,7 +918,10 @@ async fn start(
     };
     let submit_at = std::time::Instant::now();
     s.handle.metrics.observability.preprocessing.record(submit_at.duration_since(arrival.0));
-    let ticket = s.handle.submit_until(req, tx, deadline).await.map_err(|r| refusal_error(r, s.max_model_len))?;
+    let submitted = s.handle.submit_until(req, tx, deadline).await;
+    // the engine has answered: this request no longer holds an idle engine's gather window open
+    arrival.1.settle(&s.handle.metrics.observability);
+    let ticket = submitted.map_err(|r| refusal_error(r, s.max_model_len))?;
     let guard = CancelGuard::new(s.handle.clone(), ticket);
     let (otx, orx) = channel_with_failure::<Out>(Some(failure_hook.clone()));
     let tok = s.tok.clone();

@@ -305,6 +305,8 @@ impl Metrics {
 // At the advertised 262K context, 128 pending vectors occupy at most 128 MiB.
 // Image features retain their separate allocation-owned weighted leases.
 const INBOX_CAP: u64 = 128;
+/// How often an idle engine's gather window looks again at the requests still arriving (`run`).
+const GATHER_POLL: Duration = Duration::from_millis(1);
 
 /// Cloneable front for the engine thread.
 #[derive(Clone)]
@@ -759,14 +761,24 @@ fn run(engine: &mut dyn ServeEngine, rx: &Receiver<Cmd>, lp: &mut Loop, m: &Metr
             };
             match got {
                 Ok(c) => {
-                    // a request that wakes the idle engine waits the engine's gather window for the ones sent with it (filled together)
+                    // a request that wakes the idle engine waits up to the engine's gather window for the requests sent with it (their
+                    // prompts are then filled together), but only while some are still arriving: in the HTTP layer and not yet in this
+                    // inbox (`Observability::arriving` counts the submits here too, unanswered until the commands below run). A request
+                    // that arrives alone starts at once.
                     let gather = if matches!(c, Cmd::Submit { .. }) { engine.gather_window() } else { Duration::ZERO };
                     cmds.push(c);
                     let until = Instant::now() + gather;
-                    while !gather.is_zero() && Instant::now() < until {
-                        match rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                    let submits = |cmds: &[Cmd]| cmds.iter().filter(|c| matches!(c, Cmd::Submit { .. })).count() as u64;
+                    while !gather.is_zero()
+                        && Instant::now() < until
+                        && m.observability.arriving.load(std::sync::atomic::Ordering::Relaxed) > submits(&cmds)
+                    {
+                        // short slices: a request that arrived and was refused before it submitted stops the wait too
+                        let slice = until.saturating_duration_since(Instant::now()).min(GATHER_POLL);
+                        match rx.recv_timeout(slice) {
                             Ok(c) => cmds.push(c),
-                            Err(_) => break,
+                            Err(RecvTimeoutError::Timeout) => {}
+                            Err(RecvTimeoutError::Disconnected) => break,
                         }
                     }
                 }

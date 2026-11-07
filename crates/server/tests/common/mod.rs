@@ -118,6 +118,8 @@ pub struct Opts {
     pub reasoning_unverified: bool,
     /// Build the engine with this instead of the CPU mock (a scripted engine that answers chosen ids, for instance).
     pub engine: Option<Arc<dyn Fn() -> Box<dyn ServeEngine> + Send + Sync>>,
+    /// The mock engine's gather window (`Engine::with_gather_window`); zero by default.
+    pub gather: Duration,
 }
 
 impl Default for Opts {
@@ -150,6 +152,7 @@ impl Default for Opts {
             default_thinking: Default::default(),
             reasoning_unverified: false,
             engine: None,
+            gather: Duration::ZERO,
         }
     }
 }
@@ -209,7 +212,7 @@ pub fn start(o: Opts) -> Server {
         ..RuntimeConfig::default()
     };
     let cache_enabled = o.prefix_cache_enabled;
-    let (slots, mock, kv_tokens, pool) = (o.slots, o.mock.clone(), o.kv_tokens as u64, o.pool);
+    let (slots, mock, kv_tokens, pool, gather) = (o.slots, o.mock.clone(), o.kv_tokens as u64, o.pool, o.gather);
     let custom = o.engine.clone();
     let (handle, th) = spawn_with(
         Box::new(move || {
@@ -234,7 +237,8 @@ pub fn start(o: Opts) -> Server {
                     drafting: false,
                 },
                 Box::new(|| Box::new(NoDrafts) as Box<dyn Drafter>),
-            );
+            )
+            .with_gather_window(gather);
             Box::new(match prefix {
                 Some(p) => engine.with_prefix_cache(p),
                 None => engine,
