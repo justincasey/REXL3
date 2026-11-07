@@ -283,6 +283,34 @@ impl GlmTp {
         Ok(())
     }
 
+    /// Whether the dense-MLP split ([`DnSplit`]) runs a call of `rows` rows: a decode window no wider than its widest (a function of the
+    /// call, so both ranks agree).
+    pub(super) fn dense_split_on(&self, window: bool, rows: usize) -> bool {
+        window && self.split.as_ref().and_then(|h| h.dense.as_ref()).is_some_and(|s| rows <= s.max_rows)
+    }
+
+    /// A dense MLP under the dense split: this rank's down K-split partials into its splits of `z`, the peer's swapped into the others,
+    /// then the finish over all `sk` splits in split order into `out` `[rows, hidden]` f32 (the single node's [`SharedExpert::forward`]).
+    pub(super) fn dense_split(
+        &mut self,
+        m: &SharedExpert,
+        x: &DevBuf,
+        rows: usize,
+        out: &mut DevBuf,
+        sc: &mut SharedScratch,
+        st: &Stream,
+    ) -> Result<(), ModelError> {
+        let sp = self.split.as_mut().and_then(|h| h.dense.as_mut()).ok_or_else(|| ModelError::Config("no dense-MLP split".into()))?;
+        let ((s0, s1), sk, slab) = (sp.splits, sp.sk, rows * m.hidden * 4);
+        m.forward_split_partials(x, Dtype::F16, rows, sp.splits, &mut sp.z, s0 * slab, sc, &mut sp.ws, st)?;
+        let own = sp.z.subview(s0 * slab, (s1 - s0) * slab);
+        let mut z = sp.z.subview(0, sk * slab);
+        let peer = if s0 == 0 { s1 } else { 0 };
+        self.swap(&own, 0, &mut z, peer * slab, (s1 - s0) * slab, st)?;
+        m.finish_split(&z, rows, out, st)?;
+        Ok(())
+    }
+
     fn exchange(&mut self, y: &mut DevBuf, count: usize, st: &Stream) -> Result<(), ModelError> {
         self.comm.allreduce_sum_f32(y, 0, count, st)?;
         self.exchanged_bytes += count as u64 * 4;
@@ -467,19 +495,21 @@ impl GlmModel {
 /// them) and `mla` (the MLA heads at decode, 32 a rank: q_b strips, the absorb / attention / expand of the rank's heads, the o_proj by
 /// K-split partials; MLA prefill stays replicated, it holds no state) and `sh` (the shared expert of every MoE layer in decode windows:
 /// gate / up strips of the rank's intermediate half, the down projection's K-split partials of that half riding in the routed experts'
-/// exchange; prefill chunks keep it replicated). **Unset: all four, `kda,lm,mla,sh` ([`DEFAULT_SPLIT`], the default since w10); `none`
-/// (or a value that is set but empty): nothing, the layout of the builds before it, byte for byte.** Every cut keeps the single-node bits
-/// (`gb_cuda::exl3_split`, `crates/cuda/tests/kda_split.rs`, `shared_split.rs`). A fact of the TP Hello (`GlmFacts::split`): two ranks
-/// that disagree are refused by name before the load.
+/// exchange; prefill chunks keep it replicated) and `dense` (the dense MLPs of the first layers in decode windows, cut like `sh`: the
+/// rank's down K-split partials swapped with the peer's, [`DnSplit`]). **Unset: all five, `kda,lm,mla,sh,dense` ([`DEFAULT_SPLIT`]);
+/// `none` (or a value that is set but empty): nothing, the layout of the builds before it, byte for byte.** Every cut keeps the
+/// single-node bits (`gb_cuda::exl3_split`, `crates/cuda/tests/kda_split.rs`, `shared_split.rs`). A fact of the TP Hello
+/// (`GlmFacts::split`): two ranks that disagree are refused by name before the load.
 pub const TP_SPLIT_ENV: &str = "REXL3_GLM_TP_SPLIT";
 /// [`TP_SPLIT_ENV`] bits.
 pub const SPLIT_KDA: u8 = 1;
 pub const SPLIT_LM: u8 = 2;
 pub const SPLIT_MLA: u8 = 4;
 pub const SPLIT_SHARED: u8 = 8;
-/// What two ranks split when [`TP_SPLIT_ENV`] is not set (w10): the KDA heads, the vocabulary halves, the MLA heads and the shared expert.
-/// `REXL3_GLM_TP_SPLIT=none` is the opt-out.
-pub const DEFAULT_SPLIT: u8 = SPLIT_KDA | SPLIT_LM | SPLIT_MLA | SPLIT_SHARED;
+pub const SPLIT_DENSE: u8 = 16;
+/// What two ranks split when [`TP_SPLIT_ENV`] is not set: the KDA heads, the vocabulary halves, the MLA heads, the shared expert (w10) and
+/// the dense MLPs. `REXL3_GLM_TP_SPLIT=none` is the opt-out.
+pub const DEFAULT_SPLIT: u8 = SPLIT_KDA | SPLIT_LM | SPLIT_MLA | SPLIT_SHARED | SPLIT_DENSE;
 
 /// The split set of [`TP_SPLIT_ENV`] from a lookup. A name it does not know is an error naming the variable (a typo must not leave one rank
 /// unsplit while the other splits: the Hello would refuse, but by a less obvious name).
@@ -494,7 +524,8 @@ pub fn split_from_vars(get: impl Fn(&str) -> Option<String>) -> Result<u8, Strin
             "lm" => SPLIT_LM,
             "mla" => SPLIT_MLA,
             "sh" => SPLIT_SHARED,
-            other => return Err(format!("{TP_SPLIT_ENV}: {other:?} is not one of kda, lm, mla, sh, none")),
+            "dense" => SPLIT_DENSE,
+            other => return Err(format!("{TP_SPLIT_ENV}: {other:?} is not one of kda, lm, mla, sh, dense, none")),
         };
     }
     Ok(bits)
@@ -517,7 +548,7 @@ pub fn split_from_env() -> Result<u8, String> {
 
 /// The split set as text (`kda,lm`, `none`): logs and the Hello's refusal.
 pub fn split_names(bits: u8) -> String {
-    let v: Vec<&str> = [(SPLIT_KDA, "kda"), (SPLIT_LM, "lm"), (SPLIT_MLA, "mla"), (SPLIT_SHARED, "sh")]
+    let v: Vec<&str> = [(SPLIT_KDA, "kda"), (SPLIT_LM, "lm"), (SPLIT_MLA, "mla"), (SPLIT_SHARED, "sh"), (SPLIT_DENSE, "dense")]
         .iter()
         .filter(|(b, _)| bits & b != 0)
         .map(|(_, n)| *n)
@@ -553,6 +584,8 @@ pub(super) struct HeadSplit {
     peer: DevBuf,
     /// The shared-expert split (`sh`), when set.
     sh: Option<ShSplit>,
+    /// The dense-MLP split (`dense`), when set.
+    dense: Option<DnSplit>,
 }
 
 /// A rank's half of every MoE layer's shared expert in decode windows (lane E, GLM Phase 2 E2.6: `sh`). Each trunk MoE layer's shared
@@ -568,6 +601,18 @@ pub(super) struct ShSplit {
     max_rows: usize,
     scratch: SharedScratch,
     ws: DevBuf,
+}
+
+/// A rank's half of every dense MLP (the first layers', 12,288 wide) in decode windows (`dense`): the cut of [`ShSplit`] (gate / up strips
+/// of the rank's intermediate half, the down projection's K-split partials of that half) into `z` `[sk][rows][hidden]` f32, the rank's
+/// `sk / 2` splits swapped for the peer's (one swap a layer), then [`SharedExpert::finish_split`] over all `sk` in split order on every
+/// rank: the single node's `mixer_out` bit for bit. Prefill chunks keep the dense MLPs replicated (or the P2 row split).
+pub(super) struct DnSplit {
+    splits: (usize, usize),
+    sk: usize,
+    max_rows: usize,
+    ws: DevBuf,
+    z: DevBuf,
 }
 
 /// The activations a split KDA layer reads and writes (fields of the model's scratch).
@@ -941,12 +986,49 @@ impl GlmModel {
                 ws: DevBuf::zeroed(ws_bytes)?,
             });
         }
+        let mut dense = None;
+        if bits & SPLIT_DENSE != 0 {
+            // every dense MLP: the down projection's K splits halve at the rank's intermediate half, alike in every layer
+            let max_rows = alloc::WINDOW_ROWS;
+            let mut cut: Option<(usize, usize, usize)> = None; // (sk, inter, hidden)
+            let mut ws_bytes = 16usize;
+            for layer in &self.dev.layers {
+                let FfnDevice::Dense(m) = &layer.ffn else { continue };
+                let (sk, _) = m.down_plan()?;
+                let (inter, hidden) = (m.inter, m.hidden);
+                let halves = sk % 2 == 0
+                    && inter % 256 == 0
+                    && m.down_split_k_range(r * sk / 2, (r + 1) * sk / 2)? == (r * inter / 2, (r + 1) * inter / 2);
+                if !halves || cut.is_some_and(|c| c != (sk, inter, hidden)) {
+                    return cfg_err(format!(
+                        "layer {}'s dense MLP ({hidden} -> {inter}, down plan {sk} K splits) does not halve at the intermediate columns as the \
+                         other layers' do",
+                        layer.index
+                    ));
+                }
+                cut = Some((sk, inter, hidden));
+                ws_bytes = ws_bytes.max(m.split_workspace_bytes(r * sk / 2, (r + 1) * sk / 2, max_rows)?);
+            }
+            let Some((sk, _, hidden)) = cut else {
+                return cfg_err(format!("{TP_SPLIT_ENV}=dense: this model has no dense MLP"));
+            };
+            if self.s.dense.as_ref().is_none_or(|d| d.max_rows < max_rows) {
+                return cfg_err(format!("{TP_SPLIT_ENV}=dense: the dense scratch does not hold {max_rows} rows"));
+            }
+            dense = Some(DnSplit {
+                splits: (r * sk / 2, (r + 1) * sk / 2),
+                sk,
+                max_rows,
+                ws: DevBuf::zeroed(ws_bytes)?,
+                z: DevBuf::zeroed_view(sk * max_rows * hidden * 4)?,
+            });
+        }
         // views of blocks of their own: the exchanges cut them into ranges (`DevBuf::subview`)
         let z = DevBuf::zeroed_view(z_bytes.max(256))?;
         let own = DevBuf::zeroed_view(half_bytes.max(256))?;
         let peer = DevBuf::zeroed_view(half_bytes.max(256))?;
         let t = self.tp.as_mut().unwrap();
-        t.split = Some(HeadSplit { bits, rank: r, kda_heads: (h0, h1), mla_heads: (m0, m1), kda: kda_ranks, z, own, peer, sh });
+        t.split = Some(HeadSplit { bits, rank: r, kda_heads: (h0, h1), mla_heads: (m0, m1), kda: kda_ranks, z, own, peer, sh, dense });
         // the swap's point-to-point transport connects on its first use: once, eagerly, before any window is captured. Only where windows
         // are captured (a capturable communicator, NCCL): the peer runs the same call at the same point of its boot (the Hello has already
         // refused ranks that disagree on the split); the in-process loopback group waits for its peer inside every call and never captures.
@@ -986,24 +1068,26 @@ mod tests {
         assert_eq!(of("kda, lm"), Ok(SPLIT_KDA | SPLIT_LM));
         assert_eq!(of("kda,lm,mla"), Ok(SPLIT_KDA | SPLIT_LM | SPLIT_MLA));
         assert_eq!(of("sh"), Ok(SPLIT_SHARED));
+        assert_eq!(of("dense"), Ok(SPLIT_DENSE));
         assert_eq!(split_names(SPLIT_KDA | SPLIT_LM | SPLIT_MLA | SPLIT_SHARED), "kda,lm,mla,sh");
+        assert_eq!(split_names(SPLIT_SHARED | SPLIT_DENSE), "sh,dense");
         assert!(of("kda,mlx").unwrap_err().contains(TP_SPLIT_ENV));
         assert_eq!(split_from_vars(|_| None), Ok(DEFAULT_SPLIT));
     }
 
-    /// w10: unset is `kda,lm,mla,sh`; `none` (and a set-but-empty value) is exactly the builds before it; a list is read as before and
-    /// `none` among others adds nothing.
+    /// Unset is `kda,lm,mla,sh,dense`; `none` (and a set-but-empty value) is exactly the builds before the splits; a list is read as before
+    /// and `none` among others adds nothing.
     #[test]
-    fn unset_is_all_four_and_none_is_the_opt_out() {
+    fn unset_is_all_five_and_none_is_the_opt_out() {
         let of = |v: Option<&str>| split_from_vars(|k| (k == TP_SPLIT_ENV).then(|| v.map(str::to_string)).flatten());
-        assert_eq!(DEFAULT_SPLIT, SPLIT_KDA | SPLIT_LM | SPLIT_MLA | SPLIT_SHARED);
-        assert_eq!(split_names(DEFAULT_SPLIT), "kda,lm,mla,sh");
+        assert_eq!(DEFAULT_SPLIT, SPLIT_KDA | SPLIT_LM | SPLIT_MLA | SPLIT_SHARED | SPLIT_DENSE);
+        assert_eq!(split_names(DEFAULT_SPLIT), "kda,lm,mla,sh,dense");
         assert_eq!(of(None), Ok(DEFAULT_SPLIT));
         assert_eq!(of(Some("none")), Ok(0));
         assert_eq!(of(Some(" none ")), Ok(0));
         assert_eq!(of(Some("")), Ok(0));
         assert_eq!(of(Some("none,kda")), Ok(SPLIT_KDA));
-        assert_eq!(of(Some("kda,lm,mla,sh")), Ok(DEFAULT_SPLIT));
+        assert_eq!(of(Some("kda,lm,mla,sh,dense")), Ok(DEFAULT_SPLIT));
         assert_eq!(of(Some("kda,lm,mla")), Ok(SPLIT_KDA | SPLIT_LM | SPLIT_MLA));
         assert!(of(Some("kda,mlx")).unwrap_err().contains(TP_SPLIT_ENV));
         // a variable other than ours is not ours
