@@ -7,6 +7,14 @@
 //! 2. Run the 5-layer block on `[anchor, MASK x 7]` at positions `P..P+7` (dynamic convs, causal in-block attention
 //!    over the ring plus the block's own K/V), then the target's own head on rows 1..7, top-16 per row, and the
 //!    selector's chain walk, which picks the 7 draft tokens.
+//!
+//! **A split drafter** ([`DraftShare`], a two-rank group): rank `r` holds its half of every layer's attention heads (q heads
+//! `[16 r, 16 r + 16)`, kv heads `[4 r, 4 r + 4)` and their context rings), the o projection's input columns of those heads, half the
+//! MLP's intermediate columns (gate/up rows, down input columns) and half the draft head's columns; the fc, the norms, the convs and the
+//! selector are whole on both. A round runs both halves at once through a [`DraftPeer`]: per layer the o and the down partials (bf16) are
+//! swapped and added (one fp32 add and one rounding, so both ranks hold the same sum), and the halves' head top-k lists are merged by
+//! (value DESC, id ASC) (`dflash2::merge_topk`, the full head's order). The drafts may differ from one node's (each partial is rounded
+//! before the add) but are the same on both ranks; a draft only proposes, so no reply changes.
 
 use crate::error::ModelError;
 use crate::loadctx::{push_linear, LoadCtx};
@@ -18,6 +26,36 @@ use gb_cuda::q4_linear::{self, Q4Weights};
 use gb_cuda::graph::Graph;
 use gb_cuda::{glue, DevBuf, Stream};
 use std::collections::HashMap;
+use std::ops::Range;
+
+/// Rank `rank` of a two-rank group's share of a split drafter (see the module).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DraftShare {
+    pub rank: usize,
+    pub ranks: usize,
+}
+
+impl DraftShare {
+    /// Rank `rank` of two (the only group a drafter splits over).
+    pub fn of(rank: usize, ranks: usize) -> Result<Self, ModelError> {
+        if ranks != 2 || rank >= ranks {
+            return Err(ModelError::Config(format!("a drafter splits over two ranks, not rank {rank} of {ranks}")));
+        }
+        Ok(Self { rank, ranks })
+    }
+
+    /// This rank's part `[lo, hi)` of `n` things.
+    fn part(&self, n: usize) -> Range<usize> {
+        n * self.rank / self.ranks..n * (self.rank + 1) / self.ranks
+    }
+}
+
+/// The exchange a split draft round runs through: the group's swap on the stream the round is issued on, in the same order on both ranks
+/// (`GlmTp` on a group).
+pub trait DraftPeer {
+    /// `bytes` of `send` from `send_off` go to the peer; the peer's same count lands in `recv` at `recv_off`.
+    fn swap(&mut self, send: &DevBuf, send_off: usize, recv: &mut DevBuf, recv_off: usize, bytes: usize, st: &Stream) -> Result<(), ModelError>;
+}
 
 /// Round graph shapes kept at once (each a few hundred launches; a new shape past the limit runs eagerly).
 const ROUND_GRAPHS: usize = 64;
@@ -300,13 +338,32 @@ pub fn coverage_of(ranges: &[(usize, usize)], ids: &[u32]) -> f32 {
 /// head reads a fraction of its 0.95 GB each round. The verify path still uses the full head; this only decides which tokens the
 /// draft can propose, so a token outside the set is a draft that cannot match, never a different output.
 struct SubHead {
-    /// The head over the kept columns (a copy of those strips of the target's `lm_head`).
+    /// The head over the kept columns (a copy of those strips of the target's `lm_head`; a split drafter's: its share of them).
     w: Exl3Weights,
-    /// Token ids covered, as ascending `(first id, length)` ranges laid end to end in the compact numbering.
+    /// Token ids `w` covers, as ascending `(first id, length)` ranges laid end to end in the compact numbering.
     ranges: Vec<(usize, usize)>,
+    /// Token ids the whole set covers (`ranges` itself unless the drafter is split): what a sequence's coverage counts.
+    set: Vec<(usize, usize)>,
     /// bf16 `[max rows, columns]`
     logits: DevBuf,
     ws: DevBuf,
+}
+
+/// This rank's part of the ascending strip ranges `strips` (`(lo, hi)`): the share's part of their strips counted in order.
+fn share_strips(strips: &[(usize, usize)], s: DraftShare) -> Vec<(usize, usize)> {
+    let total: usize = strips.iter().map(|&(lo, hi)| hi - lo).sum();
+    let want = s.part(total);
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    for &(lo, hi) in strips {
+        let (a, b) = (at, at + hi - lo);
+        let (x, y) = (a.max(want.start), b.min(want.end));
+        if x < y {
+            out.push((lo + x - a, lo + y - a));
+        }
+        at = b;
+    }
+    out
 }
 
 /// Wall time of the steps of [`Draft::restrict_vocab`], in seconds: the strip copy ([`gb_cuda::exl3_linear::StripTimes`]), the logits and
@@ -390,6 +447,13 @@ pub struct Draft {
     walk: DevBuf,
     /// i32 `[max_seqs + 1]`: where each sequence's picks start in the packed head rows
     row_off: DevBuf,
+    /// This rank's part of a split drafter (`None`: the whole drafter).
+    share: Option<DraftShare>,
+    /// With a share: bf16 `[block rows, hidden]`, the peer's o / down partial rows.
+    peer_o: DevBuf,
+    /// With a share: i32 / f32 `[nd, SELECTOR_TOP_K]`, the peer's half of the head's top-k.
+    peer_ids: DevBuf,
+    peer_vals: DevBuf,
     sub: Option<SubHead>,
     /// With a restricted vocabulary: `Some(min)` runs the restricted head only in rounds where every sequence has at least `min` of
     /// its recent tokens inside the set (text the set cannot reach gets the full head), `None` runs it every round.
@@ -427,70 +491,83 @@ fn load_exl3<'p>(
     Ok(Lin::Exl3(w))
 }
 
-/// A bf16 `[n, k]` linear (`{name}.weight`) quantized to the affine 4-bit format on a loader thread.
-fn load_q4<'p>(
-    ctx: &mut LoadCtx<'p>,
-    pack: &'p Pack,
-    name: &str,
-    k: usize,
+/// Rows `rows` and input columns `cols` of the `[n, k]` linear `name` (without `.weight`): the whole linear, or a rank's part of it in a
+/// split drafter.
+#[derive(Clone, Debug)]
+struct Cut {
+    name: String,
     n: usize,
-    bytes: &mut usize,
-) -> Result<Lin, ModelError> {
-    let name = format!("{name}.weight");
-    pack.entry(&name, "BF16", &[n, k])?;
-    if k % q4_linear::GROUP != 0 {
-        return Err(ModelError::Config(format!("draft {name}: {k} inputs are not whole groups of {}", q4_linear::GROUP)));
-    }
-    let len = q4_linear::bytes(n, k);
-    let buf = ctx.computed(len, move || Ok(q4_linear::quantize_bf16(&pack.bf16(&name, &[n, k])?, n, k)))?;
-    *bytes += len;
-    Ok(Lin::Q4(Q4Weights::from_buf(buf, n, k)?))
+    k: usize,
+    rows: Range<usize>,
+    cols: Range<usize>,
 }
 
-/// The linears `names` (each `[n, k]`, `parts` the n's) that read one input: an EXL3 pack's one by one, a bf16 pack's as one 4-bit
-/// matrix of their rows stacked in order ([`LinGroup::Stacked`]; every part but the last whole 64-row tiles).
-fn load_group<'p>(
-    ctx: &mut LoadCtx<'p>,
-    pack: &'p Pack,
-    format: Format,
-    names: &[String],
-    k: usize,
-    parts: &[usize],
-    bytes: &mut usize,
-) -> Result<LinGroup, ModelError> {
-    if format == Format::Exl3 {
-        let mut v = Vec::with_capacity(names.len());
-        for (name, &n) in names.iter().zip(parts) {
-            v.push(load_exl3(ctx, pack, name, k, n, bytes)?);
+impl Cut {
+    fn whole(name: String, k: usize, n: usize) -> Self {
+        Cut { name, n, k, rows: 0..n, cols: 0..k }
+    }
+
+    fn is_whole(&self) -> bool {
+        self.rows == (0..self.n) && self.cols == (0..self.k)
+    }
+}
+
+/// Cuts of bf16 linears (`{name}.weight`) quantized as ONE affine 4-bit matrix of their rows stacked in order on a loader thread (every part
+/// but the last whole 64-row tiles, every part over the same input width, whole 64-input groups). Each part's rows are read in place.
+fn load_q4_stack<'p>(ctx: &mut LoadCtx<'p>, pack: &'p Pack, cuts: &[Cut], bytes: &mut usize) -> Result<Q4Weights, ModelError> {
+    let k = cuts[0].cols.len();
+    for c in cuts {
+        pack.entry(&format!("{}.weight", c.name), "BF16", &[c.n, c.k])?;
+        if c.rows.end > c.n || c.cols.end > c.k || c.cols.len() != k {
+            return Err(ModelError::Config(format!("draft {}: rows {:?} and inputs {:?} of [{}, {}]", c.name, c.rows, c.cols, c.n, c.k)));
         }
-        return Ok(LinGroup::Each(v));
     }
-    let tensors: Vec<String> = names.iter().map(|n| format!("{n}.weight")).collect();
-    for (t, &n) in tensors.iter().zip(parts) {
-        pack.entry(t, "BF16", &[n, k])?;
-    }
-    if k % q4_linear::GROUP != 0 || parts[..parts.len() - 1].iter().any(|n| n % 64 != 0) {
-        return Err(ModelError::Config(format!("draft {names:?}: parts {parts:?} of {k} inputs cannot be stacked")));
+    let parts: Vec<usize> = cuts.iter().map(|c| c.rows.len()).collect();
+    if k % q4_linear::GROUP != 0 || cuts[0].cols.start % q4_linear::GROUP != 0 || parts[..parts.len() - 1].iter().any(|n| n % 64 != 0) {
+        return Err(ModelError::Config(format!("draft {cuts:?}: parts {parts:?} of {k} inputs cannot be stacked")));
     }
     let n: usize = parts.iter().sum();
     let len = q4_linear::bytes(n, k);
-    let shapes: Vec<(String, usize)> = tensors.into_iter().zip(parts.iter().copied()).collect();
+    let cuts = cuts.to_vec();
     let buf = ctx.computed(len, move || {
         // each part's rows in place (no stacked copy): the row accessor walks the parts in order
-        let ws = shapes.iter().map(|(t, rows)| pack.bf16(t, &[*rows, k])).collect::<Result<Vec<_>, _>>()?;
+        let ws = cuts.iter().map(|c| pack.bf16(&format!("{}.weight", c.name), &[c.n, c.k])).collect::<Result<Vec<_>, _>>()?;
         let mut at = Vec::with_capacity(ws.len());
         let mut r0 = 0;
-        for (_, rows) in &shapes {
+        for c in &cuts {
             at.push(r0);
-            r0 += rows;
+            r0 += c.rows.len();
         }
         Ok(q4_linear::quantize_bf16_rows(n, k, |r| {
             let p = at.partition_point(|&s| s <= r) - 1;
-            &ws[p][(r - at[p]) * k..(r - at[p] + 1) * k]
+            let (c, row) = (&cuts[p], cuts[p].rows.start + r - at[p]);
+            &ws[p][row * c.k + c.cols.start..row * c.k + c.cols.end]
         }))
     })?;
     *bytes += len;
-    Ok(LinGroup::Stacked { w: Q4Weights::from_buf(buf, n, k)?, parts: parts.to_vec() })
+    Ok(Q4Weights::from_buf(buf, n, k)?)
+}
+
+/// A cut of a bf16 linear (`{name}.weight`) quantized to the affine 4-bit format on a loader thread.
+fn load_q4<'p>(ctx: &mut LoadCtx<'p>, pack: &'p Pack, cut: Cut, bytes: &mut usize) -> Result<Lin, ModelError> {
+    Ok(Lin::Q4(load_q4_stack(ctx, pack, &[cut], bytes)?))
+}
+
+/// The linears `cuts` that read one input: an EXL3 pack's one by one (whole linears only), a bf16 pack's as one 4-bit matrix of their
+/// rows stacked in order ([`LinGroup::Stacked`], [`load_q4_stack`]).
+fn load_group<'p>(ctx: &mut LoadCtx<'p>, pack: &'p Pack, format: Format, cuts: &[Cut], bytes: &mut usize) -> Result<LinGroup, ModelError> {
+    if format == Format::Exl3 {
+        let mut v = Vec::with_capacity(cuts.len());
+        for c in cuts {
+            if !c.is_whole() {
+                return Err(ModelError::Config(format!("draft {}: an EXL3 linear cannot be cut", c.name)));
+            }
+            v.push(load_exl3(ctx, pack, &c.name, c.k, c.n, bytes)?);
+        }
+        return Ok(LinGroup::Each(v));
+    }
+    let w = load_q4_stack(ctx, pack, cuts, bytes)?;
+    Ok(LinGroup::Stacked { w, parts: cuts.iter().map(|c| c.rows.len()).collect() })
 }
 
 fn f32_dev<'p>(ctx: &mut LoadCtx<'p>, pack: &'p Pack, name: &str, shape: &[usize]) -> Result<DevBuf, ModelError> {
@@ -599,13 +676,13 @@ impl Draft {
         max_ctx_rows: usize,
         block: usize,
     ) -> Result<(Self, usize), ModelError> {
-        Self::declare_as(ctx, pack, Format::Exl3, DraftDims::QWEN38, vocab, slots, max_ctx_rows, block)
+        Self::declare_as(ctx, pack, Format::Exl3, DraftDims::QWEN38, vocab, slots, max_ctx_rows, block, None)
     }
 
     /// Declare a bf16 pack's weights (the GLM-5.3-Flash DFlash2 checkpoint as published) against `ctx`: every linear quantized to
     /// the affine 4-bit format on a loader thread, the convs, the selector and its codebooks narrowed to fp16, the norms widened
-    /// to fp32. `dims` is the pack's (`shapes::DraftConfig::dims`), `vocab` the target head's width. The weight buffers hold
-    /// nothing until `ctx.finish()` has run.
+    /// to fp32. `dims` is the pack's (`shapes::DraftConfig::dims`), `vocab` the target head's width; with `share`, this rank's part of a
+    /// split drafter (see the module). The weight buffers hold nothing until `ctx.finish()` has run.
     #[allow(clippy::too_many_arguments)]
     pub fn declare_bf16<'p>(
         ctx: &mut LoadCtx<'p>,
@@ -615,23 +692,39 @@ impl Draft {
         slots: usize,
         max_ctx_rows: usize,
         block: usize,
+        share: Option<DraftShare>,
     ) -> Result<(Self, usize), ModelError> {
-        Self::declare_as(ctx, pack, Format::Bf16, dims, vocab, slots, max_ctx_rows, block)
+        Self::declare_as(ctx, pack, Format::Bf16, dims, vocab, slots, max_ctx_rows, block, share)
+    }
+
+    /// The context rings of `slots` slots: every kv head, or a share's.
+    fn ring_layout(slots: usize, share: Option<DraftShare>) -> DraftCtxLayout {
+        let l = DraftCtxLayout::qwen38(slots);
+        DraftCtxLayout { kv_heads: share.map_or(l.kv_heads, |s| s.part(l.kv_heads).len()), ..l }
     }
 
     /// Device bytes [`Draft::declare_bf16`] allocates for these settings (weights, context rings and scratch; the restricted
     /// head and the lattice buffer are extra): what a memory plan holds back for the draft before it is loaded.
-    pub fn planned_bf16_bytes(dims: &DraftDims, vocab: usize, slots: usize, max_ctx_rows: usize, block: usize) -> u64 {
-        let ring = DraftCtxLayout::qwen38(slots).total_bytes();
-        (Self::bf16_weight_bytes(dims, vocab) + ring + Self::scratch_bytes(dims, vocab, slots, max_ctx_rows, block, Format::Bf16)) as u64
+    pub fn planned_bf16_bytes(
+        dims: &DraftDims,
+        vocab: usize,
+        slots: usize,
+        max_ctx_rows: usize,
+        block: usize,
+        share: Option<DraftShare>,
+    ) -> u64 {
+        let ring = Self::ring_layout(slots, share).total_bytes();
+        (Self::bf16_weight_bytes(dims, vocab, share) + ring + Self::scratch_bytes(dims, vocab, slots, max_ctx_rows, block, Format::Bf16, share))
+            as u64
     }
 
     /// The weight bytes [`Draft::declare_bf16`] carves from its load context, alignment included (one carve per tensor, each rounded up to
     /// `gb_cuda::arena::ALIGN`): the size of the drafter's exact arena (`LoadCtx::exact_from_env`).
-    pub fn bf16_weight_bytes(dims: &DraftDims, vocab: usize) -> usize {
-        let (h, f, kv, q) = (dims.hidden, dims.intermediate, KV_HEADS * HEAD_DIM, Q_HEADS * HEAD_DIM);
+    pub fn bf16_weight_bytes(dims: &DraftDims, vocab: usize, share: Option<DraftShare>) -> usize {
+        let part = |n: usize| share.map_or(n, |s| s.part(n).len());
+        let (h, f, kv, q) = (dims.hidden, part(dims.intermediate), part(KV_HEADS) * HEAD_DIM, part(Q_HEADS) * HEAD_DIM);
         let lin = |n: usize, k: usize| q4_linear::bytes(n, k);
-        let per_layer = lin(q, h) + 2 * lin(kv, h) + lin(h, q) + 2 * lin(f, h) + lin(h, f)
+        let per_layer = lin(q + 2 * kv, h) + lin(h, q) + lin(2 * f, h) + lin(h, f)
             + 2 * (2 * 2 * h + dims.dyn_width() * h) * 2
             + (2 * h + 2 * HEAD_DIM) * 4;
         // the carves: per layer the qkv and gate/up groups, o, down, four norms and two conv pairs; then fc, two norms and the selector's three
@@ -666,8 +759,17 @@ impl Draft {
         }
     }
 
-    /// Bytes of the scratch [`Draft::declare_as`] allocates.
-    fn scratch_bytes(dims: &DraftDims, vocab: usize, slots: usize, max_ctx_rows: usize, block: usize, format: Format) -> usize {
+    /// Bytes of the scratch [`Draft::declare_as`] allocates (a share adds the peer's partial rows and top-k lists).
+    #[allow(clippy::too_many_arguments)]
+    fn scratch_bytes(
+        dims: &DraftDims,
+        vocab: usize,
+        slots: usize,
+        max_ctx_rows: usize,
+        block: usize,
+        format: Format,
+        share: Option<DraftShare>,
+    ) -> usize {
         let max_seqs = Self::max_seqs_of(slots, block);
         let (nb, nd) = (max_seqs * block, max_seqs * (block - 1));
         let (h, f, kv, q) = (dims.hidden, dims.intermediate, KV_HEADS * HEAD_DIM, Q_HEADS * HEAD_DIM);
@@ -691,6 +793,7 @@ impl Draft {
             + nd * 12
             + max_seqs * std::mem::size_of::<WalkSampling>()
             + (max_seqs + 1) * 4
+            + share.map_or(0, |_| nb * h * 2 + nd * SELECTOR_TOP_K * 8)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -703,6 +806,7 @@ impl Draft {
         slots: usize,
         max_ctx_rows: usize,
         block: usize,
+        share: Option<DraftShare>,
     ) -> Result<(Self, usize), ModelError> {
         if !(MIN_DRAFT_BLOCK..=MAX_DRAFT_BLOCK).contains(&block) {
             return Err(ModelError::Config(format!(
@@ -715,13 +819,24 @@ impl Draft {
                 dims.valid_vocab, dims.mask_token
             )));
         }
+        if share.is_some() && format != Format::Bf16 {
+            return Err(ModelError::Config("only a bf16 draft pack splits over ranks (its linears are quantized at load)".into()));
+        }
         let (h, f) = (dims.hidden, dims.intermediate);
         let mut bytes = 0usize;
-        let lin = |ctx: &mut LoadCtx<'p>, name: &str, k: usize, n: usize, bytes: &mut usize| match format {
-            Format::Exl3 => load_exl3(ctx, pack, name, k, n, bytes),
-            Format::Bf16 => load_q4(ctx, pack, name, k, n, bytes),
+        let lin = |ctx: &mut LoadCtx<'p>, cut: Cut, bytes: &mut usize| match format {
+            Format::Exl3 => load_exl3(ctx, pack, &cut.name, cut.k, cut.n, bytes),
+            Format::Bf16 => load_q4(ctx, pack, cut, bytes),
         };
-        let fc = lin(ctx, "fc", dims.fc_in(), h, &mut bytes)?;
+        // this rank's rows (`out`) or input columns (`inp`) of a linear: its heads' and its intermediate columns' (whole without a share)
+        let part = |n: usize| share.map_or(0..n, |s| s.part(n));
+        let heads = |n_heads: usize| {
+            let r = part(n_heads);
+            r.start * HEAD_DIM..r.end * HEAD_DIM
+        };
+        let out = |name: String, k: usize, n: usize, rows: Range<usize>| Cut { rows, ..Cut::whole(name, k, n) };
+        let inp = |name: String, k: usize, n: usize, cols: Range<usize>| Cut { cols, ..Cut::whole(name, k, n) };
+        let fc = lin(ctx, Cut::whole("fc".into(), dims.fc_in(), h), &mut bytes)?;
         let hidden_norm = f32_dev(ctx, pack, "hidden_norm.weight", &[h])?;
         let norm = f32_dev(ctx, pack, "norm.weight", &[h])?;
         let mut layers = Vec::new();
@@ -734,16 +849,24 @@ impl Draft {
                     ctx,
                     pack,
                     format,
-                    &[format!("{p}self_attn.q_proj"), format!("{p}self_attn.k_proj"), format!("{p}self_attn.v_proj")],
-                    h,
-                    &[Q_HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM],
+                    &[
+                        out(format!("{p}self_attn.q_proj"), h, Q_HEADS * HEAD_DIM, heads(Q_HEADS)),
+                        out(format!("{p}self_attn.k_proj"), h, KV_HEADS * HEAD_DIM, heads(KV_HEADS)),
+                        out(format!("{p}self_attn.v_proj"), h, KV_HEADS * HEAD_DIM, heads(KV_HEADS)),
+                    ],
                     &mut bytes,
                 )?,
-                o: lin(ctx, &format!("{p}self_attn.o_proj"), Q_HEADS * HEAD_DIM, h, &mut bytes)?,
+                o: lin(ctx, inp(format!("{p}self_attn.o_proj"), Q_HEADS * HEAD_DIM, h, heads(Q_HEADS)), &mut bytes)?,
                 q_norm: f32_dev(ctx, pack, &format!("{p}self_attn.q_norm.weight"), &[HEAD_DIM])?,
                 k_norm: f32_dev(ctx, pack, &format!("{p}self_attn.k_norm.weight"), &[HEAD_DIM])?,
-                gu: load_group(ctx, pack, format, &[format!("{p}mlp.gate_proj"), format!("{p}mlp.up_proj")], h, &[f, f], &mut bytes)?,
-                down: lin(ctx, &format!("{p}mlp.down_proj"), f, h, &mut bytes)?,
+                gu: load_group(
+                    ctx,
+                    pack,
+                    format,
+                    &[out(format!("{p}mlp.gate_proj"), h, f, part(f)), out(format!("{p}mlp.up_proj"), h, f, part(f))],
+                    &mut bytes,
+                )?,
+                down: lin(ctx, inp(format!("{p}mlp.down_proj"), f, h, part(f)), &mut bytes)?,
                 attn_conv: conv_pair(ctx, pack, &dims, &p, "attention_conv", &mut bytes)?,
                 mlp_conv: conv_pair(ctx, pack, &dims, &p, "mlp_conv", &mut bytes)?,
             });
@@ -760,7 +883,7 @@ impl Draft {
         let sel_proj = f16_dev(ctx, pack, "candidate_selector.hidden_projection.weight", &[SELECTOR_RANK, h], &mut bytes)?;
         let pred = f16_dev(ctx, pack, &codebook("predecessor_codebook"), &[vocab, SELECTOR_RANK], &mut bytes)?;
         let succ = f16_dev(ctx, pack, &codebook("successor_codebook"), &[vocab, SELECTOR_RANK], &mut bytes)?;
-        let layout = DraftCtxLayout::qwen38(slots);
+        let layout = Self::ring_layout(slots, share);
         let cache = DraftCache::new(layout)?;
         bytes += layout.total_bytes();
         let max_seqs = Self::max_seqs_of(slots, block);
@@ -774,9 +897,11 @@ impl Draft {
         // a bf16 pack's figure is everything the draft allocates (`planned_bf16_bytes`, which a memory plan holds back); the Qwen
         // pack's keeps what it always reported (its linears, fp16 tensors and rings)
         if format == Format::Bf16 {
-            bytes += (2 * h + LAYERS * (2 * h + 2 * HEAD_DIM)) * 4 + Self::scratch_bytes(&dims, vocab, slots, max_ctx_rows, block, format);
+            bytes += (2 * h + LAYERS * (2 * h + 2 * HEAD_DIM)) * 4
+                + Self::scratch_bytes(&dims, vocab, slots, max_ctx_rows, block, format, share);
         }
         let (kv, q) = (KV_HEADS * HEAD_DIM, Q_HEADS * HEAD_DIM);
+        let peer = |n: usize| if share.is_some() { DevBuf::zeroed(n) } else { DevBuf::zeroed(4) };
         let z = |n: usize| DevBuf::zeroed(n);
         let d = Self {
             dims,
@@ -832,6 +957,10 @@ impl Draft {
             margin: z(nd * 4)?,
             walk: z(max_seqs * std::mem::size_of::<WalkSampling>())?,
             row_off: z((max_seqs + 1) * 4)?,
+            share,
+            peer_o: peer(nb * h * 2)?,
+            peer_ids: peer(nd * SELECTOR_TOP_K * 4)?,
+            peer_vals: peer(nd * SELECTOR_TOP_K * 4)?,
             sub: None,
             adaptive_min: None,
             restrict_times: None,
@@ -858,15 +987,19 @@ impl Draft {
     }
 
     /// The ring segments (`(ring byte offset, bytes, offset in the window copy)`) of positions `lo..lo + n` of `slot`: one, or two when the
-    /// positions wrap the ring.
-    fn ring_segments(&self, slot: usize, lo: usize, n: usize) -> Vec<(usize, usize, usize)> {
+    /// positions wrap the ring. A split drafter's rings hold its kv heads only, which the window snapshots (rows of every kv head) do not
+    /// take: refused.
+    fn ring_segments(&self, slot: usize, lo: usize, n: usize) -> Result<Vec<(usize, usize, usize)>, ModelError> {
+        if self.share.is_some() {
+            return Err(ModelError::Config("a split drafter's context rings are not snapshotted".into()));
+        }
         let l = &self.cache.layout;
         let first = n.min(l.cap - lo % l.cap);
         let mut v = vec![((slot * l.cap + lo % l.cap) * Self::RING_ROW_BYTES, first * Self::RING_ROW_BYTES, 0)];
         if first < n {
             v.push((slot * l.cap * Self::RING_ROW_BYTES, (n - first) * Self::RING_ROW_BYTES, first * Self::RING_ROW_BYTES));
         }
-        v
+        Ok(v)
     }
 
     /// FNV-1a over the ring rows of positions `lo..lo + n` of `slot` (every layer, K then V, in position order), for tests that compare a
@@ -879,7 +1012,7 @@ impl Draft {
         let mut h = 0xcbf2_9ce4_8422_2325u64;
         for layer in 0..LAYERS {
             for buf in [self.cache.k(layer), self.cache.v(layer)] {
-                for (off, bytes, _) in self.ring_segments(slot, lo, n) {
+                for (off, bytes, _) in self.ring_segments(slot, lo, n)? {
                     let mut v = vec![0u8; bytes];
                     buf.download_range(off, &mut v)?;
                     h = v.iter().fold(h, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
@@ -904,7 +1037,7 @@ impl Draft {
     ) -> Result<(), ModelError> {
         assert!(n <= DraftCtxLayout::WINDOW && dk.len() == LAYERS && dv.len() == LAYERS);
         for (layer, (k, v)) in dk.iter_mut().zip(dv.iter_mut()).enumerate() {
-            for (off, bytes, at) in self.ring_segments(slot, lo, n) {
+            for (off, bytes, at) in self.ring_segments(slot, lo, n)? {
                 let dst = snap * DraftCtxLayout::WINDOW * Self::RING_ROW_BYTES + at;
                 k.copy_range_from(dst, self.cache.k(layer), off, bytes, stream)?;
                 v.copy_range_from(dst, self.cache.v(layer), off, bytes, stream)?;
@@ -926,7 +1059,7 @@ impl Draft {
         stream: &Stream,
     ) -> Result<(), ModelError> {
         assert!(n <= DraftCtxLayout::WINDOW && dk.len() == LAYERS && dv.len() == LAYERS);
-        let segs = self.ring_segments(slot, lo, n);
+        let segs = self.ring_segments(slot, lo, n)?;
         for (layer, (k, v)) in dk.iter().zip(dv.iter()).enumerate() {
             let (rk, rv) = self.cache.kv_mut(layer);
             for &(off, bytes, at) in &segs {
@@ -1052,11 +1185,24 @@ impl Draft {
     /// widened to whole 128-column strips; overlapping or touching ranges merge; at most 4 remain and at least 64 strips must).
     /// The kept columns are bit-identical to the full head's, so the drafts are the full draft's whenever its choices lie inside
     /// the set. Costs one device-to-device copy of those strips of the head (3.6 ms plus 12 ms of `cudaMalloc` on a GB10; no host
-    /// memory is involved) and their memory; returns the bytes added.
+    /// memory is involved) and their memory; returns the bytes added. A split drafter copies its share's part of the set's strips (at
+    /// least 64 too, so its columns are the full head's bit for bit) and merges its top-k with the peer's.
     pub fn restrict_vocab(&mut self, head: &Exl3Weights, token_ranges: &[(usize, usize)]) -> Result<usize, ModelError> {
         let t0 = std::time::Instant::now();
         let max_rows = self.max_seqs * (self.block - 1);
-        let strips = vocab_strips(token_ranges, head.n)?;
+        let all = vocab_strips(token_ranges, head.n)?;
+        let set: Vec<(usize, usize)> = all.iter().map(|&(lo, hi)| (lo * 128, (hi - lo) * 128)).collect();
+        let strips = match self.share {
+            None => all,
+            Some(s) => {
+                let mine = share_strips(&all, s);
+                let n: usize = mine.iter().map(|&(lo, hi)| hi - lo).sum();
+                if n < 64 {
+                    return Err(ModelError::Config(format!("a split draft head of {n} strips a rank (at least 64 keep the full head's bits)")));
+                }
+                mine
+            }
+        };
         let (w, strip_times) = head.select_strips_timed(&strips)?;
         let ranges: Vec<(usize, usize)> = strips.iter().map(|&(lo, hi)| (lo * 128, (hi - lo) * 128)).collect();
         let t1 = std::time::Instant::now();
@@ -1069,7 +1215,7 @@ impl Draft {
             self.top_ws = DevBuf::zeroed(top)?;
             bytes += top;
         }
-        self.sub = Some(SubHead { w, ranges, logits, ws });
+        self.sub = Some(SubHead { w, ranges, set, logits, ws });
         self.restrict_times =
             Some(RestrictTimes { strips: strip_times, buffers: t1.elapsed().as_secs_f64(), total: t0.elapsed().as_secs_f64() });
         Ok(bytes)
@@ -1106,23 +1252,28 @@ impl Draft {
 
     /// Share of `ids` (a sequence's recent tokens) inside the restricted vocabulary; 1.0 when nothing is restricted.
     pub fn coverage(&self, ids: &[u32]) -> f32 {
-        self.sub.as_ref().map_or(1.0, |s| coverage_of(&s.ranges, ids))
+        self.sub.as_ref().map_or(1.0, |s| coverage_of(&s.set, ids))
     }
 
     /// Token-id ranges the draft head covers, `(first id, length)`, or None for the full vocabulary.
     pub fn vocab_ranges(&self) -> Option<&[(usize, usize)]> {
-        self.sub.as_ref().map(|s| s.ranges.as_slice())
+        self.sub.as_ref().map(|s| s.set.as_slice())
     }
 
-    /// [`Draft::propose_batch`] with the draft's own confidence in each pick (see [`Picked`]).
+    /// [`Draft::propose_batch`] with the draft's own confidence in each pick (see [`Picked`]). A split drafter runs its half of the round
+    /// with the peer (`peer`, in step with the other rank's same call) and leaves [`Draft::round_digest`] of the merged head candidates.
     pub fn propose_batch_scored(
         &mut self,
         embed: &DevBuf,
         head: &Exl3Weights,
         vocab: usize,
         reqs: &[DraftReq],
+        peer: Option<&mut dyn DraftPeer>,
         stream: &Stream,
     ) -> Result<Vec<Picked>, ModelError> {
+        if self.share.is_some() != peer.is_some() {
+            return Err(ModelError::Config("a split drafter's round runs with its peer, a whole one's alone".into()));
+        }
         let n = reqs.len();
         if n == 0 {
             return Ok(Vec::new());
@@ -1182,11 +1333,12 @@ impl Draft {
         let nd = row_off[n] as usize;
         self.head_rounds[use_sub as usize] += 1;
         if capture {
-            self.round_launches(embed, head, vocab, &wants, use_sub, true, stream)?;
+            self.round_launches(embed, head, vocab, &wants, use_sub, true, peer, stream)?;
         } else {
-            self.round_graphed(embed, head, vocab, &wants, use_sub, stream)?;
+            self.round_graphed(embed, head, vocab, &wants, use_sub, peer, stream)?;
         }
-        let Draft { stage, out_tokens, conf, margin, top_ids, top_vals, edge, .. } = self;
+        let split = self.share.is_some();
+        let Draft { stage, out_tokens, conf, margin, top_ids, top_vals, edge, round_digest, .. } = self;
         stage.sync(stream)?;
         let mut t = vec![0i32; nd];
         out_tokens.download(&mut t)?;
@@ -1194,6 +1346,16 @@ impl Draft {
         conf.download(&mut c)?;
         let mut m = vec![0f32; nd];
         margin.download(&mut m)?;
+        if split {
+            // what both ranks of a split drafter hold alike: the merged candidates (the follower's walk draws greedily)
+            let mut ids = vec![0u32; nd * SELECTOR_TOP_K];
+            top_ids.download(&mut ids)?;
+            let mut vals = vec![0u32; nd * SELECTOR_TOP_K];
+            top_vals.download(&mut vals)?;
+            *round_digest = ids.iter().chain(&vals).flat_map(|v| v.to_le_bytes()).fold(*round_digest, |h, b| {
+                (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
+            });
+        }
         let lat = if capture {
             let mut ids = vec![0i32; nd * SELECTOR_TOP_K];
             top_ids.download(&mut ids)?;
@@ -1230,7 +1392,9 @@ impl Draft {
     /// A round's launches through the round graphs: the first round of a shape runs eagerly, the second is captured (on the draft's
     /// own capture stream) and launched, every later one replays the graph. Only the host values that reach a launcher are in the
     /// key (sequences and each one's picks, the head); every other input of the round is read from the draft's device buffers, which
-    /// the round's uploads rewrote in place. A shape whose capture fails runs eagerly from then on.
+    /// the round's uploads rewrote in place. A shape whose capture fails runs eagerly from then on; a split drafter's capture failing
+    /// is fatal (the ranks capture the same shapes at the same rounds, and both must reach the peer's exchanges the same way).
+    #[allow(clippy::too_many_arguments)]
     fn round_graphed(
         &mut self,
         embed: &DevBuf,
@@ -1238,6 +1402,7 @@ impl Draft {
         vocab: usize,
         wants: &[usize],
         use_sub: bool,
+        peer: Option<&mut dyn DraftPeer>,
         stream: &Stream,
     ) -> Result<(), ModelError> {
         let mut w = [0u8; MAX_DRAFT_SEQS];
@@ -1247,20 +1412,23 @@ impl Draft {
         let key = RoundKey { n: wants.len(), wants: w, use_sub, embed: embed.ptr() as usize, head: head as *const _ as usize };
         match self.rounds.slots.get(&key) {
             Some(RoundSlot::Ready(g)) => return Ok(g.launch(stream)?),
-            Some(RoundSlot::Eager) => return self.round_launches(embed, head, vocab, wants, use_sub, false, stream),
+            Some(RoundSlot::Eager) => return self.round_launches(embed, head, vocab, wants, use_sub, false, peer, stream),
             Some(RoundSlot::Seen) => {}
             None => {
                 if self.rounds.slots.len() < ROUND_GRAPHS {
                     self.rounds.slots.insert(key, RoundSlot::Seen);
                 }
-                return self.round_launches(embed, head, vocab, wants, use_sub, false, stream);
+                return self.round_launches(embed, head, vocab, wants, use_sub, false, peer, stream);
             }
         }
         let cap = match self.rounds.cap.take() {
             Some(c) => c,
             None => Stream::new()?,
         };
-        let captured = Graph::capture(&cap, || self.round_launches(embed, head, vocab, wants, use_sub, false, &cap));
+        let split = self.share.is_some();
+        let mut peer = peer;
+        let captured =
+            Graph::capture(&cap, || self.round_launches(embed, head, vocab, wants, use_sub, false, peer.as_deref_mut(), &cap));
         self.rounds.cap = Some(cap);
         match captured {
             Ok(g) => {
@@ -1272,15 +1440,20 @@ impl Draft {
                 if let Some(fatal) = e.fatal() {
                     return Err(ModelError::Cuda(fatal.clone()));
                 }
+                if split {
+                    return Err(ModelError::Config(format!("a split draft round of {} sequences failed to capture", wants.len())));
+                }
                 eprintln!("rexl3 level=warn event=draft_round_capture_failed rows={} (this round shape runs eagerly)", wants.len());
                 self.rounds.slots.insert(key, RoundSlot::Eager);
-                self.round_launches(embed, head, vocab, wants, use_sub, false, stream)
+                self.round_launches(embed, head, vocab, wants, use_sub, false, peer, stream)
             }
         }
     }
 
     /// The launches of a draft round on `stream` (the index arrays already uploaded): the block's layers, the head over each sequence's
-    /// first `wants[s]` picks, the top-k, the selector walk, and with `edges` the lattice's edge terms.
+    /// first `wants[s]` picks, the top-k, the selector walk, and with `edges` the lattice's edge terms. A split drafter runs its heads,
+    /// its intermediate columns and its head columns, and meets the peer twice a layer, after the o and after the down projection (their
+    /// partials swapped and added), then once more for the head's top-k lists (swapped and merged).
     #[allow(clippy::too_many_arguments)]
     fn round_launches(
         &mut self,
@@ -1290,6 +1463,7 @@ impl Draft {
         wants: &[usize],
         use_sub: bool,
         edges: bool,
+        mut peer: Option<&mut dyn DraftPeer>,
         stream: &Stream,
     ) -> Result<(), ModelError> {
         let n = wants.len();
@@ -1338,12 +1512,18 @@ impl Draft {
             row_off: row_off_d,
             sub,
             edge,
+            share,
+            peer_o,
+            peer_ids,
+            peer_vals,
             ..
         } = self;
         let capture = edges;
         let rows = n * block;
         let (hd, eps, dw) = (dims.hidden, dims.eps, dims.dyn_width());
-        let prep = dims.attn_prep();
+        let part = |n: usize| share.map_or(n, |s| s.part(n).len());
+        let (qh, kvh, fl) = (part(Q_HEADS), part(KV_HEADS), part(dims.intermediate));
+        let prep = glue::AttnPrepCfg { heads: qh, kv_heads: kvh, ..dims.attn_prep() };
         unsafe {
             glue::embed(cp(embed), cp(ids_d), mp(x), rows, hd, vocab, stream)?;
         }
@@ -1378,8 +1558,8 @@ impl Draft {
                 slot_a,
                 p_a,
                 n,
-                Q_HEADS,
-                KV_HEADS,
+                qh,
+                kvh,
                 DraftCtxLayout::DEFAULT_CAP,
                 DraftCtxLayout::WINDOW,
                 block,
@@ -1388,6 +1568,7 @@ impl Draft {
                 stream,
             )?;
             layer.o.forward(att, o, rows, lin, stream)?;
+            sum_with_peer(peer.as_deref_mut(), o, peer_o, rows * hd, stream)?;
             // x' = x + conv_finish(o), written to the other buffer, then swapped in
             dflash2::dynconv(o, dynv, &layer.attn_conv.base, 1, n, block, hd, CONV_GROUP, Some(x), x2, stream)?;
             std::mem::swap(x, x2);
@@ -1398,9 +1579,10 @@ impl Draft {
             dflash2::dynconv(h, dynv, &layer.mlp_conv.base, 0, n, block, hd, CONV_GROUP, None, y, stream)?;
             layer.gu.forward(y, 0, &mut [&mut *g, &mut *u], rows, lin, stream)?;
             unsafe {
-                glue::swiglu(cp(g), cp(u), mp(sw), rows * dims.intermediate, stream)?;
+                glue::swiglu(cp(g), cp(u), mp(sw), rows * fl, stream)?;
             }
             layer.down.forward(sw, o, rows, lin, stream)?;
+            sum_with_peer(peer.as_deref_mut(), o, peer_o, rows * hd, stream)?;
             dflash2::dynconv(o, dynv, &layer.mlp_conv.base, 1, n, block, hd, CONV_GROUP, Some(x), x2, stream)?;
             std::mem::swap(x, x2);
         }
@@ -1441,12 +1623,22 @@ impl Draft {
             }
         };
         let pad = vocab - dims.valid_vocab;
-        // the head over every column, or over the restricted set (whose top-k ids are then mapped back to token ids)
+        // the head over every column, or over the restricted set (whose top-k ids are then mapped back to token ids); a split drafter's
+        // over its half of those columns, its top-k then merged with the peer's
         match sub.as_mut().filter(|_| use_sub) {
-            None => {
-                head.forward(sel, logits, nd, Dtype::BF16, Dtype::BF16, &mut lin.ws, stream)?;
-                topk(logits, vocab, dims.valid_vocab, top_ids, top_vals, top_ws)?;
-            }
+            None => match share {
+                None => {
+                    head.forward(sel, logits, nd, Dtype::BF16, Dtype::BF16, &mut lin.ws, stream)?;
+                    topk(logits, vocab, dims.valid_vocab, top_ids, top_vals, top_ws)?;
+                }
+                Some(s) => {
+                    let st = s.part(head.n / 128);
+                    let (c0, c1) = (st.start * 128, st.end * 128);
+                    head.forward_strip(st.start, st.end, sel, logits, nd, Dtype::BF16, Dtype::BF16, &mut lin.ws, stream)?;
+                    topk(logits, c1 - c0, dims.valid_vocab.min(c1).saturating_sub(c0), top_ids, top_vals, top_ws)?;
+                    dflash2::remap_ids(top_ids, nd * SELECTOR_TOP_K, &[(c0, c1 - c0)], stream)?;
+                }
+            },
             Some(sub) => {
                 sub.w.forward(sel, &mut sub.logits, nd, Dtype::BF16, Dtype::BF16, &mut sub.ws, stream)?;
                 // the set's last columns are the head's padding when it keeps the last strip
@@ -1455,6 +1647,12 @@ impl Draft {
                 topk(&sub.logits, sub.w.n, valid, top_ids, top_vals, top_ws)?;
                 dflash2::remap_ids(top_ids, nd * SELECTOR_TOP_K, &sub.ranges, stream)?;
             }
+        }
+        if let Some(p) = peer {
+            let bytes = nd * SELECTOR_TOP_K * 4;
+            p.swap(top_ids, 0, peer_ids, 0, bytes, stream)?;
+            p.swap(top_vals, 0, peer_vals, 0, bytes, stream)?;
+            dflash2::merge_topk(top_ids, top_vals, peer_ids, peer_vals, nd, SELECTOR_TOP_K, stream)?;
         }
         unsafe {
             glue::small_linear_f16w(cp(sel), cp(sel_proj), mp(gate), nd, hd, SELECTOR_RANK, stream)?;
