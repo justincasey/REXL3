@@ -307,6 +307,9 @@ impl Metrics {
 const INBOX_CAP: u64 = 128;
 /// How often an idle engine's gather window looks again at the requests still arriving (`run`).
 const GATHER_POLL: Duration = Duration::from_millis(1);
+/// How long an idle engine's gather window waits after the last request it saw arrive, for another one sent with it (`run`): the bench's
+/// bursts arrive a millisecond or two apart, and the first one's submit reaches the engine before the second's head reaches the server.
+const GATHER_GRACE: Duration = Duration::from_millis(3);
 
 /// Cloneable front for the engine thread.
 #[derive(Clone)]
@@ -761,20 +764,32 @@ fn run(engine: &mut dyn ServeEngine, rx: &Receiver<Cmd>, lp: &mut Loop, m: &Metr
             };
             match got {
                 Ok(c) => {
-                    // a request that wakes the idle engine waits up to the engine's gather window for the requests sent with it (their
-                    // prompts are then filled together), but only while some are still arriving: in the HTTP layer and not yet in this
-                    // inbox (`Observability::arriving` counts the submits here too, unanswered until the commands below run). A request
-                    // that arrives alone starts at once.
+                    // a request that wakes the idle engine waits for the requests sent with it (their prompts are then filled together),
+                    // up to the engine's gather window: while some are still arriving (in the HTTP layer and not yet in this inbox:
+                    // `Observability::arriving` counts the submits here too, unanswered until the commands below run), and for
+                    // GATHER_GRACE after the last request it saw arrive (a burst's clients connect a millisecond or two apart, after
+                    // the first one's submit is here). A request that arrives alone starts GATHER_GRACE after its submit.
                     let gather = if matches!(c, Cmd::Submit { .. }) { engine.gather_window() } else { Duration::ZERO };
                     cmds.push(c);
-                    let until = Instant::now() + gather;
+                    let start = Instant::now();
+                    let until = start + gather;
                     let submits = |cmds: &[Cmd]| cmds.iter().filter(|c| matches!(c, Cmd::Submit { .. })).count() as u64;
-                    while !gather.is_zero()
-                        && Instant::now() < until
-                        && m.observability.arriving.load(std::sync::atomic::Ordering::Relaxed) > submits(&cmds)
-                    {
+                    let mut seen = submits(&cmds);
+                    let mut quiet_at = start + GATHER_GRACE.min(gather);
+                    loop {
+                        let now = Instant::now();
+                        let arriving = m.observability.arriving.load(std::sync::atomic::Ordering::Relaxed);
+                        let here = submits(&cmds);
+                        if arriving.max(here) > seen {
+                            seen = arriving.max(here);
+                            quiet_at = now + GATHER_GRACE;
+                        }
+                        if gather.is_zero() || now >= until || (arriving <= here && now >= quiet_at) {
+                            break;
+                        }
                         // short slices: a request that arrived and was refused before it submitted stops the wait too
-                        let slice = until.saturating_duration_since(Instant::now()).min(GATHER_POLL);
+                        let target = if arriving > here { until } else { quiet_at.min(until) };
+                        let slice = target.saturating_duration_since(now).min(GATHER_POLL);
                         match rx.recv_timeout(slice) {
                             Ok(c) => cmds.push(c),
                             Err(RecvTimeoutError::Timeout) => {}
