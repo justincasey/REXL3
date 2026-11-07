@@ -129,6 +129,20 @@ __global__ void __launch_bounds__(kGroupThreads) group_kernel(const int* __restr
 // ---------------------------------------------------------------------------------------------------------------
 // input rotation: out_mat[p] = fp16(H(x[row] * suh_mat[e])) for both matrices of a pair. One warp a 128-wide block.
 
+// One lane's 4 values of one pair's 128-wide block: x at element xi, the expert's suh at suh_k, the output at out_k.
+__device__ __forceinline__ void rot_in_lane(const void* __restrict__ x, int x_dtype, size_t xi, const half* __restrict__ suh_k,
+                                            half* __restrict__ out_k, int lane) {
+    float v[4], s[4];
+    load4(x, x_dtype, xi, v);
+    load4h(suh_k, s);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) v[j] *= s[j];
+    fwht128(v, lane);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) v[j] *= HAD_SCALE;
+    store4h(out_k, v);
+}
+
 __global__ void __launch_bounds__(128) rot_in_kernel(const void* __restrict__ x, int x_dtype, const int* __restrict__ pick,
                                                      const half* __restrict__ suh0, const half* __restrict__ suh1,
                                                      half* __restrict__ out0, half* __restrict__ out1, int K, int topk, int E) {
@@ -141,15 +155,26 @@ __global__ void __launch_bounds__(128) rot_in_kernel(const void* __restrict__ x,
     if (e < 0 || e >= E) return;
     const int row = p / topk;
     const int k = blk * 128 + 4 * lane;
-    float v[4], s[4];
-    load4(x, x_dtype, (size_t)row * K + k, v);
-    load4h((mat ? suh1 : suh0) + (size_t)e * K + k, s);
-#pragma unroll
-    for (int j = 0; j < 4; ++j) v[j] *= s[j];
-    fwht128(v, lane);
-#pragma unroll
-    for (int j = 0; j < 4; ++j) v[j] *= HAD_SCALE;
-    store4h((mat ? out1 : out0) + (size_t)p * K + k, v);
+    rot_in_lane(x, x_dtype, (size_t)row * K + k, (mat ? suh1 : suh0) + (size_t)e * K + k, (mat ? out1 : out0) + (size_t)p * K + k,
+                lane);
+}
+
+// rot_in_kernel over the experts of several banks at once: pick holds global ids (or -1), and each expert's suh row is found through a
+// table of device addresses indexed by global id (suh0 / suh1 [E], each the address of the expert's K halves).
+__global__ void __launch_bounds__(128) rot_in_multi_kernel(const void* __restrict__ x, int x_dtype, const int* __restrict__ pick,
+                                                           const uint64_t* __restrict__ suh0, const uint64_t* __restrict__ suh1,
+                                                           half* __restrict__ out0, half* __restrict__ out1, int K, int topk, int E) {
+    pdl_wait();
+    pdl_trigger();
+    const int p = blockIdx.x, mat = blockIdx.z;
+    const int blk = blockIdx.y * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (blk * 128 >= K) return;
+    const int e = pick[p];
+    if (e < 0 || e >= E) return;
+    const int row = p / topk;
+    const int k = blk * 128 + 4 * lane;
+    rot_in_lane(x, x_dtype, (size_t)row * K + k, reinterpret_cast<const half*>((mat ? suh1 : suh0)[e]) + k,
+                (mat ? out1 : out0) + (size_t)p * K + k, lane);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -202,27 +227,16 @@ __device__ __forceinline__ void step_lane_words(const uint32_t (&raw)[step_regs<
     }
 }
 
-// Block (n block of 128 columns, matrix * SK + split, distinct expert u): WK warps split the K range, the members go through in
-// 16-row passes (an expert hit by more than 16 pairs repeats the pass; each pass is self-contained, so a pair's bits are the same
-// in any pass at any tile position).
+// One block's work: n block nb of 128 columns, K split `split` of matrix `mat`, one distinct expert (its trellis T, its cnt member pairs
+// listed at mem, their rotated inputs rows of X). WK warps split the K range, the members go through in 16-row passes (an expert hit by
+// more than 16 pairs repeats the pass; each pass is self-contained, so a pair's bits are the same in any pass at any tile position).
+// red [WK * 8 * 128] floats (16-byte aligned) and rows_sh [16] are the block's shared memory.
 template <int K2, int CB, int WK>
-__global__ void __launch_bounds__(WK * 32) moe_gemv_kernel(
-    const half* __restrict__ X0, const half* __restrict__ X1, const uint64_t* __restrict__ TP0,
-    const uint64_t* __restrict__ TP1, const int* __restrict__ uids, const int* __restrict__ ucount,
-    const int* __restrict__ mcount, const int* __restrict__ members, float* __restrict__ Z, int K, int N, int P, int SK) {
+__device__ __forceinline__ void gemv_block(const half* __restrict__ X, const uint32_t* __restrict__ T, const int* __restrict__ mem,
+                                           int cnt, float* __restrict__ Z, int K, int N, int P, int SK, int nb, int split, int mat,
+                                           float* red, int* rows_sh) {
     constexpr int TW = tile_words<K2>();
     constexpr int LW = lane_words<K2>();
-    pdl_wait();                                  // uids, ucount, members and the rotated inputs are the predecessors' outputs
-    pdl_trigger();
-    const int u = blockIdx.z;
-    if (u >= ucount[0]) return;
-    __shared__ __align__(16) float red[WK * 8 * 128];
-    __shared__ int rows_sh[16];
-
-    const int nb = blockIdx.x, split = blockIdx.y % SK, mat = blockIdx.y / SK;
-    const int e = uids[u], cnt = mcount[u];
-    const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
-    const half* X = mat ? X1 : X0;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int g = lane >> 2, t = lane & 3;
     const int per_warp = (K >> 4) / SK / WK;
@@ -235,7 +249,6 @@ __global__ void __launch_bounds__(WK * 32) moe_gemv_kernel(
         lane_start<K2>(lane, word, offset);
         prev = word != lane / (8 / K2);
     }
-    const int* mem = members + (size_t)u * P;
 
     for (int m0 = 0; m0 < cnt; m0 += 16) {
         if (threadIdx.x < 16) {
@@ -318,25 +331,69 @@ __global__ void __launch_bounds__(WK * 32) moe_gemv_kernel(
     }
 }
 
+// Block (n block of 128 columns, matrix * SK + split, distinct expert u): gemv_block of the expert's trellis.
+template <int K2, int CB, int WK>
+__global__ void __launch_bounds__(WK * 32) moe_gemv_kernel(
+    const half* __restrict__ X0, const half* __restrict__ X1, const uint64_t* __restrict__ TP0,
+    const uint64_t* __restrict__ TP1, const int* __restrict__ uids, const int* __restrict__ ucount,
+    const int* __restrict__ mcount, const int* __restrict__ members, float* __restrict__ Z, int K, int N, int P, int SK) {
+    pdl_wait();                                  // uids, ucount, members and the rotated inputs are the predecessors' outputs
+    pdl_trigger();
+    const int u = blockIdx.z;
+    if (u >= ucount[0]) return;
+    __shared__ __align__(16) float red[WK * 8 * 128];
+    __shared__ int rows_sh[16];
+    const int nb = blockIdx.x, split = blockIdx.y % SK, mat = blockIdx.y / SK;
+    const int e = uids[u], cnt = mcount[u];
+    gemv_block<K2, CB, WK>(mat ? X1 : X0, reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]), members + (size_t)u * P, cnt, Z, K,
+                           N, P, SK, nb, split, mat, red, rows_sh);
+}
+
+// moe_gemv_kernel over the experts of several banks of different widths at once (one launch a stage instead of one a bank): the
+// distinct experts u are global ids, each with its trellis address (TP0 / TP1 [E]) and its width in bits (B0 / B1 [E], gate and up
+// may differ). A block runs gemv_block at its expert's width, so every block is the block a one-width launch would run. WMASK: the
+// widths compiled in (bit b-1 for b bits); a width outside it computes nothing (the host picks an instantiation that holds every width).
+template <int CB, int WK, int WMASK>
+__global__ void __launch_bounds__(WK * 32) moe_gemv_multi_kernel(
+    const half* __restrict__ X0, const half* __restrict__ X1, const uint64_t* __restrict__ TP0,
+    const uint64_t* __restrict__ TP1, const int* __restrict__ B0, const int* __restrict__ B1, const int* __restrict__ uids,
+    const int* __restrict__ ucount, const int* __restrict__ mcount, const int* __restrict__ members, float* __restrict__ Z, int K,
+    int N, int P, int SK) {
+    pdl_wait();
+    pdl_trigger();
+    const int u = blockIdx.z;
+    if (u >= ucount[0]) return;
+    __shared__ __align__(16) float red[WK * 8 * 128];
+    __shared__ int rows_sh[16];
+    const int nb = blockIdx.x, split = blockIdx.y % SK, mat = blockIdx.y / SK;
+    const int e = uids[u], cnt = mcount[u];
+    const half* X = mat ? X1 : X0;
+    const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
+    const int* mem = members + (size_t)u * P;
+    switch (mat ? B1[e] : B0[e]) {
+#define GB_MB(B)                                                                                           \
+    case B:                                                                                                \
+        if constexpr ((WMASK >> ((B) - 1)) & 1)                                                            \
+            gemv_block<2 * (B), CB, WK>(X, T, mem, cnt, Z, K, N, P, SK, nb, split, mat, red, rows_sh);      \
+        break;
+        GB_MB(1) GB_MB(2) GB_MB(3) GB_MB(4) GB_MB(5) GB_MB(6) GB_MB(7) GB_MB(8)
+#undef GB_MB
+        default:
+            break;
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // epilogues. One warp a 128-wide block of one pair (or one row for the combine).
 
 __device__ __forceinline__ float silu_f(float x) { return x / (1.0f + expf(-x)); }
 
-// Per pair: gate and up partials -> activation -> xd = fp16(H((act * suh_down[e]))). limit > 0 clamps silu(gate) from above and
-// up to +-limit (the oracle's act_gate: the activated gate is clamped, not the pre-activation).
-__global__ void __launch_bounds__(128) gateup_epilogue_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
-                                                              const half* __restrict__ svh_g, const half* __restrict__ svh_u,
-                                                              const half* __restrict__ suh_d, half* __restrict__ xd, int P, int N,
-                                                              int SK, int E, float limit) {
-    pdl_wait();                                  // Z (the gate / up partials) and pick are the predecessors' outputs
-    pdl_trigger();
-    const int p = blockIdx.x;
-    const int blk = blockIdx.y * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
-    if (blk * 128 >= N) return;
-    const int e = pick[p];
-    if (e < 0 || e >= E) return;
-    const int n = blk * 128 + 4 * lane;
+// One lane's 4 columns n.. of pair p: gate and up partials -> activation -> xd = fp16(H((act * suh_down[e]))). The expert's svh_g,
+// svh_u and suh_d at those columns are sg_n, su_n, sd_n. limit > 0 clamps silu(gate) from above and up to +-limit (the oracle's
+// act_gate: the activated gate is clamped, not the pre-activation).
+__device__ __forceinline__ void gateup_lane(const float* __restrict__ Z, int p, int P, int N, int SK, int n, int lane,
+                                            const half* __restrict__ sg_n, const half* __restrict__ su_n, const half* __restrict__ sd_n,
+                                            float limit, half* __restrict__ xd_n) {
     float gv[4], uv[4];
     {
         const float* zg = Z + (size_t)p * N + n;
@@ -354,9 +411,9 @@ __global__ void __launch_bounds__(128) gateup_epilogue_kernel(const float* __res
     fwht128(gv, lane);
     fwht128(uv, lane);
     float sg4[4], su4[4], sd4[4], v[4];
-    load4h(svh_g + (size_t)e * N + n, sg4);
-    load4h(svh_u + (size_t)e * N + n, su4);
-    load4h(suh_d + (size_t)e * N + n, sd4);
+    load4h(sg_n, sg4);
+    load4h(su_n, su4);
+    load4h(sd_n, sd4);
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         const float g = gv[j] * HAD_SCALE * sg4[j];
@@ -371,7 +428,74 @@ __global__ void __launch_bounds__(128) gateup_epilogue_kernel(const float* __res
     fwht128(v, lane);
 #pragma unroll
     for (int j = 0; j < 4; ++j) v[j] *= HAD_SCALE;
-    store4h(xd + (size_t)p * N + n, v);
+    store4h(xd_n, v);
+}
+
+// Per pair: gateup_lane over the pair's expert's scales.
+__global__ void __launch_bounds__(128) gateup_epilogue_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
+                                                              const half* __restrict__ svh_g, const half* __restrict__ svh_u,
+                                                              const half* __restrict__ suh_d, half* __restrict__ xd, int P, int N,
+                                                              int SK, int E, float limit) {
+    pdl_wait();                                  // Z (the gate / up partials) and pick are the predecessors' outputs
+    pdl_trigger();
+    const int p = blockIdx.x;
+    const int blk = blockIdx.y * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (blk * 128 >= N) return;
+    const int e = pick[p];
+    if (e < 0 || e >= E) return;
+    const int n = blk * 128 + 4 * lane;
+    const size_t en = (size_t)e * N + n;
+    gateup_lane(Z, p, P, N, SK, n, lane, svh_g + en, svh_u + en, suh_d + en, limit, xd + (size_t)p * N + n);
+}
+
+// gateup_epilogue_kernel over several banks: pick holds global ids (or -1); tab [3][E] the addresses of each expert's svh_g, svh_u
+// and suh_d rows (N halves each).
+__global__ void __launch_bounds__(128) gateup_epilogue_multi_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
+                                                                    const uint64_t* __restrict__ tab, half* __restrict__ xd, int P,
+                                                                    int N, int SK, int E, float limit) {
+    pdl_wait();
+    pdl_trigger();
+    const int p = blockIdx.x;
+    const int blk = blockIdx.y * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (blk * 128 >= N) return;
+    const int e = pick[p];
+    if (e < 0 || e >= E) return;
+    const int n = blk * 128 + 4 * lane;
+    gateup_lane(Z, p, P, N, SK, n, lane, reinterpret_cast<const half*>(tab[e]) + n, reinterpret_cast<const half*>(tab[E + e]) + n,
+                reinterpret_cast<const half*>(tab[2 * E + e]) + n, limit, xd + (size_t)p * N + n);
+}
+
+// One lane's 4 columns n.. of pair p's y: H(sum of the K splits) * svh_down (the expert's svh_down at those columns: sv_n), fp32.
+__device__ __forceinline__ void down_lane(const float* __restrict__ Z, int p, int P, int D, int SK, int n, int lane,
+                                          const half* __restrict__ sv_n, float (&o)[4]) {
+    float4 s = *reinterpret_cast<const float4*>(Z + (size_t)p * D + n);
+    for (int q = 1; q < SK; ++q) {
+        const float4 a = *reinterpret_cast<const float4*>(Z + ((size_t)q * P + p) * D + n);
+        s.x += a.x; s.y += a.y; s.z += a.z; s.w += a.w;
+    }
+    float v[4] = {s.x, s.y, s.z, s.w}, sv[4];
+    fwht128(v, lane);
+    load4h(sv_n, sv);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) o[j] = v[j] * HAD_SCALE * sv[j];
+}
+
+// The down epilogue of several banks, pairs only (no combine: a rank's pairs go to the exchange first). Block (pair, 4 blocks of 128
+// columns), warp: one block. pick holds global ids (or -1: the pair's row is left alone); svh [E] the address of each expert's svh_down.
+__global__ void __launch_bounds__(128) down_pairs_multi_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
+                                                               const uint64_t* __restrict__ svh, float* __restrict__ y_pairs, int P,
+                                                               int D, int SK, int E) {
+    pdl_wait();
+    pdl_trigger();
+    const int p = blockIdx.x;
+    const int blk = blockIdx.y * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (blk * 128 >= D) return;
+    const int e = pick[p];
+    if (e < 0 || e >= E) return;
+    const int n = blk * 128 + 4 * lane;
+    float o[4];
+    down_lane(Z, p, P, D, SK, n, lane, reinterpret_cast<const half*>(svh[e]) + n, o);
+    *reinterpret_cast<float4*>(y_pairs + (size_t)p * D + n) = make_float4(o[0], o[1], o[2], o[3]);
 }
 
 // Block (row, 128 columns of the model width), warp k = slot k: y_k = H(sum of the K splits) * svh_down[e_k] (fp32); warp 0 then
@@ -393,16 +517,7 @@ __global__ void __launch_bounds__(32 * kMaxTopK) down_combine_kernel(
         const bool ok = e >= 0 && e < E;
         float o[4] = {0.f, 0.f, 0.f, 0.f};
         if (ok) {
-            float4 s = *reinterpret_cast<const float4*>(Z + (size_t)p * D + n);
-            for (int q = 1; q < SK; ++q) {
-                const float4 a = *reinterpret_cast<const float4*>(Z + ((size_t)q * P + p) * D + n);
-                s.x += a.x; s.y += a.y; s.z += a.z; s.w += a.w;
-            }
-            float v[4] = {s.x, s.y, s.z, s.w}, sv[4];
-            fwht128(v, lane);
-            load4h(svh_d + (size_t)e * D + n, sv);
-#pragma unroll
-            for (int j = 0; j < 4; ++j) o[j] = v[j] * HAD_SCALE * sv[j];
+            down_lane(Z, p, P, D, SK, n, lane, svh_d + (size_t)e * D + n, o);
             if (y_pairs) *reinterpret_cast<float4*>(y_pairs + (size_t)p * D + n) = make_float4(o[0], o[1], o[2], o[3]);
         }
         part[k][lane] = make_float4(o[0], o[1], o[2], o[3]);
@@ -473,6 +588,19 @@ int launch_gemv(const half* X0, const half* X1, const uint64_t* TP0, const uint6
     GB_MOE_FOR_CB(X, 2, WK) GB_MOE_FOR_CB(X, 4, WK) GB_MOE_FOR_CB(X, 6, WK) GB_MOE_FOR_CB(X, 8, WK)                    \
     GB_MOE_FOR_CB(X, 10, WK) GB_MOE_FOR_CB(X, 12, WK) GB_MOE_FOR_CB(X, 14, WK) GB_MOE_FOR_CB(X, 16, WK)
 
+// The widths the RED-SNOW packs mix (4, 5 and 6 bits): the multi GEMV compiled for those alone, and for every width.
+constexpr int kWidths456 = 0x38;
+constexpr int kWidthsAll = 0xFF;
+
+template <int CB, int WK, int WMASK>
+int launch_gemv_multi(const half* X0, const half* X1, const uint64_t* TP0, const uint64_t* TP1, const int* B0, const int* B1,
+                      const int* uids, const int* ucount, const int* mcount, const int* members, float* Z, int mats, int K, int N,
+                      int P, int SK, int umax, cudaStream_t st) {
+    const dim3 grid((unsigned)(N / 128), (unsigned)(mats * SK), (unsigned)umax);
+    return gbp_pdl::launch_pdl(gbp_pdl::on(gbp_pdl::kMoe), moe_gemv_multi_kernel<CB, WK, WMASK>, grid, dim3(WK * 32), 0, st, X0, X1, TP0,
+                               TP1, B0, B1, uids, ucount, mcount, members, Z, K, N, P, SK);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -539,6 +667,80 @@ GB_EXPORT int gb_moe_gemv(const void* x0, const void* x1, const void* tp0, const
     GB_MOE_FOR_ALL(GB_G, 4)
 #undef GB_G
     return (int)cudaErrorInvalidValue;
+}
+
+// gb_moe_rot_in over several banks: pick [rows * topk] holds global ids (or -1), suh0 / suh1 [E] the device address of each expert's
+// suh row (K halves) of gate and of up.
+GB_EXPORT int gb_moe_rot_in_multi(const void* x, int x_dtype, const void* pick, const void* suh0, const void* suh1, void* out0,
+                                  void* out1, int rows, int topk, int K, int E, void* stream) {
+    if (rows < 1 || topk < 1 || topk > kMaxTopK || K <= 0 || K % 128 || E < 1 || !dtype_ok(x_dtype) || !x || !pick || !suh0 ||
+        !suh1 || !out0 || !out1)
+        return (int)cudaErrorInvalidValue;
+    const dim3 grid((unsigned)(rows * topk), (unsigned)((K / 128 + 3) / 4), 2);
+    return gbp_pdl::launch_pdl(gbp_pdl::on(gbp_pdl::kMoe), rot_in_multi_kernel, grid, dim3(128), 0, gb_stream(stream), x, x_dtype,
+                               static_cast<const int*>(pick), static_cast<const uint64_t*>(suh0), static_cast<const uint64_t*>(suh1),
+                               static_cast<half*>(out0), static_cast<half*>(out1), K, topk, E);
+}
+
+// gb_moe_gemv over several banks of different widths in one launch: uids are global ids, tp0 / tp1 [E] each expert's trellis address and
+// bits0 / bits1 [E] (i32) its width, of the first and (mats == 2) the second matrix. widths: the mask of the widths present (bit b - 1 for
+// b bits), which picks the instantiation. Every block is the block gb_moe_gemv runs at that expert's width with the same sk and wk.
+GB_EXPORT int gb_moe_gemv_multi(const void* x0, const void* x1, const void* tp0, const void* tp1, const void* bits0, const void* bits1,
+                                const void* uids, const void* ucount, const void* mcount, const void* members, void* z, int mats, int K,
+                                int N, int P, int widths, int codebook, int sk, int wk, int umax, void* stream) {
+    if (mats < 1 || mats > 2 || K <= 0 || N <= 0 || K % 128 || N % 128 || P < 1 || widths <= 0 || widths > kWidthsAll ||
+        codebook < 0 || codebook > 2 || sk < 1 || wk != 4 || (K / 16) % (sk * wk) || umax < 1 || !x0 || !tp0 || !bits0 || !uids ||
+        !ucount || !mcount || !members || !z || (mats == 2 && (!x1 || !tp1 || !bits1)))
+        return (int)cudaErrorInvalidValue;
+    cudaStream_t st = gb_stream(stream);
+    const half* X0 = static_cast<const half*>(x0);
+    const half* X1 = static_cast<const half*>(mats == 2 ? x1 : x0);
+    const uint64_t* T0 = static_cast<const uint64_t*>(tp0);
+    const uint64_t* T1 = static_cast<const uint64_t*>(mats == 2 ? tp1 : tp0);
+    const int* B0 = static_cast<const int*>(bits0);
+    const int* B1 = static_cast<const int*>(mats == 2 ? bits1 : bits0);
+    const bool narrow = (widths & ~kWidths456) == 0;
+#define GB_GM(CB_)                                                                                                     \
+    if (codebook == CB_)                                                                                               \
+        return narrow ? launch_gemv_multi<CB_, 4, kWidths456>(X0, X1, T0, T1, B0, B1, static_cast<const int*>(uids),   \
+                                                              static_cast<const int*>(ucount),                          \
+                                                              static_cast<const int*>(mcount),                          \
+                                                              static_cast<const int*>(members), static_cast<float*>(z), \
+                                                              mats, K, N, P, sk, umax, st)                              \
+                      : launch_gemv_multi<CB_, 4, kWidthsAll>(X0, X1, T0, T1, B0, B1, static_cast<const int*>(uids),   \
+                                                              static_cast<const int*>(ucount),                          \
+                                                              static_cast<const int*>(mcount),                          \
+                                                              static_cast<const int*>(members), static_cast<float*>(z), \
+                                                              mats, K, N, P, sk, umax, st);
+    GB_GM(0) GB_GM(1) GB_GM(2)
+#undef GB_GM
+    return (int)cudaErrorInvalidValue;
+}
+
+// gb_moe_gateup_epilogue over several banks: tab [3][E] the device addresses of each expert's svh_g, svh_u and suh_d rows (N halves
+// each), pick global ids (or -1).
+GB_EXPORT int gb_moe_gateup_epilogue_multi(const void* z, const void* pick, const void* tab, void* xd, int rows, int topk, int N, int sk,
+                                           int E, float limit, void* stream) {
+    const int P = rows * topk;
+    if (rows < 1 || topk < 1 || topk > kMaxTopK || N <= 0 || N % 128 || sk < 1 || E < 1 || !z || !pick || !tab || !xd)
+        return (int)cudaErrorInvalidValue;
+    const dim3 grid((unsigned)P, (unsigned)((N / 128 + 3) / 4));
+    return gbp_pdl::launch_pdl(gbp_pdl::on(gbp_pdl::kMoe), gateup_epilogue_multi_kernel, grid, dim3(128), 0, gb_stream(stream),
+                               static_cast<const float*>(z), static_cast<const int*>(pick), static_cast<const uint64_t*>(tab),
+                               static_cast<half*>(xd), P, N, sk, E, limit);
+}
+
+// y_pairs [rows * topk, D] fp32: each pair's y (the down epilogue of gb_moe_down_combine, no combine) for every pair whose pick (a
+// global id) is in [0, E); svh [E] the device address of each expert's svh_down row (D halves). Other rows are left alone.
+GB_EXPORT int gb_moe_down_pairs_multi(const void* z, const void* pick, const void* svh, void* y_pairs, int rows, int topk, int D, int sk,
+                                      int E, void* stream) {
+    const int P = rows * topk;
+    if (rows < 1 || topk < 1 || topk > kMaxTopK || D <= 0 || D % 128 || sk < 1 || E < 1 || !z || !pick || !svh || !y_pairs)
+        return (int)cudaErrorInvalidValue;
+    const dim3 grid((unsigned)P, (unsigned)((D / 128 + 3) / 4));
+    return gbp_pdl::launch_pdl(gbp_pdl::on(gbp_pdl::kMoe), down_pairs_multi_kernel, grid, dim3(128), 0, gb_stream(stream),
+                               static_cast<const float*>(z), static_cast<const int*>(pick), static_cast<const uint64_t*>(svh),
+                               static_cast<float*>(y_pairs), P, D, sk, E);
 }
 
 // xd [P, N] fp16 from the gate/up partials Z [2][sk][P][N] (N = the expert width I). limit <= 0: no clamp.

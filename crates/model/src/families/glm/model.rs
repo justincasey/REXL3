@@ -275,6 +275,13 @@ pub struct GlmModel {
     window_rows: usize,
     kv_tab: KvTables,
     table: BlockTable,
+    /// The device block table's contents as last uploaded (`[slots][max_blocks]`), and each slot's length in it: a step uploads only
+    /// the entries of the slots whose page list changed.
+    table_host: Vec<i32>,
+    table_len: Vec<usize>,
+    /// The host bytes of the per-step uploads queued on `stream` (row arrays, block-table rows), kept until the stream has run them:
+    /// the copies are queued in stream order without blocking the host behind the work already queued.
+    stage: gb_cuda::rt::HostStage,
     s: Scratch,
     sig: SigmoidTable,
     kda_dims: kda::Dims,
@@ -383,6 +390,10 @@ impl GlmModel {
         let cr = chunk_rows;
         // every head's state, or a KDA head split rank's heads only (`KdaConfig::rank`: its pools, records and workspace from the start)
         let dims = alloc::dims_of(&cfg).map_err(ModelError::Config)?;
+        // Blackwell programmatic dependent launch (pdl.cuh): a launch may start while its predecessor still runs and reads the
+        // predecessor's writes only after `pdl_wait`, so only timing changes. Default every family (7); `REXL3_GLM_PDL` (0..7) overrides.
+        let pdl = std::env::var("REXL3_GLM_PDL").ok().and_then(|v| v.trim().parse::<i32>().ok()).unwrap_or(7) & 7;
+        gb_cuda::exl3_linear::set_pdl_mask(pdl).map_err(|e| ModelError::Config(format!("pdl mask: {e}")))?;
         let kda_layers: Vec<usize> = (0..layers).filter(|&l| ops::mixer_kind(&cfg, l) == MixerKind::Kda).collect();
         let mla_layers: Vec<usize> = (0..layers).filter(|&l| ops::mixer_kind(&cfg, l) == MixerKind::MlaDsa).collect();
         let mut kda_ord = vec![usize::MAX; layers];
@@ -514,6 +525,9 @@ impl GlmModel {
             window_rows: alloc::WINDOW_ROWS,
             kv_tab: KvTables::new(o.kv_blocks, o.slots, max_blocks),
             table: BlockTable::from_host(&vec![Vec::new(); o.slots], max_blocks)?,
+            table_host: vec![0; o.slots.max(1) * max_blocks],
+            table_len: vec![0; o.slots],
+            stage: gb_cuda::rt::HostStage::new(),
             s,
             sig: SigmoidTable::new()?,
             kda_dims: dims,
@@ -911,7 +925,7 @@ impl GlmModel {
         // kept whole) is skipped altogether and the commit is the conv shift and the flip of every row (`keep == None`: two launches a layer fewer)
         let all_whole = keep.iter().enumerate().all(|(i, &k)| k >= 0 && k as usize >= w.win.seq_rows(i).len());
         if !all_whole {
-            self.s.keep.upload(&keep)?;
+            self.stage.upload(&mut self.s.keep, &keep, &self.stream)?;
         }
         if self.cfg.kda.rank.is_some() && self.tp.as_ref().is_none_or(|t| t.split_bits() & tp::SPLIT_KDA == 0) {
             return Err(kda_rank_without_split(&self.cfg));
@@ -945,10 +959,12 @@ impl GlmModel {
     // ------------------------------------------------------------------------------------------------------------- the forward
 
     fn upload_rows(&mut self, b: &RowBatch) -> Result<(), ModelError> {
-        self.s.ids.upload(&b.ids)?;
-        self.s.seq_start.upload(&b.seq_start)?;
-        self.s.seq_slot.upload(&b.seq_slot)?;
-        self.s.rowidx.upload(&b.row_slot, &b.positions)?;
+        let (stage, st) = (&mut self.stage, &self.stream);
+        stage.upload(&mut self.s.ids, &b.ids, st)?;
+        stage.upload(&mut self.s.seq_start, &b.seq_start, st)?;
+        stage.upload(&mut self.s.seq_slot, &b.seq_slot, st)?;
+        stage.upload(&mut self.s.rowidx.slot, &b.row_slot, st)?;
+        stage.upload(&mut self.s.rowidx.pos, &b.positions, st)?;
         Ok(())
     }
 
@@ -962,8 +978,33 @@ impl GlmModel {
             self.kv_tab.ensure(b.seq_slot[i] as usize, last + 1).map_err(|e| ModelError::Request(format!("{e:?}")))?;
         }
         if upload {
-            let tables: Vec<Vec<u32>> = (0..self.slots).map(|s| self.kv_tab.blocks_of(s).to_vec()).collect();
-            self.table.upload(&tables)?;
+            self.upload_table()?;
+        }
+        Ok(())
+    }
+
+    /// Bring the device block table up to the host's page lists, in the stream's order: per slot, only the span of entries that differ
+    /// from the last upload is copied (a decode step whose pages did not change copies nothing).
+    pub(in crate::families::glm) fn upload_table(&mut self) -> Result<(), ModelError> {
+        let mb = self.table.max_blocks;
+        for s in 0..self.slots {
+            let blocks = self.kv_tab.blocks_of(s);
+            if blocks.len() > mb {
+                return Err(ModelError::Request(format!("slot {s}: {} pages, the table holds {mb}", blocks.len())));
+            }
+            let span = blocks.len().max(self.table_len[s]);
+            let row = &mut self.table_host[s * mb..s * mb + span];
+            let want = |i: usize| blocks.get(i).map_or(0, |&b| b as i32);
+            let Some(lo) = (0..span).find(|&i| row[i] != want(i)) else {
+                self.table_len[s] = blocks.len();
+                continue;
+            };
+            let hi = (lo..span).rfind(|&i| row[i] != want(i)).unwrap_or(lo) + 1;
+            for (i, r) in row.iter_mut().enumerate().take(hi).skip(lo) {
+                *r = want(i);
+            }
+            self.stage.upload_at(&mut self.table.buf, (s * mb + lo) * 4, &row[lo..hi], &self.stream)?;
+            self.table_len[s] = blocks.len();
         }
         Ok(())
     }
@@ -1000,7 +1041,9 @@ impl GlmModel {
             self.upload_rows(b)?;
         }
         self.ensure_pages(b, stale != Some(GraphMutant::StaleTable))?;
+        // a replay launches the captured graph and never reads the schedule
         let plan = match self.mutant {
+            _ if replay => Vec::new(),
             Some(m) => ops::plan_forward_mutated(&self.cfg, self.layers, head != Head::None, m),
             // the drafter taps the head's mean and norm for every row, with or without logits
             None if head == Head::None && self.mtp.is_some() => ops::plan_forward_tap(&self.cfg, self.layers),
@@ -2278,10 +2321,10 @@ impl GlmModel {
         if count == 0 || count > MAX_CANDIDATES {
             return Err(ModelError::Request(format!("candidate count must be 1..={MAX_CANDIDATES}")));
         }
-        let GlmModel { cfg, stream, s, mutant, .. } = self;
+        let GlmModel { cfg, stream, s, mutant, stage, .. } = self;
         let valid = if *mutant == Some(Mutant::UnmaskedVocab) { cfg.vocab } else { TOKENIZER_VOCAB };
         glm_glue::topk_f16(&s.logits, rows, cfg.vocab, valid, count, &mut s.topk_ids, &mut s.topk_vals, &mut s.topk_ws, stream)?;
-        stream.sync()?;
+        stage.sync(stream)?;
         let mut ids = vec![0i32; rows * count];
         let mut vals = vec![0f32; rows * count];
         s.topk_ids.download(&mut ids)?;

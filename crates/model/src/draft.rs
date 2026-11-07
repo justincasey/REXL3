@@ -15,7 +15,38 @@ use core::ffi::c_void;
 use gb_cuda::dflash2::{self, DraftCache, DraftCtxLayout, GateDtype, WalkSampling};
 use gb_cuda::exl3_linear::{linear_workspace_bytes, prefill_scratch_bytes, Dtype, Exl3Weights};
 use gb_cuda::q4_linear::{self, Q4Weights};
+use gb_cuda::graph::Graph;
 use gb_cuda::{glue, DevBuf, Stream};
+use std::collections::HashMap;
+
+/// Round graph shapes kept at once (each a few hundred launches; a new shape past the limit runs eagerly).
+const ROUND_GRAPHS: usize = 64;
+
+/// What identifies a captured draft round: every host value its launches take (`Draft::round_launches`): the sequences and the picks
+/// each one asks for, the head (restricted or full), and the target's embedding and head it reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct RoundKey {
+    n: usize,
+    wants: [u8; MAX_DRAFT_SEQS],
+    use_sub: bool,
+    embed: usize,
+    head: usize,
+}
+
+enum RoundSlot {
+    /// Seen once: the next round of the shape is captured.
+    Seen,
+    Ready(Graph),
+    /// The capture failed: eager rounds.
+    Eager,
+}
+
+/// The draft's round graphs and the stream they are captured on.
+#[derive(Default)]
+struct RoundGraphs {
+    slots: HashMap<RoundKey, RoundSlot>,
+    cap: Option<Stream>,
+}
 
 pub const BLOCK: usize = 8;
 /// Most sequences one batched draft round carries (its rows go through the decode kernels, which take at most 128).
@@ -155,6 +186,52 @@ impl Lin {
     }
 }
 
+/// Linears that read one input: separate ones (an EXL3 pack's), or, for a bf16 pack, ONE 4-bit matrix of their rows stacked
+/// ([`load_group`]), which one launch runs, writing each part's output to its own buffer. Each part's rows are quantized exactly
+/// as they would be alone; only the K split (a function of the stacked shape) can differ, and a draft only proposes tokens.
+enum LinGroup {
+    Each(Vec<Lin>),
+    Stacked { w: Q4Weights, parts: Vec<usize> },
+}
+
+impl LinGroup {
+    /// Parts `from..` of the group over `m` rows of `x`: part `from + i` into `outs[i]`, bf16 `[m, part width]`.
+    fn forward(
+        &self,
+        x: &DevBuf,
+        from: usize,
+        outs: &mut [&mut DevBuf],
+        m: usize,
+        s: &mut LinScratch,
+        st: &Stream,
+    ) -> Result<(), ModelError> {
+        match self {
+            LinGroup::Each(v) => {
+                for (l, y) in v[from..].iter().zip(outs.iter_mut()) {
+                    l.forward(x, y, m, s, st)?;
+                }
+            }
+            LinGroup::Stacked { w, parts } => {
+                let col0 = parts[..from].iter().sum();
+                let mut segs: Vec<(&mut DevBuf, usize)> = outs.iter_mut().map(|y| &mut **y).zip(parts[from..].iter().copied()).collect();
+                w.forward_cols(x, &mut s.gs, col0, &mut segs, m, st)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn push<'a>(&'a self, v: &mut Vec<(String, &'a DevBuf)>, names: &[String]) {
+        match self {
+            LinGroup::Each(ls) => {
+                for (l, n) in ls.iter().zip(names) {
+                    l.push(v, n.clone());
+                }
+            }
+            LinGroup::Stacked { w, .. } => v.push((format!("{}.q4", names.join("+")), &w.buf)),
+        }
+    }
+}
+
 struct ConvPair {
     /// f16 `[2, 2, hidden]`
     base: DevBuf,
@@ -165,14 +242,13 @@ struct ConvPair {
 struct DraftLayer {
     input_norm: DevBuf,
     post_norm: DevBuf,
-    q: Lin,
-    k: Lin,
-    v: Lin,
+    /// q, k and v
+    qkv: LinGroup,
     o: Lin,
     q_norm: DevBuf,
     k_norm: DevBuf,
-    gate: Lin,
-    up: Lin,
+    /// gate and up
+    gu: LinGroup,
     down: Lin,
     attn_conv: ConvPair,
     mlp_conv: ConvPair,
@@ -327,6 +403,11 @@ pub struct Draft {
     pub capture_lattice: bool,
     /// f32 `[max_seqs * DRAFTS, k, k]`: the lattice's edge terms, allocated on first capture.
     edge: Option<DevBuf>,
+    /// The host bytes of the round's and the absorbs' index uploads, queued on the stream in its order (the host does not wait for the
+    /// work queued before them) and kept until the stream has run them.
+    stage: gb_cuda::rt::HostStage,
+    /// The draft rounds' CUDA graphs (`Draft::round_graphed`).
+    rounds: RoundGraphs,
 }
 
 fn load_exl3<'p>(
@@ -364,6 +445,45 @@ fn load_q4<'p>(
     let buf = ctx.computed(len, move || Ok(q4_linear::quantize_bf16(&pack.bf16(&name, &[n, k])?, n, k)))?;
     *bytes += len;
     Ok(Lin::Q4(Q4Weights::from_buf(buf, n, k)?))
+}
+
+/// The linears `names` (each `[n, k]`, `parts` the n's) that read one input: an EXL3 pack's one by one, a bf16 pack's as one 4-bit
+/// matrix of their rows stacked in order ([`LinGroup::Stacked`]; every part but the last whole 64-row tiles).
+fn load_group<'p>(
+    ctx: &mut LoadCtx<'p>,
+    pack: &'p Pack,
+    format: Format,
+    names: &[String],
+    k: usize,
+    parts: &[usize],
+    bytes: &mut usize,
+) -> Result<LinGroup, ModelError> {
+    if format == Format::Exl3 {
+        let mut v = Vec::with_capacity(names.len());
+        for (name, &n) in names.iter().zip(parts) {
+            v.push(load_exl3(ctx, pack, name, k, n, bytes)?);
+        }
+        return Ok(LinGroup::Each(v));
+    }
+    let tensors: Vec<String> = names.iter().map(|n| format!("{n}.weight")).collect();
+    for (t, &n) in tensors.iter().zip(parts) {
+        pack.entry(t, "BF16", &[n, k])?;
+    }
+    if k % q4_linear::GROUP != 0 || parts[..parts.len() - 1].iter().any(|n| n % 64 != 0) {
+        return Err(ModelError::Config(format!("draft {names:?}: parts {parts:?} of {k} inputs cannot be stacked")));
+    }
+    let n: usize = parts.iter().sum();
+    let len = q4_linear::bytes(n, k);
+    let shapes: Vec<(String, usize)> = tensors.into_iter().zip(parts.iter().copied()).collect();
+    let buf = ctx.computed(len, move || {
+        let mut w = Vec::with_capacity(n * k);
+        for (t, rows) in &shapes {
+            w.extend_from_slice(&pack.bf16(t, &[*rows, k])?);
+        }
+        Ok(q4_linear::quantize_bf16(&w, n, k))
+    })?;
+    *bytes += len;
+    Ok(LinGroup::Stacked { w: Q4Weights::from_buf(buf, n, k)?, parts: parts.to_vec() })
 }
 
 fn f32_dev<'p>(ctx: &mut LoadCtx<'p>, pack: &'p Pack, name: &str, shape: &[usize]) -> Result<DevBuf, ModelError> {
@@ -444,11 +564,11 @@ impl Draft {
             let p = format!("layers.{i}");
             v.push((format!("{p}.input_norm"), &l.input_norm));
             v.push((format!("{p}.post_norm"), &l.post_norm));
-            for (n, w) in
-                [("q", &l.q), ("k", &l.k), ("v", &l.v), ("o", &l.o), ("gate", &l.gate), ("up", &l.up), ("down", &l.down)]
-            {
-                w.push(&mut v, format!("{p}.{n}"));
-            }
+            let names = |ns: &[&str]| ns.iter().map(|n| format!("{p}.{n}")).collect::<Vec<_>>();
+            l.qkv.push(&mut v, &names(&["q", "k", "v"]));
+            l.o.push(&mut v, format!("{p}.o"));
+            l.gu.push(&mut v, &names(&["gate", "up"]));
+            l.down.push(&mut v, format!("{p}.down"));
             v.push((format!("{p}.q_norm"), &l.q_norm));
             v.push((format!("{p}.k_norm"), &l.k_norm));
             for (n, c) in [("attn_conv", &l.attn_conv), ("mlp_conv", &l.mlp_conv)] {
@@ -595,14 +715,19 @@ impl Draft {
             layers.push(DraftLayer {
                 input_norm: f32_dev(ctx, pack, &format!("{p}input_layernorm.weight"), &[h])?,
                 post_norm: f32_dev(ctx, pack, &format!("{p}post_attention_layernorm.weight"), &[h])?,
-                q: lin(ctx, &format!("{p}self_attn.q_proj"), h, Q_HEADS * HEAD_DIM, &mut bytes)?,
-                k: lin(ctx, &format!("{p}self_attn.k_proj"), h, KV_HEADS * HEAD_DIM, &mut bytes)?,
-                v: lin(ctx, &format!("{p}self_attn.v_proj"), h, KV_HEADS * HEAD_DIM, &mut bytes)?,
+                qkv: load_group(
+                    ctx,
+                    pack,
+                    format,
+                    &[format!("{p}self_attn.q_proj"), format!("{p}self_attn.k_proj"), format!("{p}self_attn.v_proj")],
+                    h,
+                    &[Q_HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM],
+                    &mut bytes,
+                )?,
                 o: lin(ctx, &format!("{p}self_attn.o_proj"), Q_HEADS * HEAD_DIM, h, &mut bytes)?,
                 q_norm: f32_dev(ctx, pack, &format!("{p}self_attn.q_norm.weight"), &[HEAD_DIM])?,
                 k_norm: f32_dev(ctx, pack, &format!("{p}self_attn.k_norm.weight"), &[HEAD_DIM])?,
-                gate: lin(ctx, &format!("{p}mlp.gate_proj"), h, f, &mut bytes)?,
-                up: lin(ctx, &format!("{p}mlp.up_proj"), h, f, &mut bytes)?,
+                gu: load_group(ctx, pack, format, &[format!("{p}mlp.gate_proj"), format!("{p}mlp.up_proj")], h, &[f, f], &mut bytes)?,
                 down: lin(ctx, &format!("{p}mlp.down_proj"), f, h, &mut bytes)?,
                 attn_conv: conv_pair(ctx, pack, &dims, &p, "attention_conv", &mut bytes)?,
                 mlp_conv: conv_pair(ctx, pack, &dims, &p, "mlp_conv", &mut bytes)?,
@@ -698,6 +823,8 @@ impl Draft {
             head_rounds: [0; 2],
             capture_lattice: false,
             edge: None,
+            stage: gb_cuda::rt::HostStage::new(),
+            rounds: RoundGraphs::default(),
         };
         Ok((d, bytes))
     }
@@ -836,8 +963,12 @@ impl Draft {
             slots.extend(std::iter::repeat_n(a.slot as i32, a.n));
         }
         let n = total;
-        self.ctx_pos.upload(&pos)?;
-        self.ctx_slot.upload(&slots)?;
+        // an absorb-only stretch (a serial request) never reaches a round's sync: bound what the stage keeps
+        if self.stage.queued() >= 256 {
+            self.stage.sync(stream)?;
+        }
+        self.stage.upload(&mut self.ctx_pos, &pos, stream)?;
+        self.stage.upload(&mut self.ctx_slot, &slots, stream)?;
         let Draft { dims, fc, hidden_norm, layers, cache, fc_in, ctx, kproj, vproj, ctx_pos, ctx_slot, lin, .. } = self;
         let (fc_w, h) = (dims.fc_in(), dims.hidden);
         let mut at = 0usize;
@@ -861,8 +992,7 @@ impl Draft {
             glue::rmsnorm(cp(ctx), cp(hidden_norm), mp(ctx), n, h, dims.eps, stream)?;
         }
         for (l, layer) in layers.iter().enumerate() {
-            layer.k.forward(ctx, kproj, n, lin, stream)?;
-            layer.v.forward(ctx, vproj, n, lin, stream)?;
+            layer.qkv.forward(ctx, 1, &mut [&mut *kproj, &mut *vproj], n, lin, stream)?;
             cache.write_ctx(l, kproj, vproj, &layer.k_norm, ctx_pos, ctx_slot, n, dims.eps, dims.rope_theta, stream)?;
         }
         Ok(())
@@ -1020,19 +1150,136 @@ impl Draft {
         for &w in &wants {
             row_off.push(row_off.last().unwrap() + w as i32);
         }
-        self.ids.upload(&ids)?;
-        self.pos.upload(&pos)?;
-        self.anchor.upload(&anchors)?;
-        self.slot_a.upload(&slots)?;
-        self.p_a.upload(&ps)?;
-        self.walk.upload(&walks)?;
-        self.row_off.upload(&row_off)?;
+        let st = &mut self.stage;
+        st.upload(&mut self.ids, &ids, stream)?;
+        st.upload(&mut self.pos, &pos, stream)?;
+        st.upload(&mut self.anchor, &anchors, stream)?;
+        st.upload(&mut self.slot_a, &slots, stream)?;
+        st.upload(&mut self.p_a, &ps, stream)?;
+        st.upload(&mut self.walk, &walks, stream)?;
+        st.upload(&mut self.row_off, &row_off, stream)?;
         // the restricted head runs when there is one and, if it is adaptive, when every sequence is writing text it can reach
         let use_sub = self.sub.is_some() && self.adaptive_min.is_none_or(|min| reqs.iter().all(|r| r.coverage >= min));
         let capture = self.capture_lattice;
         if capture && self.edge.is_none() {
             self.edge = Some(DevBuf::zeroed(self.max_seqs * (self.block - 1) * SELECTOR_TOP_K * SELECTOR_TOP_K * 4)?);
         }
+        let nd = row_off[n] as usize;
+        self.head_rounds[use_sub as usize] += 1;
+        if capture {
+            self.round_launches(embed, head, vocab, &wants, use_sub, true, stream)?;
+        } else {
+            self.round_graphed(embed, head, vocab, &wants, use_sub, stream)?;
+        }
+        let Draft { stage, out_tokens, conf, margin, top_ids, top_vals, edge, .. } = self;
+        stage.sync(stream)?;
+        let mut t = vec![0i32; nd];
+        out_tokens.download(&mut t)?;
+        let mut c = vec![0f32; nd];
+        conf.download(&mut c)?;
+        let mut m = vec![0f32; nd];
+        margin.download(&mut m)?;
+        let lat = if capture {
+            let mut ids = vec![0i32; nd * SELECTOR_TOP_K];
+            top_ids.download(&mut ids)?;
+            let mut vals = vec![0f32; nd * SELECTOR_TOP_K];
+            top_vals.download(&mut vals)?;
+            let mut ed = vec![0f32; nd * SELECTOR_TOP_K * SELECTOR_TOP_K];
+            edge.as_ref().expect("allocated above").download(&mut ed)?;
+            Some((ids, vals, ed))
+        } else {
+            None
+        };
+        Ok((0..n)
+            .map(|s| {
+                let (a, b) = (row_off[s] as usize, row_off[s + 1] as usize);
+                let k = SELECTOR_TOP_K;
+                let lattice = lat.as_ref().map(|(ids, vals, ed)| Lattice {
+                    rows: b - a,
+                    k,
+                    ids: ids[a * k..b * k].iter().map(|&x| x as u32).collect(),
+                    unary: vals[a * k..b * k].to_vec(),
+                    edge: ed[a * k * k..b * k * k].to_vec(),
+                    restricted_head: use_sub,
+                });
+                Picked {
+                    tokens: t[a..b].iter().map(|&x| x as u32).collect(),
+                    score: c[a..b].to_vec(),
+                    margin: m[a..b].to_vec(),
+                    lattice,
+                }
+            })
+            .collect())
+    }
+
+    /// A round's launches through the round graphs: the first round of a shape runs eagerly, the second is captured (on the draft's
+    /// own capture stream) and launched, every later one replays the graph. Only the host values that reach a launcher are in the
+    /// key (sequences and each one's picks, the head); every other input of the round is read from the draft's device buffers, which
+    /// the round's uploads rewrote in place. A shape whose capture fails runs eagerly from then on.
+    fn round_graphed(
+        &mut self,
+        embed: &DevBuf,
+        head: &Exl3Weights,
+        vocab: usize,
+        wants: &[usize],
+        use_sub: bool,
+        stream: &Stream,
+    ) -> Result<(), ModelError> {
+        let mut w = [0u8; MAX_DRAFT_SEQS];
+        for (d, &s) in w.iter_mut().zip(wants) {
+            *d = s as u8;
+        }
+        let key = RoundKey { n: wants.len(), wants: w, use_sub, embed: embed.ptr() as usize, head: head as *const _ as usize };
+        match self.rounds.slots.get(&key) {
+            Some(RoundSlot::Ready(g)) => return Ok(g.launch(stream)?),
+            Some(RoundSlot::Eager) => return self.round_launches(embed, head, vocab, wants, use_sub, false, stream),
+            Some(RoundSlot::Seen) => {}
+            None => {
+                if self.rounds.slots.len() < ROUND_GRAPHS {
+                    self.rounds.slots.insert(key, RoundSlot::Seen);
+                }
+                return self.round_launches(embed, head, vocab, wants, use_sub, false, stream);
+            }
+        }
+        let cap = match self.rounds.cap.take() {
+            Some(c) => c,
+            None => Stream::new()?,
+        };
+        let captured = Graph::capture(&cap, || self.round_launches(embed, head, vocab, wants, use_sub, false, &cap));
+        self.rounds.cap = Some(cap);
+        match captured {
+            Ok(g) => {
+                g.launch(stream)?;
+                self.rounds.slots.insert(key, RoundSlot::Ready(g));
+                Ok(())
+            }
+            Err(e) => {
+                if let Some(fatal) = e.fatal() {
+                    return Err(ModelError::Cuda(fatal.clone()));
+                }
+                eprintln!("rexl3 level=warn event=draft_round_capture_failed rows={} (this round shape runs eagerly)", wants.len());
+                self.rounds.slots.insert(key, RoundSlot::Eager);
+                self.round_launches(embed, head, vocab, wants, use_sub, false, stream)
+            }
+        }
+    }
+
+    /// The launches of a draft round on `stream` (the index arrays already uploaded): the block's layers, the head over each sequence's
+    /// first `wants[s]` picks, the top-k, the selector walk, and with `edges` the lattice's edge terms.
+    #[allow(clippy::too_many_arguments)]
+    fn round_launches(
+        &mut self,
+        embed: &DevBuf,
+        head: &Exl3Weights,
+        vocab: usize,
+        wants: &[usize],
+        use_sub: bool,
+        edges: bool,
+        stream: &Stream,
+    ) -> Result<(), ModelError> {
+        let n = wants.len();
+        let nd: usize = wants.iter().sum();
+        let block = self.block;
         let Draft {
             dims,
             layers,
@@ -1075,10 +1322,10 @@ impl Draft {
             walk,
             row_off: row_off_d,
             sub,
-            head_rounds,
             edge,
             ..
         } = self;
+        let capture = edges;
         let rows = n * block;
         let (hd, eps, dw) = (dims.hidden, dims.eps, dims.dyn_width());
         let prep = dims.attn_prep();
@@ -1091,9 +1338,7 @@ impl Draft {
                 glue::small_linear_f16w(cp(h), cp(&layer.attn_conv.proj), mp(dynv), rows, hd, dw, stream)?;
             }
             dflash2::dynconv(h, dynv, &layer.attn_conv.base, 0, n, block, hd, CONV_GROUP, None, y, stream)?;
-            layer.q.forward(y, qb, rows, lin, stream)?;
-            layer.k.forward(y, kb, rows, lin, stream)?;
-            layer.v.forward(y, vb, rows, lin, stream)?;
+            layer.qkv.forward(y, 0, &mut [&mut *qb, &mut *kb, &mut *vb], rows, lin, stream)?;
             unsafe {
                 glue::attn_prep(
                     &prep,
@@ -1136,8 +1381,7 @@ impl Draft {
                 glue::small_linear_f16w(cp(h), cp(&layer.mlp_conv.proj), mp(dynv), rows, hd, dw, stream)?;
             }
             dflash2::dynconv(h, dynv, &layer.mlp_conv.base, 0, n, block, hd, CONV_GROUP, None, y, stream)?;
-            layer.gate.forward(y, g, rows, lin, stream)?;
-            layer.up.forward(y, u, rows, lin, stream)?;
+            layer.gu.forward(y, 0, &mut [&mut *g, &mut *u], rows, lin, stream)?;
             unsafe {
                 glue::swiglu(cp(g), cp(u), mp(sw), rows * dims.intermediate, stream)?;
             }
@@ -1162,7 +1406,6 @@ impl Draft {
                 at += want;
             }
         }
-        let nd = row_off[n] as usize;
         // a head whose last columns are padding (GLM's 24): the top-k never reads them (`topk_valid`); one without keeps `topk`
         let topk = |logits: &DevBuf, cols: usize, valid: usize, top_ids: &mut DevBuf, top_vals: &mut DevBuf, top_ws: &mut DevBuf| unsafe {
             if valid < cols {
@@ -1184,7 +1427,6 @@ impl Draft {
         };
         let pad = vocab - dims.valid_vocab;
         // the head over every column, or over the restricted set (whose top-k ids are then mapped back to token ids)
-        head_rounds[use_sub as usize] += 1;
         match sub.as_mut().filter(|_| use_sub) {
             None => {
                 head.forward(sel, logits, nd, Dtype::BF16, Dtype::BF16, &mut lin.ws, stream)?;
@@ -1239,44 +1481,7 @@ impl Draft {
                 stream,
             )?;
         }
-        stream.sync()?;
-        let mut t = vec![0i32; nd];
-        out_tokens.download(&mut t)?;
-        let mut c = vec![0f32; nd];
-        conf.download(&mut c)?;
-        let mut m = vec![0f32; nd];
-        margin.download(&mut m)?;
-        let lat = if capture {
-            let mut ids = vec![0i32; nd * SELECTOR_TOP_K];
-            top_ids.download(&mut ids)?;
-            let mut vals = vec![0f32; nd * SELECTOR_TOP_K];
-            top_vals.download(&mut vals)?;
-            let mut ed = vec![0f32; nd * SELECTOR_TOP_K * SELECTOR_TOP_K];
-            edge.as_ref().expect("allocated above").download(&mut ed)?;
-            Some((ids, vals, ed))
-        } else {
-            None
-        };
-        Ok((0..n)
-            .map(|s| {
-                let (a, b) = (row_off[s] as usize, row_off[s + 1] as usize);
-                let k = SELECTOR_TOP_K;
-                let lattice = lat.as_ref().map(|(ids, vals, ed)| Lattice {
-                    rows: b - a,
-                    k,
-                    ids: ids[a * k..b * k].iter().map(|&x| x as u32).collect(),
-                    unary: vals[a * k..b * k].to_vec(),
-                    edge: ed[a * k * k..b * k * k].to_vec(),
-                    restricted_head: use_sub,
-                });
-                Picked {
-                    tokens: t[a..b].iter().map(|&x| x as u32).collect(),
-                    score: c[a..b].to_vec(),
-                    margin: m[a..b].to_vec(),
-                    lattice,
-                }
-            })
-            .collect())
+        Ok(())
     }
 }
 

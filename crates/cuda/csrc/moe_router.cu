@@ -44,8 +44,8 @@ __device__ __forceinline__ float2 load_pair(const void* p, size_t i) {
 // j = lane, lane + 32, ... in this order whatever UN (the pairs a lane loads before it consumes them) and WARPS: UN loads are issued
 // together, the fmaf chain is consumed in pair order.
 template <int RB, int WARPS, int UN, int DT>
-__global__ void __launch_bounds__(WARPS * 32)
-    router_logits_kernel(const void* __restrict__ x, const half* __restrict__ gate, half* __restrict__ logits, int rows, int K, int E) {
+__device__ __forceinline__ void router_logits_warp(const void* __restrict__ x, const half* __restrict__ gate, half* __restrict__ logits,
+                                                   int rows, int K, int E) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int e = blockIdx.x * WARPS + warp;
     // the expert's gate row is a weight: bring it into L2 while the predecessor runs; then wait (first, early exits included)
@@ -87,13 +87,19 @@ __global__ void __launch_bounds__(WARPS * 32)
             }
         }
     }
-    pdl_trigger();                               // x is read: the successor (the selection) may launch
+    pdl_trigger();                               // x is read: the successor may launch
 #pragma unroll
     for (int r = 0; r < RB; ++r) {
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1) sum[r] += __shfl_down_sync(0xffffffffu, sum[r], off);
         if (lane == 0 && row0 + r < rows) logits[(size_t)(row0 + r) * E + e] = __float2half_rn(sum[r]);
     }
+}
+
+template <int RB, int WARPS, int UN, int DT>
+__global__ void __launch_bounds__(WARPS * 32)
+    router_logits_kernel(const void* __restrict__ x, const half* __restrict__ gate, half* __restrict__ logits, int rows, int K, int E) {
+    router_logits_warp<RB, WARPS, UN, DT>(x, gate, logits, rows, K, E);
 }
 
 // The prefill tiling of the same GEMV (a chunk's rows, the router and the DSA indexer's fp16 GEMVs): warp w of block (b, r) computes
@@ -173,12 +179,18 @@ __device__ __forceinline__ uint32_t key_code(float k) {
     return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
 
-// One warp per row.
-__global__ void __launch_bounds__(32)
-    router_select_kernel(const half* __restrict__ logits, const float* __restrict__ sig, const float* __restrict__ bias,
-                         int* __restrict__ pick, half* __restrict__ wts, float scale, int E, int K) {
-    pdl_wait();                                  // the logits are the predecessor's
-    const int row = blockIdx.x, lane = threadIdx.x;
+// A logit's fp16 bits: a plain load, or (CG) one that bypasses L1 (logits written by other blocks of the same grid).
+template <bool CG>
+__device__ __forceinline__ unsigned short logit_bits(const half* lg, int id) {
+    if constexpr (CG) return __ldcg(reinterpret_cast<const unsigned short*>(lg) + id);
+    else return __half_as_ushort(lg[id]);
+}
+
+// One warp selects one row.
+template <bool CG>
+__device__ __forceinline__ void router_select_row(const half* __restrict__ logits, const float* __restrict__ sig,
+                                                  const float* __restrict__ bias, int* __restrict__ pick, half* __restrict__ wts,
+                                                  float scale, int E, int K, int row, int lane) {
     const half* lg = logits + (size_t)row * E;
     // candidate j of this lane is expert lane + 32 j; comp = key code in the high word, (~id) in the low word, so the largest
     // comp is the largest key and, among equal keys, the lowest id. 0 marks a taken or absent candidate.
@@ -188,12 +200,11 @@ __global__ void __launch_bounds__(32)
         const int id = lane + 32 * j;
         comp[j] = 0;
         if (id < E) {
-            const float act = __ldg(sig + __half_as_ushort(lg[id]));
+            const float act = __ldg(sig + logit_bits<CG>(lg, id));
             const float key = act + __ldg(bias + id);
             comp[j] = ((uint64_t)key_code(key) << 32) | (uint64_t)(0xFFFFFFFFu - (uint32_t)id);
         }
     }
-    pdl_trigger();                               // the logits are read
     int my_id = -1;
     float my_act = 0.0f;
     for (int k = 0; k < K; ++k) {
@@ -212,7 +223,7 @@ __global__ void __launch_bounds__(32)
             if (comp[j] == best) comp[j] = 0;
         if (lane == k) {
             my_id = id;
-            my_act = __ldg(sig + __half_as_ushort(lg[id]));
+            my_act = __ldg(sig + logit_bits<CG>(lg, id));
         }
     }
     // The oracle's reduction: lanes >= K contribute 0, a shfl_down tree 16 -> 1 (an out-of-range source returns the lane's own
@@ -226,6 +237,38 @@ __global__ void __launch_bounds__(32)
         pick[(size_t)row * K + lane] = my_id;
         wts[(size_t)row * K + lane] = __float2half_rn(__fdiv_rn(__fmul_rn(my_act, scale), s));
     }
+}
+
+// One warp per row.
+__global__ void __launch_bounds__(32)
+    router_select_kernel(const half* __restrict__ logits, const float* __restrict__ sig, const float* __restrict__ bias,
+                         int* __restrict__ pick, half* __restrict__ wts, float scale, int E, int K) {
+    pdl_wait();                                  // the logits are the predecessor's
+    pdl_trigger();
+    router_select_row<false>(logits, sig, bias, pick, wts, scale, E, K, blockIdx.x, threadIdx.x);
+}
+
+// The decode router in one launch: router_logits_kernel's blocks, then the LAST block to finish (a counter in `done`, back to 0 when it
+// is done) selects every row, one warp a row, exactly as router_select_kernel does. The arithmetic of a logit and of a selection is
+// the two kernels'; only the launch boundary between them is gone.
+template <int RB, int WARPS, int UN, int DT>
+__global__ void __launch_bounds__(WARPS * 32)
+    router_fused_kernel(const void* __restrict__ x, const half* __restrict__ gate, half* __restrict__ logits, const float* __restrict__ sig,
+                        const float* __restrict__ bias, int* __restrict__ pick, half* __restrict__ wts, float scale, int rows, int K,
+                        int E, int topk, unsigned* __restrict__ done) {
+    __shared__ int last;
+    router_logits_warp<RB, WARPS, UN, DT>(x, gate, logits, rows, K, E);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();                         // this block's logits are visible before it counts itself done
+        last = atomicAdd(done, 1u) == gridDim.x * gridDim.y - 1;
+    }
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    for (int row = warp; row < rows; row += WARPS) router_select_row<true>(logits, sig, bias, pick, wts, scale, E, topk, row, lane);
+    if (threadIdx.x == 0) *done = 0;
 }
 
 bool dtype_ok(int d) { return d >= 0 && d <= 2; }
@@ -327,10 +370,11 @@ GB_EXPORT int gb_moe_router_logits(const void* x, int x_dtype, const void* gate,
     // (bench_router_big, N3, L2 warm).
     if (rows >= 32) return gb_moe_router_logits_ex2(x, x_dtype, gate, logits, rows, K, E, 4, 4, 4, 1, stream);
     const int rb = rows >= 8 ? 2 : 1;
-    // Decode and verify windows (under 32 rows) keep four loads in flight a lane: the gate of a layer is cold (a layer's 2.4 MB is read once a step,
-    // in the middle of 3.7 GB of other weights), and one load in flight made every warp a chain of 64 round trips to DRAM (33 us for a read that
-    // takes 10 at the bandwidth); the order of the fmaf chain does not change with the number of loads in flight (the shape sweep test compares bits)
-    return gb_moe_router_logits_ex(x, x_dtype, gate, logits, rows, K, E, rb, 8, 4, stream);
+    // Decode and verify windows (under 32 rows) keep sixteen loads in flight a lane: the gate of a layer is cold (a layer's 2.4 MB is read once a
+    // step, in the middle of 3.7 GB of other weights), and each round of loads is a trip to DRAM: at 4,096 inputs a lane visits 64 pairs, so 4
+    // loads in flight made every warp a chain of 16 round trips, 16 make it 4; the order of the fmaf chain does not change with the number of
+    // loads in flight (the shape sweep test compares bits)
+    return gb_moe_router_logits_ex(x, x_dtype, gate, logits, rows, K, E, rb, 8, 16, stream);
 }
 
 // Top-K per row from fp16 logits: pick [rows, K] int32 expert ids in rank order, wts [rows, K] fp16. sig: the 65,536-entry fp32
@@ -342,4 +386,31 @@ GB_EXPORT int gb_moe_router_select(const void* logits, const void* sig, const vo
     return gbp_pdl::launch_pdl(gbp_pdl::on(gbp_pdl::kMoe), router_select_kernel, dim3((unsigned)rows), dim3(32), 0, gb_stream(stream),
                                static_cast<const half*>(logits), static_cast<const float*>(sig), static_cast<const float*>(bias),
                                static_cast<int*>(pick), static_cast<half*>(wts), scale, E, K);
+}
+
+// gb_moe_router_logits then gb_moe_router_select, for a decode or verify window (rows < 32), as ONE launch (router_fused_kernel): the
+// same logits (the decode blocking) and the same picks and weights. done: a u32 that is 0 between launches (the launch leaves it 0);
+// one per stream of router launches.
+GB_EXPORT int gb_moe_router_route(const void* x, int x_dtype, const void* gate, void* logits, const void* sig, const void* bias, void* pick,
+                                  void* wts, float scale, int rows, int K, int E, int topk, void* done, void* stream) {
+    if (rows < 1 || rows >= 32 || K < 2 || (K & 1) || E < 1 || E > kMaxExperts || topk < 1 || topk > kMaxTopK || topk > E ||
+        !dtype_ok(x_dtype) || !x || !gate || !logits || !sig || !bias || !pick || !wts || !done)
+        return (int)cudaErrorInvalidValue;
+    constexpr int WARPS = 8, UN = 16;
+    const int rb = rows >= 8 ? 2 : 1;
+    const dim3 grid((unsigned)((E + WARPS - 1) / WARPS), (unsigned)((rows + rb - 1) / rb));
+#define GB_RF(RB_, DT_)                                                                                                       \
+    return gbp_pdl::launch_pdl(gbp_pdl::on(gbp_pdl::kMoe), router_fused_kernel<RB_, WARPS, UN, DT_>, grid, dim3(WARPS * 32), 0, \
+                               gb_stream(stream), x, static_cast<const half*>(gate), static_cast<half*>(logits),                \
+                               static_cast<const float*>(sig), static_cast<const float*>(bias), static_cast<int*>(pick),        \
+                               static_cast<half*>(wts), scale, rows, K, E, topk, static_cast<unsigned*>(done))
+    if (rb == 2) {
+        if (x_dtype == F32) GB_RF(2, F32);
+        if (x_dtype == BF16) GB_RF(2, BF16);
+        GB_RF(2, F16);
+    }
+    if (x_dtype == F32) GB_RF(1, F32);
+    if (x_dtype == BF16) GB_RF(1, BF16);
+    GB_RF(1, F16);
+#undef GB_RF
 }

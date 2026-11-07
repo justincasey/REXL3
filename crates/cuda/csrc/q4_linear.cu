@@ -9,6 +9,7 @@
 
 #include "common.cuh"
 
+#include <climits>
 #include <cooperative_groups.h>
 #include <type_traits>
 
@@ -81,12 +82,20 @@ __device__ __forceinline__ uint32_t pairm(uint32_t w, int s, uint32_t mask) {
 template <int N>
 using ic = std::integral_constant<int, N>;
 
+// Where the output columns go: up to three consecutive column segments, segment s holding columns end[s-1]..end[s] (end[-1] = 0) of
+// the call's N as its own packed [M, end[s] - end[s-1]] matrix at p[s] (one matrix: p[0], end[0] = N). Segment widths are whole
+// 64-column tiles, so no tile and no stored column pair straddles two.
+struct Outs {
+    __nv_bfloat16* p[3];
+    int end[3];
+};
+
 // One block: BM rows x BN columns of the output over one K slice of `sk` (a cluster of sk blocks covers a column tile).
 template <int BM, int BN, int WM, int WN, int STAGES>
 __global__ void __launch_bounds__(WM * WN * 32) q4_kernel(const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs,
                                                          const uint32_t* __restrict__ wq, const __nv_bfloat16* __restrict__ scales,
-                                                         const __nv_bfloat16* __restrict__ biases, __nv_bfloat16* __restrict__ out,
-                                                         int M, int K, int N, int npad, int ldx, int rows_t, int sk) {
+                                                         const __nv_bfloat16* __restrict__ biases, Outs outs, int M, int K, int N,
+                                                         int npad, int ldx, int rows_t, int sk) {
     using T = Tile<BM, BN, WM, WN, STAGES>;
     constexpr int I = T::MT, J = T::NT;
     extern __shared__ __align__(128) unsigned char buf[];
@@ -245,16 +254,20 @@ __global__ void __launch_bounds__(WM * WN * 32) q4_kernel(const __nv_bfloat16* _
         wait<0>();
         __syncthreads();
     }
+    // this tile's segment (segments are whole tiles): its matrix, first column and width
+    const int seg = n0 >= outs.end[1] ? 2 : n0 >= outs.end[0] ? 1 : 0;
+    const int sbase = seg ? outs.end[seg - 1] : 0, sw = min(outs.end[seg], N) - sbase;
+    __nv_bfloat16* const out = outs.p[seg];
     auto emit = [&](int i, int j, int h, float v0, float v1) {
-        const int col = n0 + wn * (BN / WN) + j * 8 + (lane & 3) * 2;
+        const int col = n0 + wn * (BN / WN) + j * 8 + (lane & 3) * 2 - sbase;
         const int row = m0 + wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8;
-        if (row >= M || col >= N) return;
-        __nv_bfloat16* dst = out + static_cast<size_t>(row) * N + col;
-        if (col + 1 < N && (N & 1) == 0) {
+        if (row >= M || col >= sw) return;
+        __nv_bfloat16* dst = out + static_cast<size_t>(row) * sw + col;
+        if (col + 1 < sw && (sw & 1) == 0) {
             *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(v0, v1);
         } else {
             dst[0] = __float2bfloat16_rn(v0);
-            if (col + 1 < N) dst[1] = __float2bfloat16_rn(v1);
+            if (col + 1 < sw) dst[1] = __float2bfloat16_rn(v1);
         }
     };
     if (sk > 1) {
@@ -304,7 +317,7 @@ __global__ void gsum_kernel(const __nv_bfloat16* __restrict__ x, int ldx, int k,
 }
 
 template <int BM, int STAGES>
-int launch(const void* x, const float* xs, const uint32_t* w, const void* s, const void* b, void* y, int m, int k, int n, int npad,
+int launch(const void* x, const float* xs, const uint32_t* w, const void* s, const void* b, Outs outs, int m, int k, int n, int npad,
            int ldx, int sk, cudaStream_t st) {
     using T = Tile<BM, 64, 1, 4, STAGES>;
     auto kern = q4_kernel<BM, 64, 1, 4, STAGES>;
@@ -326,9 +339,11 @@ int launch(const void* x, const float* xs, const uint32_t* w, const void* s, con
         if (e != cudaSuccess) return (int)e;
     }
     return (int)cudaLaunchKernelEx(&cfg, kern, static_cast<const __nv_bfloat16*>(x), xs, w, static_cast<const __nv_bfloat16*>(s),
-                                   static_cast<const __nv_bfloat16*>(b), static_cast<__nv_bfloat16*>(y), m, k, n, npad, ldx,
-                                   rows_t, sk);
+                                   static_cast<const __nv_bfloat16*>(b), outs, m, k, n, npad, ldx, rows_t, sk);
 }
+
+int run(const void* x, const float* xs, const void* w, const void* scales, const void* biases, Outs outs, int m, int k, int n, int npad,
+        int ldx, cudaStream_t st);
 
 }  // namespace gb_q4
 
@@ -343,14 +358,32 @@ GB_EXPORT int gb_q4_split_k(int n, int k) {
 // y [m, n] bf16 = x [m, k] (row stride ldx) . W^T. xs: gb_q4_gsum's [m][k / 64]. k % 64 == 0, npad = n rounded up to 64s.
 GB_EXPORT int gb_q4_linear(const void* x, const float* xs, const void* w, const void* scales, const void* biases, void* y, int m,
                            int k, int n, int npad, int ldx, void* stream) {
-    if (!x || !xs || !w || !scales || !biases || !y || m <= 0 || k <= 0 || n <= 0 || k % gb_q4::GS != 0 || npad % 64 != 0 ||
-        npad < n || ldx < k || ldx % 8 != 0)
+    if (!y) return (int)cudaErrorInvalidValue;
+    const gb_q4::Outs outs = {{static_cast<__nv_bfloat16*>(y), nullptr, nullptr}, {n, INT_MAX, INT_MAX}};
+    return gb_q4::run(x, xs, w, scales, biases, outs, m, k, n, npad, ldx, gb_stream(stream));
+}
+
+// gb_q4_linear over n = n0 + n1 + n2 columns of a matrix (w, scales, biases already at its first column; npad: the matrix's scale
+// row stride), each segment written as a packed matrix of its own: columns 0..n0 to y0 [m, n0], n0..n0+n1 to y1, the rest to y2.
+// n0 and n1 whole 64-column tiles; n1 = 0 / n2 = 0 drop the later segments. The K split is the n columns' (gb_q4_split_k(n, k)).
+GB_EXPORT int gb_q4_linear_seg(const void* x, const float* xs, const void* w, const void* scales, const void* biases, void* y0, int n0,
+                               void* y1, int n1, void* y2, int n2, int m, int k, int npad, int ldx, void* stream) {
+    if (!y0 || n0 <= 0 || n1 < 0 || n2 < 0 || (n1 > 0 && (!y1 || n0 % 64)) || (n2 > 0 && (!y2 || n1 <= 0 || n1 % 64)))
+        return (int)cudaErrorInvalidValue;
+    const gb_q4::Outs outs = {{static_cast<__nv_bfloat16*>(y0), static_cast<__nv_bfloat16*>(y1), static_cast<__nv_bfloat16*>(y2)},
+                              {n0, n1 > 0 ? n0 + n1 : INT_MAX, n2 > 0 ? n0 + n1 + n2 : INT_MAX}};
+    return gb_q4::run(x, xs, w, scales, biases, outs, m, k, n0 + n1 + n2, npad, ldx, gb_stream(stream));
+}
+
+int gb_q4::run(const void* x, const float* xs, const void* w, const void* scales, const void* biases, Outs outs, int m, int k, int n,
+               int npad, int ldx, cudaStream_t st) {
+    if (!x || !xs || !w || !scales || !biases || m <= 0 || k <= 0 || n <= 0 || k % gb_q4::GS != 0 || npad % 64 != 0 || npad < n ||
+        ldx < k || ldx % 8 != 0)
         return (int)cudaErrorInvalidValue;
     const int sk = gb_q4_split_k(n, k);
     const uint32_t* wq = static_cast<const uint32_t*>(w);
-    cudaStream_t st = gb_stream(stream);
-    if (m <= 32) return gb_q4::launch<16, 8>(x, xs, wq, scales, biases, y, m, k, n, npad, ldx, sk, st);
-    return gb_q4::launch<64, 4>(x, xs, wq, scales, biases, y, m, k, n, npad, ldx, sk, st);
+    if (m <= 32) return gb_q4::launch<16, 8>(x, xs, wq, scales, biases, outs, m, k, n, npad, ldx, sk, st);
+    return gb_q4::launch<64, 4>(x, xs, wq, scales, biases, outs, m, k, n, npad, ldx, sk, st);
 }
 
 GB_EXPORT int gb_q4_gsum(const void* x, int ldx, int k, float* xs, int rows, void* stream) {

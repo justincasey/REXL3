@@ -24,6 +24,9 @@ mod ffi {
         pub fn gb_q4_split_k(n: i32, k: i32) -> i32;
         pub fn gb_q4_linear(x: *const c_void, xs: *const f32, w: *const c_void, scales: *const c_void, biases: *const c_void,
                             y: *mut c_void, m: i32, k: i32, n: i32, npad: i32, ldx: i32, stream: *mut c_void) -> i32;
+        pub fn gb_q4_linear_seg(x: *const c_void, xs: *const f32, w: *const c_void, scales: *const c_void, biases: *const c_void,
+                                y0: *mut c_void, n0: i32, y1: *mut c_void, n1: i32, y2: *mut c_void, n2: i32, m: i32, k: i32,
+                                npad: i32, ldx: i32, stream: *mut c_void) -> i32;
         pub fn gb_q4_gsum(x: *const c_void, ldx: i32, k: i32, xs: *mut f32, rows: i32, stream: *mut c_void) -> i32;
     }
 }
@@ -209,6 +212,57 @@ impl Q4Weights {
     /// [`Q4Weights::forward_ld`] with packed `x` rows.
     pub fn forward(&self, x: &DevBuf, xs: &mut DevBuf, y: &mut DevBuf, m: usize, st: &Stream) -> Result<(), CudaError> {
         self.forward_ld(x, self.k, xs, y, m, st)
+    }
+
+    /// Columns `col0..col0 + w0 + w1 + ..` of `y = x . W^T` (`x` packed rows), segment `i` of `outs = [(y_i, w_i)]` (1 to 3) as its
+    /// own packed bf16 `[m, w_i]` matrix: the rows of several linears stacked in one matrix, run as one launch. `col0` and every
+    /// width but the last are whole 64-column tiles. `xs` holds [`gsum_bytes`]`(m, k)` bytes of scratch.
+    pub fn forward_cols(
+        &self,
+        x: &DevBuf,
+        xs: &mut DevBuf,
+        col0: usize,
+        outs: &mut [(&mut DevBuf, usize)],
+        m: usize,
+        st: &Stream,
+    ) -> Result<(), CudaError> {
+        if m == 0 {
+            return Ok(());
+        }
+        let n: usize = outs.iter().map(|o| o.1).sum();
+        if outs.is_empty() || outs.len() > 3 || col0 % 64 != 0 || col0 + n > self.n || outs.iter().any(|(y, w)| y.bytes() < m * w * 2) {
+            return Err(CudaError(1));
+        }
+        if x.bytes() < m * self.k * 2 || xs.bytes() < gsum_bytes(m, self.k) {
+            return Err(CudaError(1));
+        }
+        let [cb, sb, _] = part_bytes(self.n, self.k);
+        let i = |v: usize| i32::try_from(v).map_err(|_| CudaError(1));
+        let seg = |s: usize| outs.get(s).map_or((core::ptr::null_mut(), 0), |(y, w)| (y.ptr(), *w));
+        let ((y0, n0), (y1, n1), (y2, n2)) = (seg(0), seg(1), seg(2));
+        // the first column's codes (64-column tiles of k / 64 groups, 2 KiB each) and its scale and bias in every group row
+        let codes = col0 / 64 * (self.k / GROUP) * 2048;
+        unsafe {
+            CudaError::check(ffi::gb_q4_gsum(x.ptr(), i(self.k)?, i(self.k)?, xs.ptr() as *mut f32, i(m)?, st.raw()))?;
+            CudaError::check(ffi::gb_q4_linear_seg(
+                x.ptr(),
+                xs.ptr() as *const f32,
+                self.buf.ptr_at(codes),
+                self.buf.ptr_at(cb + col0 * 2),
+                self.buf.ptr_at(cb + sb + col0 * 2),
+                y0,
+                i(n0)?,
+                y1,
+                i(n1)?,
+                y2,
+                i(n2)?,
+                i(m)?,
+                i(self.k)?,
+                i(npad_of(self.n))?,
+                i(self.k)?,
+                st.raw(),
+            ))
+        }
     }
 }
 
