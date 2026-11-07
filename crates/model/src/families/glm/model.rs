@@ -514,7 +514,13 @@ impl GlmModel {
             mixer_out: zv(cr * h * 4)?,
             kda_qkv: zv(cr * 3 * ch * 4)?,
             kda_out: zv(cr * ch * 2)?,
-            kda_ws: kda::Workspace::alloc(dims, alloc::kda_prefill_rows(r, cr))?,
+            kda_ws: {
+                let mut ws = kda::Workspace::alloc(dims, alloc::kda_prefill_rows(r, cr))?;
+                if alloc::kda_pipe_rows(r, cr) > 0 {
+                    ws.add_pipe()?;
+                }
+                ws
+            },
             kda_prefill_rec: kda::Record::alloc(dims, alloc::kda_prefill_rows(r, cr))?,
             // views: a row-split rank cuts its rows out of them (`layers::mla_dsa_mixer`)
             q_a: zv(cr * m.q_lora_rank * 2)?,
@@ -657,6 +663,7 @@ impl GlmModel {
             ("kda_window_records", self.recs.iter().map(rec).sum()),
             ("kda_prefill_record", rec(&s.kda_prefill_rec)),
             ("kda_workspace", kda::Workspace::bytes_per_row(self.kda_dims) as u64 * s.kda_ws.rows as u64),
+            ("kda_pipe", if s.kda_ws.pipelined() { kda::Workspace::pipe_bytes_per_row(self.kda_dims) as u64 * s.kda_ws.rows as u64 } else { 0 }),
             ("row_arrays", sum(&[&s.ids, &s.rowidx.slot, &s.rowidx.pos, &s.seq_start, &s.seq_slot, &s.keep])),
             ("streams", s.streams.bytes() as u64),
             ("mhc_work", sum(&[&s.mhc.part, &s.mhc.post, &s.mhc.comb])),
@@ -1605,7 +1612,7 @@ impl GlmModel {
                         // A forward of several prompts runs each one's recurrence on its own rows and slot
                         (MixerDevice::Kda(w), MixerKind::Kda) if p2 && *p2_kda_chunked => {
                             let ord = kda_ord[layer];
-                            layers::lin(&w.qkv, &s.hidden, &mut s.kda_qkv, rows, Dtype::F16, Dtype::F32, &mut s.ws, st, path)?;
+                            layers::lin(&w.qkv, &s.hidden, &mut s.kda_qkv, rows, Dtype::F16, Dtype::BF16, &mut s.ws, st, path)?;
                             mark!("kda: qkv_proj");
                             let slot = b.seq_slot[0] as usize;
                             let piece = p2_kda_piece(&s.kda_prefill_rec, &s.kda_ws);
@@ -1616,7 +1623,7 @@ impl GlmModel {
                                 let (h, ch) = (cfg.hidden, cfg.kda.heads * cfg.kda.head_dim);
                                 for g in kda_segs(b, &kda_descs) {
                                     let hv = s.hidden.subview(g.row0 * h * 2, g.rows * h * 2);
-                                    let qv = s.kda_qkv.subview(g.row0 * 3 * ch * 4, g.rows * 3 * ch * 4);
+                                    let qv = s.kda_qkv.subview(g.row0 * 3 * ch * 2, g.rows * 3 * ch * 2);
                                     let mut ov = s.kda_out.subview(g.row0 * ch * 2, g.rows * ch * 2);
                                     kda::prefill_chunked(
                                         st,
@@ -1626,7 +1633,7 @@ impl GlmModel {
                                         &hv,
                                         Dtype::F16,
                                         &qv,
-                                        Dtype::F32,
+                                        Dtype::BF16,
                                         &mut pools[ord],
                                         g.slot,
                                         g.rows,
@@ -1645,7 +1652,7 @@ impl GlmModel {
                                     let len = end - from;
                                     let desc = kda::prefill_descriptor_pieces(slot, len, piece)?;
                                     let hv = s.hidden.subview(from * h * 2, len * h * 2);
-                                    let qv = s.kda_qkv.subview(from * 3 * ch * 4, len * 3 * ch * 4);
+                                    let qv = s.kda_qkv.subview(from * 3 * ch * 2, len * 3 * ch * 2);
                                     let mut ov = s.kda_out.subview(from * ch * 2, len * ch * 2);
                                     kda::prefill_chunked(
                                         st,
@@ -1655,7 +1662,7 @@ impl GlmModel {
                                         &hv,
                                         Dtype::F16,
                                         &qv,
-                                        Dtype::F32,
+                                        Dtype::BF16,
                                         &mut pools[ord],
                                         slot,
                                         len,

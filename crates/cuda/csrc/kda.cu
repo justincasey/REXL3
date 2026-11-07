@@ -233,6 +233,137 @@ __global__ void __launch_bounds__(PI_NT) proj_in_kernel(
     }
 }
 
+// proj_in for many rows at hidden 4096, the same bits as proj_in_kernel with a different schedule. proj_in_kernel's output (r, j) is
+// sum_{w = 0..7, in order} B_w, where B_w is the xor butterfly (offsets 16, 8, 4, 2, 1) over the lanes l of warp w of the leaf L_t,
+// t = 32 w + l: the fmaf chain from +0 over x[r][k] w[j][k] for k = 8 t .. 8 t + 7, then 2048 + 8 t .. + 7. Every addition of the
+// butterfly pairs the lanes that differ in bit 4, then bit 3, .., bit 0, so in the lane order i -> l = bitrev5(i) it is the balanced
+// binary tree over 32 consecutive leaves (operands commute bit for bit): one thread evaluates it with a stack of 5 partial sums.
+// Here a block takes 64 rows x 32 outputs of ONE warp's 32 leaves (blockIdx.z = w), x and w staged in shared memory as fp32 four
+// leaves (64 k) at a time, a thread 4 rows x 4 outputs; B_w goes to part[w][r][j] and proj_in_fin_kernel sums w = 0..7 in order and
+// applies proj_in_kernel's epilogue. (proj_in_kernel re-reads x for every 4 outputs and w for every 8 rows from L2: L2-bound.)
+constexpr int PT_RM = 64;  // rows a block
+constexpr int PT_JN = 32;  // outputs a block
+constexpr int PT_NT = 128;
+
+__device__ __forceinline__ constexpr int brev5(int i) {
+    return ((i & 1) << 4) | ((i & 2) << 2) | (i & 4) | ((i & 8) >> 2) | ((i & 16) >> 4);
+}
+
+template <int XT>
+__global__ void __launch_bounds__(PT_NT) proj_in_tile_kernel(
+        const void* __restrict__ x, const __half* __restrict__ w_b, const __half* __restrict__ w_fa,
+        const __half* __restrict__ w_ga, int rows, int heads, int rank, float* __restrict__ part) {
+    constexpr int HID = 4096, NV = HID / 8;
+    __shared__ __align__(16) float xs[64][PT_RM];  // [leaf q * 16 + element][row]
+    __shared__ __align__(16) float wsm[64][PT_JN];  // [leaf q * 16 + element][output]
+    const int n_out = heads + 2 * rank;
+    const int j0 = blockIdx.x * PT_JN, r0 = blockIdx.y * PT_RM, wv = blockIdx.z;
+    const int tid = threadIdx.x, og = tid & 7, rg = tid >> 3;
+    float st[5][4][4];
+    float res[4][4];
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {  // leaves 4 s .. 4 s + 3 in tree order
+        __syncthreads();
+#pragma unroll
+        for (int u = tid; u < PT_RM * 8; u += PT_NT) {  // 8 runs of 8 elements a row: leaf q = run / 2, its first or second half
+            const int r = u % PT_RM, run = u / PT_RM, q = run >> 1, hf = run & 1;
+            const int t = 32 * wv + brev5(4 * s + q);
+            float f[8];
+            if (r0 + r < rows) {
+                load_x8<XT>(x, (size_t)(r0 + r) * NV + t + hf * 256, f);
+            } else {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) f[e] = 0.0f;
+            }
+#pragma unroll
+            for (int e = 0; e < 8; ++e) xs[q * 16 + hf * 8 + e][r] = f[e];
+        }
+#pragma unroll
+        for (int u = tid; u < PT_JN * 8; u += PT_NT) {
+            const int jj = u % PT_JN, run = u / PT_JN, q = run >> 1, hf = run & 1;
+            const int t = 32 * wv + brev5(4 * s + q);
+            const int j = min(j0 + jj, n_out - 1);  // a tail output beyond n_out reads a valid row and is discarded
+            const __half* wr = j < heads ? w_b + (size_t)j * HID
+                               : j < heads + rank ? w_fa + (size_t)(j - heads) * HID
+                                                  : w_ga + (size_t)(j - heads - rank) * HID;
+            const uint4 wu = __ldg(reinterpret_cast<const uint4*>(wr) + t + hf * 256);
+            const __half2* h2 = reinterpret_cast<const __half2*>(&wu);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float2 f = __half22float2(h2[i]);
+                wsm[q * 16 + hf * 8 + 2 * i][jj] = f.x;
+                wsm[q * 16 + hf * 8 + 2 * i + 1][jj] = f.y;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            float a[4][4];
+#pragma unroll
+            for (int r = 0; r < 4; ++r)
+#pragma unroll
+                for (int c = 0; c < 4; ++c) a[r][c] = 0.0f;
+#pragma unroll
+            for (int e = 0; e < 16; ++e) {
+                const float4 xv = *reinterpret_cast<const float4*>(&xs[q * 16 + e][4 * rg]);
+                const float4 wq = *reinterpret_cast<const float4*>(&wsm[q * 16 + e][4 * og]);
+                const float xr[4] = {xv.x, xv.y, xv.z, xv.w}, wc[4] = {wq.x, wq.y, wq.z, wq.w};
+#pragma unroll
+                for (int r = 0; r < 4; ++r)
+#pragma unroll
+                    for (int c = 0; c < 4; ++c) a[r][c] = __fmaf_rn(xr[r], wc[c], a[r][c]);
+            }
+            // leaf i = 4 s + q of the tree: fold it into the stack (bit lvl of i set: the left sibling waits at level lvl)
+            const int i = 4 * s + q;
+#pragma unroll
+            for (int r = 0; r < 4; ++r)
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    float v = a[r][c];
+                    bool placed = false;
+#pragma unroll
+                    for (int lvl = 0; lvl < 5; ++lvl) {
+                        if (placed) continue;
+                        if ((i >> lvl) & 1) {
+                            v = st[lvl][r][c] + v;
+                        } else {
+                            st[lvl][r][c] = v;
+                            placed = true;
+                        }
+                    }
+                    if (!placed) res[r][c] = v;  // i = 31: the root
+                }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        const int row = r0 + 4 * rg + r;
+        if (row >= rows) continue;
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const int j = j0 + 4 * og + c;
+            if (j < n_out) part[((size_t)wv * rows + row) * n_out + j] = res[r][c];
+        }
+    }
+}
+
+// The 8 warp sums of proj_in_tile_kernel in proj_in_kernel's order, then its epilogue.
+__global__ void __launch_bounds__(256) proj_in_fin_kernel(const float* __restrict__ part, int rows, int heads, int rank,
+                                                          float* __restrict__ beta, float* __restrict__ fa, float* __restrict__ ga) {
+    const int n_out = heads + 2 * rank;
+    const size_t n = (size_t)rows * n_out;
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float s = part[idx];
+#pragma unroll
+    for (int wv = 1; wv < PI_NT / 32; ++wv) s = s + part[(size_t)wv * n + idx];
+    const size_t r = idx / n_out;
+    const int j = (int)(idx % n_out);
+    if (j < heads) beta[r * heads + j] = round_bf16(sigmoid_ieee(s));
+    else if (j < heads + rank) fa[r * rank + (j - heads)] = s;
+    else ga[r * rank + (j - heads - rank)] = s;
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // proj_out: f_b and g_b, the low-rank second stages, with an fp32 input (the first stage's fp32 output, not rounded to
 // half: the BC graph's choice). One THREAD per output channel (block = one head's 128 channels of one path), PO_RT rows of
@@ -306,6 +437,84 @@ __global__ void __launch_bounds__(D) proj_out_kernel(
             if (is_g) g[o] = expf(lower * sigmoid_ieee(decay * (acc[r] + dtb)));
             else z[o] = acc[r];
         }
+    }
+}
+
+// proj_out for many rows, the same bits as proj_out_kernel (each output the 128-term fmaf chain in k order from +0, then the same
+// epilogue): a block takes 64 rows of one head of one path, x and w staged transposed in shared memory 64 k at a time, a thread 8 rows x
+// 4 channels (x read as warp broadcasts, w as 8-byte vectors).
+constexpr int PO2_RM = 64;
+constexpr int PO2_KS = 64;
+
+__global__ void __launch_bounds__(256) proj_out_tile_kernel(
+        const float* __restrict__ fa, const float* __restrict__ ga, const __half* __restrict__ w_fb,
+        const __half* __restrict__ w_gb, const float* __restrict__ a_log, const float* __restrict__ dt_bias, float lower,
+        int rows, int heads, float* __restrict__ g, float* __restrict__ z) {
+    __shared__ __align__(16) float xs[PO2_KS][PO2_RM];
+    __shared__ __align__(16) __half wsm[PO2_KS][D];
+    const bool is_g = blockIdx.x < heads;
+    const int h = is_g ? blockIdx.x : blockIdx.x - heads;
+    const int r0 = blockIdx.y * PO2_RM;
+    const int nr = min(PO2_RM, rows - r0);
+    const float* x = is_g ? fa : ga;
+    const __half* wh = (is_g ? w_fb : w_gb) + (size_t)h * D * D;
+    const int tx = threadIdx.x & 31, ty = threadIdx.x >> 5;  // channels 4 tx .. 4 tx + 3, rows 8 ty .. 8 ty + 7
+    float acc[8][4];
+#pragma unroll
+    for (int r = 0; r < 8; ++r)
+#pragma unroll
+        for (int c = 0; c < 4; ++c) acc[r][c] = 0.0f;
+#pragma unroll
+    for (int k0 = 0; k0 < D; k0 += PO2_KS) {
+        __syncthreads();
+#pragma unroll
+        for (int i = threadIdx.x; i < PO2_RM * PO2_KS / 4; i += 256) {
+            const int r = i % PO2_RM, kq = i / PO2_RM;
+            const float4 v = r < nr ? __ldg(reinterpret_cast<const float4*>(x + (size_t)(r0 + r) * D + k0) + kq) : make_float4(0.f, 0.f, 0.f, 0.f);
+            xs[4 * kq][r] = v.x;
+            xs[4 * kq + 1][r] = v.y;
+            xs[4 * kq + 2][r] = v.z;
+            xs[4 * kq + 3][r] = v.w;
+        }
+#pragma unroll
+        for (int i = threadIdx.x; i < D * PO2_KS / 8; i += 256) {
+            const int c = i % D, kq = i / D;
+            const uint4 u = __ldg(reinterpret_cast<const uint4*>(wh + (size_t)c * D + k0) + kq);
+            const __half* hv = reinterpret_cast<const __half*>(&u);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) wsm[8 * kq + e][c] = hv[e];
+        }
+        __syncthreads();
+#pragma unroll 8
+        for (int k = 0; k < PO2_KS; ++k) {
+            const float4 xa = *reinterpret_cast<const float4*>(&xs[k][8 * ty]);
+            const float4 xb = *reinterpret_cast<const float4*>(&xs[k][8 * ty + 4]);
+            const uint2 wu = *reinterpret_cast<const uint2*>(&wsm[k][4 * tx]);
+            const float2 w01 = __half22float2(*reinterpret_cast<const __half2*>(&wu.x));
+            const float2 w23 = __half22float2(*reinterpret_cast<const __half2*>(&wu.y));
+            const float xr[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w}, wc[4] = {w01.x, w01.y, w23.x, w23.y};
+#pragma unroll
+            for (int r = 0; r < 8; ++r)
+#pragma unroll
+                for (int c = 0; c < 4; ++c) acc[r][c] = __fmaf_rn(xr[r], wc[c], acc[r][c]);
+        }
+    }
+    const int n_half = heads * D;
+    const int c0 = h * D + 4 * tx;
+    float decay = 0.0f, dtb[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (is_g) {
+        decay = expf(a_log[h]);
+#pragma unroll
+        for (int c = 0; c < 4; ++c) dtb[c] = dt_bias[c0 + c];
+    }
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        const int row = 8 * ty + r;
+        if (row >= nr) continue;
+        float o[4];
+#pragma unroll
+        for (int c = 0; c < 4; ++c) o[c] = is_g ? expf(lower * sigmoid_ieee(decay * (acc[r][c] + dtb[c]))) : acc[r][c];
+        *reinterpret_cast<float4*>((is_g ? g : z) + (size_t)(r0 + row) * n_half + c0) = make_float4(o[0], o[1], o[2], o[3]);
     }
 }
 
@@ -704,6 +913,13 @@ __global__ void __launch_bounds__(256) commit_tail_kernel(
     if (flip && blockIdx.x == 0 && threadIdx.x == 0) parity[slot[seq]] ^= 1;
 }
 
+// The parity flip alone (the commit tail's last step without its conv shift): the pipelined P2 prefill shifts the conv history on its
+// side stream as soon as a piece's prep has run and flips `cur` on the main stream after the piece's state kernel.
+__global__ void flip_kernel(int* parity, const int* __restrict__ slot, int n_seq) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_seq) parity[slot[i]] ^= 1;
+}
+
 // Test hook: the halves-exchanging reduction against the plain xor butterfly on the same data. in f32 [32 lanes][N]; out f32 [32][2]:
 // the butterfly's sum for the value this lane holds, and halve_reduce's (they must be bit-identical).
 template <int N>
@@ -747,15 +963,27 @@ int launch_state(int r_step, const float* q, const float* k, const __nv_bfloat16
 }  // namespace
 
 // b, f_a, g_a GEMVs (f16 weights [heads or rank, hidden]) off x [rows, hidden] of dtype x_dtype (0 f16, 1 bf16, 2 f32).
-// Outputs f32: beta [rows, heads] (already bf16(sigmoid)), fa [rows, rank], ga [rows, rank].
+// Outputs f32: beta [rows, heads] (already bf16(sigmoid)), fa [rows, rank], ga [rows, rank]. `part` (nullable, f32
+// [8][rows][heads + 2 rank]): scratch of the tiled schedule, which takes hidden 4096 and 64 rows or more (the same bits).
 GB_EXPORT int gb_kda_proj_in(const void* x, int x_dtype, const void* w_b, const void* w_fa, const void* w_ga, int rows,
-                             int hidden, int heads, int rank, float* beta, float* fa, float* ga, void* stream) {
+                             int hidden, int heads, int rank, float* beta, float* fa, float* ga, float* part, void* stream) {
     if (rows < 0 || hidden <= 0 || hidden % 8 != 0 || rank <= 0 || bad_heads(heads) || x_dtype < 0 || x_dtype > 2)
         return ERR_INVALID;
     if (rows == 0) return 0;
     const int n_out = heads + 2 * rank;
     cudaStream_t st = gb_stream(stream);
     const __half *b = (const __half*)w_b, *f = (const __half*)w_fa, *gg = (const __half*)w_ga;
+    if (part && hidden == 4096 && rows >= PT_RM) {
+        const dim3 grid((n_out + PT_JN - 1) / PT_JN, (rows + PT_RM - 1) / PT_RM, PI_NT / 32);
+        if (x_dtype == X_F16) proj_in_tile_kernel<X_F16><<<grid, PT_NT, 0, st>>>(x, b, f, gg, rows, heads, rank, part);
+        else if (x_dtype == X_BF16) proj_in_tile_kernel<X_BF16><<<grid, PT_NT, 0, st>>>(x, b, f, gg, rows, heads, rank, part);
+        else proj_in_tile_kernel<X_F32><<<grid, PT_NT, 0, st>>>(x, b, f, gg, rows, heads, rank, part);
+        const int rc = GB_CHECK_LAUNCH();
+        if (rc) return rc;
+        const size_t n = (size_t)rows * n_out;
+        proj_in_fin_kernel<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(part, rows, heads, rank, beta, fa, ga);
+        return GB_CHECK_LAUNCH();
+    }
     const int ty = (rows + PI_RT - 1) / PI_RT;
     if (rows <= PI_RT) {  // few rows: the weight stream is the cost, one output per block
         const dim3 grid(n_out, ty);
@@ -772,13 +1000,18 @@ GB_EXPORT int gb_kda_proj_in(const void* x, int x_dtype, const void* w_b, const 
 }
 
 // f_b and g_b (f16 weights [heads*128, 128]) off fa/ga f32 [rows, 128] (rank must be 128). g [rows, heads*128] is the final
-// per-channel DECAY (exp of the log decay), z [rows, heads*128] the f32 output gate.
+// per-channel DECAY (exp of the log decay), z [rows, heads*128] the f32 output gate. 64 rows or more take the tiled schedule (the
+// same bits).
 GB_EXPORT int gb_kda_proj_out(const float* fa, const float* ga, const void* w_fb, const void* w_gb, const float* a_log,
                               const float* dt_bias, float lower, int rows, int heads, float* g, float* z, void* stream) {
     if (rows < 0 || bad_heads(heads)) return ERR_INVALID;
     if (rows == 0) return 0;
-    proj_out_kernel<<<dim3(2 * heads, (rows + PO_RT - 1) / PO_RT), D, 0, gb_stream(stream)>>>(
-        fa, ga, (const __half*)w_fb, (const __half*)w_gb, a_log, dt_bias, lower, rows, heads, g, z);
+    if (rows >= PO2_RM)
+        proj_out_tile_kernel<<<dim3(2 * heads, (rows + PO2_RM - 1) / PO2_RM), 256, 0, gb_stream(stream)>>>(
+            fa, ga, (const __half*)w_fb, (const __half*)w_gb, a_log, dt_bias, lower, rows, heads, g, z);
+    else
+        proj_out_kernel<<<dim3(2 * heads, (rows + PO_RT - 1) / PO_RT), D, 0, gb_stream(stream)>>>(
+            fa, ga, (const __half*)w_fb, (const __half*)w_gb, a_log, dt_bias, lower, rows, heads, g, z);
     return GB_CHECK_LAUNCH();
 }
 
@@ -868,6 +1101,13 @@ GB_EXPORT int gb_kda_commit_tail(const void* raw, void* conv_pool, int* parity, 
     const int conv_dim = 3 * heads * D;
     commit_tail_kernel<<<dim3((conv_dim + 255) / 256, n_seq), 256, 0, gb_stream(stream)>>>(
         (const __nv_bfloat16*)raw, (__nv_bfloat16*)conv_pool, parity, seq_start, slot, keep, conv_dim, flip != 0);
+    return GB_CHECK_LAUNCH();
+}
+
+GB_EXPORT int gb_kda_flip(int* parity, const int* slot, int n_seq, void* stream) {
+    if (n_seq < 0) return ERR_INVALID;
+    if (n_seq == 0) return 0;
+    flip_kernel<<<(n_seq + 127) / 128, 128, 0, gb_stream(stream)>>>(parity, slot, n_seq);
     return GB_CHECK_LAUNCH();
 }
 

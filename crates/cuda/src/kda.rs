@@ -40,7 +40,8 @@
 //! Per sequence the committed state is `34 x 2 x 64 x 128 x 128 x 4 B = 272 MiB` (two buffers per layer: the price of "a full
 //! accept needs no replay"; 136 MiB if single-buffered) plus the conv state `34 x 3 x 24576 x 2 B = 4.8 MiB`. Per window row
 //! the record is 2.79 MB over 34 layers. Scratch ([`Workspace`], shared by all layers, transient): q, k f32 and v bf16 per row
-//! (`80 KiB`), z f32 (`32 KiB`), y bf16 (`16 KiB`), fa, ga (`1 KiB`).
+//! (`80 KiB`), z f32 (`32 KiB`), y bf16 (`16 KiB`), fa, ga (`1 KiB`), the tiled proj_in's 8 partial sums of each output (`10 KiB`);
+//! a pipelined workspace ([`Workspace::add_pipe`]) adds a second q, k, v, z, g, beta set (`Workspace::pipe_bytes_per_row`).
 //!
 //! # Numerics: what is matched to the oracle, and the decisions
 //!
@@ -76,7 +77,7 @@
 //! descriptor buffer per call).
 
 use crate::exl3_linear::Dtype;
-use crate::rt::{CudaError, DevBuf, Stream};
+use crate::rt::{CudaError, DevBuf, Event, Stream};
 
 pub const HEAD_DIM: usize = 128;
 pub const CONV_TAPS: usize = 4;
@@ -87,6 +88,8 @@ pub const GLM_HEADS: usize = 64;
 pub const GLM_HIDDEN: usize = 4096;
 /// Rank of the low-rank f/g projections (fixed at the head dimension).
 pub const RANK: usize = 128;
+/// Partial sums per output of the tiled proj_in (`csrc/kda.cu` proj_in_tile_kernel: one per warp of proj_in_kernel's 8).
+const PROJ_IN_PARTS: usize = 8;
 /// Rows [`prefill`] processes per piece (the scratch and the record are sized for this many).
 pub const PREFILL_PIECE_ROWS: usize = 128;
 
@@ -465,6 +468,25 @@ pub struct Workspace {
     ga: DevBuf,
     z: DevBuf,
     y: DevBuf,
+    /// f32 `[8][rows][heads + 2 * RANK]`: the tiled proj_in's per-warp partial sums
+    part: DevBuf,
+    pipe: Option<Pipe>,
+}
+
+/// The second buffer set and the side stream of the pipelined P2 prefill ([`prefill_chunked`] on bf16 qkv rows after
+/// [`Workspace::add_pipe`]): the projections, prep and conv shift of piece `i + 1` run on `side` into one set while the main stream runs
+/// piece `i`'s chunked recurrence and norm on the other. Set 0 is the workspace's own q, k, v, z with the record's g and beta.
+struct Pipe {
+    side: Stream,
+    start: Event,
+    ready: [Event; 2],
+    free: [Event; 2],
+    q: DevBuf,
+    k: DevBuf,
+    v: DevBuf,
+    z: DevBuf,
+    g: DevBuf,
+    beta: DevBuf,
 }
 
 impl Workspace {
@@ -480,11 +502,43 @@ impl Workspace {
             ga: DevBuf::alloc(rows * RANK * 4)?,
             z: DevBuf::alloc(rows * dims.v_dim() * 4)?,
             y: DevBuf::alloc(rows * dims.v_dim() * 2)?,
+            part: DevBuf::alloc(rows * PROJ_IN_PARTS * (dims.heads + 2 * RANK) * 4)?,
+            pipe: None,
         })
     }
     /// Scratch bytes per row.
     pub fn bytes_per_row(dims: Dims) -> usize {
-        dims.v_dim() * (4 + 4 + 2 + 4 + 2) + 2 * RANK * 4
+        dims.v_dim() * (4 + 4 + 2 + 4 + 2) + 2 * RANK * 4 + PROJ_IN_PARTS * (dims.heads + 2 * RANK) * 4
+    }
+    /// Bytes per row of the pipelined prefill's second buffer set ([`Workspace::add_pipe`]): q, k, z, g f32, v bf16, beta f32.
+    pub fn pipe_bytes_per_row(dims: Dims) -> usize {
+        dims.v_dim() * (4 + 4 + 2 + 4 + 4) + dims.heads * 4
+    }
+    /// Give [`prefill_chunked`] a second buffer set of this workspace's rows and a side stream: on bf16 qkv rows it then overlaps each
+    /// piece's projections, prep and conv shift with the previous piece's recurrence. Every kernel reads and writes what it did in the
+    /// serial order (the events order each set's reuse), so not a bit moves.
+    pub fn add_pipe(&mut self) -> Result<(), CudaError> {
+        if self.pipe.is_some() {
+            return Ok(());
+        }
+        let (d, rows) = (self.dims, self.rows);
+        self.pipe = Some(Pipe {
+            side: Stream::new_nonblocking()?,
+            start: Event::new()?,
+            ready: [Event::new()?, Event::new()?],
+            free: [Event::new()?, Event::new()?],
+            q: DevBuf::alloc(rows * d.v_dim() * 4)?,
+            k: DevBuf::alloc(rows * d.v_dim() * 4)?,
+            v: DevBuf::alloc(rows * d.v_dim() * 2)?,
+            z: DevBuf::alloc(rows * d.v_dim() * 4)?,
+            g: DevBuf::alloc(rows * d.v_dim() * 4)?,
+            beta: DevBuf::alloc(rows * d.heads * 4)?,
+        });
+        Ok(())
+    }
+    /// Whether [`Workspace::add_pipe`] has run.
+    pub fn pipelined(&self) -> bool {
+        self.pipe.is_some()
     }
     /// The core output of the last [`window`], bf16 `[rows, heads * 128]`.
     pub fn y(&self) -> &DevBuf {
@@ -528,6 +582,7 @@ mod ffi {
             beta: *mut f32,
             fa: *mut f32,
             ga: *mut f32,
+            part: *mut f32,
             stream: *mut c_void,
         ) -> i32;
         pub fn gb_kda_proj_out(
@@ -652,6 +707,7 @@ mod ffi {
             flip: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn gb_kda_flip(parity: *mut i32, slot: *const i32, n_seq: i32, stream: *mut c_void) -> i32;
     }
 }
 
@@ -743,6 +799,7 @@ fn project_stages_raw(
                 rec_beta,
                 fa,
                 ga,
+                ws.part.ptr() as *mut f32,
                 st.raw(),
             )
         };
@@ -1380,6 +1437,11 @@ pub fn p2_piece_rows(rec: &Record, ws: &Workspace) -> usize {
 /// caller puts on a chunk boundary of its prefill segment), P1's norm and commit tail (the conv history shift and the parity flip). `x`
 /// `[rows, hidden]`, `qkv` `[rows, conv_dim]`, `out` fp16 `[rows, heads * 128]` as for [`prefill_with`]; `desc` from
 /// [`prefill_descriptor_pieces`] with `piece` (a whole number of chunks the record and workspace hold: [`p2_piece_rows`]).
+///
+/// bf16 `qkv` rows are the record's raw rows already (prep's rounding of an f32 row is the bf16 the GEMM would have stored): prep writes no
+/// record and the conv shift reads `qkv` itself. With bf16 rows and a pipelined workspace ([`Workspace::add_pipe`]) the projections, prep
+/// and conv shift of piece `i + 1` run on the workspace's side stream while `st` runs piece `i`'s recurrence, norm and parity flip; every
+/// launch has the operands it has in the serial order, so the bits are the serial order's.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_chunked(
     st: &Stream,
@@ -1420,84 +1482,137 @@ pub fn prefill_chunked(
     CHUNKED_RUNS_HERE.with(|c| c.set(c.get() + 1));
     CHUNKED_HEADS_HERE.with(|c| c.set(c.get() + d.heads as u64));
     let vs = CHUNK_VS.load(std::sync::atomic::Ordering::Relaxed);
-    for i in 0..n_pieces {
+    let bf16_rows = qkv_dtype == Dtype::BF16;
+    let rz = (p.round == Round::TowardZero) as i32;
+    let set0 = Set {
+        q: ws.q.ptr() as *mut f32,
+        k: ws.k.ptr() as *mut f32,
+        v: ws.v.ptr(),
+        z: ws.z.ptr() as *mut f32,
+        g: rec.g.ptr() as *mut f32,
+        beta: rec.beta.ptr() as *mut f32,
+    };
+    let ws: &Workspace = ws;
+    // piece i's projections and prep into `set` on `s` (with `shift`, the conv shift of bf16 rows too); its recurrence and norm on `s`
+    let front = |s: &Stream, set: &Set, i: usize, shift: bool| -> Result<(), CudaError> {
         let r0 = i * piece;
         let len = (rows - r0).min(piece);
-        let base = i * 16;
-        let sel = Sel {
-            seq_start: desc.ptr_at(base) as *const i32,
-            slot: desc.ptr_at(base + 8) as *const i32,
-            n_seq: 1,
-            rows: len,
-            _life: core::marker::PhantomData,
-        };
-        let xp = x.ptr_at(r0 * d.hidden * x_dtype.size());
-        project_raw(
-            st,
-            d,
-            w,
-            p,
-            xp,
-            x_dtype,
-            len,
-            rec.g.ptr() as *mut f32,
-            rec.beta.ptr() as *mut f32,
-            ws,
-            ws.z.ptr() as *mut f32,
-        )?;
+        let (seq_start, sl) = (desc.ptr_at(i * 16) as *const i32, desc.ptr_at(i * 16 + 8) as *const i32);
+        project_raw(s, d, w, p, x.ptr_at(r0 * d.hidden * x_dtype.size()), x_dtype, len, set.g, set.beta, ws, set.z)?;
         let qp = qkv.ptr_at(r0 * d.conv_dim() * qkv_dtype.size());
-        prep_raw(st, d, w, qp, qkv_dtype == Dtype::F32, pool, &sel, core::ptr::null(), true, false, rec.qkv.ptr(), ws)?;
-        // SAFETY: q, k, v (the workspace), g, beta (the record) hold `len <= piece` rows of this layer's dims; S and parity are the pool's
+        let raw_out = if bf16_rows { core::ptr::null_mut() } else { rec.qkv.ptr() };
+        // SAFETY: the set holds `len <= piece` rows of this layer's dims, the record's raw rows too; the conv pool is the layer's
         let rc = unsafe {
+            ffi::gb_kda_prep(
+                qp,
+                !bf16_rows as i32,
+                w.conv_w.ptr(),
+                pool.conv.ptr(),
+                seq_start,
+                sl,
+                core::ptr::null(),
+                1,
+                len as i32,
+                d.heads as i32,
+                1,
+                0,
+                raw_out,
+                set.q,
+                set.k,
+                set.v,
+                s.raw(),
+            )
+        };
+        CudaError::check(rc)?;
+        if shift {
+            CudaError::check(unsafe {
+                ffi::gb_kda_commit_tail(qp, pool.conv.ptr(), pool.parity.ptr() as *mut i32, seq_start, sl, core::ptr::null(), 1, d.heads as i32, 0, s.raw())
+            })?;
+        }
+        Ok(())
+    };
+    let back = |s: &Stream, set: &Set, i: usize| -> Result<(), CudaError> {
+        let r0 = i * piece;
+        let len = (rows - r0).min(piece);
+        // SAFETY: as for `front`; S and parity are the pool's
+        CudaError::check(unsafe {
             ffi::gb_glm_p2_kda_chunk(
-                ws.q.ptr(),
-                ws.k.ptr(),
-                ws.v.ptr(),
-                rec.g.ptr(),
-                rec.beta.ptr(),
+                set.q as *const _,
+                set.k as *const _,
+                set.v,
+                set.g as *const _,
+                set.beta as *const _,
                 pool.s.ptr(),
                 pool.parity.ptr(),
                 slot as i32,
                 len as i32,
                 d.heads as i32,
                 vs,
-                (p.round == Round::TowardZero) as i32,
+                rz,
                 ws.y.ptr(),
-                st.raw(),
+                s.raw(),
             )
-        };
-        CudaError::check(rc)?;
-        let op = out.ptr_at(r0 * d.v_dim() * 2);
-        let rc = unsafe {
-            ffi::gb_kda_norm(
-                ws.y.ptr(),
-                ws.z.ptr() as *const f32,
-                w.o_norm.ptr(),
-                p.eps,
-                len as i32,
-                d.heads as i32,
-                op,
-                st.raw(),
-            )
-        };
-        CudaError::check(rc)?;
-        let rc = unsafe {
-            ffi::gb_kda_commit_tail(
-                rec.qkv.ptr(),
-                pool.conv.ptr(),
-                pool.parity.ptr() as *mut i32,
-                sel.seq_start,
-                sel.slot,
-                core::ptr::null(),
-                1,
-                d.heads as i32,
-                1,
-                st.raw(),
-            )
-        };
-        CudaError::check(rc)?;
+        })?;
+        CudaError::check(unsafe {
+            ffi::gb_kda_norm(ws.y.ptr(), set.z, w.o_norm.ptr(), p.eps, len as i32, d.heads as i32, out.ptr_at(r0 * d.v_dim() * 2), s.raw())
+        })
+    };
+    let tail_flip = |s: &Stream, i: usize, shift: bool| -> Result<(), CudaError> {
+        let (seq_start, sl) = (desc.ptr_at(i * 16) as *const i32, desc.ptr_at(i * 16 + 8) as *const i32);
+        if !shift {
+            return CudaError::check(unsafe { ffi::gb_kda_flip(pool.parity.ptr() as *mut i32, sl, 1, s.raw()) });
+        }
+        let raw = if bf16_rows { qkv.ptr_at(i * piece * d.conv_dim() * 2) } else { rec.qkv.ptr() };
+        CudaError::check(unsafe {
+            ffi::gb_kda_commit_tail(raw, pool.conv.ptr(), pool.parity.ptr() as *mut i32, seq_start, sl, core::ptr::null(), 1, d.heads as i32, 1, s.raw())
+        })
+    };
+    match ws.pipe.as_ref().filter(|_| bf16_rows && n_pieces > 1) {
+        None => {
+            for i in 0..n_pieces {
+                front(st, &set0, i, false)?;
+                back(st, &set0, i)?;
+                tail_flip(st, i, true)?;
+            }
+        }
+        Some(pp) => {
+            let set1 = Set {
+                q: pp.q.ptr() as *mut f32,
+                k: pp.k.ptr() as *mut f32,
+                v: pp.v.ptr(),
+                z: pp.z.ptr() as *mut f32,
+                g: pp.g.ptr() as *mut f32,
+                beta: pp.beta.ptr() as *mut f32,
+            };
+            let sets = [&set0, &set1];
+            // the side stream starts after everything `st` has queued (this layer's x and qkv, the last users of both sets)
+            pp.start.record(st)?;
+            crate::graph::wait(&pp.side, &pp.start)?;
+            for i in 0..n_pieces {
+                let b = i & 1;
+                if i >= 2 {
+                    crate::graph::wait(&pp.side, &pp.free[b])?;
+                }
+                front(&pp.side, sets[b], i, true)?;
+                pp.ready[b].record(&pp.side)?;
+                crate::graph::wait(st, &pp.ready[b])?;
+                back(st, sets[b], i)?;
+                tail_flip(st, i, false)?;
+                pp.free[b].record(st)?;
+            }
+        }
     }
     Ok(())
+}
+
+/// One piece's buffers of [`prefill_chunked`]: q, k, z, g, beta f32 and v bf16, `piece` rows each.
+struct Set {
+    q: *mut f32,
+    k: *mut f32,
+    v: *mut core::ffi::c_void,
+    z: *mut f32,
+    g: *mut f32,
+    beta: *mut f32,
 }
 
 /// Test hook: the P2 chunked recurrence alone on raw inputs (`q`, `k` f32 `[rows][heads][128]`, `v` bf16, `g` f32 `[rows][heads * 128]`,

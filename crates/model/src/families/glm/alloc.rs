@@ -71,6 +71,21 @@ pub fn kda_prefill_rows(rows: usize, chunk_rows: usize) -> usize {
     }
 }
 
+/// The rows of the pipelined KDA prefill's second buffer set (`kda::Workspace::add_pipe`, priced as `kda_pipe`): under P2, one piece
+/// ([`kda_prefill_rows`]) when a chunk spans more than one, so that each piece's projections, prep and conv shift run on a side stream beside
+/// the previous piece's recurrence (the same launches on the same operands: no bit moves); else 0. `REXL3_GLM_KDA_PIPE=0` turns it off
+/// (the serial order, for timing comparisons).
+pub fn kda_pipe_rows(rows: usize, chunk_rows: usize) -> usize {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| !std::env::var("REXL3_GLM_KDA_PIPE").is_ok_and(|v| v.trim() == "0"));
+    let on = *ON;
+    let piece = kda_prefill_rows(rows, chunk_rows);
+    match super::contract::current() {
+        super::contract::PrefillContract::P2 if on && chunk_rows > piece => piece,
+        _ => 0,
+    }
+}
+
 /// The widest chunk the plan prices under the process's contract.
 pub fn max_prefill_chunk() -> usize {
     match super::contract::current() {
@@ -321,6 +336,7 @@ impl AllocPlan {
         let mut v = vec![
             sc("kda_prefill_record", kda_prefill_rows(rows, chunk_rows) as u64 * d.record_bytes_per_row() as u64),
             sc("kda_workspace", kda_prefill_rows(rows, chunk_rows) as u64 * kda::Workspace::bytes_per_row(d) as u64),
+            sc("kda_pipe", kda_pipe_rows(rows, chunk_rows) as u64 * kda::Workspace::pipe_bytes_per_row(d) as u64),
             // ids i32 [chunk], the row index (slot, position) i32 each, the sequences' starts [chunk + 1] and slots, the commit's keep counts [window]
             sc("row_arrays", cr * 4 + cr * 8 + (cr + 1) * 4 + cr * 4 + r * 4),
             sc("streams", cr * (gb_cuda::mhc::ROW * 4) as u64),
@@ -552,6 +568,10 @@ mod tests {
         for n in ["kda_workspace", "kda_prefill_record"] {
             assert_eq!(get(&big, n), kda_scale * get(&base, n), "{n}: the window's under P1, a 512-row piece under P2");
         }
+        // the pipelined KDA prefill's second buffer set: one piece, only for a P2 chunk of several pieces
+        assert_eq!(get(&base, "kda_pipe"), 0);
+        let pipe = kda_pipe_rows(128, 1024) as u64 * kda::Workspace::pipe_bytes_per_row(dims_of(&c).unwrap()) as u64;
+        assert_eq!(get(&big, "kda_pipe"), pipe);
         // the routed experts' scratch at 2,048 rows by hand: sorted pairs padded to 16-row tiles (16,384 + 15 x 288), fp16 rotated inputs of both
         // matrices and the down input, fp32 y of every pair, the picks, the logits, the sorted-row to pair map and the work items, then the
         // pair planner's buffers (fp32 weights and local picks per pair, and per 256-pair block a histogram over the experts, plus the
