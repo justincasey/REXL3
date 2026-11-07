@@ -14,6 +14,7 @@ use crate::pack::Pack;
 use core::ffi::c_void;
 use gb_cuda::dflash2::{self, DraftCache, DraftCtxLayout, GateDtype, WalkSampling};
 use gb_cuda::exl3_linear::{linear_workspace_bytes, prefill_scratch_bytes, Dtype, Exl3Weights};
+use gb_cuda::q4_linear::{self, Q4Weights};
 use gb_cuda::{glue, DevBuf, Stream};
 
 pub const BLOCK: usize = 8;
@@ -64,42 +65,115 @@ pub struct Picked {
 /// after pick `parent` is `unary[i][c] + edge[i][parent][c]`, bit for bit (`gb_dflash_selector_edges`). The tree policy and the S0 study
 /// read it.
 pub use gb_spec::tree::Lattice;
-pub const HIDDEN: usize = 5120;
+/// The shapes the draft kernels are built for: every DFlash2 pack the engine serves has them (its config is checked against them,
+/// `shapes::DraftConfig::check_kernels`). The rest of a pack's shapes and constants are its own ([`DraftDims`]).
 pub const LAYERS: usize = 5;
 pub const Q_HEADS: usize = 32;
 pub const KV_HEADS: usize = 8;
 pub const HEAD_DIM: usize = 128;
-pub const INTERMEDIATE: usize = 17408;
 pub const CONV_GROUP: usize = 16;
 pub const SELECTOR_RANK: usize = 256;
 pub const SELECTOR_TOP_K: usize = 16;
-pub const MASK_TOKEN: i32 = 248070;
-pub const EPS: f32 = 1e-6;
-pub const ROPE_THETA: f64 = 1e7;
-/// Tap rows per fc input row: 5 taps x 5120.
-pub const FC_IN: usize = 5 * HIDDEN;
 /// Context positions the draft can ever look back over (its window plus a block of slack).
 pub const CTX_KEEP: usize = DraftCtxLayout::WINDOW + 16;
 
+/// The shapes and constants a draft pack's `config.json` gives (`shapes::DraftConfig::dims`): its width, its MLP, how many target
+/// layers it taps, its mask token, its norms' epsilon and rope's theta, and the token ids the target's head may propose.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DraftDims {
+    pub hidden: usize,
+    pub intermediate: usize,
+    /// Target layers tapped (the fc's input is this many hidden rows side by side).
+    pub taps: usize,
+    pub mask_token: u32,
+    pub eps: f32,
+    pub rope_theta: f64,
+    /// Head columns that are tokens: a draft never proposes a column at or past it (the padding columns of a head whose
+    /// vocabulary is not a multiple of 128). Equal to the head's width when every column is a token.
+    pub valid_vocab: usize,
+}
+
+impl DraftDims {
+    /// The Qwen3.8-27B target's DFlash2 pack.
+    pub const QWEN38: DraftDims = DraftDims {
+        hidden: 5120,
+        intermediate: 17408,
+        taps: 5,
+        mask_token: 248070,
+        eps: 1e-6,
+        rope_theta: 1e7,
+        valid_vocab: 248320,
+    };
+
+    /// Inputs of the fc: the tapped rows side by side.
+    pub const fn fc_in(&self) -> usize {
+        self.taps * self.hidden
+    }
+
+    /// The dynamic convs' width: four taps a group of `CONV_GROUP` channels.
+    pub const fn dyn_width(&self) -> usize {
+        4 * (self.hidden / CONV_GROUP)
+    }
+
+    /// The attention prep of the draft's block (per-head norms and full rope over 128 dims) at this pack's epsilon and theta.
+    pub fn attn_prep(&self) -> glue::AttnPrepCfg {
+        glue::AttnPrepCfg { eps: self.eps, theta: self.rope_theta as f32, ..glue::AttnPrepCfg::DFLASH2_DRAFT }
+    }
+}
+
+/// A draft linear: an EXL3 group of a quantized pack (Qwen's), or the affine 4-bit matrix a bf16 pack's linear is quantized to at
+/// load (GLM's, [`Draft::declare_bf16`]).
+enum Lin {
+    Exl3(Exl3Weights),
+    Q4(Q4Weights),
+}
+
+/// The scratch a draft linear runs in: the EXL3 decode workspace (`<= 128` rows) and prefill scratch, and the 4-bit linear's input
+/// group sums.
+struct LinScratch {
+    ws: DevBuf,
+    pws: DevBuf,
+    gs: DevBuf,
+}
+
+impl Lin {
+    /// `y [m, n] = x [m, k] . W^T`, bf16 in and out.
+    fn forward(&self, x: &DevBuf, y: &mut DevBuf, m: usize, s: &mut LinScratch, st: &Stream) -> Result<(), ModelError> {
+        match self {
+            Lin::Exl3(w) if m > 128 => w.forward_prefill(x, y, m, Dtype::BF16, &mut s.pws, st)?,
+            Lin::Exl3(w) => w.forward(x, y, m, Dtype::BF16, Dtype::BF16, &mut s.ws, st)?,
+            Lin::Q4(w) => w.forward(x, &mut s.gs, y, m, st)?,
+        }
+        Ok(())
+    }
+
+    fn push<'a>(&'a self, v: &mut Vec<(String, &'a DevBuf)>, name: String) {
+        match self {
+            Lin::Exl3(w) => push_linear(v, name, w),
+            Lin::Q4(w) => v.push((format!("{name}.q4"), &w.buf)),
+        }
+    }
+}
+
 struct ConvPair {
-    /// f16 `[2, 2, 5120]`
+    /// f16 `[2, 2, hidden]`
     base: DevBuf,
-    /// f16 `[1280, 5120]`
+    /// f16 `[4 hidden / 16, hidden]`
     proj: DevBuf,
 }
 
 struct DraftLayer {
     input_norm: DevBuf,
     post_norm: DevBuf,
-    q: Exl3Weights,
-    k: Exl3Weights,
-    v: Exl3Weights,
-    o: Exl3Weights,
+    q: Lin,
+    k: Lin,
+    v: Lin,
+    o: Lin,
     q_norm: DevBuf,
     k_norm: DevBuf,
-    gate: Exl3Weights,
-    up: Exl3Weights,
-    down: Exl3Weights,
+    gate: Lin,
+    up: Lin,
+    down: Lin,
     attn_conv: ConvPair,
     mlp_conv: ConvPair,
 }
@@ -176,7 +250,11 @@ fn mp(b: &DevBuf) -> *mut c_void {
 }
 
 pub struct Draft {
-    fc: Exl3Weights,
+    /// The pack's shapes and constants.
+    pub dims: DraftDims,
+    /// Columns of the target head the draft runs (and rows of its selector codebooks).
+    vocab: usize,
+    fc: Lin,
     hidden_norm: DevBuf,
     norm: DevBuf,
     layers: Vec<DraftLayer>,
@@ -199,8 +277,8 @@ pub struct Draft {
     vproj: DevBuf,
     ctx_pos: DevBuf,
     ctx_slot: DevBuf,
-    ws: DevBuf,
-    pws: DevBuf,
+    /// The linears' scratch; its EXL3 decode workspace is the target head's too.
+    lin: LinScratch,
     attn_ws: DevBuf,
     x: DevBuf,
     x2: DevBuf,
@@ -258,20 +336,41 @@ fn load_exl3<'p>(
     k: usize,
     n: usize,
     bytes: &mut usize,
-) -> Result<Exl3Weights, ModelError> {
+) -> Result<Lin, ModelError> {
     let g = pack.group_meta(name)?;
     if (g.k, g.n) != (k, n) {
         return Err(ModelError::Config(format!("draft {name}: expected K={k} N={n}, found K={} N={}", g.k, g.n)));
     }
     let w = ctx.group(pack, name)?;
     *bytes += w.weight_bytes();
-    Ok(w)
+    Ok(Lin::Exl3(w))
+}
+
+/// A bf16 `[n, k]` linear (`{name}.weight`) quantized to the affine 4-bit format on a loader thread.
+fn load_q4<'p>(
+    ctx: &mut LoadCtx<'p>,
+    pack: &'p Pack,
+    name: &str,
+    k: usize,
+    n: usize,
+    bytes: &mut usize,
+) -> Result<Lin, ModelError> {
+    let name = format!("{name}.weight");
+    pack.entry(&name, "BF16", &[n, k])?;
+    if k % q4_linear::GROUP != 0 {
+        return Err(ModelError::Config(format!("draft {name}: {k} inputs are not whole groups of {}", q4_linear::GROUP)));
+    }
+    let len = q4_linear::bytes(n, k);
+    let buf = ctx.computed(len, move || Ok(q4_linear::quantize_bf16(&pack.bf16(&name, &[n, k])?, n, k)))?;
+    *bytes += len;
+    Ok(Lin::Q4(Q4Weights::from_buf(buf, n, k)?))
 }
 
 fn f32_dev<'p>(ctx: &mut LoadCtx<'p>, pack: &'p Pack, name: &str, shape: &[usize]) -> Result<DevBuf, ModelError> {
     ctx.f32_from_bf16(pack, name, shape, false)
 }
 
+/// An fp16 tensor of the draft: stored as fp16 (a quantized pack), or bf16 narrowed on a loader thread (a bf16 pack).
 fn f16_dev<'p>(
     ctx: &mut LoadCtx<'p>,
     pack: &'p Pack,
@@ -279,16 +378,37 @@ fn f16_dev<'p>(
     shape: &[usize],
     bytes: &mut usize,
 ) -> Result<DevBuf, ModelError> {
-    let b = ctx.raw16(pack, name, "F16", shape)?;
+    let b = if pack.entry(name, "BF16", shape).is_ok() {
+        ctx.f16_from_bf16(pack, name, shape)?
+    } else {
+        ctx.raw16(pack, name, "F16", shape)?
+    };
     *bytes += b.bytes();
     Ok(b)
 }
 
-fn conv_pair<'p>(ctx: &mut LoadCtx<'p>, pack: &'p Pack, p: &str, which: &str, bytes: &mut usize) -> Result<ConvPair, ModelError> {
+fn conv_pair<'p>(
+    ctx: &mut LoadCtx<'p>,
+    pack: &'p Pack,
+    dims: &DraftDims,
+    p: &str,
+    which: &str,
+    bytes: &mut usize,
+) -> Result<ConvPair, ModelError> {
+    let h = dims.hidden;
     Ok(ConvPair {
-        base: f16_dev(ctx, pack, &format!("{p}{which}.base_kernel"), &[2, 2, HIDDEN], bytes)?,
-        proj: f16_dev(ctx, pack, &format!("{p}{which}.kernel_projection.weight"), &[4 * (HIDDEN / CONV_GROUP), HIDDEN], bytes)?,
+        base: f16_dev(ctx, pack, &format!("{p}{which}.base_kernel"), &[2, 2, h], bytes)?,
+        proj: f16_dev(ctx, pack, &format!("{p}{which}.kernel_projection.weight"), &[dims.dyn_width(), h], bytes)?,
     })
+}
+
+/// How a draft's linears are stored in its pack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Format {
+    /// EXL3 groups (Qwen's quantized pack).
+    Exl3,
+    /// bf16 tensors, quantized to the affine 4-bit format at load.
+    Bf16,
 }
 
 impl Draft {
@@ -317,7 +437,7 @@ impl Draft {
     /// Every weight buffer of the draft (not its scratch), named and in a fixed order, for comparing two loads of one pack.
     pub fn weight_buffers(&self) -> Vec<(String, &DevBuf)> {
         let mut v: Vec<(String, &DevBuf)> = Vec::new();
-        push_linear(&mut v, "fc".into(), &self.fc);
+        self.fc.push(&mut v, "fc".into());
         v.push(("hidden_norm".into(), &self.hidden_norm));
         v.push(("norm".into(), &self.norm));
         for (i, l) in self.layers.iter().enumerate() {
@@ -327,7 +447,7 @@ impl Draft {
             for (n, w) in
                 [("q", &l.q), ("k", &l.k), ("v", &l.v), ("o", &l.o), ("gate", &l.gate), ("up", &l.up), ("down", &l.down)]
             {
-                push_linear(&mut v, format!("{p}.{n}"), w);
+                w.push(&mut v, format!("{p}.{n}"));
             }
             v.push((format!("{p}.q_norm"), &l.q_norm));
             v.push((format!("{p}.k_norm"), &l.k_norm));
@@ -342,11 +462,108 @@ impl Draft {
         v
     }
 
-    /// Declare the draft's weights against `ctx` and allocate its scratch. The weight buffers hold nothing until
-    /// `ctx.finish()` has run.
+    /// Declare the Qwen3.8 pack's weights (EXL3 linears, fp16 convs and selector) against `ctx` and allocate the draft's scratch.
+    /// The weight buffers hold nothing until `ctx.finish()` has run.
     pub fn declare<'p>(
         ctx: &mut LoadCtx<'p>,
         pack: &'p Pack,
+        vocab: usize,
+        slots: usize,
+        max_ctx_rows: usize,
+        block: usize,
+    ) -> Result<(Self, usize), ModelError> {
+        Self::declare_as(ctx, pack, Format::Exl3, DraftDims::QWEN38, vocab, slots, max_ctx_rows, block)
+    }
+
+    /// Declare a bf16 pack's weights (the GLM-5.3-Flash DFlash2 checkpoint as published) against `ctx`: every linear quantized to
+    /// the affine 4-bit format on a loader thread, the convs, the selector and its codebooks narrowed to fp16, the norms widened
+    /// to fp32. `dims` is the pack's (`shapes::DraftConfig::dims`), `vocab` the target head's width. The weight buffers hold
+    /// nothing until `ctx.finish()` has run.
+    #[allow(clippy::too_many_arguments)]
+    pub fn declare_bf16<'p>(
+        ctx: &mut LoadCtx<'p>,
+        pack: &'p Pack,
+        dims: DraftDims,
+        vocab: usize,
+        slots: usize,
+        max_ctx_rows: usize,
+        block: usize,
+    ) -> Result<(Self, usize), ModelError> {
+        Self::declare_as(ctx, pack, Format::Bf16, dims, vocab, slots, max_ctx_rows, block)
+    }
+
+    /// Device bytes [`Draft::declare_bf16`] allocates for these settings (weights, context rings and scratch; the restricted
+    /// head and the lattice buffer are extra): what a memory plan holds back for the draft before it is loaded.
+    pub fn planned_bf16_bytes(dims: &DraftDims, vocab: usize, slots: usize, max_ctx_rows: usize, block: usize) -> u64 {
+        let (h, f, kv, q) = (dims.hidden, dims.intermediate, KV_HEADS * HEAD_DIM, Q_HEADS * HEAD_DIM);
+        let lin = |n: usize, k: usize| q4_linear::bytes(n, k);
+        let per_layer = lin(q, h) + 2 * lin(kv, h) + lin(h, q) + 2 * lin(f, h) + lin(h, f)
+            + 2 * (2 * 2 * h + dims.dyn_width() * h) * 2
+            + (2 * h + 2 * HEAD_DIM) * 4;
+        let weights = lin(h, dims.fc_in()) + 2 * h * 4 + LAYERS * per_layer + SELECTOR_RANK * h * 2 + 2 * vocab * SELECTOR_RANK * 2;
+        let ring = DraftCtxLayout::qwen38(slots).total_bytes();
+        (weights + ring + Self::scratch_bytes(dims, vocab, slots, max_ctx_rows, block, Format::Bf16)) as u64
+    }
+
+    /// Sequences a batched round carries at this many slots and this block.
+    fn max_seqs_of(slots: usize, block: usize) -> usize {
+        slots.clamp(1, MAX_DRAFT_SEQS.min(128 / block))
+    }
+
+    /// The linears' workspaces `(EXL3 decode, EXL3 prefill, 4-bit group sums)` in bytes.
+    fn lin_scratch_bytes(dims: &DraftDims, vocab: usize, max_ctx_rows: usize, nb: usize, nd: usize, format: Format) -> [usize; 3] {
+        let (h, f) = (dims.hidden, dims.intermediate);
+        let shapes =
+            [(h, Q_HEADS * HEAD_DIM), (h, KV_HEADS * HEAD_DIM), (Q_HEADS * HEAD_DIM, h), (h, f), (f, h), (dims.fc_in(), h)];
+        // the target head's decode workspace always; the EXL3 linears' decode workspace at up to 128 rows and prefill scratch for
+        // the fc over a whole chunk, or the 4-bit linears' group sums over the widest input at the most rows a call takes
+        let head = linear_workspace_bytes(nd, h, vocab, 6);
+        match format {
+            Format::Exl3 => [
+                shapes.iter().map(|&(k, n)| linear_workspace_bytes(max_ctx_rows.min(128).max(nb), k, n, 4)).max().unwrap_or(0).max(head),
+                shapes.iter().map(|&(k, n)| prefill_scratch_bytes(max_ctx_rows, k, n)).max().unwrap_or(0),
+                0,
+            ],
+            Format::Bf16 => {
+                let widest = shapes.iter().map(|&(k, _)| k).max().unwrap_or(0);
+                [head, 0, q4_linear::gsum_bytes(max_ctx_rows.max(nb), widest)]
+            }
+        }
+    }
+
+    /// Bytes of the scratch [`Draft::declare_as`] allocates.
+    fn scratch_bytes(dims: &DraftDims, vocab: usize, slots: usize, max_ctx_rows: usize, block: usize, format: Format) -> usize {
+        let max_seqs = Self::max_seqs_of(slots, block);
+        let (nb, nd) = (max_seqs * block, max_seqs * (block - 1));
+        let (h, f, kv, q) = (dims.hidden, dims.intermediate, KV_HEADS * HEAD_DIM, Q_HEADS * HEAD_DIM);
+        let topk = if dims.valid_vocab < vocab {
+            glue::topk_valid_workspace_bytes(nd, dims.valid_vocab, SELECTOR_TOP_K)
+        } else {
+            glue::topk_workspace_bytes(nd, vocab, SELECTOR_TOP_K)
+        };
+        let lin: usize = Self::lin_scratch_bytes(dims, vocab, max_ctx_rows, nb, nd, format).iter().sum();
+        max_ctx_rows * (dims.fc_in() + h + 2 * kv) * 2
+            + max_ctx_rows * 8
+            + lin
+            + dflash2::attn_workspace_bytes(max_seqs, DraftCtxLayout::WINDOW, Q_HEADS, block)
+            + nb * (5 * h + dims.dyn_width() + 3 * q + 2 * kv + 3 * f) * 2
+            + nd * (h + vocab) * 2
+            + nd * SELECTOR_TOP_K * 8
+            + topk
+            + nd * SELECTOR_RANK * 2
+            + nb * 8
+            + max_seqs * 12
+            + nd * 12
+            + max_seqs * std::mem::size_of::<WalkSampling>()
+            + (max_seqs + 1) * 4
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn declare_as<'p>(
+        ctx: &mut LoadCtx<'p>,
+        pack: &'p Pack,
+        format: Format,
+        dims: DraftDims,
         vocab: usize,
         slots: usize,
         max_ctx_rows: usize,
@@ -357,55 +574,73 @@ impl Draft {
                 "the draft block is {block} rows, the kernels are built for {MIN_DRAFT_BLOCK} to {MAX_DRAFT_BLOCK}"
             )));
         }
+        if dims.valid_vocab > vocab || dims.mask_token as usize >= vocab {
+            return Err(ModelError::Config(format!(
+                "the draft's vocabulary ({} tokens, mask {}) does not fit the target head's {vocab} columns",
+                dims.valid_vocab, dims.mask_token
+            )));
+        }
+        let (h, f) = (dims.hidden, dims.intermediate);
         let mut bytes = 0usize;
-        let fc = load_exl3(ctx, pack, "fc", FC_IN, HIDDEN, &mut bytes)?;
-        let hidden_norm = f32_dev(ctx, pack, "hidden_norm.weight", &[HIDDEN])?;
-        let norm = f32_dev(ctx, pack, "norm.weight", &[HIDDEN])?;
+        let lin = |ctx: &mut LoadCtx<'p>, name: &str, k: usize, n: usize, bytes: &mut usize| match format {
+            Format::Exl3 => load_exl3(ctx, pack, name, k, n, bytes),
+            Format::Bf16 => load_q4(ctx, pack, name, k, n, bytes),
+        };
+        let fc = lin(ctx, "fc", dims.fc_in(), h, &mut bytes)?;
+        let hidden_norm = f32_dev(ctx, pack, "hidden_norm.weight", &[h])?;
+        let norm = f32_dev(ctx, pack, "norm.weight", &[h])?;
         let mut layers = Vec::new();
         for l in 0..LAYERS {
             let p = format!("layers.{l}.");
             layers.push(DraftLayer {
-                input_norm: f32_dev(ctx, pack, &format!("{p}input_layernorm.weight"), &[HIDDEN])?,
-                post_norm: f32_dev(ctx, pack, &format!("{p}post_attention_layernorm.weight"), &[HIDDEN])?,
-                q: load_exl3(ctx, pack, &format!("{p}self_attn.q_proj"), HIDDEN, Q_HEADS * HEAD_DIM, &mut bytes)?,
-                k: load_exl3(ctx, pack, &format!("{p}self_attn.k_proj"), HIDDEN, KV_HEADS * HEAD_DIM, &mut bytes)?,
-                v: load_exl3(ctx, pack, &format!("{p}self_attn.v_proj"), HIDDEN, KV_HEADS * HEAD_DIM, &mut bytes)?,
-                o: load_exl3(ctx, pack, &format!("{p}self_attn.o_proj"), Q_HEADS * HEAD_DIM, HIDDEN, &mut bytes)?,
+                input_norm: f32_dev(ctx, pack, &format!("{p}input_layernorm.weight"), &[h])?,
+                post_norm: f32_dev(ctx, pack, &format!("{p}post_attention_layernorm.weight"), &[h])?,
+                q: lin(ctx, &format!("{p}self_attn.q_proj"), h, Q_HEADS * HEAD_DIM, &mut bytes)?,
+                k: lin(ctx, &format!("{p}self_attn.k_proj"), h, KV_HEADS * HEAD_DIM, &mut bytes)?,
+                v: lin(ctx, &format!("{p}self_attn.v_proj"), h, KV_HEADS * HEAD_DIM, &mut bytes)?,
+                o: lin(ctx, &format!("{p}self_attn.o_proj"), Q_HEADS * HEAD_DIM, h, &mut bytes)?,
                 q_norm: f32_dev(ctx, pack, &format!("{p}self_attn.q_norm.weight"), &[HEAD_DIM])?,
                 k_norm: f32_dev(ctx, pack, &format!("{p}self_attn.k_norm.weight"), &[HEAD_DIM])?,
-                gate: load_exl3(ctx, pack, &format!("{p}mlp.gate_proj"), HIDDEN, INTERMEDIATE, &mut bytes)?,
-                up: load_exl3(ctx, pack, &format!("{p}mlp.up_proj"), HIDDEN, INTERMEDIATE, &mut bytes)?,
-                down: load_exl3(ctx, pack, &format!("{p}mlp.down_proj"), INTERMEDIATE, HIDDEN, &mut bytes)?,
-                attn_conv: conv_pair(ctx, pack, &p, "attention_conv", &mut bytes)?,
-                mlp_conv: conv_pair(ctx, pack, &p, "mlp_conv", &mut bytes)?,
+                gate: lin(ctx, &format!("{p}mlp.gate_proj"), h, f, &mut bytes)?,
+                up: lin(ctx, &format!("{p}mlp.up_proj"), h, f, &mut bytes)?,
+                down: lin(ctx, &format!("{p}mlp.down_proj"), f, h, &mut bytes)?,
+                attn_conv: conv_pair(ctx, pack, &dims, &p, "attention_conv", &mut bytes)?,
+                mlp_conv: conv_pair(ctx, pack, &dims, &p, "mlp_conv", &mut bytes)?,
             });
         }
-        let sel_proj = f16_dev(ctx, pack, "candidate_selector.hidden_projection.weight", &[SELECTOR_RANK, HIDDEN], &mut bytes)?;
-        let pred = f16_dev(ctx, pack, "candidate_selector.predecessor_codebook.weight", &[vocab, SELECTOR_RANK], &mut bytes)?;
-        let succ = f16_dev(ctx, pack, "candidate_selector.successor_codebook.weight", &[vocab, SELECTOR_RANK], &mut bytes)?;
+        // the codebooks are `.weight` tensors in the Qwen pack and bare in the GLM checkpoint
+        let codebook = |name: &str| {
+            let w = format!("candidate_selector.{name}.weight");
+            if pack.ck.plain.contains_key(&w) {
+                w
+            } else {
+                format!("candidate_selector.{name}")
+            }
+        };
+        let sel_proj = f16_dev(ctx, pack, "candidate_selector.hidden_projection.weight", &[SELECTOR_RANK, h], &mut bytes)?;
+        let pred = f16_dev(ctx, pack, &codebook("predecessor_codebook"), &[vocab, SELECTOR_RANK], &mut bytes)?;
+        let succ = f16_dev(ctx, pack, &codebook("successor_codebook"), &[vocab, SELECTOR_RANK], &mut bytes)?;
         let layout = DraftCtxLayout::qwen38(slots);
         let cache = DraftCache::new(layout)?;
         bytes += layout.total_bytes();
-        // decode workspace for every draft shape at up to 128 rows; prefill scratch for the fc over a whole chunk
-        let shapes = [
-            (HIDDEN, Q_HEADS * HEAD_DIM),
-            (HIDDEN, KV_HEADS * HEAD_DIM),
-            (Q_HEADS * HEAD_DIM, HIDDEN),
-            (HIDDEN, INTERMEDIATE),
-            (INTERMEDIATE, HIDDEN),
-            (FC_IN, HIDDEN),
-        ];
-        let max_seqs = slots.clamp(1, MAX_DRAFT_SEQS.min(128 / block));
+        let max_seqs = Self::max_seqs_of(slots, block);
         let (nb, nd) = (max_seqs * block, max_seqs * (block - 1));
-        let ws_bytes = shapes
-            .iter()
-            .map(|&(k, n)| linear_workspace_bytes(max_ctx_rows.min(128).max(nb), k, n, 4))
-            .max()
-            .unwrap_or(0)
-            .max(linear_workspace_bytes(nd, HIDDEN, vocab, 6));
-        let pws_bytes = shapes.iter().map(|&(k, n)| prefill_scratch_bytes(max_ctx_rows, k, n)).max().unwrap_or(0);
+        let [ws_bytes, pws_bytes, gs_bytes] = Self::lin_scratch_bytes(&dims, vocab, max_ctx_rows, nb, nd, format);
+        let topk_ws = if dims.valid_vocab < vocab {
+            glue::topk_valid_workspace_bytes(nd, dims.valid_vocab, SELECTOR_TOP_K)
+        } else {
+            glue::topk_workspace_bytes(nd, vocab, SELECTOR_TOP_K)
+        };
+        // a bf16 pack's figure is everything the draft allocates (`planned_bf16_bytes`, which a memory plan holds back); the Qwen
+        // pack's keeps what it always reported (its linears, fp16 tensors and rings)
+        if format == Format::Bf16 {
+            bytes += (2 * h + LAYERS * (2 * h + 2 * HEAD_DIM)) * 4 + Self::scratch_bytes(&dims, vocab, slots, max_ctx_rows, block, format);
+        }
+        let (kv, q) = (KV_HEADS * HEAD_DIM, Q_HEADS * HEAD_DIM);
         let z = |n: usize| DevBuf::zeroed(n);
         let d = Self {
+            dims,
+            vocab,
             fc,
             hidden_norm,
             norm,
@@ -418,35 +653,34 @@ impl Draft {
             max_seqs,
             block,
             max_ctx_rows,
-            fc_in: z(max_ctx_rows * FC_IN * 2)?,
-            ctx: z(max_ctx_rows * HIDDEN * 2)?,
-            kproj: z(max_ctx_rows * KV_HEADS * HEAD_DIM * 2)?,
-            vproj: z(max_ctx_rows * KV_HEADS * HEAD_DIM * 2)?,
+            fc_in: z(max_ctx_rows * dims.fc_in() * 2)?,
+            ctx: z(max_ctx_rows * h * 2)?,
+            kproj: z(max_ctx_rows * kv * 2)?,
+            vproj: z(max_ctx_rows * kv * 2)?,
             ctx_pos: z(max_ctx_rows * 4)?,
             ctx_slot: z(max_ctx_rows * 4)?,
-            ws: z(ws_bytes)?,
-            pws: z(pws_bytes)?,
+            lin: LinScratch { ws: z(ws_bytes)?, pws: z(pws_bytes)?, gs: z(gs_bytes)? },
             attn_ws: z(dflash2::attn_workspace_bytes(max_seqs, DraftCtxLayout::WINDOW, Q_HEADS, block))?,
-            x: z(nb * HIDDEN * 2)?,
-            x2: z(nb * HIDDEN * 2)?,
-            h: z(nb * HIDDEN * 2)?,
-            y: z(nb * HIDDEN * 2)?,
-            o: z(nb * HIDDEN * 2)?,
-            dynv: z(nb * 4 * (HIDDEN / CONV_GROUP) * 2)?,
-            qb: z(nb * Q_HEADS * HEAD_DIM * 2)?,
-            kb: z(nb * KV_HEADS * HEAD_DIM * 2)?,
-            vb: z(nb * KV_HEADS * HEAD_DIM * 2)?,
-            q2: z(nb * Q_HEADS * HEAD_DIM * 2)?,
-            k2: z(nb * KV_HEADS * HEAD_DIM * 2)?,
-            att: z(nb * Q_HEADS * HEAD_DIM * 2)?,
-            g: z(nb * INTERMEDIATE * 2)?,
-            u: z(nb * INTERMEDIATE * 2)?,
-            sw: z(nb * INTERMEDIATE * 2)?,
-            sel: z(nd * HIDDEN * 2)?,
+            x: z(nb * h * 2)?,
+            x2: z(nb * h * 2)?,
+            h: z(nb * h * 2)?,
+            y: z(nb * h * 2)?,
+            o: z(nb * h * 2)?,
+            dynv: z(nb * dims.dyn_width() * 2)?,
+            qb: z(nb * q * 2)?,
+            kb: z(nb * kv * 2)?,
+            vb: z(nb * kv * 2)?,
+            q2: z(nb * q * 2)?,
+            k2: z(nb * kv * 2)?,
+            att: z(nb * q * 2)?,
+            g: z(nb * f * 2)?,
+            u: z(nb * f * 2)?,
+            sw: z(nb * f * 2)?,
+            sel: z(nd * h * 2)?,
             logits: z(nd * vocab * 2)?,
             top_ids: z(nd * SELECTOR_TOP_K * 4)?,
             top_vals: z(nd * SELECTOR_TOP_K * 4)?,
-            top_ws: z(glue::topk_workspace_bytes(nd, vocab, SELECTOR_TOP_K))?,
+            top_ws: z(topk_ws)?,
             gate: z(nd * SELECTOR_RANK * 2)?,
             ids: z(nb * 4)?,
             pos: z(nb * 4)?,
@@ -557,7 +791,7 @@ impl Draft {
         Ok(())
     }
 
-    /// Absorb `n` contiguous tap rows (`taps` is the target's `[rows, 5, 5120]` tap buffer; rows `row0..row0+n`) of
+    /// Absorb `n` contiguous tap rows (`taps` is the target's `[rows, taps, hidden]` tap buffer; rows `row0..row0+n`) of
     /// `slot` at absolute positions `pos0..pos0+n` into the slot's context ring.
     #[allow(clippy::too_many_arguments)]
     pub fn absorb(
@@ -599,40 +833,32 @@ impl Draft {
         let n = total;
         self.ctx_pos.upload(&pos)?;
         self.ctx_slot.upload(&slots)?;
-        let Draft { fc, hidden_norm, layers, cache, fc_in, ctx, kproj, vproj, ctx_pos, ctx_slot, ws, pws, .. } = self;
+        let Draft { dims, fc, hidden_norm, layers, cache, fc_in, ctx, kproj, vproj, ctx_pos, ctx_slot, lin, .. } = self;
+        let (fc_w, h) = (dims.fc_in(), dims.hidden);
         let mut at = 0usize;
         for a in items.iter().filter(|a| a.n > 0) {
             unsafe {
-                // fc input rows are the tap rows themselves: 5 consecutive 5120-wide taps
+                // fc input rows are the tap rows themselves: the tapped layers' rows side by side
                 glue::copy_rows(
-                    (taps.ptr() as *const u16).add(a.row0 * FC_IN) as *const c_void,
-                    FC_IN,
-                    (fc_in.ptr() as *mut u16).add(at * FC_IN) as *mut c_void,
-                    FC_IN,
+                    (taps.ptr() as *const u16).add(a.row0 * fc_w) as *const c_void,
+                    fc_w,
+                    (fc_in.ptr() as *mut u16).add(at * fc_w) as *mut c_void,
+                    fc_w,
                     a.n,
-                    FC_IN,
+                    fc_w,
                     stream,
                 )?;
             }
             at += a.n;
         }
-        if n > 128 {
-            fc.forward_prefill(fc_in, ctx, n, Dtype::BF16, pws, stream)?;
-        } else {
-            fc.forward(fc_in, ctx, n, Dtype::BF16, Dtype::BF16, ws, stream)?;
-        }
+        fc.forward(fc_in, ctx, n, lin, stream)?;
         unsafe {
-            glue::rmsnorm(cp(ctx), cp(hidden_norm), mp(ctx), n, HIDDEN, EPS, stream)?;
+            glue::rmsnorm(cp(ctx), cp(hidden_norm), mp(ctx), n, h, dims.eps, stream)?;
         }
         for (l, layer) in layers.iter().enumerate() {
-            if n > 128 {
-                layer.k.forward_prefill(ctx, kproj, n, Dtype::BF16, pws, stream)?;
-                layer.v.forward_prefill(ctx, vproj, n, Dtype::BF16, pws, stream)?;
-            } else {
-                layer.k.forward(ctx, kproj, n, Dtype::BF16, Dtype::BF16, ws, stream)?;
-                layer.v.forward(ctx, vproj, n, Dtype::BF16, Dtype::BF16, ws, stream)?;
-            }
-            cache.write_ctx(l, kproj, vproj, &layer.k_norm, ctx_pos, ctx_slot, n, EPS, ROPE_THETA, stream)?;
+            layer.k.forward(ctx, kproj, n, lin, stream)?;
+            layer.v.forward(ctx, vproj, n, lin, stream)?;
+            cache.write_ctx(l, kproj, vproj, &layer.k_norm, ctx_pos, ctx_slot, n, dims.eps, dims.rope_theta, stream)?;
         }
         Ok(())
     }
@@ -685,8 +911,14 @@ impl Draft {
         let ranges: Vec<(usize, usize)> = strips.iter().map(|&(lo, hi)| (lo * 128, (hi - lo) * 128)).collect();
         let t1 = std::time::Instant::now();
         let logits = DevBuf::zeroed(max_rows * w.n * 2)?;
-        let ws = DevBuf::zeroed(linear_workspace_bytes(max_rows, HIDDEN, w.n, w.bits))?;
-        let bytes = w.weight_bytes() + logits.bytes() + ws.bytes();
+        let ws = DevBuf::zeroed(linear_workspace_bytes(max_rows, self.dims.hidden, w.n, w.bits))?;
+        let mut bytes = w.weight_bytes() + logits.bytes() + ws.bytes();
+        // the top-k over the kept columns (its valid columns: `sub_valid`) may need more workspace than the full head's
+        let top = glue::topk_valid_workspace_bytes(max_rows, w.n, SELECTOR_TOP_K);
+        if top > self.top_ws.bytes() {
+            self.top_ws = DevBuf::zeroed(top)?;
+            bytes += top;
+        }
         self.sub = Some(SubHead { w, ranges, logits, ws });
         self.restrict_times =
             Some(RestrictTimes { strips: strip_times, buffers: t1.elapsed().as_secs_f64(), total: t0.elapsed().as_secs_f64() });
@@ -748,12 +980,15 @@ impl Draft {
         if n > self.max_seqs {
             return Err(ModelError::Request(format!("a draft round of {n} sequences; the draft takes {}", self.max_seqs)));
         }
+        if vocab != self.vocab {
+            return Err(ModelError::Config(format!("the draft was built for a head of {} columns, not {vocab}", self.vocab)));
+        }
         let block = self.block;
         let mut ids: Vec<i32> = Vec::with_capacity(n * block);
         let mut pos: Vec<i32> = Vec::with_capacity(n * block);
         for r in reqs {
             ids.push(r.anchor as i32);
-            ids.extend(std::iter::repeat_n(MASK_TOKEN, block - 1));
+            ids.extend(std::iter::repeat_n(self.dims.mask_token as i32, block - 1));
             pos.extend((0..block).map(|i| (r.p + i) as i32));
         }
         let anchors: Vec<i32> = reqs.iter().map(|r| r.anchor as i32).collect();
@@ -794,13 +1029,14 @@ impl Draft {
             self.edge = Some(DevBuf::zeroed(self.max_seqs * (self.block - 1) * SELECTOR_TOP_K * SELECTOR_TOP_K * 4)?);
         }
         let Draft {
+            dims,
             layers,
             norm,
             sel_proj,
             pred,
             succ,
             cache,
-            ws,
+            lin,
             attn_ws,
             x,
             x2,
@@ -839,32 +1075,23 @@ impl Draft {
             ..
         } = self;
         let rows = n * block;
-        let ff = |w: &Exl3Weights, a: &DevBuf, b: &mut DevBuf, m: usize, ws: &mut DevBuf| {
-            w.forward(a, b, m, Dtype::BF16, Dtype::BF16, ws, stream)
-        };
+        let (hd, eps, dw) = (dims.hidden, dims.eps, dims.dyn_width());
+        let prep = dims.attn_prep();
         unsafe {
-            glue::embed(cp(embed), cp(ids_d), mp(x), rows, HIDDEN, vocab, stream)?;
+            glue::embed(cp(embed), cp(ids_d), mp(x), rows, hd, vocab, stream)?;
         }
         for (l, layer) in layers.iter().enumerate() {
             unsafe {
-                glue::rmsnorm(cp(x), cp(&layer.input_norm), mp(h), rows, HIDDEN, EPS, stream)?;
-                glue::small_linear_f16w(
-                    cp(h),
-                    cp(&layer.attn_conv.proj),
-                    mp(dynv),
-                    rows,
-                    HIDDEN,
-                    4 * (HIDDEN / CONV_GROUP),
-                    stream,
-                )?;
+                glue::rmsnorm(cp(x), cp(&layer.input_norm), mp(h), rows, hd, eps, stream)?;
+                glue::small_linear_f16w(cp(h), cp(&layer.attn_conv.proj), mp(dynv), rows, hd, dw, stream)?;
             }
-            dflash2::dynconv(h, dynv, &layer.attn_conv.base, 0, n, block, HIDDEN, CONV_GROUP, None, y, stream)?;
-            ff(&layer.q, y, qb, rows, ws)?;
-            ff(&layer.k, y, kb, rows, ws)?;
-            ff(&layer.v, y, vb, rows, ws)?;
+            dflash2::dynconv(h, dynv, &layer.attn_conv.base, 0, n, block, hd, CONV_GROUP, None, y, stream)?;
+            layer.q.forward(y, qb, rows, lin, stream)?;
+            layer.k.forward(y, kb, rows, lin, stream)?;
+            layer.v.forward(y, vb, rows, lin, stream)?;
             unsafe {
                 glue::attn_prep(
-                    &glue::AttnPrepCfg::DFLASH2_DRAFT,
+                    &prep,
                     cp(qb),
                     cp(kb),
                     cp(pos_d),
@@ -895,89 +1122,80 @@ impl Draft {
                 att,
                 stream,
             )?;
-            ff(&layer.o, att, o, rows, ws)?;
+            layer.o.forward(att, o, rows, lin, stream)?;
             // x' = x + conv_finish(o), written to the other buffer, then swapped in
-            dflash2::dynconv(o, dynv, &layer.attn_conv.base, 1, n, block, HIDDEN, CONV_GROUP, Some(x), x2, stream)?;
+            dflash2::dynconv(o, dynv, &layer.attn_conv.base, 1, n, block, hd, CONV_GROUP, Some(x), x2, stream)?;
             std::mem::swap(x, x2);
             unsafe {
-                glue::rmsnorm(cp(x), cp(&layer.post_norm), mp(h), rows, HIDDEN, EPS, stream)?;
-                glue::small_linear_f16w(
-                    cp(h),
-                    cp(&layer.mlp_conv.proj),
-                    mp(dynv),
-                    rows,
-                    HIDDEN,
-                    4 * (HIDDEN / CONV_GROUP),
-                    stream,
-                )?;
+                glue::rmsnorm(cp(x), cp(&layer.post_norm), mp(h), rows, hd, eps, stream)?;
+                glue::small_linear_f16w(cp(h), cp(&layer.mlp_conv.proj), mp(dynv), rows, hd, dw, stream)?;
             }
-            dflash2::dynconv(h, dynv, &layer.mlp_conv.base, 0, n, block, HIDDEN, CONV_GROUP, None, y, stream)?;
-            ff(&layer.gate, y, g, rows, ws)?;
-            ff(&layer.up, y, u, rows, ws)?;
+            dflash2::dynconv(h, dynv, &layer.mlp_conv.base, 0, n, block, hd, CONV_GROUP, None, y, stream)?;
+            layer.gate.forward(y, g, rows, lin, stream)?;
+            layer.up.forward(y, u, rows, lin, stream)?;
             unsafe {
-                glue::swiglu(cp(g), cp(u), mp(sw), rows * INTERMEDIATE, stream)?;
+                glue::swiglu(cp(g), cp(u), mp(sw), rows * dims.intermediate, stream)?;
             }
-            ff(&layer.down, sw, o, rows, ws)?;
-            dflash2::dynconv(o, dynv, &layer.mlp_conv.base, 1, n, block, HIDDEN, CONV_GROUP, Some(x), x2, stream)?;
+            layer.down.forward(sw, o, rows, lin, stream)?;
+            dflash2::dynconv(o, dynv, &layer.mlp_conv.base, 1, n, block, hd, CONV_GROUP, Some(x), x2, stream)?;
             std::mem::swap(x, x2);
         }
         unsafe {
-            glue::rmsnorm(cp(x), cp(norm), mp(h), rows, HIDDEN, EPS, stream)?;
+            glue::rmsnorm(cp(x), cp(norm), mp(h), rows, hd, eps, stream)?;
             // rows 1..=want of each sequence's block feed the target's head and the selector, packed
             let mut at = 0usize;
             for (s, &want) in wants.iter().enumerate() {
                 glue::copy_rows(
-                    (h.ptr() as *const u16).add((s * block + 1) * HIDDEN) as *const c_void,
-                    HIDDEN,
-                    (sel.ptr() as *mut u16).add(at * HIDDEN) as *mut c_void,
-                    HIDDEN,
+                    (h.ptr() as *const u16).add((s * block + 1) * hd) as *const c_void,
+                    hd,
+                    (sel.ptr() as *mut u16).add(at * hd) as *mut c_void,
+                    hd,
                     want,
-                    HIDDEN,
+                    hd,
                     stream,
                 )?;
                 at += want;
             }
         }
         let nd = row_off[n] as usize;
+        // a head whose last columns are padding (GLM's 24): the top-k never reads them (`topk_valid`); one without keeps `topk`
+        let topk = |logits: &DevBuf, cols: usize, valid: usize, top_ids: &mut DevBuf, top_vals: &mut DevBuf, top_ws: &mut DevBuf| unsafe {
+            if valid < cols {
+                glue::topk_valid(
+                    cp(logits),
+                    nd,
+                    cols,
+                    valid,
+                    SELECTOR_TOP_K,
+                    mp(top_ids),
+                    mp(top_vals),
+                    mp(top_ws),
+                    top_ws.bytes(),
+                    stream,
+                )
+            } else {
+                glue::topk(cp(logits), nd, cols, SELECTOR_TOP_K, mp(top_ids), mp(top_vals), mp(top_ws), top_ws.bytes(), stream)
+            }
+        };
+        let pad = vocab - dims.valid_vocab;
         // the head over every column, or over the restricted set (whose top-k ids are then mapped back to token ids)
         head_rounds[use_sub as usize] += 1;
         match sub.as_mut().filter(|_| use_sub) {
             None => {
-                head.forward(sel, logits, nd, Dtype::BF16, Dtype::BF16, ws, stream)?;
-                unsafe {
-                    glue::topk(
-                        cp(logits),
-                        nd,
-                        vocab,
-                        SELECTOR_TOP_K,
-                        mp(top_ids),
-                        mp(top_vals),
-                        mp(top_ws),
-                        top_ws.bytes(),
-                        stream,
-                    )?;
-                }
+                head.forward(sel, logits, nd, Dtype::BF16, Dtype::BF16, &mut lin.ws, stream)?;
+                topk(logits, vocab, dims.valid_vocab, top_ids, top_vals, top_ws)?;
             }
             Some(sub) => {
                 sub.w.forward(sel, &mut sub.logits, nd, Dtype::BF16, Dtype::BF16, &mut sub.ws, stream)?;
-                unsafe {
-                    glue::topk(
-                        cp(&sub.logits),
-                        nd,
-                        sub.w.n,
-                        SELECTOR_TOP_K,
-                        mp(top_ids),
-                        mp(top_vals),
-                        mp(top_ws),
-                        top_ws.bytes(),
-                        stream,
-                    )?;
-                }
+                // the set's last columns are the head's padding when it keeps the last strip
+                let keeps_end = sub.ranges.last().is_some_and(|&(first, len)| first + len >= vocab);
+                let valid = if keeps_end { sub.w.n - pad } else { sub.w.n };
+                topk(&sub.logits, sub.w.n, valid, top_ids, top_vals, top_ws)?;
                 dflash2::remap_ids(top_ids, nd * SELECTOR_TOP_K, &sub.ranges, stream)?;
             }
         }
         unsafe {
-            glue::small_linear_f16w(cp(sel), cp(sel_proj), mp(gate), nd, HIDDEN, SELECTOR_RANK, stream)?;
+            glue::small_linear_f16w(cp(sel), cp(sel_proj), mp(gate), nd, hd, SELECTOR_RANK, stream)?;
         }
         dflash2::selector_walk_ragged(
             anchor_d,

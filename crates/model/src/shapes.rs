@@ -129,18 +129,15 @@ impl DraftConfig {
         })
     }
 
-    /// The draft against the kernels and against the target it drafts for.
-    pub fn check(&self, target: &QwenConfig) -> Result<(), String> {
+    /// The shapes compiled into the draft kernels (`crate::draft`'s constants: layers, heads, the conv and the selector, the window
+    /// and the trained block), which every DFlash2 pack must have.
+    fn kernel_mismatches(&self) -> Mismatches {
         use crate::draft as d;
         let mut m = Mismatches::default();
-        m.eq("hidden_size", self.hidden, d::HIDDEN);
         m.eq("num_hidden_layers", self.layers, d::LAYERS);
         m.eq("num_attention_heads", self.heads, d::Q_HEADS);
         m.eq("num_key_value_heads", self.kv_heads, d::KV_HEADS);
         m.eq("head_dim", self.head_dim, d::HEAD_DIM);
-        m.eq("intermediate_size", self.intermediate, d::INTERMEDIATE);
-        m.eq("rms_norm_eps", self.rms_eps as f32, d::EPS);
-        m.eq("rope_theta", self.rope_theta, d::ROPE_THETA);
         m.eq("sliding_window", self.sliding_window, gb_cuda::dflash2::DraftCtxLayout::WINDOW);
         // the pack's block is what the checkpoint was TRAINED with (8): the runtime knob `REXL3_DRAFT_BLOCK` (8..=16) runs the
         // block longer, it does not retune the pack, so a pack trained with another block is still a different draft
@@ -152,9 +149,34 @@ impl DraftConfig {
         }
         m.eq("dflash_config.conv_group_size", self.conv_group, d::CONV_GROUP);
         m.eq("dflash_config.conv_kernel_size", self.conv_kernel, 2);
-        m.eq("dflash_config.mask_token_id", self.mask_token, d::MASK_TOKEN as u64);
         m.eq("dflash_config.selector_rank", self.selector_rank, d::SELECTOR_RANK);
         m.eq("dflash_config.selector_top_k", self.selector_top_k, d::SELECTOR_TOP_K);
+        m
+    }
+
+    /// The shapes and constants the draft runs with, for a target head whose first `valid_vocab` columns are tokens.
+    pub fn dims(&self, valid_vocab: usize) -> crate::draft::DraftDims {
+        crate::draft::DraftDims {
+            hidden: self.hidden,
+            intermediate: self.intermediate,
+            taps: self.target_layer_ids.len(),
+            mask_token: self.mask_token as u32,
+            eps: self.rms_eps as f32,
+            rope_theta: self.rope_theta,
+            valid_vocab,
+        }
+    }
+
+    /// The draft against the kernels and against the Qwen3.8 target it drafts for (its own shapes are the Qwen pack's,
+    /// `DraftDims::QWEN38`).
+    pub fn check(&self, target: &QwenConfig) -> Result<(), String> {
+        let q = crate::draft::DraftDims::QWEN38;
+        let mut m = self.kernel_mismatches();
+        m.eq("hidden_size", self.hidden, q.hidden);
+        m.eq("intermediate_size", self.intermediate, q.intermediate);
+        m.eq("rms_norm_eps", self.rms_eps as f32, q.eps);
+        m.eq("rope_theta", self.rope_theta, q.rope_theta);
+        m.eq("dflash_config.mask_token_id", self.mask_token, q.mask_token as u64);
         if self.target_layer_ids != crate::forward::TAP_LAYERS {
             m.0.push(format!(
                 "dflash_config.target_layer_ids is {:?}, the engine taps layers {:?}",
@@ -176,20 +198,54 @@ impl DraftConfig {
                 target.layers.len()
             ));
         }
-        if d::MASK_TOKEN as usize >= target.vocab {
-            m.0.push(format!("the mask token {} is outside the target's vocabulary of {}", d::MASK_TOKEN, target.vocab));
+        if q.mask_token as usize >= target.vocab {
+            m.0.push(format!("the mask token {} is outside the target's vocabulary of {}", q.mask_token, target.vocab));
+        }
+        m.finish("the draft's config.json")
+    }
+
+    /// The draft against the kernels and against a target of `hidden` channels, `layers` layers and a head (and embedding) of `vocab`
+    /// rows (a family whose draft shapes come from the pack: GLM-5.3-Flash's). The taps must be ascending layers of the target, the
+    /// mask a row of the target's embedding (GLM's is the first padding id), and the widths ones the 4-bit linears and the convs take.
+    pub fn check_for(&self, hidden: usize, layers: usize, vocab: usize) -> Result<(), String> {
+        let mut m = self.kernel_mismatches();
+        if self.hidden != hidden {
+            m.0.push(format!("hidden_size {} differs from the target's {hidden}", self.hidden));
+        }
+        if self.vocab != vocab {
+            m.0.push(format!("vocab_size {} differs from the target's {vocab}", self.vocab));
+        }
+        if self.num_target_layers != layers {
+            m.0.push(format!("num_target_layers {} differs from the target's {layers} layers", self.num_target_layers));
+        }
+        let ids = &self.target_layer_ids;
+        if ids.is_empty() || ids.windows(2).any(|w| w[0] >= w[1]) || ids.iter().any(|&l| l >= layers) {
+            m.0.push(format!("dflash_config.target_layer_ids {ids:?} must be ascending layers of the target's {layers}"));
+        }
+        if self.mask_token as usize >= vocab {
+            m.0.push(format!("the mask token {} is outside the target's embedding of {vocab} rows", self.mask_token));
+        }
+        for (what, v) in [("hidden_size", self.hidden), ("intermediate_size", self.intermediate)] {
+            if v == 0 || v % gb_cuda::q4_linear::GROUP != 0 {
+                m.0.push(format!("{what} {v} is not a multiple of {}", gb_cuda::q4_linear::GROUP));
+            }
         }
         m.finish("the draft's config.json")
     }
 }
 
-/// Read `dir/config.json` of a draft pack and check it (see [`DraftConfig::check`]). A missing or unreadable config is an error: the
-/// draft's shapes are compiled in, so the pack has to say they are the ones it was trained with.
-pub fn check_draft_dir(dir: &Path, target: &QwenConfig) -> Result<(), ModelError> {
+/// Read and parse `dir/config.json` of a draft pack.
+pub fn read_draft_config(dir: &Path) -> Result<DraftConfig, ModelError> {
     let path = dir.join("config.json");
     let text = std::fs::read_to_string(&path).map_err(|e| ModelError::Config(format!("{}: {e}", path.display())))?;
     let root: Value = serde_json::from_str(&text).map_err(|e| ModelError::Config(format!("{}: {e}", path.display())))?;
-    DraftConfig::from_json(&root).and_then(|d| d.check(target)).map_err(ModelError::Config)
+    DraftConfig::from_json(&root).map_err(ModelError::Config)
+}
+
+/// Read `dir/config.json` of a draft pack and check it (see [`DraftConfig::check`]). A missing or unreadable config is an error: the
+/// draft's shapes are compiled in, so the pack has to say they are the ones it was trained with.
+pub fn check_draft_dir(dir: &Path, target: &QwenConfig) -> Result<(), ModelError> {
+    read_draft_config(dir)?.check(target).map_err(ModelError::Config)
 }
 
 /// The driver must report CUDA 13.0 or newer. A missing driver is its own message.
@@ -227,6 +283,28 @@ mod tests {
     fn the_real_target_and_draft_configs_match_the_kernels() {
         check_target(&target()).unwrap();
         DraftConfig::from_json(&draft_json()).unwrap().check(&target()).unwrap();
+    }
+
+    #[test]
+    fn the_glm_draft_config_gives_its_own_dims_and_checks_against_a_glm_shaped_target() {
+        let v: Value = serde_json::from_str(include_str!("../../../testdata/glm53/dflash2_draft_config.json")).unwrap();
+        let d = DraftConfig::from_json(&v).unwrap();
+        d.check_for(4096, 45, 154880).unwrap();
+        let dims = d.dims(154856);
+        assert_eq!((dims.hidden, dims.intermediate, dims.taps, dims.mask_token), (4096, 12288, 5, 154856));
+        assert_eq!((dims.eps, dims.rope_theta, dims.fc_in()), (1e-5, 1e4, 20480));
+        assert_eq!(d.target_layer_ids, [5, 14, 24, 33, 42]);
+        // a target it does not belong to, and a mask past the embedding, are refused by name
+        let e = d.check_for(5120, 45, 154880).unwrap_err();
+        assert!(e.contains("hidden_size 4096 differs"), "{e}");
+        let e = d.check_for(4096, 40, 154880).unwrap_err();
+        assert!(e.contains("num_target_layers 45") && e.contains("target_layer_ids"), "{e}");
+        let mut small = d.clone();
+        small.vocab = 154800;
+        let e = small.check_for(4096, 45, 154800).unwrap_err();
+        assert!(e.contains("mask token 154856"), "{e}");
+        // the Qwen check refuses it: its shapes are not the Qwen pack's
+        assert!(d.check(&target()).is_err());
     }
 
     #[test]
