@@ -112,7 +112,12 @@ impl P2Exchange {
         let b = || DevBuf::zeroed(max_rows * hidden * 4);
         Ok(Self {
             parts: [b()?, b()?],
-            stream: Stream::new_nonblocking()?,
+            // at the greatest priority: a swap begun beside a compute grid (the sequence-parallel gathers before the router, a KDA
+            // layer's qkv or an MLA layer's query chain; the part swap beside the shared expert) gets its blocks as soon as SMs free up
+            // instead of after the grid's last wave (MEASURED, pair A nsys, 4,096-row chunk: the hidden gather before a MoE layer's
+            // router started when the router ended, 1.4 ms of the main stream's wait a layer; at this priority it starts with the router,
+            // 0.85 ms). Only what overlaps in time changes.
+            stream: Stream::new_nonblocking_high_priority()?,
             ready: Event::new()?,
             done: Event::new()?,
             max_rows,
