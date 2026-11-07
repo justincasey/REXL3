@@ -446,20 +446,11 @@ __global__ void __launch_bounds__(D) proj_out_kernel(
 constexpr int PO2_RM = 64;
 constexpr int PO2_KS = 64;
 
-__global__ void __launch_bounds__(256) proj_out_tile_kernel(
-        const float* __restrict__ fa, const float* __restrict__ ga, const __half* __restrict__ w_fb,
-        const __half* __restrict__ w_gb, const float* __restrict__ a_log, const float* __restrict__ dt_bias, float lower,
-        int rows, int heads, float* __restrict__ g, float* __restrict__ z) {
-    __shared__ __align__(16) float xs[PO2_KS][PO2_RM];
-    __shared__ __align__(16) __half wsm[PO2_KS][D];
-    const bool is_g = blockIdx.x < heads;
-    const int h = is_g ? blockIdx.x : blockIdx.x - heads;
-    const int r0 = blockIdx.y * PO2_RM;
-    const int nr = min(PO2_RM, rows - r0);
-    const float* x = is_g ? fa : ga;
-    const __half* wh = (is_g ? w_fb : w_gb) + (size_t)h * D * D;
-    const int tx = threadIdx.x & 31, ty = threadIdx.x >> 5;  // channels 4 tx .. 4 tx + 3, rows 8 ty .. 8 ty + 7
-    float acc[8][4];
+// The tile of rows r0 .. r0 + nr - 1 (nr <= 64) of x [rows, 128] times the head's 128 rows of w [., 128]: thread (tx, ty) = (lane, warp)
+// ends with acc[r][c] = the chain of row 8 ty + r, channel 4 tx + c.
+__device__ __forceinline__ void po_tile(const float* __restrict__ x, const __half* __restrict__ wh, int r0, int nr, float (&xs)[PO2_KS][PO2_RM],
+                                        __half (&wsm)[PO2_KS][D], float (&acc)[8][4]) {
+    const int tx = threadIdx.x & 31, ty = threadIdx.x >> 5;
 #pragma unroll
     for (int r = 0; r < 8; ++r)
 #pragma unroll
@@ -499,6 +490,22 @@ __global__ void __launch_bounds__(256) proj_out_tile_kernel(
                 for (int c = 0; c < 4; ++c) acc[r][c] = __fmaf_rn(xr[r], wc[c], acc[r][c]);
         }
     }
+}
+
+// gridDim.x = 2 heads (g then z blocks) or heads (z == nullptr: the g path alone).
+__global__ void __launch_bounds__(256) proj_out_tile_kernel(
+        const float* __restrict__ fa, const float* __restrict__ ga, const __half* __restrict__ w_fb,
+        const __half* __restrict__ w_gb, const float* __restrict__ a_log, const float* __restrict__ dt_bias, float lower,
+        int rows, int heads, float* __restrict__ g, float* __restrict__ z) {
+    __shared__ __align__(16) float xs[PO2_KS][PO2_RM];
+    __shared__ __align__(16) __half wsm[PO2_KS][D];
+    const bool is_g = blockIdx.x < heads;
+    const int h = is_g ? blockIdx.x : blockIdx.x - heads;
+    const int r0 = blockIdx.y * PO2_RM;
+    const int nr = min(PO2_RM, rows - r0);
+    const int tx = threadIdx.x & 31, ty = threadIdx.x >> 5;  // channels 4 tx .. 4 tx + 3, rows 8 ty .. 8 ty + 7
+    float acc[8][4];
+    po_tile(is_g ? fa : ga, (is_g ? w_fb : w_gb) + (size_t)h * D * D, r0, nr, xs, wsm, acc);
     const int n_half = heads * D;
     const int c0 = h * D + 4 * tx;
     float decay = 0.0f, dtb[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -515,6 +522,53 @@ __global__ void __launch_bounds__(256) proj_out_tile_kernel(
 #pragma unroll
         for (int c = 0; c < 4; ++c) o[c] = is_g ? expf(lower * sigmoid_ieee(decay * (acc[r][c] + dtb[c]))) : acc[r][c];
         *reinterpret_cast<float4*>((is_g ? g : z) + (size_t)(r0 + row) * n_half + c0) = make_float4(o[0], o[1], o[2], o[3]);
+    }
+}
+
+// The output gate z of a 64-row tile of one head (proj_out's g_b path: the same chains) and, in its epilogue, norm_kernel's gated RMSNorm
+// of the head's core output y with it: lane tx of warp ty holds channels 4 tx .. 4 tx + 3 of its rows, norm_kernel's lane layout, so the
+// sum of squares is norm_kernel's (lane-local in element order, the xor butterfly) and every output its expression. z never leaves the
+// block (the separate path writes it [rows, heads * 128] f32 and the norm reads it back).
+__global__ void __launch_bounds__(256) z_norm_tile_kernel(const float* __restrict__ ga, const __half* __restrict__ w_gb,
+                                                          const __nv_bfloat16* __restrict__ y, const __nv_bfloat16* __restrict__ w_norm,
+                                                          float eps, int rows, int heads, __half* __restrict__ out) {
+    __shared__ __align__(16) float xs[PO2_KS][PO2_RM];
+    __shared__ __align__(16) __half wsm[PO2_KS][D];
+    const int h = blockIdx.x;
+    const int r0 = blockIdx.y * PO2_RM;
+    const int nr = min(PO2_RM, rows - r0);
+    const int tx = threadIdx.x & 31, ty = threadIdx.x >> 5;
+    float acc[8][4];
+    po_tile(ga, w_gb + (size_t)h * D * D, r0, nr, xs, wsm, acc);
+    float wt[4];
+    load4_bf16(w_norm + tx * 4, wt);
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        const int row = 8 * ty + r;  // the same for the whole warp
+        if (row >= nr) continue;
+        const size_t off = ((size_t)(r0 + row) * heads + h) * D + tx * 4;
+        float x[4];
+        load4_bf16(y + off, x);
+        float ss = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) ss = ss + x[i] * x[i];
+        ss = warp_sum(ss);
+        const float rmf = 1.0f / sqrtf(ss / (float)D + eps);
+        __half2 hh[2];
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            float o[2];
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const int c = 2 * i + e;
+                o[e] = ((x[c] * wt[c]) * rmf) * sigmoid_ieee(acc[r][c]);
+            }
+            hh[i] = __floats2half2_rn(o[0], o[1]);
+        }
+        uint2 u;
+        u.x = *reinterpret_cast<const unsigned*>(&hh[0]);
+        u.y = *reinterpret_cast<const unsigned*>(&hh[1]);
+        *reinterpret_cast<uint2*>(out + off) = u;
     }
 }
 
@@ -1000,18 +1054,30 @@ GB_EXPORT int gb_kda_proj_in(const void* x, int x_dtype, const void* w_b, const 
 }
 
 // f_b and g_b (f16 weights [heads*128, 128]) off fa/ga f32 [rows, 128] (rank must be 128). g [rows, heads*128] is the final
-// per-channel DECAY (exp of the log decay), z [rows, heads*128] the f32 output gate. 64 rows or more take the tiled schedule (the
-// same bits).
+// per-channel DECAY (exp of the log decay), z [rows, heads*128] the f32 output gate; z == nullptr: the decay alone (gb_kda_z_norm takes
+// the gate). 64 rows or more take the tiled schedule (the same bits).
 GB_EXPORT int gb_kda_proj_out(const float* fa, const float* ga, const void* w_fb, const void* w_gb, const float* a_log,
                               const float* dt_bias, float lower, int rows, int heads, float* g, float* z, void* stream) {
     if (rows < 0 || bad_heads(heads)) return ERR_INVALID;
     if (rows == 0) return 0;
+    const int paths = z ? 2 : 1;
     if (rows >= PO2_RM)
-        proj_out_tile_kernel<<<dim3(2 * heads, (rows + PO2_RM - 1) / PO2_RM), 256, 0, gb_stream(stream)>>>(
+        proj_out_tile_kernel<<<dim3(paths * heads, (rows + PO2_RM - 1) / PO2_RM), 256, 0, gb_stream(stream)>>>(
             fa, ga, (const __half*)w_fb, (const __half*)w_gb, a_log, dt_bias, lower, rows, heads, g, z);
     else
-        proj_out_kernel<<<dim3(2 * heads, (rows + PO_RT - 1) / PO_RT), D, 0, gb_stream(stream)>>>(
+        proj_out_kernel<<<dim3(paths * heads, (rows + PO_RT - 1) / PO_RT), D, 0, gb_stream(stream)>>>(
             fa, ga, (const __half*)w_fb, (const __half*)w_gb, a_log, dt_bias, lower, rows, heads, g, z);
+    return GB_CHECK_LAUNCH();
+}
+
+// The output gate of gb_kda_proj_out (off ga f32 [rows, 128] and g_b) and gb_kda_norm with it, in one pass (z_norm_tile_kernel: the same
+// bits as the two): y bf16 [rows, heads, 128] the core output, w the norm's bf16 [128] weight, out fp16 [rows, heads * 128].
+GB_EXPORT int gb_kda_z_norm(const float* ga, const void* w_gb, const void* y, const void* w, float eps, int rows, int heads, void* out,
+                            void* stream) {
+    if (rows < 0 || bad_heads(heads)) return ERR_INVALID;
+    if (rows == 0) return 0;
+    z_norm_tile_kernel<<<dim3(heads, (rows + PO2_RM - 1) / PO2_RM), 256, 0, gb_stream(stream)>>>(
+        ga, (const __half*)w_gb, (const __nv_bfloat16*)y, (const __nv_bfloat16*)w, eps, rows, heads, (__half*)out);
     return GB_CHECK_LAUNCH();
 }
 

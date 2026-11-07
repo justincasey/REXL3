@@ -475,7 +475,7 @@ pub struct Workspace {
 
 /// The second buffer set and the side stream of the pipelined P2 prefill ([`prefill_chunked`] on bf16 qkv rows after
 /// [`Workspace::add_pipe`]): the projections, prep and conv shift of piece `i + 1` run on `side` into one set while the main stream runs
-/// piece `i`'s chunked recurrence and norm on the other. Set 0 is the workspace's own q, k, v, z with the record's g and beta.
+/// piece `i`'s chunked recurrence and gated norm on the other. Set 0 is the workspace's own q, k, v, ga with the record's g and beta.
 struct Pipe {
     side: Stream,
     start: Event,
@@ -484,7 +484,7 @@ struct Pipe {
     q: DevBuf,
     k: DevBuf,
     v: DevBuf,
-    z: DevBuf,
+    ga: DevBuf,
     g: DevBuf,
     beta: DevBuf,
 }
@@ -510,9 +510,9 @@ impl Workspace {
     pub fn bytes_per_row(dims: Dims) -> usize {
         dims.v_dim() * (4 + 4 + 2 + 4 + 2) + 2 * RANK * 4 + PROJ_IN_PARTS * (dims.heads + 2 * RANK) * 4
     }
-    /// Bytes per row of the pipelined prefill's second buffer set ([`Workspace::add_pipe`]): q, k, z, g f32, v bf16, beta f32.
+    /// Bytes per row of the pipelined prefill's second buffer set ([`Workspace::add_pipe`]): q, k, g f32, v bf16, ga, beta f32.
     pub fn pipe_bytes_per_row(dims: Dims) -> usize {
-        dims.v_dim() * (4 + 4 + 2 + 4 + 4) + dims.heads * 4
+        dims.v_dim() * (4 + 4 + 2 + 4) + RANK * 4 + dims.heads * 4
     }
     /// Give [`prefill_chunked`] a second buffer set of this workspace's rows and a side stream: on bf16 qkv rows it then overlaps each
     /// piece's projections, prep and conv shift with the previous piece's recurrence. Every kernel reads and writes what it did in the
@@ -530,7 +530,7 @@ impl Workspace {
             q: DevBuf::alloc(rows * d.v_dim() * 4)?,
             k: DevBuf::alloc(rows * d.v_dim() * 4)?,
             v: DevBuf::alloc(rows * d.v_dim() * 2)?,
-            z: DevBuf::alloc(rows * d.v_dim() * 4)?,
+            ga: DevBuf::alloc(rows * RANK * 4)?,
             g: DevBuf::alloc(rows * d.v_dim() * 4)?,
             beta: DevBuf::alloc(rows * d.heads * 4)?,
         });
@@ -708,6 +708,17 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn gb_kda_flip(parity: *mut i32, slot: *const i32, n_seq: i32, stream: *mut c_void) -> i32;
+        pub fn gb_kda_z_norm(
+            ga: *const f32,
+            w_gb: *const c_void,
+            y: *const c_void,
+            w: *const c_void,
+            eps: f32,
+            rows: i32,
+            heads: i32,
+            out: *mut c_void,
+            stream: *mut c_void,
+        ) -> i32;
     }
 }
 
@@ -763,10 +774,11 @@ fn project_raw(
     ws: &Workspace,
     z: *mut f32,
 ) -> Result<(), CudaError> {
-    project_stages_raw(st, d, w, p, x, x_dtype, rows, rec_g, rec_beta, ws, z, 3)
+    project_stages_raw(st, d, w, p, x, x_dtype, rows, rec_g, rec_beta, ws, ws.ga.ptr() as *mut f32, z, 3)
 }
 
-/// `stages`: bit 0 = the b / f_a / g_a GEMVs, bit 1 = f_b / g_b and the gate (needs the first stage's output).
+/// `stages`: bit 0 = the b / f_a / g_a GEMVs, bit 1 = f_b / g_b and the gate (needs the first stage's output). The g_a output goes to `ga`
+/// (`[rows, RANK]` f32); a null `z` leaves the output gate out (the decay alone: `gb_kda_z_norm` takes the gate with the norm).
 #[allow(clippy::too_many_arguments)]
 fn project_stages_raw(
     st: &Stream,
@@ -779,11 +791,11 @@ fn project_stages_raw(
     rec_g: *mut f32,
     rec_beta: *mut f32,
     ws: &Workspace,
+    ga: *mut f32,
     z: *mut f32,
     stages: u8,
 ) -> Result<(), CudaError> {
     let fa = ws.fa.ptr() as *mut f32;
-    let ga = ws.ga.ptr() as *mut f32;
     if stages & 1 != 0 {
         let rc = unsafe {
             ffi::gb_kda_proj_in(
@@ -856,6 +868,7 @@ pub fn project_stage(
         rec.g.ptr() as *mut f32,
         rec.beta.ptr() as *mut f32,
         ws,
+        ws.ga.ptr() as *mut f32,
         ws.z.ptr() as *mut f32,
         stages,
     )
@@ -1436,12 +1449,13 @@ pub fn p2_piece_rows(rec: &Record, ws: &Workspace) -> usize {
 /// each piece, then the CHUNKED recurrence (`csrc/glm_p2_kda.cu`: chunks of [`P2_CHUNK_ROWS`] rows from the call's first row, which the
 /// caller puts on a chunk boundary of its prefill segment), P1's norm and commit tail (the conv history shift and the parity flip). `x`
 /// `[rows, hidden]`, `qkv` `[rows, conv_dim]`, `out` fp16 `[rows, heads * 128]` as for [`prefill_with`]; `desc` from
-/// [`prefill_descriptor_pieces`] with `piece` (a whole number of chunks the record and workspace hold: [`p2_piece_rows`]).
+/// [`prefill_descriptor_pieces`] with `piece` (a whole number of chunks the record and workspace hold: [`p2_piece_rows`]). The output gate
+/// is computed in the norm's pass (`gb_kda_z_norm`: proj_out's g_b chains and norm_kernel's arithmetic; z never goes to memory).
 ///
 /// bf16 `qkv` rows are the record's raw rows already (prep's rounding of an f32 row is the bf16 the GEMM would have stored): prep writes no
 /// record and the conv shift reads `qkv` itself. With bf16 rows and a pipelined workspace ([`Workspace::add_pipe`]) the projections, prep
-/// and conv shift of piece `i + 1` run on the workspace's side stream while `st` runs piece `i`'s recurrence, norm and parity flip; every
-/// launch has the operands it has in the serial order, so the bits are the serial order's.
+/// and conv shift of piece `i + 1` run on the workspace's side stream while `st` runs piece `i`'s recurrence, gate and norm, and parity
+/// flip; every launch has the operands it has in the serial order, so the bits are the serial order's.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_chunked(
     st: &Stream,
@@ -1488,17 +1502,19 @@ pub fn prefill_chunked(
         q: ws.q.ptr() as *mut f32,
         k: ws.k.ptr() as *mut f32,
         v: ws.v.ptr(),
-        z: ws.z.ptr() as *mut f32,
+        ga: ws.ga.ptr() as *mut f32,
         g: rec.g.ptr() as *mut f32,
         beta: rec.beta.ptr() as *mut f32,
     };
     let ws: &Workspace = ws;
-    // piece i's projections and prep into `set` on `s` (with `shift`, the conv shift of bf16 rows too); its recurrence and norm on `s`
+    // piece i's projections (beta, the decay g and the gate's first stage ga) and prep into `set` on `s` (with `shift`, the conv shift of
+    // bf16 rows too); its recurrence, then the gate's second stage and the norm in one pass, on `s`
     let front = |s: &Stream, set: &Set, i: usize, shift: bool| -> Result<(), CudaError> {
         let r0 = i * piece;
         let len = (rows - r0).min(piece);
         let (seq_start, sl) = (desc.ptr_at(i * 16) as *const i32, desc.ptr_at(i * 16 + 8) as *const i32);
-        project_raw(s, d, w, p, x.ptr_at(r0 * d.hidden * x_dtype.size()), x_dtype, len, set.g, set.beta, ws, set.z)?;
+        let xp = x.ptr_at(r0 * d.hidden * x_dtype.size());
+        project_stages_raw(s, d, w, p, xp, x_dtype, len, set.g, set.beta, ws, set.ga, core::ptr::null_mut(), 3)?;
         let qp = qkv.ptr_at(r0 * d.conv_dim() * qkv_dtype.size());
         let raw_out = if bf16_rows { core::ptr::null_mut() } else { rec.qkv.ptr() };
         // SAFETY: the set holds `len <= piece` rows of this layer's dims, the record's raw rows too; the conv pool is the layer's
@@ -1554,7 +1570,7 @@ pub fn prefill_chunked(
             )
         })?;
         CudaError::check(unsafe {
-            ffi::gb_kda_norm(ws.y.ptr(), set.z, w.o_norm.ptr(), p.eps, len as i32, d.heads as i32, out.ptr_at(r0 * d.v_dim() * 2), s.raw())
+            ffi::gb_kda_z_norm(set.ga, w.g_b.ptr(), ws.y.ptr(), w.o_norm.ptr(), p.eps, len as i32, d.heads as i32, out.ptr_at(r0 * d.v_dim() * 2), s.raw())
         })
     };
     let tail_flip = |s: &Stream, i: usize, shift: bool| -> Result<(), CudaError> {
@@ -1580,7 +1596,7 @@ pub fn prefill_chunked(
                 q: pp.q.ptr() as *mut f32,
                 k: pp.k.ptr() as *mut f32,
                 v: pp.v.ptr(),
-                z: pp.z.ptr() as *mut f32,
+                ga: pp.ga.ptr() as *mut f32,
                 g: pp.g.ptr() as *mut f32,
                 beta: pp.beta.ptr() as *mut f32,
             };
@@ -1605,12 +1621,12 @@ pub fn prefill_chunked(
     Ok(())
 }
 
-/// One piece's buffers of [`prefill_chunked`]: q, k, z, g, beta f32 and v bf16, `piece` rows each.
+/// One piece's buffers of [`prefill_chunked`]: q, k, the gate's first stage ga (`[piece, RANK]`), g, beta f32 and v bf16, `piece` rows each.
 struct Set {
     q: *mut f32,
     k: *mut f32,
     v: *mut core::ffi::c_void,
-    z: *mut f32,
+    ga: *mut f32,
     g: *mut f32,
     beta: *mut f32,
 }

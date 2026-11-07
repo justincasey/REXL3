@@ -1238,9 +1238,35 @@ fn run_chunked(ctx: &Ctx, inp: &Inp, slot: usize, pool: &mut Pool, piece: usize,
     out.to_vec::<u16>().unwrap()
 }
 
-/// The P2 prefill on bf16 qkv rows (no record copy, the conv shift off the rows themselves) and on a pipelined workspace (each piece's
-/// projections, prep and conv shift on the side stream beside the previous piece's recurrence) gives the serial f32 path's bits: output,
-/// state, conv history and parity, in one call and across calls cut on a chunk boundary.
+/// The P2 prefill piece by piece through the public kernels (project, prep, the chunked recurrence, norm, commit), each on its own: what
+/// [`prefill_chunked`] computed before its fusions, the reference its bits are held to.
+fn run_chunked_reference(ctx: &Ctx, inp: &Inp, slot: usize, pool: &mut Pool, piece: usize) -> Vec<u16> {
+    let rows = inp.rows();
+    let mut rec = Record::alloc(dims(), piece).unwrap();
+    let mut ws = Workspace::alloc(dims(), piece).unwrap();
+    let w = ctx.dw.view();
+    let mut out = Vec::new();
+    for r0 in (0..rows).step_by(piece) {
+        let part = inp.slice(r0, (r0 + piece).min(rows));
+        let len = part.rows();
+        let (x, qkv) = (DevBuf::from_slice(&part.x).unwrap(), DevBuf::from_slice(&part.qkv).unwrap());
+        let batch = BatchBuf::new(&[len], &[slot]).unwrap();
+        let mut o = DevBuf::zeroed(len * VD * 2).unwrap();
+        project(&ctx.st, dims(), &w, &ctx.p, &x, Dtype::F16, len, &mut rec, &mut ws).unwrap();
+        prep(&ctx.st, dims(), &w, &qkv, Dtype::F32, pool, &batch.view(), &mut rec, &mut ws).unwrap();
+        window_chunked(&ctx.st, dims(), &ctx.p, pool, slot, len, &rec, &mut ws).unwrap();
+        norm(&ctx.st, dims(), &w, &ctx.p, len, &ws, &mut o).unwrap();
+        commit(&ctx.st, dims(), &w, &ctx.p, pool, &batch.view(), &rec, &mut ws, None, true).unwrap();
+        ctx.st.sync().unwrap();
+        out.extend(o.to_vec::<u16>().unwrap());
+    }
+    out
+}
+
+/// The P2 prefill (the decay alone from proj_out, the output gate with the norm in one pass; on f32 or bf16 qkv rows, bf16 rows needing no
+/// record copy and shifting the conv history off the rows themselves; serial or pipelined: each piece's projections, prep and conv shift on
+/// the side stream beside the previous piece's recurrence) gives the bits of the public kernels run one by one: output, state, conv
+/// history and parity, in one call and across calls cut on a chunk boundary.
 #[test]
 fn chunked_prefill_on_bf16_rows_and_pipelined_keeps_the_bits() {
     need_gpu!();
@@ -1251,9 +1277,9 @@ fn chunked_prefill_on_bf16_rows_and_pipelined_keeps_the_bits() {
     let start = Slot::random(&mut rng);
     for piece in [256usize, 512] {
         let mut base = pool_with(&[(1, &start)], 2);
-        let want = run_chunked(&ctx, &inp, 1, &mut base, piece, false, false);
+        let want = run_chunked_reference(&ctx, &inp, 1, &mut base, piece);
         let (want_slot, want_par) = (snap(&base, 1), base.read_parity().unwrap());
-        for (bf, pipe) in [(true, false), (true, true), (false, true)] {
+        for (bf, pipe) in [(false, false), (true, false), (true, true), (false, true)] {
             let what = format!("piece {piece}, bf16 rows {bf}, pipelined {pipe}");
             let mut pool = pool_with(&[(1, &start)], 2);
             let got = run_chunked(&ctx, &inp, 1, &mut pool, piece, bf, pipe);
