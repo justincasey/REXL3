@@ -13,10 +13,11 @@
 //! groups in one kernel ([`CombineMode::Both`]); a TP=2 rank runs its own group ([`CombineMode::Own`]), the ranks exchange one fp32 row
 //! each, and [`CombineMode::Parts`] adds them in the same order: P2 at TP=2 equals P2 on one node bit for bit.
 //!
-//! **Schedule** (per layer, one stream): P1's plan (`gb_moe_pf_plan`: pairs sorted by expert, items of 1, 2 and 3-4 tiles of 16 rows of
-//! one expert), the rotation into row-major fp16 A rows, ONE grouped gate/up GEMM with the SwiGLU epilogue (warps 0-3 gate, 4-7 up,
-//! the same 128 columns), the grouped down GEMM writing each pair's y, the combine. The scratch is P1's [`PrefillScratch`] (its sorted-row
-//! buffers have the bytes the row-major rows need), so P2 needs no memory of its own.
+//! **Schedule** (per layer, one stream): the plan (P1's sorted rows, `gb_moe_pf_plan`: pairs sorted by expert; P1's work items of 1 to 4
+//! tiles of 16 rows of one expert, listed in expert order so that one launch per GEMM takes them all and an expert's items share its
+//! weights through L2), the rotation into row-major fp16 A rows, ONE grouped gate/up GEMM with the SwiGLU epilogue (warps 0-3 gate, 4-7
+//! up, the same 128 columns), the grouped down GEMM writing each pair's y, the combine. The scratch is P1's [`PrefillScratch`] (its
+//! sorted-row buffers have the bytes the row-major rows need), so P2 needs no memory of its own.
 //!
 //! **Mixed-width layers** ([`run_subbanks`]). A layer whose experts do not share one width binds as homogeneous subbanks
 //! (`moe_subbanks.rs`). Because a pair's output depends on its row and its expert's weights only, the pairs stage runs once per subbank
@@ -512,8 +513,9 @@ fn pairs_on(
     }
 }
 
-/// P1's plan (the pairs sorted by expert, the work items: `s.spair`, `s.items`, `s.nitems`, the same bytes as `gb_moe_pf_plan` gives) on
-/// many blocks. Its workspace is the down projection's A rows (`s.xd`), which nothing reads before the gate/up GEMM writes them.
+/// The plan (`s.spair`: P1's sorted pairs, the same bytes as `gb_moe_pf_plan` gives; `s.items`: P1's items in expert order, `s.nitems`:
+/// {items, 0, 0, sorted rows}) on many blocks. Its workspace is the down projection's A rows (`s.xd`), which nothing reads before the
+/// gate/up GEMM writes them.
 pub(crate) fn plan(s: &mut PrefillScratch, rows: usize, d: &crate::moe::MoeDims, st: &Stream) -> Result<(), CudaError> {
     let pick = s.pick.ptr() as *const c_void;
     plan_on(s, pick, rows, d.topk, d.experts, st)

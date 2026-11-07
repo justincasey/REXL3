@@ -419,19 +419,23 @@ fn the_plan_is_p1s_plan() {
             s.set_picks(&pick, &wts).unwrap();
             glm_p2_moe::plan_only(&mut s, rows, &st).unwrap();
             let (sp2, it2, n2) = glm_p2_moe::plan_view(&s, &st).unwrap();
-            assert_eq!(n1[..4], n2[..4], "{style:?} rows {rows}: the item counts and sorted rows");
+            assert_eq!(n1[3], n2[3], "{style:?} rows {rows}: the sorted rows");
+            assert_eq!((n2[1], n2[2]), (0, 0), "{style:?} rows {rows}: one list of items");
             let sorted = n1[3] as usize;
             assert_eq!(sp1[..sorted], sp2[..sorted], "{style:?} rows {rows}: the sorted pairs");
+            // P1's three classes regrouped per expert in tile order: P2's one list (the same items, in expert order)
             let cap = it1.len() / 12;
-            for c in 0..3 {
-                let a = &it1[c * cap * 4..(c * cap + n1[c] as usize) * 4];
-                let b = &it2[c * cap * 4..(c * cap + n1[c] as usize) * 4];
-                assert_eq!(a, b, "{style:?} rows {rows}: the items of class {c}");
-            }
+            let mut want: Vec<&[i32]> =
+                (0..3).flat_map(|c| (0..n1[c] as usize).map(move |k| (c * cap + k) * 4)).map(|i| &it1[i..i + 4]).collect();
+            want.sort_by_key(|it| (it[0], it[1]));
+            let got: Vec<&[i32]> = (0..n2[0] as usize).map(|k| &it2[k * 4..k * 4 + 4]).collect();
+            assert_eq!(want, got, "{style:?} rows {rows}: P1's items in expert order");
             checked += 1;
         }
     }
-    eprintln!("the P2 plan equals P1's plan (sorted pairs, items, counts) on {checked} cases (5 routing styles x 7 row counts, 288 experts)");
+    eprintln!(
+        "the P2 plan is P1's plan (sorted pairs, the items in expert order) on {checked} cases (5 routing styles x 7 row counts, 288 experts)"
+    );
 }
 
 #[test]

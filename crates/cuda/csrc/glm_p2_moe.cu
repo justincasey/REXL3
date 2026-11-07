@@ -17,11 +17,15 @@
 // The weights are the trellis decoded by the decode path's own decoder (exl3_linear_decode.cuh), fp32 accumulation (P2 (c)).
 //
 // Schedule. The pairs are sorted by expert with P1's plan (csrc/moe_prefill.cu gb_moe_pf_plan: each expert's pairs padded to 16-row tiles,
-// work items of 1, 2 and 3-4 tiles of one expert). Gate and up run in ONE block per (128 output columns, item): 8 warps, warps 0-3 the
-// gate matrix and 4-7 the up matrix, warp w owning 32 columns (two 16-column tiles) of its matrix and every row of the item; a 3-stage
-// cp.async ring of 64 k streams the two matrices' A rows (16-byte chunks XOR-swizzled by row for conflict-free ldmatrix) and raw trellis
-// tiles; each warp decodes its own tiles once per k tile into B fragments and multiplies all of the item's m16 tiles by them. The sums
-// meet in shared memory for the SwiGLU epilogue. The down GEMM is the same loop on one matrix (warp w: 16 columns). The structure follows
+// the same sorted rows), cut into work items of 1 to 4 tiles of one expert and listed IN EXPERT ORDER (an expert's full 4-tile items, then
+// its remainder of 1-3 tiles), all of them in ONE launch per GEMM: an expert's items are neighbours in the grid, so the blocks that read
+// its weights run together and all but the first find them in L2 (P1's three item classes, each its own launch, read the weights of an
+// expert with a remainder twice: MEASURED, a quarter of the routed GEMMs' time at 4,096 rows). Gate and up run in ONE block per (128
+// output columns, item): 8 warps, warps 0-3 the gate matrix and 4-7 the up matrix, warp w owning 32 columns (two 16-column tiles) of its
+// matrix and every row of the item; a 3-stage cp.async ring of 64 k streams the two matrices' A rows (16-byte chunks XOR-swizzled by row
+// for conflict-free ldmatrix) and raw trellis tiles; each warp decodes its own tiles once per k tile into B fragments and multiplies all
+// of the item's m16 tiles by them. The sums meet in shared memory for the SwiGLU epilogue. The down GEMM is the same loop on one matrix
+// (warp w: 16 columns). The structure follows
 // the dense P2 kernel (glm_p2_dense.cu) and REXL3's Nemotron routed GEMM (nemotron_moe_mma.cu, lane S2); the trellis tile decode is
 // exl3_linear_decode.cuh (TensorFold, MIT, in the tree); the ideas of streaming raw trellis tiles through cp.async and decoding them per
 // warp are upstream ExLlamaV3's (MIT, Copyright (c) 2025 Turboderp; see THIRD_PARTY_NOTICES.md). No code was copied from either.
@@ -105,12 +109,13 @@ __device__ __forceinline__ int a_off(int r, int c) { return r * kBK + ((c ^ (r &
 
 // ---- the plan -----------------------------------------------------------------------------------------------------------------------
 //
-// The pairs sorted by expert, each expert's pairs padded to whole 16-row tiles, and the work items in three classes (1 tile, 2 tiles, 3-4
-// tiles of one expert): EXACTLY the output of P1's plan (csrc/moe_prefill.cu plan_kernel: the same spair, items and nitems, pairs in pair
-// order inside an expert), computed by many blocks instead of one (P1's single block scans every pair once per expert: 2.8 ms a layer at
-// 4,096 rows, MEASURED). Three launches: per chunk of kPlanChunk pairs, each expert's count (one thread an expert); one block turns the
-// counts into each chunk's first position per expert, the tile offsets and the items; per chunk, each expert's pairs placed in order.
-// Deterministic, no atomics; the order is a function of the picks alone.
+// The pairs sorted by expert, each expert's pairs padded to whole 16-row tiles (EXACTLY P1's sorted rows: csrc/moe_prefill.cu plan_kernel's
+// spair, pairs in pair order inside an expert), and ONE list of work items in expert order: per expert its full items of 4 tiles (64
+// rows) in tile order, then the remainder item of 1-3 tiles; the items are P1's (the same expert, first tile, tiles and valid rows),
+// listed per expert instead of by class. Computed by many blocks instead of one (P1's single block scans every pair once per expert: 2.8
+// ms a layer at 4,096 rows, MEASURED). Three launches: per chunk of kPlanChunk pairs, each expert's count (one thread an expert); one block
+// turns the counts into each chunk's first position per expert, the tile offsets and the items; per chunk, each expert's pairs placed in
+// order. Deterministic, no atomics; the order is a function of the picks alone.
 
 constexpr int kPlanThreads = 1024;  // one expert a thread: E <= 1024
 constexpr int kPlanChunk = 2048;    // pairs a block
@@ -159,7 +164,7 @@ __global__ void __launch_bounds__(kPlanThreads) plan_count(const int* __restrict
 }
 
 // One block: per expert, the chunks' counts become each chunk's first rank (in place), the expert's tile offset `base` (in rows), the padding
-// rows' spair -1, the items and nitems (P1's plan_kernel's formulas).
+// rows' spair -1, the items in expert order (items [cap]) and nitems: {items, 0, 0, sorted rows}.
 __global__ void __launch_bounds__(kPlanThreads) plan_scan(int* __restrict__ cnt, int* __restrict__ base, int* __restrict__ spair,
                                                           int4* __restrict__ items, int* __restrict__ nitems, int nb, int E, int cap) {
     __shared__ int ws[33];
@@ -180,22 +185,16 @@ __global__ void __launch_bounds__(kPlanThreads) plan_scan(int* __restrict__ cnt,
         for (int j = c; j < tiles * 16; ++j) spair[toff * 16 + j] = -1;
     }
     const int full = tiles >> 2, rem = tiles & 3;
-    const int cC = full + (rem == 3), cB = rem == 2, cA = rem == 1;
-    int nA, nB, nC;
-    const int oA = block_excl_scan(cA, &nA, ws);
-    const int oB = block_excl_scan(cB, &nB, ws);
-    const int oC = block_excl_scan(cC, &nC, ws);
+    int n;
+    const int o = block_excl_scan(full + (rem != 0), &n, ws);
     if (tid < E && tiles > 0) {
-        for (int gi = 0; gi < full; ++gi) items[2 * cap + oC + gi] = make_int4(tid, toff + 4 * gi, 4, min(64, c - 64 * gi));
-        const int t0 = toff + 4 * full, vr = c - 64 * full;
-        if (rem == 1) items[oA] = make_int4(tid, t0, 1, vr);
-        if (rem == 2) items[cap + oB] = make_int4(tid, t0, 2, vr);
-        if (rem == 3) items[2 * cap + oC + full] = make_int4(tid, t0, 3, vr);
+        for (int gi = 0; gi < full; ++gi) items[o + gi] = make_int4(tid, toff + 4 * gi, 4, min(64, c - 64 * gi));
+        if (rem) items[o + full] = make_int4(tid, toff + 4 * full, rem, c - 64 * full);
     }
     if (tid == 0) {
-        nitems[0] = nA;
-        nitems[1] = nB;
-        nitems[2] = nC;
+        nitems[0] = n;
+        nitems[1] = 0;
+        nitems[2] = 0;
         nitems[3] = total_tiles * 16;
     }
 }
@@ -279,8 +278,8 @@ struct GemmArgs {
     const half* a1;          // matrix 1 (MATS = 2)
     const uint64_t* t0;      // per-expert trellis device addresses of matrix 0 [E]
     const uint64_t* t1;      // matrix 1
-    const int4* items;       // {expert, first tile, tiles, valid rows} of this class
-    const int* nitems;       // this class's count
+    const int4* items;       // {expert, first tile, tiles, valid rows}: the plan's items in expert order
+    const int* nitems;       // their count
     const half* svh0;        // [E][N] output scales of matrix 0
     const half* svh1;        // matrix 1
     const half* suh_next;    // [E][N] the down projection's input scales (MATS = 2)
@@ -291,8 +290,8 @@ struct GemmArgs {
     float limit;
 };
 
-// Block (x = 128-column block, y = item of the class). See the file comment for the arithmetic; MT is the class's most m16 tiles, the
-// item's own count `tiles` (<= MT) is a compile-time constant of the loop (MA) so no MMA is predicated.
+// Block (x = 128-column block, y = item). See the file comment for the arithmetic; MT is an item's most m16 tiles, the item's own count
+// `tiles` (<= MT) is a compile-time constant of the loop (MA) so no MMA is predicated.
 template <int K2, int MT, int MATS, bool FOLD, int NW, int ST>
 __global__ void __launch_bounds__(NW * 32, MATS == 1 ? 2 : 1) gemm_kernel(const GemmArgs g) {
     using S = Shape<MATS, NW>;
@@ -575,21 +574,10 @@ int launch(const GemmArgs& a, int cap, cudaStream_t st) {
     return GB_CHECK_LAUNCH();
 }
 
-// The three item classes of P1's plan, heaviest first (its blocks fill the machine, the single-tile ones fill in behind): 3-4 tiles at
-// MT = 4, 2 tiles at MT = 2, 1 tile at MT = 1.
+// Every item of the plan (1 to 4 tiles) in one launch at MT = 4, in the plan's expert order.
 template <int K2, int MATS, bool FOLD, int NW, int ST>
-int launch_classes(const GemmArgs& a, int cap, cudaStream_t st) {
-    GemmArgs c = a;
-    c.items = a.items + 2 * cap;
-    c.nitems = a.nitems + 2;
-    int rc = launch<K2, 4, MATS, FOLD, NW, ST>(c, cap, st);
-    c.items = a.items + cap;
-    c.nitems = a.nitems + 1;
-    if (!rc) rc = launch<K2, 2, MATS, FOLD, NW, ST>(c, cap, st);
-    c.items = a.items;
-    c.nitems = a.nitems;
-    if (!rc) rc = launch<K2, 1, MATS, FOLD, NW, ST>(c, cap, st);
-    return rc;
+int launch_items(const GemmArgs& a, int cap, cudaStream_t st) {
+    return launch<K2, 4, MATS, FOLD, NW, ST>(a, cap, st);
 }
 
 // The block shapes (`shape`, never a bit): 0 the default (= 1); gate/up 1 = 8 warps (32 columns a warp) and 3 stages, 2 = 16 warps (16
@@ -599,18 +587,18 @@ int launch_shape(int shape, const GemmArgs& a, int cap, cudaStream_t st) {
     if constexpr (MATS == 2) {
         switch (shape) {
             case 0:  // MEASURED on node 4 (tests/glm_p2_moe.rs bench): 8 warps at least as fast as 16 at 512 to 4,096 rows, 2 and 3 bits
-            case 1: return launch_classes<K2, 2, FOLD, 8, 3>(a, cap, st);
-            case 2: return launch_classes<K2, 2, FOLD, 16, 3>(a, cap, st);
+            case 1: return launch_items<K2, 2, FOLD, 8, 3>(a, cap, st);
+            case 2: return launch_items<K2, 2, FOLD, 16, 3>(a, cap, st);
             case 3:
-                if constexpr (smem_bytes<K2, 4, 2, 4>() <= 101376) return launch_classes<K2, 2, FOLD, 16, 4>(a, cap, st);
+                if constexpr (smem_bytes<K2, 4, 2, 4>() <= 101376) return launch_items<K2, 2, FOLD, 16, 4>(a, cap, st);
                 else return (int)cudaErrorInvalidValue;
             default: return (int)cudaErrorInvalidValue;
         }
     } else {
         switch (shape) {
             case 0:
-            case 1: return launch_classes<K2, 1, FOLD, 8, 3>(a, cap, st);
-            case 2: return launch_classes<K2, 1, FOLD, 8, 4>(a, cap, st);
+            case 1: return launch_items<K2, 1, FOLD, 8, 3>(a, cap, st);
+            case 2: return launch_items<K2, 1, FOLD, 8, 4>(a, cap, st);
             default: return (int)cudaErrorInvalidValue;
         }
     }
@@ -651,7 +639,8 @@ GB_EXPORT long long gb_glm_p2m_plan_ws_bytes(int rows, int topk, int E) {
     return (nb + 1) * E * 4;
 }
 
-// P1's plan (gb_moe_pf_plan: spair [padded rows], items [3 * cap] int4, nitems [4]), the same bytes, in three launches over many blocks.
+// The plan (the file's plan section): spair [padded rows] (P1's gb_moe_pf_plan's bytes), items [cap] int4 in expert order (the buffer has
+// P1's 3 * cap), nitems [4] = {items, 0, 0, sorted rows}, in three launches over many blocks.
 // ws: gb_glm_p2m_plan_ws_bytes bytes of device memory whose contents never matter (the caller may lend any buffer free until the plan ends).
 GB_EXPORT int gb_glm_p2m_plan(const void* pick, void* spair, void* items, void* nitems, void* ws, long long ws_bytes, int rows, int topk,
                               int E, int cap, void* stream) {
@@ -686,7 +675,7 @@ GB_EXPORT int gb_glm_p2m_rotate(const void* x, int x_dtype, const void* pick, co
 }
 
 // Gate and up with the SwiGLU epilogue: ad [padded rows][N] fp16 (the down projection's A rows). K = the model width, N = the expert width.
-// items / nitems: P1's plan (3 classes of `cap` slots). fold: the K order (1 fold128, 0 chain). limit <= 0: no clamp.
+// items / nitems: the plan's (one launch over `cap` item slots). fold: the K order (1 fold128, 0 chain). limit <= 0: no clamp.
 GB_EXPORT int gb_glm_p2m_gateup(const void* a0, const void* a1, const void* tg, const void* tu, const void* items, const void* nitems,
                                 const void* svh_g, const void* svh_u, const void* suh_d, void* ad, int K, int N, int bits, int fold,
                                 int shape, int cap, float limit, void* stream) {
