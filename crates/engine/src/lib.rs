@@ -1217,6 +1217,8 @@ impl<B: Backend> Engine<B> {
     pub fn submit_with_budget(&mut self, req: Request, budget: Option<ReasoningBudget>) -> Result<u64, SubmitError> {
         let id = self.submit_deferred_with_budget(req, budget)?;
         while self.prefilling.iter().any(|p| p.id == id) {
+            // as `step` does before anything allocates: a pool cache's entries give back the pages the admitted sequences may claim
+            self.keep_pool_room();
             self.advance_prefill().map_err(|e| SubmitError::Backend(e.to_string()))?;
         }
         match self.failed.iter().position(|(f, _)| *f == id) {
@@ -1230,6 +1232,7 @@ impl<B: Backend> Engine<B> {
     pub fn submit(&mut self, req: Request) -> Result<u64, SubmitError> {
         let id = self.submit_deferred(req)?;
         while self.prefilling.iter().any(|p| p.id == id) {
+            self.keep_pool_room();
             self.advance_prefill().map_err(|e| SubmitError::Backend(e.to_string()))?;
         }
         match self.failed.iter().position(|(f, _)| *f == id) {

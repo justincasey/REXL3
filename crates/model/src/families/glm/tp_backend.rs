@@ -2222,6 +2222,312 @@ pub(crate) mod tests {
         assert_eq!(a.iter().filter(|x| x.starts_with("restore ") && x.contains(&restored)).count(), 1, "{a:?}");
     }
 
+    // ---------------------------------------------------------- the pool cache: cuts in batched slices, in slices in parts, at the end
+
+    /// A P2 leader backend with the pool cache (`with_pool_prefix_cache`: `snapshots` snapshot slots whose entries keep idle pool pages)
+    /// over a follower thread, both recording, whose runtimes run forwards of several prompts and in parts (`room` rows meanwhile, `layers`
+    /// layers), with parts of `part_ms` while a sequence decodes. The follower numbers its snapshot slots from 1000.
+    fn pool_group(
+        chunk: usize,
+        room: usize,
+        layers: usize,
+        part_ms: f64,
+        snapshots: usize,
+    ) -> (GlmTpBackend<Rec>, Log, Log, std::thread::JoinHandle<FollowerExit>) {
+        let (a, b) = Link::<GlmCall>::pair(Duration::from_secs(30)).unwrap();
+        let (l0, l1): (Log, Log) = (Arc::default(), Arc::default());
+        let f = Rec { parts: Some((room, layers)), snap_base: 1000, ..Rec::new(l1.clone()) };
+        let h = std::thread::spawn(move || run_follower(f, b, FollowerConfig::new(t())).unwrap());
+        let leader = TpLeader::lead(Rec { parts: Some((room, layers)), ..Rec::new(l0.clone()) }, a, t());
+        let budget = CacheBudget { snapshot_slots: snapshots, page_blocks: 0, snapshot_bytes: 4096, page_bytes: 1 << 20 };
+        let be = GlmTpBackend::new(leader, chunk, 4)
+            .with_contract(super::super::contract::PrefillContract::P2)
+            .with_parts(part_ms)
+            .with_pool_prefix_cache(7, budget, 4096)
+            .unwrap();
+        (be, l0, l1, h)
+    }
+
+    /// Rank 0's state of `slot`: the mock's chain over the (position, token) pairs the slot holds.
+    fn chain_of(be: &GlmTpBackend<Rec>, slot: usize) -> u64 {
+        be.leader.inner().chain[slot]
+    }
+
+    /// The state and the row (4 candidates) a cold, uncached prefill of `prompt` leaves: a P2 group without a cache, slice by slice.
+    fn cold(chunk: usize, prompt: &[u32]) -> (u64, RowOutput) {
+        let (be, _l0, _l1, h) = group(chunk, false);
+        let mut be = be.with_contract(super::super::contract::PrefillContract::P2);
+        let mut done = 0;
+        let row = loop {
+            let s = be.prefill_slice(0, prompt, &[], done, 4);
+            done = s.done;
+            if let Some(r) = s.row {
+                break r;
+            }
+        };
+        let chain = chain_of(&be, 0);
+        drop(be);
+        h.join().unwrap();
+        (chain, row)
+    }
+
+    /// The cache calls of a log (every line but the single-prompt forwards').
+    fn cache_calls(l: &Log) -> Vec<String> {
+        l.lock().unwrap().iter().filter(|x| !x.starts_with("prefill ")).cloned().collect()
+    }
+
+    /// The pool cache's batched call (`prefill_slices` with cuts, `prefill_slices_take_cuts`): a slot restored from a hit, a fresh prompt
+    /// with a cut inside it and a fresh prompt without one go through ONE prompt forward. Each slice ends at its first cut (on its segment's
+    /// 16-row grid: the restored slot's at its prompt's end, counted from the restored length), and the snapshot of every job that ended
+    /// at a cut is a `Snapshot` call after the forward, in job order, returned with that job's step. The fresh prompt's next slices take
+    /// its next cut (its end moved down to the grid) and then answer. The follower replays rank 0's stream; every row is the prompt's cold
+    /// row and every slot's state the cold prefill's.
+    #[test]
+    fn a_batched_call_takes_each_prompts_cuts_and_resumes_a_restored_slot() {
+        let mut r = (0u32..).map(|i| (i * 7 + 3) % 1000);
+        let base: Vec<u32> = r.by_ref().take(160).collect();
+        let grown: Vec<u32> = base.iter().copied().chain(r.by_ref().take(48)).collect();
+        let fresh: Vec<u32> = r.by_ref().take(100).collect();
+        let short: Vec<u32> = r.by_ref().take(30).collect();
+        let (mut be, l0, l1, h) = pool_group(256, 32, 6, 300.0, 4);
+        assert!(be.batches() && be.prefill_slices_take_cuts() && be.prefix_end_cut());
+        let (_, caps) = cut_slices(&mut be, 0, &base, 0, &[160]);
+        assert_eq!(caps.iter().map(|c| c.len).collect::<Vec<_>>(), [160], "the end cut, after the prompt's only slice");
+        be.release(0);
+        be.prefix_restore(1, &caps[0].handle, 160).unwrap();
+        let jobs = [
+            PrefillJob { slot: 1, prompt: &grown, images: &[], done: 160, candidates: 4, cuts: &[208] },
+            PrefillJob { slot: 2, prompt: &fresh, images: &[], done: 0, candidates: 4, cuts: &[64, 100] },
+            PrefillJob { slot: 3, prompt: &short, images: &[], done: 0, candidates: 4, cuts: &[] },
+        ];
+        let out = be.prefill_slices(&jobs);
+        let lens = |c: &CutStep| c.captured.iter().map(|x| x.len).collect::<Vec<_>>();
+        assert_eq!(out.iter().map(|c| (c.step.done, c.step.row.is_some())).collect::<Vec<_>>(), [(208, true), (64, false), (30, true)]);
+        assert_eq!(out.iter().map(lens).collect::<Vec<_>>(), [vec![208], vec![64], vec![]], "each job's own snapshot");
+        let mut more = Vec::new();
+        let mut done = 64;
+        let fresh_row = loop {
+            let s = be.prefill_slices(&[PrefillJob { slot: 2, prompt: &fresh, images: &[], done, candidates: 4, cuts: &[64, 100] }]);
+            let s = s.into_iter().next().unwrap();
+            more.extend(s.captured.iter().map(|c| c.len));
+            done = s.step.done;
+            if let Some(row) = s.step.row {
+                break row;
+            }
+        };
+        assert_eq!(more, [96], "the end cut moved down to the grid: one more slice of 4 rows answers");
+        for (slot, prompt, row) in [(1, &grown, out[0].step.row.as_ref()), (2, &fresh, Some(&fresh_row)), (3, &short, out[2].step.row.as_ref())] {
+            let (chain, want) = cold(256, prompt);
+            assert_eq!(row, Some(&want), "slot {slot}: the row is the cold prefill's");
+            assert_eq!(chain_of(&be, slot), chain, "slot {slot}: the state is the cold prefill's");
+        }
+        assert!(be.take_error().is_none());
+        be.quiesce().unwrap();
+        drop(be);
+        assert!(matches!(h.join().unwrap(), FollowerExit::Shutdown(_)));
+        assert_eq!(*l0.lock().unwrap(), *l1.lock().unwrap(), "the follower's call stream is rank 0's");
+        assert_eq!(
+            cache_calls(&l0),
+            [
+                "enable_snapshots 4",
+                "begin 0",
+                "snapshot 0 160 mtp_ok=true",
+                "retain 0 160 [0]",
+                "end 0",
+                "restore 1 160 [0]",
+                "begin 2",
+                "begin 3",
+                "part [1@160+48 2@0+64 3@0+30] Some(4) until=4294967295",
+                "snapshot 1 208 mtp_ok=true",
+                "retain 1 208 [1]",
+                "snapshot 2 64 mtp_ok=true",
+                "retain 2 64 [2]",
+                "snapshot 2 96 mtp_ok=true",
+                "retain 2 96 [2]",
+            ]
+        );
+    }
+
+    /// The pool cache's slice in parts (`tp_part`, while a sequence decodes): a long slice ends at its cut like any other and runs in
+    /// parts, `done` unchanged and nothing captured until its last part, after which its snapshot is taken (one `Snapshot` call right after
+    /// the last `resume`) and returned with the step that moves `done` to the cut. A short prompt with its end cut runs whole between two
+    /// parts and takes its snapshot there. The follower replays rank 0's stream; rows and states are the cold prefill's.
+    #[test]
+    fn a_slice_in_parts_ends_at_its_cut_and_takes_its_snapshot_after_its_last_part() {
+        let long: Vec<u32> = (0..200).map(|i| (i * 11 + 5) % 1000).collect();
+        let short: Vec<u32> = (0..32).map(|i| (i * 13 + 1) % 1000).collect();
+        let (mut be, l0, l1, h) = pool_group(256, 32, 6, 1e-3, 4);
+        be.set_decode_waiting(true);
+        let lens = |c: &CutStep| c.captured.iter().map(|x| x.len).collect::<Vec<_>>();
+        let s = be.prefill_slice_cuts(0, &long, &[], 0, 4, &[160, 200]);
+        assert!(s.step.done == 0 && s.step.row.is_none() && s.captured.is_empty(), "the first part of the slice 0..160");
+        assert_eq!(be.prefill_in_flight(), Some((0, 32)));
+        let s = be.prefill_slice_cuts(1, &short, &[], 0, 4, &[32]);
+        assert!(s.step.done == 32 && s.step.row.is_some() && lens(&s) == [32], "the short prompt and its end cut, between two parts");
+        let short_row = s.step.row.unwrap();
+        let s = be.prefill_slice_cuts(0, &long, &[], 0, 4, &[160, 200]);
+        assert!(s.step.done == 0 && s.step.row.is_none() && s.captured.is_empty(), "a middle part captures nothing");
+        be.set_decode_waiting(false);
+        let s = be.prefill_slice_cuts(0, &long, &[], 0, 4, &[160, 200]);
+        assert!(s.step.done == 160 && s.step.row.is_none() && lens(&s) == [160], "the last part ends the slice at its cut");
+        assert_eq!(be.prefill_in_flight(), None);
+        let (long_row, caps) = cut_slices(&mut be, 0, &long, 160, &[160, 200]);
+        assert_eq!(caps.iter().map(|c| c.len).collect::<Vec<_>>(), [192], "the end cut on the grid");
+        for (slot, prompt, row) in [(0, &long, &long_row), (1, &short, &short_row)] {
+            let (chain, want) = cold(256, prompt);
+            assert_eq!(row, &want, "slot {slot}: the row is the cold prefill's");
+            assert_eq!(chain_of(&be, slot), chain, "slot {slot}: the state is the cold prefill's");
+        }
+        assert!(be.take_error().is_none());
+        be.quiesce().unwrap();
+        drop(be);
+        assert!(matches!(h.join().unwrap(), FollowerExit::Shutdown(_)));
+        assert_eq!(*l0.lock().unwrap(), *l1.lock().unwrap(), "the follower's call stream is rank 0's");
+        assert_eq!(
+            cache_calls(&l0),
+            [
+                "enable_snapshots 4",
+                "begin 0",
+                "part [0@0+160] None until=1",
+                "begin 1",
+                "snapshot 1 32 mtp_ok=true",
+                "retain 1 32 [0]",
+                "resume until=2",
+                "resume until=4294967295",
+                "snapshot 0 160 mtp_ok=true",
+                "retain 0 160 [1]",
+                "snapshot 0 192 mtp_ok=true",
+                "retain 0 192 [1]",
+            ]
+        );
+    }
+
+    /// The end cut (`Backend::prefix_end_cut`, a policy of no tail): a cut at the prompt's end on the 16-row grid is a snapshot after the
+    /// last slice, in the step that answers the prompt's row; one off the grid moves down to it, so the slice before it ends there, the
+    /// snapshot follows, and one short slice answers. A turn restored from either end cut (one that grows the prompt, a warm turn of the
+    /// same prompt) resumes from all of it and answers with the cold row and state.
+    #[test]
+    fn an_end_cut_snaps_after_the_last_slice_and_off_the_grid_costs_one_short_slice() {
+        let on_grid: Vec<u32> = (0..288).map(|i| (i * 3 + 7) % 1000).collect();
+        let off_grid: Vec<u32> = (0..300).map(|i| (i * 5 + 2) % 1000).collect();
+        let (mut be, l0, l1, h) = pool_group(128, 32, 6, 300.0, 4);
+        // (done, answered, captured) of every step of `prompt` into `slot` with its end cut, and the snapshots
+        let steps_of_end_cut = |be: &mut GlmTpBackend<Rec>, slot: usize, prompt: &[u32]| {
+            let (mut done, mut steps, mut caps) = (0, Vec::new(), Vec::new());
+            loop {
+                let s = be.prefill_slice_cuts(slot, prompt, &[], done, 4, &[prompt.len()]);
+                done = s.step.done;
+                let answered = s.step.row.is_some();
+                steps.push((done, answered, s.captured.iter().map(|c| c.len).collect::<Vec<_>>()));
+                caps.extend(s.captured);
+                if answered {
+                    return (steps, caps);
+                }
+            }
+        };
+        let (steps, on_caps) = steps_of_end_cut(&mut be, 0, &on_grid);
+        assert_eq!(steps, [(128, false, vec![]), (256, false, vec![]), (288, true, vec![288])]);
+        let (steps, off_caps) = steps_of_end_cut(&mut be, 1, &off_grid);
+        assert_eq!(steps, [(128, false, vec![]), (256, false, vec![]), (288, false, vec![288]), (300, true, vec![])]);
+        be.release(0);
+        be.release(1);
+        let grown: Vec<u32> = on_grid.iter().copied().chain(900..920).collect();
+        be.prefix_restore(2, &on_caps[0].handle, 288).unwrap();
+        let (grown_row, more) = cut_slices(&mut be, 2, &grown, 288, &[]);
+        assert!(more.is_empty());
+        be.prefix_restore(3, &off_caps[0].handle, 288).unwrap();
+        let (warm_row, _) = cut_slices(&mut be, 3, &off_grid, 288, &[]);
+        for (slot, prompt, row) in [(2, &grown, &grown_row), (3, &off_grid, &warm_row)] {
+            let (chain, want) = cold(128, prompt);
+            assert_eq!(row, &want, "slot {slot}: the row is the cold prefill's");
+            assert_eq!(chain_of(&be, slot), chain, "slot {slot}: the state is the cold prefill's");
+        }
+        assert!(be.take_error().is_none());
+        be.quiesce().unwrap();
+        drop(be);
+        assert!(matches!(h.join().unwrap(), FollowerExit::Shutdown(_)));
+        let (a, b) = (l0.lock().unwrap().clone(), l1.lock().unwrap().clone());
+        assert_eq!(a, b, "the follower's call stream is rank 0's");
+        // the chunk right before each snapshot, without its tokens: `prefill <slot> <start> <want> / snapshot ...`
+        let before: Vec<String> = a
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| x.starts_with("snapshot "))
+            .map(|(i, x)| {
+                let p = &a[i - 1];
+                let head: Vec<&str> = p.split(' ').take(3).collect();
+                format!("{} {} / {x}", head.join(" "), &p[p.rfind(']').unwrap() + 2..])
+            })
+            .collect();
+        assert_eq!(before, ["prefill 0 256 Some(4) / snapshot 0 288 mtp_ok=true", "prefill 1 256 None / snapshot 1 288 mtp_ok=true"]);
+    }
+
+    /// The ENGINE over rank 0's backend with the pool cache and the policy of no tail (`REXL3_PREFIX_TAIL=0`), prefill batching on as the
+    /// boot serves it: a first turn leaves its end cut (moved down to the 16-row grid); the follow-up turn (the first prompt, its reply, a
+    /// question) resumes from all of it while a fresh prompt shares its forwards (the batched call with a restored slot); both reply as
+    /// uncached. Then the pool runs short (rank 0 reports no free page): the engine gives every entry back before anything allocates
+    /// (`evicted_for_pool`), and the next turn finds nothing and replies as uncached too. Both ranks saw the same stream.
+    #[test]
+    fn the_engine_resumes_a_follow_up_turn_from_the_end_cut_beside_a_fresh_prompt_through_the_group() {
+        use crate::families::glm::tp_boot::engine_over;
+        use gb_engine::{PrefillPolicy, Request};
+        use gb_sched::{Admission, ModelMemory};
+        let (be, l0, l1, h) = pool_group(256, 32, 6, 300.0, 4);
+        let mm = ModelMemory { weights_bytes: 0, kv_bytes_per_token: 1, state_bytes_per_slot: 1, activation_reserve: 0 };
+        let cfg = crate::serve::interactive_prefix_config_from(&|n| (n == "REXL3_PREFIX_TAIL").then(|| "0".to_string())).unwrap();
+        let mut e = engine_over(be, Admission::new(1 << 30, 0, mm, 4).unwrap(), false)
+            .with_prefill_policy(PrefillPolicy::Burst { div: 1, cap: 4 })
+            .with_prefill_batching(true)
+            .with_prefix_cache(cfg);
+        let t1: Vec<u32> = (0..1100).map(|i| (i * 5 % 1000) as u32).collect();
+        let a = serve(&mut e, &t1, true).unwrap();
+        assert_eq!(a.cached_tokens, 0);
+        let t2: Vec<u32> = t1.iter().chain(&a.tokens).copied().chain((0..40).map(|i| (i * 7 % 997) as u32)).collect();
+        let other: Vec<u32> = (0..150).map(|i| (i * 13 % 991) as u32).collect();
+        let req = |prompt: &[u32]| Request {
+            prompt: prompt.to_vec(),
+            sampling: gb_sampling::Sampling::default(),
+            max_new: 3,
+            stop: vec![],
+            draft: false,
+            images: vec![],
+            cache: true,
+        };
+        let ids = [e.submit_deferred(req(&t2)).unwrap(), e.submit_deferred(req(&other)).unwrap()];
+        let mut outs: Vec<Option<gb_engine::Output>> = vec![None, None];
+        for _ in 0..400 {
+            e.step().unwrap();
+            for o in e.take_outputs() {
+                let i = ids.iter().position(|&id| id == o.id).unwrap();
+                outs[i] = Some(o);
+            }
+            if outs.iter().all(Option::is_some) {
+                break;
+            }
+        }
+        let (b, c) = (outs[0].take().unwrap(), outs[1].take().unwrap());
+        assert_eq!((b.cached_tokens, c.cached_tokens), (1088, 0), "the follow-up resumes from the first prompt's end cut (1,100 on the grid)");
+        assert_eq!(b.tokens, serve(&mut e, &t2, false).unwrap().tokens, "the follow-up replies as uncached");
+        assert_eq!(c.tokens, serve(&mut e, &other, false).unwrap().tokens, "the fresh prompt replies as uncached");
+        let st = e.prefix_stats();
+        assert!(st.hits == 1 && st.evicted_for_pool == 0 && st.entries >= 2, "{st:?}");
+        assert!(
+            l0.lock().unwrap().iter().any(|x| x.starts_with("part [") && x.contains("@1088+") && x.contains("@0+")),
+            "the restored slot and the fresh prompt shared a forward: {:?}",
+            cache_calls(&l0)
+        );
+        // the pool runs short: every entry goes back before the next turn allocates, and the turn finds none
+        e.backend.leader.inner_mut().pool_free = 0;
+        let t3: Vec<u32> = t2.iter().chain(&b.tokens).copied().chain(0..20).collect();
+        let d = serve(&mut e, &t3, true).unwrap();
+        let st = e.prefix_stats();
+        assert!(d.cached_tokens == 0 && st.hits == 1 && st.evicted_for_pool >= 2, "{st:?}");
+        assert_eq!(d.tokens, serve(&mut e, &t3, false).unwrap().tokens, "the turn after the evictions replies as uncached");
+        drop(e);
+        h.join().unwrap();
+        assert_eq!(*l0.lock().unwrap(), *l1.lock().unwrap(), "the follower's call stream is rank 0's");
+    }
+
     // ---------------------------------------------------------------------------------------- the restore verified per rank, cold otherwise
 
     /// The engine over a two-rank cache group whose FOLLOWER has the fault switches `faults` (shared with the test), with these cache
