@@ -919,21 +919,28 @@ pub fn build_leader(
     if small != 0 {
         backend = backend.with_adaptive(small);
     }
-    // long slices in parts while a sequence decodes (`tp_part`; every rank holds the stash): replaces the adaptive slice; and
-    // the rows of fresh short prompts one forward takes meanwhile
+    // long slices in parts while a sequence decodes (`tp_part`; every rank holds the stashes): replaces the adaptive slice; a short
+    // prompt's forward in parts of its own; with nothing decoding, an opening forward that prompts arriving a little late join; and the
+    // rows of fresh short prompts one forward takes meanwhile
     let part_ms = super::tp_part::part_ms_from_env()?;
+    let short_part_ms = super::tp_part::short_part_ms_from_env()?;
+    let open_ms = super::tp_part::open_ms_from_env()?;
     let batch_rows = super::tp_part::batch_rows_from_env()?;
-    backend = backend.with_parts(part_ms).with_batch_rows(batch_rows);
+    backend = backend.with_parts(part_ms).with_short_parts(short_part_ms).with_open(open_ms).with_batch_rows(batch_rows);
     eprintln!(
-        "rexl3 event=tp_glm_levers graphs={} overlap={} graph_at_first={} prefill_rows={} prefill_small={} part_ms={} batch_rows={} (REXL3_GLM_TP_GRAPHS, REXL3_GLM_OVERLAP, REXL3_GLM_GRAPH_AT, --prefill-chunk, REXL3_GLM_ADAPTIVE_PREFILL, {}, {})",
+        "rexl3 event=tp_glm_levers graphs={} overlap={} graph_at_first={} prefill_rows={} prefill_small={} part_ms={} short_part_ms={} open_ms={} batch_rows={} (REXL3_GLM_TP_GRAPHS, REXL3_GLM_OVERLAP, REXL3_GLM_GRAPH_AT, --prefill-chunk, REXL3_GLM_ADAPTIVE_PREFILL, {}, {}, {}, {})",
         gate.family.graphs,
         gate.family.overlap,
         gate.family.graph_at_first,
         p.chunk,
         small,
         part_ms,
+        short_part_ms,
+        open_ms,
         batch_rows,
         super::tp_part::PART_MS_ENV,
+        super::tp_part::SHORT_PART_MS_ENV,
+        super::tp_part::OPEN_MS_ENV,
         super::tp_part::BATCH_ROWS_ENV
     );
     if tower.is_some() {

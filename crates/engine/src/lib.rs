@@ -226,6 +226,12 @@ pub trait Backend {
     fn prefill_in_flight(&self) -> Option<(usize, usize)> {
         None
     }
+    /// A prompt's forward is paused mid-way and goes on right after the next decode round, its first token waiting for that round alone
+    /// (GLM's tensor-parallel rank 0: a short prompt's forward in parts of its own). The engine then makes the round as short as it can:
+    /// no drafts, one row a sequence. Drafts never change what is emitted, so only when tokens arrive moves, never a bit. The default: no.
+    fn prefill_waits_round(&self) -> bool {
+        false
+    }
     /// A proven cold-call bound, when available (CPU mock); native families require observed work, not a guessed rate.
     fn cold_step_budget(&self) -> Option<std::time::Duration> {
         None
@@ -1741,9 +1747,15 @@ impl<B: Backend> Engine<B> {
         self.backend.set_decode_waiting(decoded || !self.active.is_empty());
         if matches!(self.prefill_policy, PrefillPolicy::Burst { .. }) {
             // every prompt waiting at the start of the step is passed over by it unless it is served (a pick resets its count): the guard
-            // counts steps, not the slices of one step, which are served together
+            // counts steps, not the slices of one step, which are served together. While the backend runs a slice in parts, its parts
+            // are that ONE slice: a prompt waiting behind it is not passed over by each of them (counted so, the prompt behind would be
+            // served before a shorter one when the slice ends, and two long prompts would take turns slice by slice), only the prompt in
+            // flight is, by the prompts that run between its parts
+            let pinned = self.backend.prefill_in_flight().map(|(slot, _)| slot);
             for p in self.prefilling.iter_mut() {
-                p.passed += 1;
+                if pinned.is_none_or(|s| s == p.slot) {
+                    p.passed += 1;
+                }
             }
         }
         if slices >= 2 && self.prefill_batching {
@@ -1988,12 +2000,14 @@ impl<B: Backend> Engine<B> {
         if self.verifies_trees() {
             return self.decode_round_trees();
         }
+        // a prompt's forward paused mid-way waits for this round only: the round drafts nothing (`Backend::prefill_waits_round`)
+        let lean = self.backend.prefill_waits_round();
         let maxes: Vec<usize> = self
             .active
             .iter()
             .map(|s| {
                 let left = s.req.max_new - s.generated();
-                if !self.cfg.drafting || !s.draft {
+                if lean || !self.cfg.drafting || !s.draft {
                     0
                 } else {
                     let m = self.cfg.max_drafts.min(left.saturating_sub(1));

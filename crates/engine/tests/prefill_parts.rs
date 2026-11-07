@@ -30,6 +30,8 @@ struct Parts {
     inner: MockBackend,
     log: Log,
     decode_waiting: bool,
+    /// Calls a slice in parts takes.
+    parts: usize,
     /// The slot in flight and the calls left of its slice.
     inflight: Option<(usize, usize)>,
 }
@@ -77,7 +79,7 @@ impl Backend for Parts {
             }
             Some(_) => self.note("between", slot),
             None if self.decode_waiting && prompt.len() - done >= LONG => {
-                self.inflight = Some((slot, PARTS - 1));
+                self.inflight = Some((slot, self.parts - 1));
                 self.note("begin", slot);
                 return PrefillStep { done, row: None };
             }
@@ -123,8 +125,12 @@ fn drafter() -> Box<dyn Fn() -> Box<dyn Drafter>> {
 }
 
 fn engine(policy: PrefillPolicy, log: &Log) -> Engine<Parts> {
-    let inner = MockBackend::new(VOCAB, 8, Fault::None);
-    Engine::new(Parts { inner, log: log.clone(), decode_waiting: false, inflight: None }, admission(8), config(), drafter())
+    engine_with(MockBackend::new(VOCAB, 8, Fault::None), PARTS, policy, log)
+}
+
+/// [`engine`] over `inner`, with slices in parts of `parts` calls.
+fn engine_with(inner: MockBackend, parts: usize, policy: PrefillPolicy, log: &Log) -> Engine<Parts> {
+    Engine::new(Parts { inner, log: log.clone(), decode_waiting: false, parts, inflight: None }, admission(8), config(), drafter())
         .with_prefill_policy(policy)
         .with_prefill_batching(true)
 }
@@ -196,4 +202,38 @@ fn under_the_serial_policy_the_slice_in_parts_is_served_every_step_until_it_ends
     let begin = log.iter().position(|l| l == "begin 2").unwrap();
     // the parts of slot 2 follow one another: nothing else is prefilled until its last
     assert_eq!(&log[begin..begin + PARTS], &["begin 2", "part 2", "part 2", "last 2"][..], "{log:?}");
+}
+
+/// While a slice runs in parts its parts are ONE slice to the pass-over guard: a long prompt that waits behind it (it does not fit the
+/// room) is not passed over by each of them. So when a slice ends, the prompt with the fewest rows left goes next, and two long prompts
+/// do not take turns slice by slice (each part counted, the one behind would pass the guard before every slice of the other ends).
+#[test]
+fn a_prompt_waiting_behind_a_slice_in_parts_is_not_passed_over_by_each_of_its_parts() {
+    let log: Log = Rc::default();
+    // slices of 100 rows, each in more parts than the guard's steps
+    let parts = gb_engine::PREFILL_PASS_GUARD as usize + 4;
+    let inner = MockBackend::new(VOCAB, 8, Fault::None).with_prefill_slice(100);
+    let mut e = engine_with(inner, parts, PrefillPolicy::BATCHED_SHORT, &log);
+    // two chats that decode throughout; a 400-row prompt (four slices) begins in parts, then a 200-row one (two slices) arrives
+    let shapes = [(0usize, 12usize, 2000usize), (1, 9, 2000), (2, 400, 4), (3, 200, 4)];
+    let mut ids = BTreeMap::new();
+    for &(i, len, max_new) in &shapes[..2] {
+        ids.insert(e.submit_deferred(request(i, len, max_new)).unwrap(), i);
+    }
+    for _ in 0..3 {
+        e.step().unwrap();
+    }
+    for &(i, len, max_new) in &shapes[2..] {
+        ids.insert(e.submit_deferred(request(i, len, max_new)).unwrap(), i);
+        e.step().unwrap();
+    }
+    e.run().unwrap();
+    let got: BTreeMap<usize, Vec<u32>> = e.take_outputs().into_iter().map(|o| (ids[&o.id], o.tokens)).collect();
+    for &(i, len, max_new) in &shapes {
+        assert_eq!(got[&i], solo(i, len, max_new), "request {i}");
+    }
+    let log = log.borrow().clone();
+    let begins: Vec<&str> = log.iter().filter(|l| l.starts_with("begin")).map(String::as_str).collect();
+    // slot 2's first slice was in flight when slot 3 arrived; then slot 3 (fewer rows left) to its end, then the rest of slot 2
+    assert_eq!(begins, ["begin 2", "begin 3", "begin 3", "begin 2", "begin 2", "begin 2"], "{log:?}");
 }

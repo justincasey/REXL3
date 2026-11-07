@@ -16,6 +16,11 @@
 //! so the paused forward's first [`GlmModel::prefill_part_rows`] rows of those three buffers are copied aside at the pause and back at the
 //! resume (after the commits of the windows that ran meanwhile, which read their own tap rows). A part is the same launches on the same
 //! inputs as the whole forward's, so the pause moves no bit; nothing that runs meanwhile reads or writes the paused slot.
+//!
+//! **Two at once.** While a forward is paused, a forward of at most [`GlmModel::prefill_part_rows`] rows may itself run in parts (a
+//! short prompt beside a long one in parts): all of its rows fit its own stash, and the forward below keeps its rows past the stash
+//! untouched, since nothing that runs meanwhile has more rows. Each paused forward has a stash of its own ([`PAUSE_DEPTH`] of them); a
+//! resume goes on with the forward paused last, so the forward on top ends before the one below it runs again.
 
 use super::{Begun, GlmModel, Head, Mode};
 use crate::error::ModelError;
@@ -24,6 +29,9 @@ use crate::rows::RowBatch;
 use gb_cuda::{mhc, DevBuf};
 
 use super::super::ops::{Op, Site, SiteKind};
+
+/// How many prompt forwards may be paused at once (a stash each; see the module).
+pub const PAUSE_DEPTH: usize = 2;
 
 /// A prompt forward paused at the start of a layer.
 pub(in crate::families::glm) struct Paused {
@@ -36,6 +44,8 @@ pub(in crate::families::glm) struct Paused {
     /// The op the next part starts at (a layer's first, its attention site's `Finalize`).
     next: usize,
     skip_taps: bool,
+    /// The stash its first rows are kept in.
+    stash: usize,
 }
 
 /// The copies of a paused forward's first rows (see the module).
@@ -52,36 +62,39 @@ fn layer_op(plan: &[Op], layer: usize) -> usize {
 }
 
 impl GlmModel {
-    /// Let prompt forwards run in parts (`prefill_rows` with a layer bound): the stash of `rows` rows (at least a window's) of the streams,
-    /// the mHC partials and the drafter's taps. Returns its bytes. Every rank of a group enables the same rows (the leader's parts are
-    /// calls every rank runs).
+    /// Let prompt forwards run in parts (`prefill_rows` with a layer bound): [`PAUSE_DEPTH`] stashes of `rows` rows (at least a
+    /// window's) of the streams, the mHC partials and the drafter's taps. Returns their bytes. Every rank of a group enables the same rows
+    /// (the leader's parts are calls every rank runs).
     pub fn enable_prefill_parts(&mut self, rows: usize) -> Result<usize, ModelError> {
         let rows = rows.max(self.window_rows).min(self.s.rows);
         let part_row = self.s.mhc.part.bytes() / self.s.mhc.rows_cap.max(1);
         let tap_row = self.dflash_tap_row_bytes();
-        let streams = DevBuf::zeroed_view(rows * mhc::ROW * 4)?;
-        let part = DevBuf::zeroed_view(rows * part_row)?;
-        let taps = if tap_row > 0 { Some(DevBuf::zeroed_view(rows * tap_row)?) } else { None };
-        let bytes = streams.bytes() + part.bytes() + taps.as_ref().map_or(0, |t| t.bytes());
-        self.stash = Some(Stash { rows, streams, part, taps });
+        let mut stash = Vec::with_capacity(PAUSE_DEPTH);
+        let mut bytes = 0;
+        for _ in 0..PAUSE_DEPTH {
+            let streams = DevBuf::zeroed_view(rows * mhc::ROW * 4)?;
+            let part = DevBuf::zeroed_view(rows * part_row)?;
+            let taps = if tap_row > 0 { Some(DevBuf::zeroed_view(rows * tap_row)?) } else { None };
+            bytes += streams.bytes() + part.bytes() + taps.as_ref().map_or(0, |t| t.bytes());
+            stash.push(Stash { rows, streams, part, taps });
+        }
+        self.stash = stash;
         Ok(bytes)
     }
 
     /// The rows another forward may have while a prompt forward is paused (0: parts are off).
     pub fn prefill_part_rows(&self) -> usize {
-        self.stash.as_ref().map_or(0, |s| s.rows)
+        self.stash.first().map_or(0, |s| s.rows)
     }
 
-    /// The batch of the prompt forward paused at a layer boundary, if one is.
+    /// The batch of the prompt forward a resume goes on with (the one paused last), if one is paused.
     pub fn prefill_paused(&self) -> Option<&RowBatch> {
-        self.paused.as_ref().map(|p| &p.b)
+        self.paused.last().map(|p| &p.b)
     }
 
     /// Forget a paused prompt forward of `slot` (its slot ended or begins again: the state it left in the slot is the slot's to reset).
     pub(super) fn drop_paused_of(&mut self, slot: usize) {
-        if self.paused.as_ref().is_some_and(|p| p.b.seq_slot.contains(&(slot as i32))) {
-            self.paused = None;
-        }
+        self.paused.retain(|p| !p.b.seq_slot.contains(&(slot as i32)));
     }
 
     /// A forward of several prompts (see the module): KDA through the row-by-row (P1) or chunked (P2) prompt path, no snapshot inside it,
@@ -107,7 +120,9 @@ impl GlmModel {
 
     /// While a forward is paused, what runs must fit the stash and stay off the paused slots.
     pub(super) fn check_room(&self, b: &RowBatch) -> Result<(), ModelError> {
-        let Some(p) = self.paused.as_ref() else { return Ok(()) };
+        if self.paused.is_empty() {
+            return Ok(());
+        }
         let room = self.prefill_part_rows();
         if b.rows > room {
             return Err(ModelError::Request(format!(
@@ -115,7 +130,7 @@ impl GlmModel {
                 b.rows
             )));
         }
-        if let Some(sl) = b.seq_slot.iter().find(|s| p.b.seq_slot.contains(s)) {
+        if let Some(sl) = b.seq_slot.iter().find(|s| self.paused.iter().any(|p| p.b.seq_slot.contains(s))) {
             return Err(ModelError::Request(format!("a forward on slot {sl} while its prompt forward is paused")));
         }
         Ok(())
@@ -124,15 +139,19 @@ impl GlmModel {
     /// Prefill `b`: the consecutive prompt rows of one sequence or (under P2) several, each continuing its own prompt. With `until` at or
     /// past the model's layers the whole forward runs, its rows join the drafters' contexts, and with `want` the candidates of each
     /// sequence's LAST row come back, in sequence order (each sequence's slice must then end its prompt for them to be used). With a
-    /// smaller `until` (one sequence, parts enabled, none paused) only the layers before `until` run and the forward PAUSES there:
-    /// `Ok(None)`, finished by [`GlmModel::prefill_resume`].
+    /// smaller `until` (parts enabled; with none paused, of any sequences; with one paused, of one sequence of at most the stash's rows;
+    /// never more than [`PAUSE_DEPTH`] paused) only the layers before `until` run and the forward PAUSES there: `Ok(None)`, finished by
+    /// [`GlmModel::prefill_resume`].
     pub fn prefill_rows(&mut self, b: &RowBatch, want: Option<usize>, until: usize) -> Result<Option<Candidates>, ModelError> {
         let whole = until >= self.layers;
-        if !whole && (b.n_seq() != 1 || self.paused.is_some()) {
-            return Err(ModelError::Request("a prompt forward in parts is of one sequence, with no other paused".into()));
-        }
-        if !whole && self.stash.is_none() {
+        if !whole && self.stash.is_empty() {
             return Err(ModelError::Request("prompt forwards in parts are not enabled (enable_prefill_parts)".into()));
+        }
+        if !whole && (self.paused.len() >= self.stash.len() || (b.n_seq() != 1 && !self.paused.is_empty())) {
+            return Err(ModelError::Request(format!(
+                "a prompt forward in parts while another is paused is of one sequence, with fewer than {} paused",
+                self.stash.len()
+            )));
         }
         let head = if want.is_some() { Head::LastRow } else { Head::None };
         self.dflash_begin_rows(b);
@@ -152,22 +171,23 @@ impl GlmModel {
         let Begun { plan, max_pos, segs } = f;
         if end < plan.len() {
             let skip_taps = self.dflash_skips_taps();
-            self.pause(Paused { b: b.clone(), plan, max_pos, segs, head, want, next: end, skip_taps })?;
+            let stash = (0..self.stash.len()).find(|&i| self.paused.iter().all(|p| p.stash != i)).expect("a free stash");
+            self.pause(Paused { b: b.clone(), plan, max_pos, segs, head, want, next: end, skip_taps, stash })?;
             return Ok(None);
         }
         self.forward_end(b, Mode::Prefill, &segs);
         self.prefill_finish(b, want)
     }
 
-    /// Run the paused prompt forward's layers up to `until` (at or past the model's layers: to its end, with its drafters' absorbs and
-    /// its candidates, as [`GlmModel::prefill_rows`] gives them); before `until`'s layer it pauses again (`Ok(None)`). An error drops the
-    /// paused forward: its slot's state is then the slot's to begin again.
+    /// Run the layers up to `until` of the prompt forward paused last (at or past the model's layers: to its end, with its drafters'
+    /// absorbs and its candidates, as [`GlmModel::prefill_rows`] gives them); before `until`'s layer it pauses again (`Ok(None)`). An error
+    /// drops that forward: its slot's state is then the slot's to begin again.
     pub fn prefill_resume(&mut self, until: usize) -> Result<Option<Candidates>, ModelError> {
-        let mut p = self.paused.take().ok_or_else(|| ModelError::Request("no prompt forward is paused".into()))?;
+        let mut p = self.paused.pop().ok_or_else(|| ModelError::Request("no prompt forward is paused".into()))?;
         // the windows that ran meanwhile are committed first (their commits read their own index arrays and tap rows), then the paused
         // forward's rows come back and its row arrays and pages are bound again
         self.flush()?;
-        self.restore_stash(p.b.rows)?;
+        self.restore_stash(p.b.rows, p.stash)?;
         self.upload_rows(&p.b)?;
         self.ensure_pages(&p.b, true)?;
         self.dflash_set_skip_taps(p.skip_taps);
@@ -204,14 +224,14 @@ impl GlmModel {
         }
     }
 
-    /// Keep `p` paused: its first rows of the streams, the partials and the taps copied aside, the taps on again for what runs meanwhile.
-    /// Synchronises (a part ends when its work has, as a whole prompt forward does).
+    /// Keep `p` paused (on top): its first rows of the streams, the partials and the taps copied into its stash, the taps on again for what
+    /// runs meanwhile. Synchronises (a part ends when its work has, as a whole prompt forward does).
     fn pause(&mut self, p: Paused) -> Result<(), ModelError> {
         let n = p.b.rows.min(self.prefill_part_rows());
         let part_row = self.s.mhc.part.bytes() / self.s.mhc.rows_cap.max(1);
         let tap_row = self.dflash_tap_row_bytes();
         let GlmModel { stash, s, dflash, stream, .. } = self;
-        let sh = stash.as_mut().ok_or_else(|| ModelError::Request("prompt forwards in parts are not enabled".into()))?;
+        let sh = stash.get_mut(p.stash).ok_or_else(|| ModelError::Request("prompt forwards in parts are not enabled".into()))?;
         sh.streams.copy_from_at(0, &s.streams, 0, n * mhc::ROW * 4, stream)?;
         sh.part.copy_from_at(0, &s.mhc.part, 0, n * part_row, stream)?;
         if let (Some(t), Some(d)) = (sh.taps.as_mut(), dflash.as_ref()) {
@@ -219,17 +239,17 @@ impl GlmModel {
         }
         self.dflash_end_chunk();
         self.stream.sync()?;
-        self.paused = Some(p);
+        self.paused.push(p);
         Ok(())
     }
 
-    /// The stashed rows of a forward of `rows` rows back into the scratch.
-    fn restore_stash(&mut self, rows: usize) -> Result<(), ModelError> {
+    /// The rows of a forward of `rows` rows stashed in stash `at`, back into the scratch.
+    fn restore_stash(&mut self, rows: usize, at: usize) -> Result<(), ModelError> {
         let n = rows.min(self.prefill_part_rows());
         let part_row = self.s.mhc.part.bytes() / self.s.mhc.rows_cap.max(1);
         let tap_row = self.dflash_tap_row_bytes();
         let GlmModel { stash, s, dflash, stream, .. } = self;
-        let sh = stash.as_ref().ok_or_else(|| ModelError::Request("prompt forwards in parts are not enabled".into()))?;
+        let sh = stash.get(at).ok_or_else(|| ModelError::Request("prompt forwards in parts are not enabled".into()))?;
         s.streams.copy_from_at(0, &sh.streams, 0, n * mhc::ROW * 4, stream)?;
         s.mhc.part.copy_from_at(0, &sh.part, 0, n * part_row, stream)?;
         if let (Some(t), Some(d)) = (sh.taps.as_ref(), dflash.as_mut()) {
