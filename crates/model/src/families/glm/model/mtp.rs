@@ -635,8 +635,7 @@ impl GlmModel {
             }
             self.kv_tab.ensure(slot, p + 1).map_err(|e| ModelError::Request(format!("{e:?}")))?;
         }
-        let tables: Vec<Vec<u32>> = (0..self.slots).map(|s| self.kv_tab.blocks_of(s).to_vec()).collect();
-        self.table.upload(&tables)?;
+        self.upload_table()?;
         Ok(())
     }
 

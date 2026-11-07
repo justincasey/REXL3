@@ -327,6 +327,9 @@ pub struct Draft {
     pub capture_lattice: bool,
     /// f32 `[max_seqs * DRAFTS, k, k]`: the lattice's edge terms, allocated on first capture.
     edge: Option<DevBuf>,
+    /// The host bytes of the round's and the absorbs' index uploads, queued on the stream in its order (the host does not wait for the
+    /// work queued before them) and kept until the stream has run them.
+    stage: gb_cuda::rt::HostStage,
 }
 
 fn load_exl3<'p>(
@@ -698,6 +701,7 @@ impl Draft {
             head_rounds: [0; 2],
             capture_lattice: false,
             edge: None,
+            stage: gb_cuda::rt::HostStage::new(),
         };
         Ok((d, bytes))
     }
@@ -836,8 +840,12 @@ impl Draft {
             slots.extend(std::iter::repeat_n(a.slot as i32, a.n));
         }
         let n = total;
-        self.ctx_pos.upload(&pos)?;
-        self.ctx_slot.upload(&slots)?;
+        // an absorb-only stretch (a serial request) never reaches a round's sync: bound what the stage keeps
+        if self.stage.queued() >= 256 {
+            self.stage.sync(stream)?;
+        }
+        self.stage.upload(&mut self.ctx_pos, &pos, stream)?;
+        self.stage.upload(&mut self.ctx_slot, &slots, stream)?;
         let Draft { dims, fc, hidden_norm, layers, cache, fc_in, ctx, kproj, vproj, ctx_pos, ctx_slot, lin, .. } = self;
         let (fc_w, h) = (dims.fc_in(), dims.hidden);
         let mut at = 0usize;
@@ -1020,13 +1028,14 @@ impl Draft {
         for &w in &wants {
             row_off.push(row_off.last().unwrap() + w as i32);
         }
-        self.ids.upload(&ids)?;
-        self.pos.upload(&pos)?;
-        self.anchor.upload(&anchors)?;
-        self.slot_a.upload(&slots)?;
-        self.p_a.upload(&ps)?;
-        self.walk.upload(&walks)?;
-        self.row_off.upload(&row_off)?;
+        let st = &mut self.stage;
+        st.upload(&mut self.ids, &ids, stream)?;
+        st.upload(&mut self.pos, &pos, stream)?;
+        st.upload(&mut self.anchor, &anchors, stream)?;
+        st.upload(&mut self.slot_a, &slots, stream)?;
+        st.upload(&mut self.p_a, &ps, stream)?;
+        st.upload(&mut self.walk, &walks, stream)?;
+        st.upload(&mut self.row_off, &row_off, stream)?;
         // the restricted head runs when there is one and, if it is adaptive, when every sequence is writing text it can reach
         let use_sub = self.sub.is_some() && self.adaptive_min.is_none_or(|min| reqs.iter().all(|r| r.coverage >= min));
         let capture = self.capture_lattice;
@@ -1077,6 +1086,7 @@ impl Draft {
             sub,
             head_rounds,
             edge,
+            stage,
             ..
         } = self;
         let rows = n * block;
@@ -1239,7 +1249,7 @@ impl Draft {
                 stream,
             )?;
         }
-        stream.sync()?;
+        stage.sync(stream)?;
         let mut t = vec![0i32; nd];
         out_tokens.download(&mut t)?;
         let mut c = vec![0f32; nd];

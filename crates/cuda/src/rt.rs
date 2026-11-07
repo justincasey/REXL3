@@ -861,6 +861,20 @@ impl HostStage {
         unsafe { st.memcpy_h2d_async(dst.ptr(), src, n) }
     }
 
+    /// [`HostStage::upload`] to `byte_offset` bytes into `dst` (a part of a buffer, such as one slot's row of a block table).
+    pub fn upload_at<T: Copy>(&mut self, dst: &mut DevBuf, byte_offset: usize, v: &[T], st: &Stream) -> Result<(), CudaError> {
+        let n = std::mem::size_of_val(v);
+        assert!(byte_offset + n <= dst.bytes(), "upload of {n} bytes at {byte_offset} into a {}-byte buffer", dst.bytes());
+        assert!(dst.block().and_then(|b| b.host_base()).is_none(), "HostStage::upload_at into host memory");
+        if n == 0 {
+            return Ok(());
+        }
+        let src = self.keep(v);
+        // SAFETY: `dst` is device memory with `n` bytes at `byte_offset`, and `src` is `n` bytes the stage holds unchanged until `sync`
+        // has waited for the stream (or, on drop, for the device)
+        unsafe { st.memcpy_h2d_async(dst.ptr_at(byte_offset), src, n) }
+    }
+
     /// Waits for `st`, the stream every copy of this stage was queued on; the kept buffers are reused from here on.
     pub fn sync(&mut self, st: &Stream) -> Result<(), CudaError> {
         st.sync()?;
