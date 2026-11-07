@@ -208,6 +208,10 @@ impl MultiTables {
             for (dst, src) in ptrs.iter_mut().zip([&b.gate_ptrs, &b.up_ptrs, &b.down_ptrs]) {
                 src.download(dst)?;
             }
+            // the multi GEMV streams a k step's tiles as 16-byte copies; another alignment keeps the per-subbank chain
+            if ptrs.iter().flatten().any(|&p| p % 16 != 0) {
+                return Ok(None);
+            }
             let widths = [b.bits_gu, b.bits_u, b.bits_d];
             widths_gu |= (1 << (widths[0] - 1)) | (1 << (widths[1] - 1));
             widths_d |= 1 << (widths[2] - 1);

@@ -1218,6 +1218,9 @@ impl GlmModel {
         // down partials riding in the routed experts' exchange (`model/tp.rs` `ShSplit`); prefill chunks keep it replicated
         let sh_split = mode == Mode::Window && tp.as_ref().is_some_and(|t| t.shared_split_on(true, rows));
         let sh_topk = cfg.ffn.experts_per_token;
+        // a rank of the dense-MLP split (`dense`) runs its half of every dense MLP in this window, the down partials swapped
+        // (`model/tp.rs` `DnSplit`); prefill chunks keep them replicated
+        let dn_split = mode == Mode::Window && tp.as_ref().is_some_and(|t| t.dense_split_on(true, rows));
         let mut last_sublayer_was_mixer = false;
         let mut cur_layer = 0usize;
         // MLA needs the batch's positions bound; the DSA grid is sized by the largest number of pools any row sees
@@ -1888,7 +1891,10 @@ impl GlmModel {
                         m.forward_big(&s.hidden, Dtype::F16, rows, &mut s.mixer_out, sc, st)?;
                     } else {
                         let sc = s.dense.as_mut().ok_or_else(|| ModelError::Config("no dense scratch".into()))?;
-                        m.forward(&s.hidden, Dtype::F16, rows, &mut s.mixer_out, sc, st)?;
+                        match tp.as_mut().filter(|_| dn_split) {
+                            Some(t) => t.dense_split(m, &s.hidden, rows, &mut s.mixer_out, sc, st)?,
+                            None => m.forward(&s.hidden, Dtype::F16, rows, &mut s.mixer_out, sc, st)?,
+                        }
                     }
                 }
                 Op::MoeShared { layer } => {

@@ -331,6 +331,152 @@ __device__ __forceinline__ void gemv_block(const half* __restrict__ X, const uin
     }
 }
 
+// The multi kernel's gemv_block at the unshuffled widths (3 to 8 bits), with the same arithmetic and its loads ahead of the arithmetic:
+// each warp copies its k steps by cp.async into a ring of ring_stages(K2) slots in shared memory (exl3_linear_decode.cuh), ring_stages -
+// 1 steps ahead of the step it multiplies. A slot holds the step's weights (its 8 contiguous tiles: the 128 columns) and its x words (16
+// halves of each of the pass's 16 row slots); gemv_block loads the next step's weights into registers and each step's x words at the
+// step, whose latency it then waits for. Every lane word, every x word, the tile order, the mma chain of a warp and the warp-order sum
+// are gemv_block's, so a pair's partials are gemv_block's bit for bit.
+//
+// PDL: the weights of the first pass's first steps are copied before the wait for the predecessor (the GEMVs' predecessors are the
+// rotations and the epilogue; the expert lists come from the group kernel before them, complete once this grid runs, as its predecessor
+// waited for it before it let this grid launch; the trellis tables are the layer's), then pdl_wait / pdl_trigger, then the x words. The
+// caller calls neither for this block. ring: WK * ring_stages * ring_slot_words, 16-byte aligned; it may alias red (the ring is idle once
+// the warps' k loops end, and the block syncs before red is written). The pass's row ids stay in registers (no other shared memory: four
+// blocks of 4-warp rings at 6 bits fill an SM's 100 KB exactly). T must be 16-byte aligned (MultiTables::of refuses other addresses).
+template <int K2, int CB, int WK>
+__device__ __forceinline__ void gemv_block_pipe(const half* __restrict__ X, const uint32_t* __restrict__ T, const int* __restrict__ mem,
+                                                int cnt, float* __restrict__ Z, int K, int N, int P, int SK, int nb, int split, int mat,
+                                                float* red, uint32_t* ring) {
+    static_assert(!step_shuffled<K2>(), "the shuffled widths keep gemv_block");
+    constexpr int TW = tile_words<K2>(), LW = lane_words<K2>(), SW = ring_step_words(K2), LS = ring_slot_words(K2), S = ring_stages(K2);
+    constexpr int CH = SW / 4;
+    static_assert(SW == 8 * TW && SW % 4 == 0, "a step is its 8 tiles, whole 16-byte chunks");
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int per_warp = (K >> 4) / SK / WK;
+    const int kt0 = split * (per_warp * WK) + warp * per_warp;
+    const long long stride_k = (long long)(N >> 4) * TW;
+    const uint32_t* steps = T + (size_t)nb * 8 * TW + (size_t)kt0 * stride_k;
+    uint32_t* wring = ring + warp * S * LS;
+    int word, offset;
+    lane_start<K2>(lane, word, offset);
+    // step i's weights into slot i % S: the warp's 16-byte chunks of the step's SW contiguous words
+    auto issue_w = [&](int i) {
+        const uint4* src = reinterpret_cast<const uint4*>(steps + (size_t)i * stride_k);
+        uint4* dst = reinterpret_cast<uint4*>(wring + (i % S) * LS);
+#pragma unroll
+        for (int q = 0; q < (CH + 31) / 32; ++q) {
+            const int c = lane + 32 * q;
+            if (CH % 32 == 0 || c < CH) ring_cp16(dst + c, src + c);
+        }
+    };
+    // step i's x words: lane l the halves 8 (l & 1) .. 8 (l & 1) + 7 of the step's 16 of row slot l / 2 (xr: that row's x at the
+    // warp's first k tile)
+    const half* xr;
+    auto issue_x = [&](int i) { ring_cp16(wring + (i % S) * LS + SW + 4 * lane, xr + (size_t)i * 16); };
+
+    for (int m0 = 0; m0 < cnt; m0 += 16) {
+        if (m0 == 0) {
+#pragma unroll
+            for (int s = 0; s < S - 1; ++s)
+                if (s < per_warp) issue_w(s);
+        }
+        // the pass's row slots in registers (every warp reads them itself): lanes 2r and 2r + 1 hold slot r's pair, -1 past the members
+        const int m = m0 + (lane >> 1);
+        const int raw = m < cnt ? __ldcg(mem + m) : -1;
+        const int first = __shfl_sync(0xffffffffu, raw, 0);   // a pass has at least one member
+        const int rs = raw >= 0 ? raw : first;             // padded rows repeat a member and are never stored
+        xr = X + (size_t)rs * K + kt0 * 16 + 8 * (lane & 1);
+        if (m0 == 0) {
+            pdl_wait();                                    // X is the predecessor's output
+            pdl_trigger();
+        }
+#pragma unroll
+        for (int s = 0; s < S - 1; ++s) {
+            if (s < per_warp) {
+                if (m0 > 0) issue_w(s);
+                issue_x(s);
+            }
+            ring_commit();
+        }
+
+        float acc[8][2][4];
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+#pragma unroll
+                for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
+
+        int slot = 0;
+#pragma unroll 1
+        for (int i = 0; i < per_warp; ++i) {
+            ring_wait<S - 2>();
+            __syncwarp();                                  // every lane's copies of step i landed; every lane is done with step i - 1's slot
+            if (i + S - 1 < per_warp) {
+                issue_w(i + S - 1);
+                issue_x(i + S - 1);
+            }
+            ring_commit();
+            const uint32_t* st = wring + slot * LS;
+            uint32_t a[4];
+            a[0] = st[SW + g * 8 + t];                     // row g: halves 2t, 2t + 1 and 2t + 8, 2t + 9 of the step; row g + 8 the same
+            a[1] = st[SW + (g + 8) * 8 + t];
+            a[2] = st[SW + g * 8 + 4 + t];
+            a[3] = st[SW + (g + 8) * 8 + 4 + t];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                uint32_t w[LW];
+#pragma unroll
+                for (int q = 0; q < LW; ++q) w[q] = st[j * TW + (word + q) % TW];
+                uint32_t b0[2], b1[2];
+                decode_lane<K2, CB>(w, lane, b0, b1);
+                mma16816(acc[j][0], a, b0);
+                mma16816(acc[j][1], a, b1);
+            }
+            slot = slot + 1 == S ? 0 : slot + 1;
+        }
+        ring_wait<0>();
+
+        // the warps' sums in warp order, rows 0-7 and then rows 8-15 of the pass (gemv_block's)
+        for (int rlo = 0; rlo < 16 && m0 + rlo < cnt; rlo += 8) {
+            const int rn = min(cnt - m0 - rlo, 8);
+            __syncthreads();                               // red (the ring's bytes) is reused by every half
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int col = i * 16 + h * 8 + 2 * t;
+                    *reinterpret_cast<float2*>(red + (warp * 8 + g) * 128 + col) =
+                        rlo ? make_float2(acc[i][h][2], acc[i][h][3]) : make_float2(acc[i][h][0], acc[i][h][1]);
+                }
+            __syncthreads();
+            for (int idx = threadIdx.x; idx < rn * 32; idx += WK * 32) {   // a warp's lanes take one row r together
+                const int r = idx >> 5, c = 4 * (idx & 31);
+                float4 s = *reinterpret_cast<const float4*>(red + r * 128 + c);
+#pragma unroll
+                for (int w = 1; w < WK; ++w) {
+                    const float4 q = *reinterpret_cast<const float4*>(red + (w * 8 + r) * 128 + c);
+                    s.x += q.x; s.y += q.y; s.z += q.z; s.w += q.w;
+                }
+                const int p = __shfl_sync(0xffffffffu, raw, 2 * (rlo + r));
+                *reinterpret_cast<float4*>(Z + (((size_t)mat * SK + split) * P + p) * N + (size_t)nb * 128 + c) = s;
+            }
+        }
+        __syncthreads();                                   // red (the ring) is reused by the next pass
+    }
+}
+
+// The multi kernel's shared words: the warps' reduction (WK * 8 * 128 floats) or the largest ring of a width in WMASK, which alias.
+template <int WK, int WMASK>
+__host__ __device__ constexpr int multi_smem_words() {
+    int m = WK * 8 * 128;
+    for (int b = 3; b <= 8; ++b)                       // 1 and 2 bits (shuffled) run gemv_block, on red alone
+        if ((WMASK >> (b - 1)) & 1) m = WK * ring_stages(2 * b) * ring_slot_words(2 * b) > m ? WK * ring_stages(2 * b) * ring_slot_words(2 * b) : m;
+    return m;
+}
+
 // Block (n block of 128 columns, matrix * SK + split, distinct expert u): gemv_block of the expert's trellis.
 template <int K2, int CB, int WK>
 __global__ void __launch_bounds__(WK * 32) moe_gemv_kernel(
@@ -351,34 +497,49 @@ __global__ void __launch_bounds__(WK * 32) moe_gemv_kernel(
 
 // moe_gemv_kernel over the experts of several banks of different widths at once (one launch a stage instead of one a bank): the
 // distinct experts u are global ids, each with its trellis address (TP0 / TP1 [E]) and its width in bits (B0 / B1 [E], gate and up
-// may differ). A block runs gemv_block at its expert's width, so every block is the block a one-width launch would run. WMASK: the
-// widths compiled in (bit b-1 for b bits); a width outside it computes nothing (the host picks an instantiation that holds every width).
+// may differ). A block runs gemv_block (1 and 2 bits) or gemv_block_pipe (3 to 8 bits) at its expert's width, so every block's bits are
+// the block a one-width launch would run. WMASK: the widths compiled in (bit b-1 for b bits); a width outside it computes nothing (the
+// host picks an instantiation that holds every width). Every trellis address is 16-byte aligned. At most 128 registers a thread: 4
+// blocks an SM (the rings' 24 KB each fit; rows_sh exists only where 1 and 2 bits are compiled in). The expert lists (uids, ucount,
+// mcount, members) are read before the PDL wait, through L2: they are the group kernel's, which is never this launch's predecessor
+// (gemv_block_pipe).
 template <int CB, int WK, int WMASK>
-__global__ void __launch_bounds__(WK * 32) moe_gemv_multi_kernel(
+__global__ void __launch_bounds__(WK * 32, 4) moe_gemv_multi_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const uint64_t* __restrict__ TP0,
     const uint64_t* __restrict__ TP1, const int* __restrict__ B0, const int* __restrict__ B1, const int* __restrict__ uids,
     const int* __restrict__ ucount, const int* __restrict__ mcount, const int* __restrict__ members, float* __restrict__ Z, int K,
     int N, int P, int SK) {
-    pdl_wait();
-    pdl_trigger();
     const int u = blockIdx.z;
-    if (u >= ucount[0]) return;
-    __shared__ __align__(16) float red[WK * 8 * 128];
+    if (u >= __ldcg(ucount)) {
+        pdl_wait();
+        pdl_trigger();
+        return;
+    }
+    __shared__ __align__(128) uint32_t sm[multi_smem_words<WK, WMASK>()];
     __shared__ int rows_sh[16];
+    float* red = reinterpret_cast<float*>(sm);
     const int nb = blockIdx.x, split = blockIdx.y % SK, mat = blockIdx.y / SK;
-    const int e = uids[u], cnt = mcount[u];
+    const int e = __ldcg(uids + u), cnt = __ldcg(mcount + u);
     const half* X = mat ? X1 : X0;
     const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
     const int* mem = members + (size_t)u * P;
     switch (mat ? B1[e] : B0[e]) {
 #define GB_MB(B)                                                                                           \
     case B:                                                                                                \
-        if constexpr ((WMASK >> ((B) - 1)) & 1)                                                            \
-            gemv_block<2 * (B), CB, WK>(X, T, mem, cnt, Z, K, N, P, SK, nb, split, mat, red, rows_sh);      \
+        if constexpr (((WMASK >> ((B) - 1)) & 1) && !step_shuffled<2 * (B)>()) {                          \
+            gemv_block_pipe<2 * (B), CB, WK>(X, T, mem, cnt, Z, K, N, P, SK, nb, split, mat, red, sm);    \
+        } else {                                                                                           \
+            pdl_wait();                                                                                    \
+            pdl_trigger();                                                                                 \
+            if constexpr ((WMASK >> ((B) - 1)) & 1)                                                        \
+                gemv_block<2 * (B), CB, WK>(X, T, mem, cnt, Z, K, N, P, SK, nb, split, mat, red, rows_sh);  \
+        }                                                                                                  \
         break;
         GB_MB(1) GB_MB(2) GB_MB(3) GB_MB(4) GB_MB(5) GB_MB(6) GB_MB(7) GB_MB(8)
 #undef GB_MB
         default:
+            pdl_wait();
+            pdl_trigger();
             break;
     }
 }
