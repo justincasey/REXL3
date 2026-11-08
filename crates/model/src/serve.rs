@@ -429,10 +429,23 @@ pub fn floor_bytes_from_env() -> u64 {
     }
 }
 
+/// The widest `--prefill-chunk` of a family that does not name its own ([`crate::family::ModelFamily::max_prefill_chunk`]): the Qwen
+/// prefill kernels' limit (attention and Gated DeltaNet, 4,096 rows).
+pub const DEFAULT_MAX_PREFILL_CHUNK: usize = if gb_cuda::attention::MAX_PREFILL_ROWS < gb_cuda::gdn::PREFILL_MAX_ROWS {
+    gb_cuda::attention::MAX_PREFILL_ROWS
+} else {
+    gb_cuda::gdn::PREFILL_MAX_ROWS
+};
+
 /// Refuse settings the kernels cannot honour, before any weight is loaded: an over-wide prefill chunk used to pass startup
 /// and then trip an assert on the engine thread at the first long prompt, leaving a server that answers "engine has shut down".
+/// The chunk is held to [`DEFAULT_MAX_PREFILL_CHUNK`]; [`check_options_for`] takes a family's own limit.
 pub fn check_options(o: &ServeOptions) -> Result<(), ModelError> {
-    let max_chunk = gb_cuda::attention::MAX_PREFILL_ROWS.min(gb_cuda::gdn::PREFILL_MAX_ROWS);
+    check_options_for(o, DEFAULT_MAX_PREFILL_CHUNK)
+}
+
+/// [`check_options`] with `--prefill-chunk` held to `max_chunk` rows (the family's [`crate::family::ModelFamily::max_prefill_chunk`]).
+pub fn check_options_for(o: &ServeOptions, max_chunk: usize) -> Result<(), ModelError> {
     if o.prefill_chunk == 0 || o.prefill_chunk > max_chunk {
         return Err(ModelError::Config(format!("--prefill-chunk must be between 1 and {max_chunk}, got {}", o.prefill_chunk)));
     }
@@ -681,8 +694,8 @@ pub fn start(o: &ServeOptions) -> Result<Box<dyn ServeEngine>, ModelError> {
 
 /// [`start`] against a given registry.
 pub fn start_in(registry: &Registry, o: &ServeOptions) -> Result<Box<dyn ServeEngine>, ModelError> {
-    check_options(o)?;
     let (family, plan) = registry.probe(&o.model_dir)?;
+    check_options_for(o, family.max_prefill_chunk())?;
     if let Some(dir) = &o.intervention_dir {
         // fail-closed: an overlay whose layers or tensors do not match this model refuses to serve, naming both sides
         let iv =
@@ -785,8 +798,8 @@ pub fn start_follower(o: &ServeOptions) -> Result<(), ModelError> {
 
 /// [`start_follower`] against a given registry.
 pub fn start_follower_in(registry: &Registry, o: &ServeOptions) -> Result<(), ModelError> {
-    check_options(o)?;
     let (family, plan) = registry.probe(&o.model_dir)?;
+    check_options_for(o, family.max_prefill_chunk())?;
     refuse_tensor_parallel(family, o, 1)?;
     refuse_unbuilt_vision(&plan, o)?;
     // every rank checks its own pack against the list, as rank 0 does (the group's flags are one list: `rexl3-cluster` serve.flags)
@@ -1460,8 +1473,16 @@ mod tests {
         assert!(check_options(&o).is_ok());
         o.prefill_chunk = 4097;
         assert!(check_options(&o).unwrap_err().to_string().contains("--prefill-chunk"));
+        // a family that names a wider limit (GLM's P2: 8,192 rows) is held to its own
+        assert!(check_options_for(&o, 8192).is_ok());
+        o.prefill_chunk = 8192;
+        assert!(check_options(&o).is_err());
+        assert!(check_options_for(&o, 8192).is_ok());
+        o.prefill_chunk = 8193;
+        assert!(check_options_for(&o, 8192).unwrap_err().to_string().contains("between 1 and 8192"));
         o.prefill_chunk = 0;
         assert!(check_options(&o).is_err());
+        assert!(check_options_for(&o, 8192).is_err());
     }
 
     #[test]

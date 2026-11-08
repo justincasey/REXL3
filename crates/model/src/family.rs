@@ -331,6 +331,11 @@ pub trait ModelFamily: Sync {
     fn quantization_from_tensors(&self) -> bool {
         false
     }
+    /// The widest `--prefill-chunk` the start lets through to this family (`serve::check_options_for`, before anything is loaded): the Qwen
+    /// prefill kernels' 4,096 rows ([`crate::serve::DEFAULT_MAX_PREFILL_CHUNK`]) unless the family's own check and kernels take more.
+    fn max_prefill_chunk(&self) -> usize {
+        crate::serve::DEFAULT_MAX_PREFILL_CHUNK
+    }
     /// The most ranks of a tensor-parallel group (`--tp-ranks N`, `docs/NEMOTRON_TP.md`, `docs/CLUSTER_FAMILY_PORTING.md`) this family's
     /// runtime supports: `1` (the default) means the family has none and the start refuses a group for it by name; a family that built
     /// one says how many ranks its shard plan, memory plan and tests cover. A cap is a statement about what the family can shard to,

@@ -739,7 +739,7 @@ fn bench_prefill_contracts() {
                 let (c, chunk, side, kda) = arm;
                 m.set_prefill_contract(c).unwrap();
                 m.set_p2_shared_side(side != 0);
-                m.set_p2_kda_chunked(kda != 0);
+                m.set_p2_kda_chunked(kda != 0).unwrap();
                 m.begin_slot(0).unwrap();
                 m.prefill_chunk(0, 0, &ids[..chunk.min(n)], None).unwrap();
                 m.begin_slot(0).unwrap();
@@ -765,7 +765,7 @@ fn bench_prefill_contracts() {
     }
     m.set_prefill_contract(PrefillContract::P1).unwrap();
     m.set_p2_shared_side(false);
-    m.set_p2_kda_chunked(true);
+    m.set_p2_kda_chunked(true).unwrap();
     for &n in &lens {
         let mut line = format!("BENCH {n:6} tokens:");
         let mut base = None;

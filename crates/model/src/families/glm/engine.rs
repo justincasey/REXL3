@@ -149,8 +149,8 @@ pub fn check_options(o: &ServeOptions) -> Result<(), ModelError> {
     if o.max_model_len == 0 {
         return Err(ModelError::Config("--max-model-len must be at least 1".into()));
     }
-    // `--prefill-chunk` is taken by `alloc::prefill_chunk_for`: under the default P2 the server's 4,096 default is the P2 slice (4,096 rows) and
-    // 129..=4,096 in whole 16-row chunks is accepted; under `REXL3_GLM_PREFILL_CONTRACT=p1` 512 rows unless asked, 128..=2,048. The prefill contract (`REXL3_GLM_PREFILL_CONTRACT`, logged once as `event=glm_prefill_contract`): a value that is not p1 or p2 is
+    // `--prefill-chunk` is taken by `alloc::prefill_chunk_for`: under the default P2 129..=8,192 rows in whole 16-row chunks is accepted (the
+    // server's default, 4,096, among them); under `REXL3_GLM_PREFILL_CONTRACT=p1` 512 rows unless asked, 128..=2,048. The prefill contract (`REXL3_GLM_PREFILL_CONTRACT`, logged once as `event=glm_prefill_contract`): a value that is not p1 or p2 is
     // refused here by name, before any weight is read, never run as another contract
     let c = super::contract::check_selected().map_err(ModelError::Config)?;
     super::contract::check_built(c).map_err(ModelError::Config)?;

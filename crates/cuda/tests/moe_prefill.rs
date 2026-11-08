@@ -1252,10 +1252,10 @@ fn parallel_plan_matches_legacy_bit_for_bit_on_gpu() {
     gpu!();
     let st = Stream::new().unwrap();
     let d = qwen_dims();
-    let mut s = PrefillScratch::new(&d, 4096).unwrap();
+    let mut s = PrefillScratch::new(&d, gb_cuda::moe_prefill::MAX_ROWS).unwrap();
     s.poison(0xAB, &st).unwrap();
     let mut r = Rng(99);
-    for &rows in &[1usize, 17, 127, 128, 129, 130, 255, 256, 257, 1024, 2048, 4096] {
+    for &rows in &[1usize, 17, 127, 128, 129, 130, 255, 256, 257, 1024, 2048, 4096, 6144, 8192] {
         let p = rows * d.topk;
         let cap = item_cap(p, d.experts);
         for style in [Style::Uniform, Style::Skewed, Style::Hot, Style::Sparse] {

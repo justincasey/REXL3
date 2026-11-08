@@ -288,7 +288,7 @@ mod tests {
         let cfg = crate::families::glm::config::GlmConfig::from_json(&serde_json::from_str(text).unwrap()).unwrap();
         let shapes = crate::families::glm::alloc::exl3_shapes(&cfg);
         assert!(shapes.iter().any(|&(k, _)| k == 16384), "MLA o_proj's K is the widest: {shapes:?}");
-        for chunk in [128usize, 256, 512, 1024, 2048] {
+        for chunk in [128usize, 256, 512, 1024, 2048, 4096, 6144, 8192] {
             let ws = crate::families::glm::alloc::exl3_workspace_bytes(&cfg, chunk);
             for &(k, n) in &shapes {
                 assert!(
@@ -306,12 +306,12 @@ mod tests {
             let e = check_prefill_chunk(f, PrefillContract::P2).unwrap_err();
             assert!(e.contains("REXL3_GLM_PREFILL_CONTRACT=p2 needs --prefill-chunk above 128 rows"), "{e}");
         }
-        // 4096 (the server's default) is P2's 4,096-row slice; above 4,096 is clamped to it
-        for f in [144usize, 512, 2048, 4096, 9000] {
+        // 4096 is the server's default; P2 takes up to 8,192 rows, and above 8,192 is clamped to it
+        for f in [144usize, 512, 2048, 4096, 6144, 8192, 9000] {
             assert!(check_prefill_chunk(f, PrefillContract::P2).is_ok(), "{f}");
         }
         // a chunk that is not a whole number of P2's 16-row KDA chunks is refused by name (never rounded silently)
-        for f in [129usize, 1000, 4095] {
+        for f in [129usize, 1000, 4095, 6150] {
             let e = check_prefill_chunk(f, PrefillContract::P2).unwrap_err();
             assert!(e.contains("multiple of 16 rows"), "{e}");
             assert!(check_prefill_chunk(f, PrefillContract::P1).is_ok(), "P1 takes {f}");

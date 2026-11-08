@@ -394,6 +394,34 @@ fn p2_six_bit_pairs_are_bit_identical_in_any_call() {
     }
 }
 
+/// The widest P2 prompt chunk (`moe_prefill::MAX_ROWS`, 8,192 rows) on GLM's expert shapes at RED-SNOW's widths (gate/up 6 bits, down 4):
+/// every pair's y and every row's out of one 8,192-row call equal those of calls of 4,096 and 2,731 rows, bit for bit, under uniform
+/// routing and with every row on a few hot experts (the longest item lists, the largest item count).
+#[test]
+fn p2_pairs_of_an_8192_row_call_are_those_of_smaller_calls() {
+    gpu!();
+    let st = Stream::new().unwrap();
+    let d = glm_dims(288);
+    let rows = gb_cuda::moe_prefill::MAX_ROWS;
+    assert_eq!(rows, 8192);
+    let mut s = PrefillScratch::new(&d, rows).unwrap();
+    let lay = synth_layer(d, 6, 4, 97, false);
+    for (si, &style) in [Style::Uniform, Style::Hot].iter().enumerate() {
+        let mut r = Rng(8192 + si as u64);
+        let xh = activations(&mut r, rows, d.hidden, 1.5);
+        let (pick, wts) = make_picks(&mut r, style, rows, d.experts, d.topk);
+        let shared: Vec<f32> = (0..rows * d.hidden).map(|_| 0.1 * normal(&mut r) as f32).collect();
+        let o = Some(glm_p2_moe::DEFAULT_ORDER);
+        let whole = run(&lay.ex, &st, &mut s, &xh, &pick, &wts, &shared, rows, rows, o);
+        assert!(whole.out.iter().all(|v| v.is_finite()) && whole.out.iter().any(|v| *v != 0.0), "{style:?}: degenerate");
+        for chunk in [4096usize, 2731] {
+            let got = run(&lay.ex, &st, &mut s, &xh, &pick, &wts, &shared, rows, chunk, o);
+            assert_same(&format!("6/4 {style:?} 8,192 rows in calls of {chunk}"), &got, &whole, &d, &pick);
+        }
+        eprintln!("6/4-bit P2 experts, {style:?}: an 8,192-row call == calls of 4,096 / 2,731 rows, bit for bit");
+    }
+}
+
 #[test]
 fn the_plan_is_p1s_plan() {
     gpu!();
@@ -402,10 +430,10 @@ fn the_plan_is_p1s_plan() {
     let d = MoeDims { hidden: 128, inter: 128, experts: 288, topk: 8, scale: 2.5, limit: 10.0 };
     let lay = synth_layer(d, 2, 2, 11, false);
     let ex = &lay.ex;
-    let mut s = PrefillScratch::new(&d, 4096).unwrap();
+    let mut s = PrefillScratch::new(&d, gb_cuda::moe_prefill::MAX_ROWS).unwrap();
     let mut checked = 0;
     for (si, &style) in [Style::Uniform, Style::Skewed, Style::Hot, Style::Holes, Style::Sparse].iter().enumerate() {
-        for rows in [1usize, 17, 255, 256, 257, 700, 4096] {
+        for rows in [1usize, 17, 255, 256, 257, 700, 4096, 6144, 8192] {
             let mut r = Rng(300 + si as u64 * 100 + rows as u64);
             let (pick, wts) = make_picks(&mut r, style, rows, d.experts, d.topk);
             let xh = activations(&mut r, rows, d.hidden, 1.0);
@@ -434,7 +462,7 @@ fn the_plan_is_p1s_plan() {
         }
     }
     eprintln!(
-        "the P2 plan is P1's plan (sorted pairs, the items in expert order) on {checked} cases (5 routing styles x 7 row counts, 288 experts)"
+        "the P2 plan is P1's plan (sorted pairs, the items in expert order) on {checked} cases (5 routing styles x 9 row counts to 8,192, 288 experts)"
     );
 }
 

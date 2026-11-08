@@ -146,6 +146,12 @@ impl ModelFamily for GlmFamily {
         tp::MAX_TP_RANKS
     }
 
+    /// P2's widest chunk (`alloc::P2_MAX_PREFILL_CHUNK`, 8,192 rows); the family's own check (`engine::check_prefill_chunk`) then reads the
+    /// flag by the prefill contract (P1 clamps to 2,048).
+    fn max_prefill_chunk(&self) -> usize {
+        alloc::P2_MAX_PREFILL_CHUNK
+    }
+
     fn run_follower(&self, _plan: FamilyPlan, ctx: &BuildCtx<'_>) -> Result<(), ModelError> {
         tp_boot::follow(ctx)
     }

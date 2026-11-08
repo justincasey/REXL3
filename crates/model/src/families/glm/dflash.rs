@@ -94,6 +94,13 @@ pub fn relay_bytes(o: &ServeOptions, cfg: &GlmConfig, chunk: usize) -> u64 {
     }
 }
 
+/// The context rows the drafter's scratch holds (`Draft::max_ctx_rows`) for prompt chunks of `chunk` rows: one absorb's, which a prompt
+/// chunk's rows join in writes of at most the ring's window (`GlmModel::dflash_prefill_rows`) and a window's commit in one: a chunk wider
+/// than the window adds nothing the drafter reads at once.
+pub fn ctx_rows(chunk: usize) -> usize {
+    chunk.clamp(alloc::WINDOW_ROWS, gb_cuda::dflash2::DraftCtxLayout::WINDOW)
+}
+
 /// The drafter's plan for a trunk of `cfg` with `slots` slots and prompt chunks of `chunk` rows, when this process loads one: its config
 /// read and checked (by name, before any weight is read), this rank's share and its bytes.
 pub fn plan(o: &ServeOptions, cfg: &GlmConfig, slots: usize, chunk: usize) -> Result<Option<DflashPlan>, ModelError> {
@@ -107,7 +114,7 @@ pub fn plan(o: &ServeOptions, cfg: &GlmConfig, slots: usize, chunk: usize) -> Re
     let dims = dc.dims(TOKENIZER_VOCAB);
     let share = share_of(o)?;
     let rows = chunk.max(alloc::WINDOW_ROWS);
-    let bytes = Draft::planned_bf16_bytes(&dims, cfg.vocab, slots, chunk, BLOCK, share) as u64
+    let bytes = Draft::planned_bf16_bytes(&dims, cfg.vocab, slots, ctx_rows(chunk), BLOCK, share) as u64
         + DflashState::planned_tap_bytes(&dims, rows) as u64
         + restricted_head_bytes(cfg, slots, share)?;
     Ok(Some(DflashPlan { dir, cfg: dc, dims, share, bytes }))
@@ -130,7 +137,7 @@ pub fn load(m: &mut GlmModel, p: &DflashPlan) -> Result<(), ModelError> {
     let pack = Pack::open(&p.dir).map_err(|e| ModelError::Config(format!("--draft {}: {e}", p.dir.display())))?;
     // the arena is exactly the drafter's weights: a fixed 1 GiB block would strand ~0.22 GiB of rank 0 for the process's life
     let mut ctx = LoadCtx::exact_from_env(Draft::bf16_weight_bytes(&p.dims, m.cfg.vocab, p.share));
-    let (draft, bytes) = Draft::declare_bf16(&mut ctx, &pack, p.dims, m.cfg.vocab, m.slots, m.chunk_rows(), BLOCK, p.share)
+    let (draft, bytes) = Draft::declare_bf16(&mut ctx, &pack, p.dims, m.cfg.vocab, m.slots, ctx_rows(m.chunk_rows()), BLOCK, p.share)
         .map_err(|e| ModelError::Config(format!("--draft {}: {e}", p.dir.display())))?;
     ctx.finish()?;
     let load_s = t.elapsed().as_secs_f64();
