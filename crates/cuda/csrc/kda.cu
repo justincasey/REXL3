@@ -391,40 +391,55 @@ int launch_proj_in_lane(const void* x, const __half* b, const __half* f, const _
 
 // ---------------------------------------------------------------------------------------------------------------
 // proj_out: f_b and g_b, the low-rank second stages, with an fp32 input (the first stage's fp32 output, not rounded to
-// half: the BC graph's choice). One THREAD per output channel (block = one head's 128 channels of one path), PO_RT rows of
-// the input staged in shared memory and read as broadcasts, the 128-term dot product a plain fma chain in index order: no
-// shuffles, and the order of an output does not depend on the rows of the launch. Outputs of the forget path go straight
-// through the gate: g = exp(lower * sigmoid(exp(A_log[h]) * (f + dt_bias[c]))), written to the record; the others are the output
-// gate z (fp32, read by the norm). (Measured and rejected, same bits, slower: prefetching the whole weight row before staging x;
-// four outputs per thread for many rows.)
+// half: the BC graph's choice). One THREAD per output channel, PO_RT rows of the input staged in shared memory and read as
+// broadcasts, the 128-term dot product a plain fma chain in index order: no shuffles, and the order of an output does not depend
+// on the rows of the launch. Outputs of the forget path go straight through the gate: g = exp(lower * sigmoid(exp(A_log[h]) *
+// (f + dt_bias[c]))), written to the record; the others are the output gate z (fp32, read by the norm). (Measured and rejected,
+// same bits, slower: four outputs per thread for many rows.)
 // ---------------------------------------------------------------------------------------------------------------
 constexpr int PO_RT = 16;
 
-__global__ void __launch_bounds__(D) proj_out_kernel(
+// Few rows (decode windows): a block takes PS_C channels of one head of one path, its weight rows (PS_C x 256 bytes) staged in shared
+// memory by coalesced 16-byte loads (a thread reading its own 256-byte row touches 32 lines a warp instruction: 134 GB/s cold on GB10,
+// 31 us a 64-head layer at 1 row), rows padded by 16 bytes so a quarter warp's row reads hit distinct banks; lane = channel, warp w
+// the rows w, w + 4, .. of the PO_RT-row tile.
+constexpr int PS_C = 32;
+constexpr int PS_NT = 128;
+constexpr int PS_LD = D + 8;
+
+__global__ void __launch_bounds__(PS_NT) proj_out_small_kernel(
         const float* __restrict__ fa, const float* __restrict__ ga, const __half* __restrict__ w_fb,
         const __half* __restrict__ w_gb, const float* __restrict__ a_log, const float* __restrict__ dt_bias, float lower,
         int rows, int heads, float* __restrict__ g, float* __restrict__ z) {
+    __shared__ __align__(16) __half wsm[PS_C][PS_LD];
     __shared__ __align__(16) float xs[PO_RT][D];
-    const bool is_g = blockIdx.x < heads;
-    const int h = is_g ? blockIdx.x : blockIdx.x - heads;
-    const int t = threadIdx.x;
-    const int c = h * D + t;  // output channel within the path
-    const int n_half = heads * D;
+    constexpr int CG = D / PS_C;
+    const int hp = blockIdx.x / CG, cg = blockIdx.x % CG;
+    const bool is_g = hp < heads;
+    const int h = is_g ? hp : hp - heads;
+    const int c0 = h * D + cg * PS_C;  // the block's first output channel within the path
     const int r0 = blockIdx.y * PO_RT;
     const int nr = min(PO_RT, rows - r0);
+    const uint4* wsrc = reinterpret_cast<const uint4*>((is_g ? w_fb : w_gb) + (size_t)c0 * D);
+#pragma unroll
+    for (int i = threadIdx.x; i < PS_C * D / 8; i += PS_NT) {
+        const int c = i / (D / 8), kq = i % (D / 8);
+        *reinterpret_cast<uint4*>(&wsm[c][8 * kq]) = __ldg(wsrc + i);
+    }
     const float* x = is_g ? fa : ga;
-    for (int i = t; i < nr * (D / 4); i += D) {
+    for (int i = threadIdx.x; i < nr * (D / 4); i += PS_NT) {
         const int r = i / (D / 4), q = i % (D / 4);
         reinterpret_cast<float4*>(xs[r])[q] = __ldg(reinterpret_cast<const float4*>(x + (size_t)(r0 + r) * D) + q);
     }
     __syncthreads();
-    const uint4* wr = reinterpret_cast<const uint4*>((is_g ? w_fb : w_gb) + (size_t)c * D);
-    float acc[PO_RT];
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    constexpr int RW = PO_RT / (PS_NT / 32);  // rows a warp may hold
+    float acc[RW];
 #pragma unroll
-    for (int r = 0; r < PO_RT; ++r) acc[r] = 0.0f;
+    for (int j = 0; j < RW; ++j) acc[j] = 0.0f;
 #pragma unroll
     for (int kb = 0; kb < D / 8; ++kb) {
-        const uint4 wu = __ldg(wr + kb);
+        const uint4 wu = *reinterpret_cast<const uint4*>(&wsm[lane][8 * kb]);
         float wf[8];
         const __half2* h2 = reinterpret_cast<const __half2*>(&wu);
 #pragma unroll
@@ -433,11 +448,12 @@ __global__ void __launch_bounds__(D) proj_out_kernel(
             wf[2 * i] = f.x; wf[2 * i + 1] = f.y;
         }
 #pragma unroll
-        for (int r = 0; r < PO_RT; ++r) {
+        for (int j = 0; j < RW; ++j) {
+            const int r = wid + 4 * j;
             if (r < nr) {
                 const float4 x0 = *reinterpret_cast<const float4*>(&xs[r][kb * 8]);
                 const float4 x1 = *reinterpret_cast<const float4*>(&xs[r][kb * 8 + 4]);
-                float a = acc[r];
+                float a = acc[j];
                 a = __fmaf_rn(x0.x, wf[0], a);
                 a = __fmaf_rn(x0.y, wf[1], a);
                 a = __fmaf_rn(x0.z, wf[2], a);
@@ -446,26 +462,29 @@ __global__ void __launch_bounds__(D) proj_out_kernel(
                 a = __fmaf_rn(x1.y, wf[5], a);
                 a = __fmaf_rn(x1.z, wf[6], a);
                 a = __fmaf_rn(x1.w, wf[7], a);
-                acc[r] = a;
+                acc[j] = a;
             }
         }
     }
+    const int c = c0 + lane;
+    const int n_half = heads * D;
     float decay = 0.0f, dtb = 0.0f;
     if (is_g) {
         decay = expf(a_log[h]);
         dtb = dt_bias[c];
     }
 #pragma unroll
-    for (int r = 0; r < PO_RT; ++r) {
+    for (int j = 0; j < RW; ++j) {
+        const int r = wid + 4 * j;
         if (r < nr) {
             const size_t o = (size_t)(r0 + r) * n_half + c;
-            if (is_g) g[o] = expf(lower * sigmoid_ieee(decay * (acc[r] + dtb)));
-            else z[o] = acc[r];
+            if (is_g) g[o] = expf(lower * sigmoid_ieee(decay * (acc[j] + dtb)));
+            else z[o] = acc[j];
         }
     }
 }
 
-// proj_out for many rows, the same bits as proj_out_kernel (each output the 128-term fmaf chain in k order from +0, then the same
+// proj_out for many rows, the same bits as proj_out_small_kernel (each output the 128-term fmaf chain in k order from +0, then the same
 // epilogue): a block takes 64 rows of one head of one path, x and w staged transposed in shared memory 64 k at a time, a thread 8 rows x
 // 4 channels (x read as warp broadcasts, w as 8-byte vectors).
 constexpr int PO2_RM = 64;
@@ -1091,7 +1110,7 @@ GB_EXPORT int gb_kda_proj_out(const float* fa, const float* ga, const void* w_fb
         proj_out_tile_kernel<<<dim3(paths * heads, (rows + PO2_RM - 1) / PO2_RM), 256, 0, gb_stream(stream)>>>(
             fa, ga, (const __half*)w_fb, (const __half*)w_gb, a_log, dt_bias, lower, rows, heads, g, z);
     else
-        proj_out_kernel<<<dim3(paths * heads, (rows + PO_RT - 1) / PO_RT), D, 0, gb_stream(stream)>>>(
+        proj_out_small_kernel<<<dim3(paths * heads * (D / PS_C), (rows + PO_RT - 1) / PO_RT), PS_NT, 0, gb_stream(stream)>>>(
             fa, ga, (const __half*)w_fb, (const __half*)w_gb, a_log, dt_bias, lower, rows, heads, g, z);
     return GB_CHECK_LAUNCH();
 }
