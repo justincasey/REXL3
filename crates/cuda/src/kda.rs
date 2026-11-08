@@ -40,7 +40,7 @@
 //! Per sequence the committed state is `34 x 2 x 64 x 128 x 128 x 4 B = 272 MiB` (two buffers per layer: the price of "a full
 //! accept needs no replay"; 136 MiB if single-buffered) plus the conv state `34 x 3 x 24576 x 2 B = 4.8 MiB`. Per window row
 //! the record is 2.79 MB over 34 layers. Scratch ([`Workspace`], shared by all layers, transient): q, k f32 and v bf16 per row
-//! (`80 KiB`), z f32 (`32 KiB`), y bf16 (`16 KiB`), fa, ga (`1 KiB`), the tiled proj_in's 8 partial sums of each output (`10 KiB`);
+//! (`80 KiB`), z f32 (`32 KiB`), y bf16 (`16 KiB`), fa, ga (`1 KiB`), the lane-scheduled proj_in's 8 partial sums of each output (`10 KiB`);
 //! a pipelined workspace ([`Workspace::add_pipe`]) adds a second q, k, v, z, g, beta set (`Workspace::pipe_bytes_per_row`).
 //!
 //! # Numerics: what is matched to the oracle, and the decisions
@@ -88,7 +88,7 @@ pub const GLM_HEADS: usize = 64;
 pub const GLM_HIDDEN: usize = 4096;
 /// Rank of the low-rank f/g projections (fixed at the head dimension).
 pub const RANK: usize = 128;
-/// Partial sums per output of the tiled proj_in (`csrc/kda.cu` proj_in_tile_kernel: one per warp of proj_in_kernel's 8).
+/// Partial sums per output of the lane-scheduled proj_in (`csrc/kda.cu` proj_in_lane_kernel: one per warp of proj_in_kernel's 8).
 const PROJ_IN_PARTS: usize = 8;
 /// Rows [`prefill`] processes per piece (the scratch and the record are sized for this many).
 pub const PREFILL_PIECE_ROWS: usize = 128;
@@ -468,7 +468,7 @@ pub struct Workspace {
     ga: DevBuf,
     z: DevBuf,
     y: DevBuf,
-    /// f32 `[8][rows][heads + 2 * RANK]`: the tiled proj_in's per-warp partial sums
+    /// f32 `[8][rows][heads + 2 * RANK]`: the lane-scheduled proj_in's per-warp partial sums
     part: DevBuf,
     pipe: Option<Pipe>,
 }

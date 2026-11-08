@@ -233,121 +233,7 @@ __global__ void __launch_bounds__(PI_NT) proj_in_kernel(
     }
 }
 
-// proj_in for many rows at hidden 4096, the same bits as proj_in_kernel with a different schedule. proj_in_kernel's output (r, j) is
-// sum_{w = 0..7, in order} B_w, where B_w is the xor butterfly (offsets 16, 8, 4, 2, 1) over the lanes l of warp w of the leaf L_t,
-// t = 32 w + l: the fmaf chain from +0 over x[r][k] w[j][k] for k = 8 t .. 8 t + 7, then 2048 + 8 t .. + 7. Every addition of the
-// butterfly pairs the lanes that differ in bit 4, then bit 3, .., bit 0, so in the lane order i -> l = bitrev5(i) it is the balanced
-// binary tree over 32 consecutive leaves (operands commute bit for bit): one thread evaluates it with a stack of 5 partial sums.
-// Here a block takes 64 rows x 32 outputs of ONE warp's 32 leaves (blockIdx.z = w), x and w staged in shared memory as fp32 four
-// leaves (64 k) at a time, a thread 4 rows x 4 outputs; B_w goes to part[w][r][j] and proj_in_fin_kernel sums w = 0..7 in order and
-// applies proj_in_kernel's epilogue. (proj_in_kernel re-reads x for every 4 outputs and w for every 8 rows from L2: L2-bound.)
-constexpr int PT_RM = 64;  // rows a block
-constexpr int PT_JN = 32;  // outputs a block
-constexpr int PT_NT = 128;
-
-__device__ __forceinline__ constexpr int brev5(int i) {
-    return ((i & 1) << 4) | ((i & 2) << 2) | (i & 4) | ((i & 8) >> 2) | ((i & 16) >> 4);
-}
-
-template <int XT>
-__global__ void __launch_bounds__(PT_NT) proj_in_tile_kernel(
-        const void* __restrict__ x, const __half* __restrict__ w_b, const __half* __restrict__ w_fa,
-        const __half* __restrict__ w_ga, int rows, int heads, int rank, float* __restrict__ part) {
-    constexpr int HID = 4096, NV = HID / 8;
-    __shared__ __align__(16) float xs[64][PT_RM];  // [leaf q * 16 + element][row]
-    __shared__ __align__(16) float wsm[64][PT_JN];  // [leaf q * 16 + element][output]
-    const int n_out = heads + 2 * rank;
-    const int j0 = blockIdx.x * PT_JN, r0 = blockIdx.y * PT_RM, wv = blockIdx.z;
-    const int tid = threadIdx.x, og = tid & 7, rg = tid >> 3;
-    float st[5][4][4];
-    float res[4][4];
-#pragma unroll
-    for (int s = 0; s < 8; ++s) {  // leaves 4 s .. 4 s + 3 in tree order
-        __syncthreads();
-#pragma unroll
-        for (int u = tid; u < PT_RM * 8; u += PT_NT) {  // 8 runs of 8 elements a row: leaf q = run / 2, its first or second half
-            const int r = u % PT_RM, run = u / PT_RM, q = run >> 1, hf = run & 1;
-            const int t = 32 * wv + brev5(4 * s + q);
-            float f[8];
-            if (r0 + r < rows) {
-                load_x8<XT>(x, (size_t)(r0 + r) * NV + t + hf * 256, f);
-            } else {
-#pragma unroll
-                for (int e = 0; e < 8; ++e) f[e] = 0.0f;
-            }
-#pragma unroll
-            for (int e = 0; e < 8; ++e) xs[q * 16 + hf * 8 + e][r] = f[e];
-        }
-#pragma unroll
-        for (int u = tid; u < PT_JN * 8; u += PT_NT) {
-            const int jj = u % PT_JN, run = u / PT_JN, q = run >> 1, hf = run & 1;
-            const int t = 32 * wv + brev5(4 * s + q);
-            const int j = min(j0 + jj, n_out - 1);  // a tail output beyond n_out reads a valid row and is discarded
-            const __half* wr = j < heads ? w_b + (size_t)j * HID
-                               : j < heads + rank ? w_fa + (size_t)(j - heads) * HID
-                                                  : w_ga + (size_t)(j - heads - rank) * HID;
-            const uint4 wu = __ldg(reinterpret_cast<const uint4*>(wr) + t + hf * 256);
-            const __half2* h2 = reinterpret_cast<const __half2*>(&wu);
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const float2 f = __half22float2(h2[i]);
-                wsm[q * 16 + hf * 8 + 2 * i][jj] = f.x;
-                wsm[q * 16 + hf * 8 + 2 * i + 1][jj] = f.y;
-            }
-        }
-        __syncthreads();
-#pragma unroll
-        for (int q = 0; q < 4; ++q) {
-            float a[4][4];
-#pragma unroll
-            for (int r = 0; r < 4; ++r)
-#pragma unroll
-                for (int c = 0; c < 4; ++c) a[r][c] = 0.0f;
-#pragma unroll
-            for (int e = 0; e < 16; ++e) {
-                const float4 xv = *reinterpret_cast<const float4*>(&xs[q * 16 + e][4 * rg]);
-                const float4 wq = *reinterpret_cast<const float4*>(&wsm[q * 16 + e][4 * og]);
-                const float xr[4] = {xv.x, xv.y, xv.z, xv.w}, wc[4] = {wq.x, wq.y, wq.z, wq.w};
-#pragma unroll
-                for (int r = 0; r < 4; ++r)
-#pragma unroll
-                    for (int c = 0; c < 4; ++c) a[r][c] = __fmaf_rn(xr[r], wc[c], a[r][c]);
-            }
-            // leaf i = 4 s + q of the tree: fold it into the stack (bit lvl of i set: the left sibling waits at level lvl)
-            const int i = 4 * s + q;
-#pragma unroll
-            for (int r = 0; r < 4; ++r)
-#pragma unroll
-                for (int c = 0; c < 4; ++c) {
-                    float v = a[r][c];
-                    bool placed = false;
-#pragma unroll
-                    for (int lvl = 0; lvl < 5; ++lvl) {
-                        if (placed) continue;
-                        if ((i >> lvl) & 1) {
-                            v = st[lvl][r][c] + v;
-                        } else {
-                            st[lvl][r][c] = v;
-                            placed = true;
-                        }
-                    }
-                    if (!placed) res[r][c] = v;  // i = 31: the root
-                }
-        }
-    }
-#pragma unroll
-    for (int r = 0; r < 4; ++r) {
-        const int row = r0 + 4 * rg + r;
-        if (row >= rows) continue;
-#pragma unroll
-        for (int c = 0; c < 4; ++c) {
-            const int j = j0 + 4 * og + c;
-            if (j < n_out) part[((size_t)wv * rows + row) * n_out + j] = res[r][c];
-        }
-    }
-}
-
-// The 8 warp sums of proj_in_tile_kernel in proj_in_kernel's order, then its epilogue.
+// The 8 warp sums of proj_in_lane_kernel in proj_in_kernel's order, then its epilogue.
 __global__ void __launch_bounds__(256) proj_in_fin_kernel(const float* __restrict__ part, int rows, int heads, int rank,
                                                           float* __restrict__ beta, float* __restrict__ fa, float* __restrict__ ga) {
     const int n_out = heads + 2 * rank;
@@ -362,6 +248,145 @@ __global__ void __launch_bounds__(256) proj_in_fin_kernel(const float* __restric
     if (j < heads) beta[r * heads + j] = round_bf16(sigmoid_ieee(s));
     else if (j < heads + rank) fa[r * rank + (j - heads)] = s;
     else ga[r * rank + (j - heads - rank)] = s;
+}
+
+// proj_in for many rows at hidden 4096, the same bits as proj_in_kernel with proj_in_kernel's own lane structure. proj_in_kernel's output
+// (r, j) is sum_{w = 0..7, in order} B_w, where B_w is the xor butterfly (offsets 16, 8, 4, 2, 1) over the lanes l of warp w of the leaf
+// L_t, t = 32 w + l: the fmaf chain from +0 over x[r][k] w[j][k] for k = 8 t .. 8 t + 7, then 2048 + 8 t .. + 7. Here lane l of a warp
+// of block z = w is that thread t for PL_R rows x PL_J outputs at once, the warp's halve_reduce (the butterfly's association) gives B_w
+// into part[w][r][j], and proj_in_fin_kernel sums w = 0..7 in order and applies proj_in_kernel's epilogue. A block stages the x rows and
+// weight rows of warp w's leaves (k in [256 w, 256 w + 256) and [2048 + 256 w, ..)) for PL_RM rows and PL_JN outputs in shared memory
+// once (cp.async), then a lane reads its two 8-vectors per row and output as 16-byte vectors, each feeding PL_J (PL_R) chains: one shared
+// 16-byte read per 64 fmaf (proj_in_kernel re-reads x for every 4 outputs and w for every 8 rows from L2: L2-bound; the 64 x 32 shared
+// tiles this replaced read two 16-byte vectors per 16 fmaf and kept a 5-deep tree stack: as fast alone, but beside the chunked recurrence
+// on the pipelined KDA prefill's side stream they shared its shared-memory bandwidth, MEASURED: a 4,096-row chunk 2,425 -> 2,400 ms).
+// A block is PL_WR x PL_WJ warps over PL_WR * PL_R rows and PL_WJ * PL_J outputs, two blocks an SM.
+constexpr int PL_R = 8, PL_J = 8, PL_WR = 2, PL_WJ = 2;
+constexpr int PL_RM = PL_R * PL_WR;  // rows a block
+constexpr int PL_JN = PL_J * PL_WJ;  // outputs a block
+constexpr int PL_NT = PL_WR * PL_WJ * 32;
+constexpr int PL_K = 512;  // k values of one warp's leaves: two runs of 256
+
+template <int XT>
+__host__ __device__ constexpr int pl_xbytes() {
+    return XT == X_F32 ? 4 : 2;
+}
+template <int XT>
+__host__ __device__ constexpr int pl_smem() {
+    return PL_RM * PL_K * pl_xbytes<XT>() + PL_JN * PL_K * 2;
+}
+
+__device__ __forceinline__ void pl_cp16(void* smem, const void* gmem, bool valid) {
+    const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem), "r"(valid ? 16 : 0));
+}
+
+template <int XT>
+__device__ __forceinline__ void pl_x8(const unsigned char* p, float (&f)[8]) {
+    if (XT == X_F32) {
+        const float4 a = *reinterpret_cast<const float4*>(p), b = *reinterpret_cast<const float4*>(p + 16);
+        f[0] = a.x; f[1] = a.y; f[2] = a.z; f[3] = a.w; f[4] = b.x; f[5] = b.y; f[6] = b.z; f[7] = b.w;
+    } else {
+        const uint4 u = *reinterpret_cast<const uint4*>(p);
+        if (XT == X_F16) {
+            const __half2* h2 = reinterpret_cast<const __half2*>(&u);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float2 t = __half22float2(h2[i]);
+                f[2 * i] = t.x; f[2 * i + 1] = t.y;
+            }
+        } else {
+            const __nv_bfloat162* b2 = reinterpret_cast<const __nv_bfloat162*>(&u);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                f[2 * i] = __low2float(b2[i]);
+                f[2 * i + 1] = __high2float(b2[i]);
+            }
+        }
+    }
+}
+
+template <int XT>
+__global__ void __launch_bounds__(PL_NT, 2) proj_in_lane_kernel(
+        const void* __restrict__ x, const __half* __restrict__ w_b, const __half* __restrict__ w_fa,
+        const __half* __restrict__ w_ga, int rows, int heads, int rank, float* __restrict__ part) {
+    constexpr int HID = 4096, XB = pl_xbytes<XT>();
+    constexpr int XC = PL_K * XB / 16;  // 16-byte chunks of a staged x row
+    constexpr int WC = PL_K * 2 / 16;   // of a staged weight row
+    extern __shared__ __align__(16) unsigned char pl_sm[];
+    unsigned char* xs = pl_sm;                       // [PL_RM][PL_K] of x's type
+    unsigned char* wsm = pl_sm + PL_RM * PL_K * XB;  // [PL_JN][PL_K] fp16
+    const int n_out = heads + 2 * rank;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int wv = blockIdx.z;
+    const int rb = blockIdx.y * PL_RM, jb = blockIdx.x * PL_JN;
+    // stage: chunk c of row r covers k = run * 2048 + 256 wv + (c % (XC / 2)) * (16 / XB) .. (run = c / (XC / 2))
+    for (int u = threadIdx.x; u < PL_RM * XC; u += PL_NT) {
+        const int r = u / XC, c = u % XC, run = c / (XC / 2), k = run * 2048 + 256 * wv + (c % (XC / 2)) * (16 / XB);
+        const bool ok = rb + r < rows;
+        const unsigned char* src = static_cast<const unsigned char*>(x) + ((size_t)(ok ? rb + r : 0) * HID + k) * XB;
+        pl_cp16(xs + (size_t)r * PL_K * XB + (size_t)c * 16, src, ok);
+    }
+    for (int u = threadIdx.x; u < PL_JN * WC; u += PL_NT) {
+        const int q = u / WC, c = u % WC, run = c / (WC / 2), k = run * 2048 + 256 * wv + (c % (WC / 2)) * 8;
+        const int j = min(jb + q, n_out - 1);  // a tail output beyond n_out reads a valid row and is discarded
+        const __half* wr = j < heads ? w_b + (size_t)j * HID
+                           : j < heads + rank ? w_fa + (size_t)(j - heads) * HID
+                                              : w_ga + (size_t)(j - heads - rank) * HID;
+        pl_cp16(wsm + (size_t)q * PL_K * 2 + (size_t)c * 16, wr + k, true);
+    }
+    asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n" ::);
+    __syncthreads();
+    const int rg = warp % PL_WR, og = warp / PL_WR;
+    float acc[PL_R][PL_J];
+#pragma unroll
+    for (int r = 0; r < PL_R; ++r)
+#pragma unroll
+        for (int q = 0; q < PL_J; ++q) acc[r][q] = 0.0f;
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {  // the leaf's two 8-vectors, t then t + 256, in proj_in_kernel's order
+        const int e0 = h * 256 + 8 * lane;
+        float wf[PL_J][8];
+#pragma unroll
+        for (int q = 0; q < PL_J; ++q) pl_x8<X_F16>(wsm + ((size_t)(og * PL_J + q) * PL_K + e0) * 2, wf[q]);
+#pragma unroll
+        for (int r = 0; r < PL_R; ++r) {
+            float xf[8];
+            pl_x8<XT>(xs + ((size_t)(rg * PL_R + r) * PL_K + e0) * XB, xf);
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+#pragma unroll
+                for (int q = 0; q < PL_J; ++q) acc[r][q] = __fmaf_rn(xf[i], wf[q][i], acc[r][q]);
+        }
+    }
+    // the warp's butterfly over its 32 leaves, 32 (row, output) sums at a time: lane l ends with the sum of value owned_index<32>(l)
+    const int r0 = rb + rg * PL_R, j0 = jb + og * PL_J;
+#pragma unroll
+    for (int hh = 0; hh < PL_R * PL_J / 32; ++hh) {
+        float flat[32];
+#pragma unroll
+        for (int i = 0; i < 32; ++i) flat[i] = acc[(hh * 32 + i) / PL_J][(hh * 32 + i) % PL_J];
+        const float s = halve_reduce<32>(flat, lane);
+        const int idx = hh * 32 + owned_index<32>(lane);
+        const int row = r0 + idx / PL_J, j = j0 + idx % PL_J;
+        if (row < rows && j < n_out) part[((size_t)wv * rows + row) * n_out + j] = s;
+    }
+}
+
+template <int XT>
+int launch_proj_in_lane(const void* x, const __half* b, const __half* f, const __half* g, int rows, int heads, int rank, float* part,
+                        cudaStream_t st) {
+    constexpr int sm = pl_smem<XT>();
+    static bool attr = false;  // idempotent; a race between host threads sets the same value twice
+    if (!attr) {
+        const cudaError_t e = cudaFuncSetAttribute(proj_in_lane_kernel<XT>, cudaFuncAttributeMaxDynamicSharedMemorySize, sm);
+        if (e != cudaSuccess) return (int)e;
+        attr = true;
+    }
+    const int n_out = heads + 2 * rank;
+    const dim3 grid((n_out + PL_JN - 1) / PL_JN, (rows + PL_RM - 1) / PL_RM, PI_NT / 32);
+    proj_in_lane_kernel<XT><<<grid, PL_NT, sm, st>>>(x, b, f, g, rows, heads, rank, part);
+    return 0;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1018,7 +1043,8 @@ int launch_state(int r_step, const float* q, const float* k, const __nv_bfloat16
 
 // b, f_a, g_a GEMVs (f16 weights [heads or rank, hidden]) off x [rows, hidden] of dtype x_dtype (0 f16, 1 bf16, 2 f32).
 // Outputs f32: beta [rows, heads] (already bf16(sigmoid)), fa [rows, rank], ga [rows, rank]. `part` (nullable, f32
-// [8][rows][heads + 2 rank]): scratch of the tiled schedule, which takes hidden 4096 and 64 rows or more (the same bits).
+// [8][rows][heads + 2 rank]): scratch of the lane schedule (proj_in_lane_kernel), which takes hidden 4096 and 64 rows or more (the same
+// bits).
 GB_EXPORT int gb_kda_proj_in(const void* x, int x_dtype, const void* w_b, const void* w_fa, const void* w_ga, int rows,
                              int hidden, int heads, int rank, float* beta, float* fa, float* ga, float* part, void* stream) {
     if (rows < 0 || hidden <= 0 || hidden % 8 != 0 || rank <= 0 || bad_heads(heads) || x_dtype < 0 || x_dtype > 2)
@@ -1027,13 +1053,13 @@ GB_EXPORT int gb_kda_proj_in(const void* x, int x_dtype, const void* w_b, const 
     const int n_out = heads + 2 * rank;
     cudaStream_t st = gb_stream(stream);
     const __half *b = (const __half*)w_b, *f = (const __half*)w_fa, *gg = (const __half*)w_ga;
-    if (part && hidden == 4096 && rows >= PT_RM) {
-        const dim3 grid((n_out + PT_JN - 1) / PT_JN, (rows + PT_RM - 1) / PT_RM, PI_NT / 32);
-        if (x_dtype == X_F16) proj_in_tile_kernel<X_F16><<<grid, PT_NT, 0, st>>>(x, b, f, gg, rows, heads, rank, part);
-        else if (x_dtype == X_BF16) proj_in_tile_kernel<X_BF16><<<grid, PT_NT, 0, st>>>(x, b, f, gg, rows, heads, rank, part);
-        else proj_in_tile_kernel<X_F32><<<grid, PT_NT, 0, st>>>(x, b, f, gg, rows, heads, rank, part);
-        const int rc = GB_CHECK_LAUNCH();
+    if (part && hidden == 4096 && rows >= 64) {
+        const int rc = x_dtype == X_F16    ? launch_proj_in_lane<X_F16>(x, b, f, gg, rows, heads, rank, part, st)
+                       : x_dtype == X_BF16 ? launch_proj_in_lane<X_BF16>(x, b, f, gg, rows, heads, rank, part, st)
+                                           : launch_proj_in_lane<X_F32>(x, b, f, gg, rows, heads, rank, part, st);
         if (rc) return rc;
+        const int lrc = GB_CHECK_LAUNCH();
+        if (lrc) return lrc;
         const size_t n = (size_t)rows * n_out;
         proj_in_fin_kernel<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(part, rows, heads, rank, beta, fa, ga);
         return GB_CHECK_LAUNCH();

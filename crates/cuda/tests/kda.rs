@@ -1011,7 +1011,7 @@ fn halving_reduction_is_the_butterfly_tree() {
 }
 
 /// project() alone: every output row of an r-row launch equals the same row computed alone, for the row counts around every kernel
-/// configuration (proj_in one output per block up to 8 rows, four above, the tiled schedule from 64 rows; proj_out one thread an output
+/// configuration (proj_in one output per block up to 8 rows, four above, the lane schedule from 64 rows; proj_out one thread an output
 /// below 64 rows, tiled from 64) up to a 600-row launch; and the three input dtypes agree.
 #[test]
 fn projections_are_row_invariant_and_dtype_agnostic() {
