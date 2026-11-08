@@ -209,7 +209,7 @@ fn p2_rank_layer(
     }
     let shared = with_shared.then_some(&s.moe_shared_out);
     match split {
-        Some(sp) if sp_res => t.p2_finish_own_rows(&ex.dims(), shared, &mut s.mixer_out, sp, st)?,
+        Some(sp) if sp_res => t.p2_finish_own_rows(&ex.dims(), moe_sc, shared, &mut s.mixer_out, sp, st)?,
         _ => t.p2_finish(&ex.dims(), moe_sc, shared, &mut s.mixer_out, split, st)?,
     }
     Ok(())
