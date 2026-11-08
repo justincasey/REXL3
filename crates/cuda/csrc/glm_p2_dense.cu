@@ -31,8 +31,18 @@ namespace {
 enum DType : int { F16 = 0, BF16 = 1, F32 = 2 };
 
 constexpr int kThreads = 256;  // 8 warps, warp w owns columns 16 w .. 16 w + 15 of the block's 128 (a strip)
-constexpr int kBK = 64;        // k of one pipeline stage (4 k tiles); a 128-k fold block is two stages
-constexpr int kStages = 3;
+
+// The cp.async ring of a tile: k a stage and stages. The 128 x 1 tile streams 128 k a stage (a fold block) through 2 stages, one barrier
+// a 128-k block (MEASURED on GB10, tests/glm_p2_dense.rs bench_p2_on_the_serving_shapes, against 64 k through 3 stages: KDA qkv 3.30 ->
+// 3.14 ms, KDA o 2.40 -> 2.27, MLA o 4.7-4.9 -> 4.4-4.5; 96 KB at 8 bits); the others 64 k (a fold block is two stages) through 3.
+template <int BM, int SN>
+constexpr int stage_k() {
+    return BM == 128 && SN == 1 ? 128 : 64;
+}
+template <int BM, int SN>
+constexpr int ring_stages() {
+    return BM == 128 && SN == 1 ? 2 : 3;
+}
 
 __device__ __forceinline__ float load_scale(const void* p, int f32, int i) {
     return f32 ? __ldg(static_cast<const float*>(p) + i) : __half2float(__ldg(static_cast<const half*>(p) + i));
@@ -136,12 +146,13 @@ __device__ __forceinline__ void tile_of(int bid, int num_m, int num_n, int& mt, 
 // 16-column tiles w SN .. w SN + SN - 1 (strip w SN / 8) and all BM rows. A strip past N (an odd strip count) is skipped whole.
 template <int K2, int CB, int BM, int SN, bool FOLD>
 __global__ void __launch_bounds__(kThreads, (BM == 64 && !(FOLD && SN == 2)) ? 2 : 1) gemm_kernel(const GemmArgs g) {
+    constexpr int BK = stage_k<BM, SN>(), ST = ring_stages<BM, SN>();
     constexpr int TW = tile_words<K2>();
     constexpr int LW = lane_words<K2>();
     constexpr int MT = BM / 16;
-    constexpr int A_BYTES = BM * kBK * 2;
+    constexpr int A_BYTES = BM * BK * 2;
     constexpr int TN = 8 * SN;
-    constexpr int B_WORDS = (kBK / 16) * TN * TW;
+    constexpr int B_WORDS = (BK / 16) * TN * TW;
     constexpr int STAGE = A_BYTES + B_WORDS * 4;
     extern __shared__ __align__(128) unsigned char smem[];
 
@@ -154,7 +165,7 @@ __global__ void __launch_bounds__(kThreads, (BM == 64 && !(FOLD && SN == 2)) ? 2
     const int m0 = mt * BM, s0 = nt * SN;
     const int my_strips = min(SN, strips - s0);
     const bool active = (warp * SN) / 8 < my_strips;
-    const int KC = K / kBK;
+    const int KC = K / BK;
     const int tiles_n = N / 16;
 
     auto stage_a = [&](int s) { return reinterpret_cast<half*>(smem + s * STAGE); };
@@ -162,14 +173,14 @@ __global__ void __launch_bounds__(kThreads, (BM == 64 && !(FOLD && SN == 2)) ? 2
 
     auto load_stage = [&](int s, int kc) {
         half* sa = stage_a(s);
-        constexpr int CPR = kBK / 8;
+        constexpr int CPR = BK / 8;
 #pragma unroll
         for (int i = 0; i < BM * CPR / kThreads; ++i) {
             const int idx = i * kThreads + t, r = idx / CPR, c = idx % CPR;
             const int gr = m0 + r;
             const bool ok = gr < M;
-            const half* src = g.a + (size_t)(ok ? gr : 0) * K + kc * kBK + c * 8;
-            cp_async16(sa + r * kBK + ((c ^ (r & 7)) * 8), src, ok);
+            const half* src = g.a + (size_t)(ok ? gr : 0) * K + kc * BK + c * 8;
+            cp_async16(sa + r * BK + ((c ^ (r & 7)) * 8), src, ok);
         }
         uint32_t* sb = stage_b(s);
         constexpr int CH = B_WORDS / 4;
@@ -181,7 +192,7 @@ __global__ void __launch_bounds__(kThreads, (BM == 64 && !(FOLD && SN == 2)) ? 2
             if (c < CH) {
                 const int kl = c / CH_ROW, w = c % CH_ROW;
                 if (w < ch_valid) {
-                    const uint32_t* src = g.T + ((size_t)(kc * (kBK / 16) + kl) * tiles_n + s0 * 8) * TW + w * 4;
+                    const uint32_t* src = g.T + ((size_t)(kc * (BK / 16) + kl) * tiles_n + s0 * 8) * TW + w * 4;
                     cp_async16(sb + kl * TN * TW + w * 4, src, true);
                 }
             }
@@ -210,7 +221,7 @@ __global__ void __launch_bounds__(kThreads, (BM == 64 && !(FOLD && SN == 2)) ? 2
     }
 
 #pragma unroll
-    for (int s = 0; s < kStages - 1; ++s) {
+    for (int s = 0; s < ST - 1; ++s) {
         if (s < KC) load_stage(s, s);
         cp_async_commit();
     }
@@ -219,18 +230,18 @@ __global__ void __launch_bounds__(kThreads, (BM == 64 && !(FOLD && SN == 2)) ? 2
 
 #pragma unroll 1
     for (int kc = 0; kc < KC; ++kc) {
-        cp_async_wait<kStages - 2>();
+        cp_async_wait<ST - 2>();
         __syncthreads();
         {
-            const int nk = kc + kStages - 1;
-            if (nk < KC) load_stage(nk % kStages, nk);
+            const int nk = kc + ST - 1;
+            if (nk < KC) load_stage(nk % ST, nk);
             cp_async_commit();
         }
         if (!active) continue;
-        const half* sa = stage_a(kc % kStages);
-        const uint32_t* sb = stage_b(kc % kStages);
+        const half* sa = stage_a(kc % ST);
+        const uint32_t* sb = stage_b(kc % ST);
 #pragma unroll
-        for (int kk = 0; kk < kBK / 16; ++kk) {
+        for (int kk = 0; kk < BK / 16; ++kk) {
             uint32_t b[SN][2][2];
 #pragma unroll
             for (int j = 0; j < SN; ++j) {
@@ -242,7 +253,7 @@ __global__ void __launch_bounds__(kThreads, (BM == 64 && !(FOLD && SN == 2)) ? 2
             for (int p = 0; p < MT; ++p) {
                 uint32_t a[4];
                 const int r = p * 16 + lr, c = kk * 2 + lc;
-                ldsm_x4(a, sa + r * kBK + ((c ^ (r & 7)) * 8));
+                ldsm_x4(a, sa + r * BK + ((c ^ (r & 7)) * 8));
 #pragma unroll
                 for (int j = 0; j < SN; ++j) {
                     mma16816(acc[p][j][0], a, b[j][0]);
@@ -251,8 +262,8 @@ __global__ void __launch_bounds__(kThreads, (BM == 64 && !(FOLD && SN == 2)) ? 2
             }
         }
         if constexpr (FOLD) {
-            // the end of 128-k block kc / 2: its partials join the running sums in block order, the chains restart from +0.0
-            if (kc & 1) {
+            // the end of 128-k block kc / (128 / BK): its partials join the running sums in block order, the chains restart from +0.0
+            if (kc % (128 / BK) == 128 / BK - 1) {
 #pragma unroll
                 for (int p = 0; p < MT; ++p)
 #pragma unroll
@@ -324,8 +335,9 @@ __global__ void __launch_bounds__(kThreads, (BM == 64 && !(FOLD && SN == 2)) ? 2
 
 template <int K2, int BM, int SN>
 constexpr size_t smem_bytes() {
-    constexpr size_t stage = (size_t)BM * kBK * 2 + (size_t)(kBK / 16) * 8 * SN * tile_words<K2>() * 4;
-    constexpr size_t pipe = kStages * stage;
+    constexpr int BK = stage_k<BM, SN>(), ST = ring_stages<BM, SN>();
+    constexpr size_t stage = (size_t)BM * BK * 2 + (size_t)(BK / 16) * 8 * SN * tile_words<K2>() * 4;
+    constexpr size_t pipe = ST * stage;
     constexpr size_t epi = (size_t)BM * (128 + 4) * 4;
     return pipe > epi ? pipe : epi;
 }
@@ -349,8 +361,9 @@ int launch_gemm(const GemmArgs& g, cudaStream_t st) {
 // The tile shape (never changes a bit). 0: pick; else BM * 10 + SN (641, 642, 1281, 1282). The chain's pick is nemotron_dense_mma.cu's
 // (MEASURED there): 64 rows by 2 strips whenever that gives at least two waves of resident blocks, else 64 by 1. The fold's (MEASURED on
 // node 4 over the 18 GLM shapes at 512 and 2,048 rows, crates/cuda/tests/glm_p2_dense.rs bench): 128 rows by 1 strip for a big layer
-// (K x N of 32 Mi or more) at 1,024 rows or more (2-5 % over 64 x 1 there: the decoded tile feeds twice the rows), else 64 by 1 (two
-// blocks an SM; the narrow and the short-K layers: 128 x 1 lost up to 12 % on q_b). Its 64 x 2 tile holds twice the accumulators.
+// (K x N of 32 Mi or more) at 1,024 rows or more (2-5 % over 64 x 1 there: the decoded tile feeds twice the rows; with its 128-k stages
+// 2-6 % over 64 x 1 on the RED-SNOW serving shapes, bench_p2_on_the_serving_shapes), else 64 by 1 (two blocks an SM; the narrow and the
+// short-K layers: 128 x 1 lost up to 12 % on q_b). Its 64 x 2 tile holds twice the accumulators.
 int pick_tile(int m, int k, int n, int fold, int force, int& bm, int& sn) {
     if (force) {
         bm = force / 10;

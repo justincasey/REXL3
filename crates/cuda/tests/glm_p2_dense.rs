@@ -498,6 +498,84 @@ fn bench_p2_against_the_large_row_kernel_on_the_glm_shapes() {
     }
 }
 
+/// (name, M, K, N, bits, launches in one 4,096-row prompt chunk on a rank): the P2 dense GEMMs a TP=2 RED-SNOW 4.91 bpw prefill chunk
+/// runs under the sequence-parallel row split (2,048 own rows a rank; kv_a over all 4,096), at each layer's most common width in the
+/// pack (KDA qkv the rank's strip cut 4096 x 12288 at 6 bits in 29 of 34 layers, 7 and 8 in the rest; shared gate / up 8 bits in 29 of
+/// 42, 7 in 13; shared down 6 in 27, 7 or 8 in 15).
+const SERVING: &[(&str, usize, usize, usize, usize, usize)] = &[
+    ("kda qkv strips", 2048, 4096, 12288, 6, 68),
+    ("kda o", 2048, 8192, 4096, 6, 34),
+    ("shared gate/up", 2048, 4096, 2048, 8, 82),
+    ("shared down", 2048, 2048, 4096, 6, 41),
+    ("mla q_a", 2048, 4096, 1536, 6, 11),
+    ("mla q_b", 2048, 1536, 16384, 8, 11),
+    ("mla kv_a", 4096, 4096, 512, 6, 11),
+    ("mla o", 2048, 16384, 4096, 6, 11),
+    ("dense gate/up", 2048, 4096, 12288, 8, 6),
+    ("dense down", 2048, 12288, 4096, 6, 3),
+];
+
+/// The serving shapes ([`SERVING`]) in the serving K order (fold128), cold (a 256 MiB memset before each call), the median of
+/// `REXL3_P2_BENCH_ROUNDS` (default 9) CUDA-event timed calls of the whole linear (the input rotation, a few % of the GEMM, then the
+/// GEMM), the tiles interleaved round by round (GB10's clock drifts by a few % between runs); `REXL3_P2_BENCH_TILES` (comma separated,
+/// default `0`: the pick) the tiles, each checked bit for bit against the pick, `REXL3_P2_BENCH_ONLY` a name filter. Last, the chunk's
+/// sum over the launch counts at the pick.
+#[test]
+#[ignore]
+fn bench_p2_on_the_serving_shapes() {
+    gpu!();
+    let st = Stream::new().unwrap();
+    let mut flush = DevBuf::alloc(256 << 20).unwrap();
+    let tiles: Vec<i32> = std::env::var("REXL3_P2_BENCH_TILES")
+        .unwrap_or_else(|_| "0".into())
+        .split(',')
+        .map(|t| t.trim().parse().expect("REXL3_P2_BENCH_TILES"))
+        .collect();
+    let only = std::env::var("REXL3_P2_BENCH_ONLY").ok();
+    let events = gb_cuda::moe::EventTimer::new(2).unwrap();
+    let rounds: usize = std::env::var("REXL3_P2_BENCH_ROUNDS").map_or(9, |r| r.parse().expect("REXL3_P2_BENCH_ROUNDS"));
+    let mut chunk = 0f64;
+    for (i, &(name, rows, k, n, bits, launches)) in SERVING.iter().enumerate() {
+        if only.as_deref().is_some_and(|o| !name.contains(o)) {
+            continue;
+        }
+        let (w, _) = layer(k, n, bits, 7000 + i as u64);
+        let (xb, _) = activations(70 + i as u64, rows, k, 1.0);
+        let x = upload(&xb);
+        let mut y = DevBuf::alloc(rows * n * 4).unwrap();
+        let mut ws = DevBuf::alloc(glm_p2::workspace_bytes(rows, k)).unwrap();
+        let tf = 2.0 * rows as f64 * k as f64 * n as f64 / 1e9;
+        let pick = glm_p2::pick_tile(rows, k, n, Variant::Fold128);
+        let mut line = format!("SERVE {name:15} M {rows:5} K {k:5} N {n:5} {bits}b x{launches:3}");
+        let want = p2v(&w, &x, rows, Variant::Fold128, 0, &st);
+        let mut same = Vec::new();
+        for &tile in &tiles {
+            glm_p2::linear_variant(&w, &x, &mut y, rows, Dtype::F16, Dtype::F32, &mut ws, Variant::Fold128, tile, &st).unwrap();
+            same.push(y.to_vec::<f32>().unwrap().iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()));
+        }
+        let mut t = vec![Vec::new(); tiles.len()];
+        for r in 0..rounds {
+            for (ti, &tile) in tiles.iter().enumerate() {
+                flush.memset_async((r * tiles.len() + ti) as u8, &st).unwrap();
+                events.record(0, &st).unwrap();
+                glm_p2::linear_variant(&w, &x, &mut y, rows, Dtype::F16, Dtype::F32, &mut ws, Variant::Fold128, tile, &st).unwrap();
+                events.record(1, &st).unwrap();
+                t[ti].push(events.ms(0, 1).unwrap() as f64);
+            }
+        }
+        for (ti, &tile) in tiles.iter().enumerate() {
+            let ms = median(t[ti].clone());
+            if tile == 0 {
+                chunk += ms * launches as f64;
+            }
+            let tag = if tile == 0 { format!("pick{pick}") } else { format!("{tile}") };
+            line += &format!(" | {tag} {ms:.3} ms {:5.1} TF{}", tf / ms, if same[ti] { "" } else { " BITS DIFFER" });
+        }
+        eprintln!("{line}");
+    }
+    eprintln!("SERVE chunk sum at the pick: {chunk:.1} ms");
+}
+
 /// The golden of GLM's P2 dense GEMM (`testdata/gpu/golden_glm_p2_dense.txt`, scripts/gpu_gate.sh): hashes of its outputs in both K orders
 /// on synthetic layers of the GLM shapes, at widths that are and are not multiples of a tile, through the default tile and a forced one
 /// (the same bits), and of the gated MLP; committed so that a change that moves a P2 bit shows up in the gate (and the arithmetic id
