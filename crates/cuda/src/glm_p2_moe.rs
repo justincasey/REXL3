@@ -729,7 +729,27 @@ pub fn combine_dims(
     d: &MoeDims,
     st: &Stream,
 ) -> Result<(), CudaError> {
-    let row_bytes = rows * d.hidden * 4;
+    combine_dims_rows(mode, y, pick, wts, shared, parts, out, 0, rows, d, st)
+}
+
+/// [`combine_dims`] on rows `row0 .. row0 + rows` of every row-indexed buffer (the pairs of those rows in `y`, `pick`, `wts`; the rows
+/// of `shared`, the parts and `out`, each from row 0): exactly the whole call's operations on those rows (every row is its own sum), so
+/// a caller may run a chunk's rows in several calls, e.g. the rows a TP rank sends its peer first.
+#[allow(clippy::too_many_arguments)]
+pub fn combine_dims_rows(
+    mode: CombineMode,
+    y: &DevBuf,
+    pick: &DevBuf,
+    wts: &DevBuf,
+    shared: Option<&DevBuf>,
+    parts: Option<(&DevBuf, &DevBuf)>,
+    out: &mut DevBuf,
+    row0: usize,
+    rows: usize,
+    d: &MoeDims,
+    st: &Stream,
+) -> Result<(), CudaError> {
+    let (rb, end) = (d.hidden * 4, (row0 + rows) * d.hidden * 4);
     // `All` is the one-group part: every expert id below the cut (the cut at E), group 0 alone
     let (m, only, gsplit) = match mode {
         CombineMode::Both => (0, 0, group_split(d.experts)),
@@ -738,28 +758,29 @@ pub fn combine_dims(
         CombineMode::All => (1, 0, d.experts),
         CombineMode::Parts => (2, 0, group_split(d.experts)),
     };
+    let pairs_end = (row0 + rows) * d.topk;
     if rows == 0
-        || out.bytes() < row_bytes
-        || (m != 2
-            && (y.bytes() < rows * d.topk * d.hidden * 4 || pick.bytes() < rows * d.topk * 4 || wts.bytes() < rows * d.topk * 2))
-        || (m == 2 && !parts.is_some_and(|(a, b)| a.bytes() >= row_bytes && b.bytes() >= row_bytes))
-        || shared.is_some_and(|b| b.bytes() < row_bytes)
+        || out.bytes() < end
+        || (m != 2 && (y.bytes() < pairs_end * d.hidden * 4 || pick.bytes() < pairs_end * 4 || wts.bytes() < pairs_end * 2))
+        || (m == 2 && !parts.is_some_and(|(a, b)| a.bytes() >= end && b.bytes() >= end))
+        || shared.is_some_and(|b| b.bytes() < end)
     {
         return Err(INVALID);
     }
+    let (off, poff) = (row0 * rb, row0 * d.topk);
     let null = core::ptr::null();
-    let (p0, p1) = parts.map_or((null, null), |(a, b)| (a.ptr() as *const _, b.ptr() as *const _));
-    // SAFETY: the sizes were checked above
+    let (p0, p1) = parts.map_or((null, null), |(a, b)| (a.ptr_at(off) as *const _, b.ptr_at(off) as *const _));
+    // SAFETY: every buffer holds the rows (or their pairs) up to row0 + rows (checked above); mode 2 reads no pair buffer
     unsafe {
         check(ffi::gb_glm_p2m_combine(
             m,
-            y.ptr(),
-            pick.ptr(),
-            wts.ptr(),
-            shared.map_or(null, |b| b.ptr() as *const _),
+            if m == 2 { null } else { y.ptr_at(poff * d.hidden * 4) as *const _ },
+            if m == 2 { null } else { pick.ptr_at(poff * 4) as *const _ },
+            if m == 2 { null } else { wts.ptr_at(poff * 2) as *const _ },
+            shared.map_or(null, |b| b.ptr_at(off) as *const _),
             p0,
             p1,
-            out.ptr(),
+            out.ptr_at(off),
             rows as i32,
             d.topk as i32,
             d.hidden as i32,

@@ -240,8 +240,9 @@ impl GlmTp {
     /// The first half of a P2 MoE layer on this rank: the rank's pairs (`glm_p2_moe::pairs_rank` on the global picks in `s`, or
     /// `pairs_subbanks_rank` for a share of several subbanks, whose split gate/up subbank runs through the decode scratch `sd`), its part
     /// (`Own(rank)`), and the swap of the parts queued on the exchange stream (with `split`: only the peer's rows of this rank's part go,
-    /// only this rank's rows of the peer's come). The caller may queue replicated work on `st` (the shared expert; with `split` on this
-    /// rank's rows only) before [`GlmTp::p2_finish`].
+    /// only this rank's rows of the peer's come; only the peer's rows are summed here, this rank's own in [`GlmTp::p2_finish`] /
+    /// [`GlmTp::p2_finish_own_rows`], after the caller's work, so the swap runs beside that work). The caller may queue replicated work on
+    /// `st` (the shared expert; with `split` on this rank's rows only) before [`GlmTp::p2_finish`].
     #[allow(clippy::too_many_arguments)]
     pub(in crate::families::glm::model) fn p2_begin(
         &mut self,
@@ -296,9 +297,12 @@ impl GlmTp {
             p2.zero_copy = Some(z);
         } else if t.ranks == 2 {
             let r = t.rank;
-            glm_p2_moe::combine_dims(own_part, &s.y_pairs, &s.pick, &s.wts, None, None, &mut p2.parts[r], rows, &d, st)?;
-            mark("combine")?;
-            // the swap on its own stream, after the part
+            // with a row split, only the part's rows the peer reads before the swap: this rank's own rows are summed in `p2_finish*`,
+            // after the caller's shared expert, so the swap runs beside that expert and nothing else reads memory with it (every row is its
+            // own sum: the two calls are the one call's operations); else every row before the swap
+            let first = split.map_or((0, rows), |sp| (sp.plo, sp.phi - sp.plo));
+            glm_p2_moe::combine_dims_rows(own_part, &s.y_pairs, &s.pick, &s.wts, None, None, &mut p2.parts[r], first.0, first.1, &d, st)?;
+            // the swap on its own stream, after the rows it sends
             gb_cuda::graph::fork(st, &p2.stream, &p2.ready)?;
             let rb = p2.hidden * 4;
             let (soff, sbytes, roff, rbytes) = match split {
@@ -321,6 +325,7 @@ impl GlmTp {
             )?;
             let bytes = sbytes.max(rbytes);
             p2.done.record(&p2.stream)?;
+            mark("combine")?;
             self.exchanged_bytes += bytes as u64;
             self.exchanges += 1;
             p2.swaps += 1;
@@ -330,8 +335,9 @@ impl GlmTp {
     }
 
     /// The second half: wait for the swap, then `out = (part_0 + part_1) + shared` (a group of one rank: the one-node combine of its pairs).
-    /// With `split` (the one `p2_begin` took): the sum on this rank's rows only (`shared` holds those rows), then the output rows swapped
-    /// with the peer's on the exchange stream, which `st` waits for.
+    /// With `split` (the one `p2_begin` took): this rank's own rows of its part first (`p2_begin` summed only the peer's), then the sum on
+    /// this rank's rows only (`shared` holds those rows), then the output rows swapped with the peer's on the exchange stream, which `st`
+    /// waits for.
     pub(in crate::families::glm::model) fn p2_finish(
         &mut self,
         d: &MoeDims,
@@ -342,6 +348,9 @@ impl GlmTp {
         st: &Stream,
     ) -> Result<(), ModelError> {
         let t = self.comm.topology();
+        if let Some(sp) = split.filter(|_| t.ranks == 2) {
+            self.p2_own_rows_part(d, s, sp, st)?;
+        }
         let p2 = self
             .p2
             .as_mut()
@@ -389,17 +398,19 @@ impl GlmTp {
         Ok(())
     }
 
-    /// [`GlmTp::p2_finish`] of a row-split chunk under the sequence-parallel residual (`GlmModel::run`'s `sp`): the parts' sum on this
-    /// rank's rows `[sp.lo, sp.hi)` of `out` alone, and no output swap (the rank's residual holds only its own rows). The rows it writes
-    /// are `p2_finish`'s with `Some(sp)`: the same sum of the same values.
+    /// [`GlmTp::p2_finish`] of a row-split chunk under the sequence-parallel residual (`GlmModel::run`'s `sp`): this rank's own rows of its
+    /// part, then the parts' sum on those rows `[sp.lo, sp.hi)` of `out` alone, and no output swap (the rank's residual holds only its own
+    /// rows). The rows it writes are `p2_finish`'s with `Some(sp)`: the same sum of the same values.
     pub(in crate::families::glm::model) fn p2_finish_own_rows(
         &mut self,
         d: &MoeDims,
+        s: &PrefillScratch,
         shared: Option<&DevBuf>,
         out: &mut DevBuf,
         sp: RowSplit,
         st: &Stream,
     ) -> Result<(), ModelError> {
+        self.p2_own_rows_part(d, s, sp, st)?;
         let p2 = self
             .p2
             .as_mut()
@@ -407,6 +418,19 @@ impl GlmTp {
         p2.pending.take().ok_or_else(|| ModelError::Config("a P2 exchange finished before it began".into()))?;
         gb_cuda::graph::wait(st, &p2.done)?;
         glm_p2_moe::combine_parts_rows(shared, (&p2.parts[0], &p2.parts[1]), out, sp.lo, sp.rows(), d, st)?;
+        Ok(())
+    }
+
+    /// This rank's own rows `[sp.lo, sp.hi)` of its part (the rows of a row-split layer `p2_begin` left out: neither the swap in flight
+    /// reads nor writes them), with `p2_begin`'s combine mode.
+    fn p2_own_rows_part(&mut self, d: &MoeDims, s: &PrefillScratch, sp: RowSplit, st: &Stream) -> Result<(), ModelError> {
+        let r = self.comm.topology().rank;
+        let own_part = if self.width.is_some() { CombineMode::All } else { CombineMode::Own(r) };
+        let p2 = self
+            .p2
+            .as_mut()
+            .ok_or_else(|| ModelError::Config("a P2 MoE layer on a rank built without the P2 exchange".into()))?;
+        glm_p2_moe::combine_dims_rows(own_part, &s.y_pairs, &s.pick, &s.wts, None, None, &mut p2.parts[r], sp.lo, sp.rows(), d, st)?;
         Ok(())
     }
 }
