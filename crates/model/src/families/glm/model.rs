@@ -405,8 +405,9 @@ pub struct GlmModel {
     /// `snap`. Ascending, each strictly inside the chunk, only ever set for a chunk of more than `MAX_ROWS` rows. Empty for every other call.
     snap_cuts: Vec<snapshot::InChunkCut>,
     /// Per slot, the snapshot to take inside the slot's next P2 prompt forward that passes its length ([`GlmModel::arm_cut`], the
-    /// tensor-parallel end cut: `snapshot.rs`): every KDA layer splits that sequence's chunked recurrence there and copies its state out
-    /// between the two segments; the rest is copied after the forward ([`GlmModel::finish_cut`]). `None` for every slot otherwise.
+    /// tensor-parallel end cut: `snapshot.rs`): every KDA layer splits that sequence's chunked recurrence there and copies its conv
+    /// history out between the two segments; the state and the rest are copied after the forward ([`GlmModel::finish_cut`]). `None` for
+    /// every slot otherwise.
     armed: Vec<Option<snapshot::ArmedCut>>,
     /// Under P2, each slot's open prefill SEGMENT (`docs/GLM_PREFILL_P2.md` 8.1): `(anchor, next)`, the segment's first position and the
     /// position after its last prefilled row. The KDA chunks of a segment are 16-row runs from its anchor, so a prompt chunk that continues
@@ -1248,18 +1249,25 @@ impl GlmModel {
         }
         // a prompt forward paused at a layer boundary keeps its rows of the streams in the stash: what runs meanwhile must fit it
         self.check_room(b)?;
-        // an armed cut inside a sequence is taken by the P2 chunked recurrence alone (`arm_cut` refuses every other model; refused
-        // here too, by name, for any other forward that would pass it, before any work)
+        // an armed cut inside a sequence is taken by the P2 chunked recurrence alone, with fewer than 16 rows of the sequence after it
+        // (one piece of the recurrence: `snapshot::save_armed`); `arm_cut` refuses every other model, and any other forward that would
+        // pass it is refused here, by name, before any work
+        let armed_tail_ok = (0..b.n_seq()).all(|i| {
+            self.armed_row(b, i).is_none_or(|row| b.seq_rows(i).len() - row < gb_cuda::kda::P2_CHUNK_ROWS)
+        });
         let armed_inside = (0..b.n_seq()).any(|i| self.armed_row(b, i).is_some());
         if armed_inside
             && !(mode == Mode::Prefill
                 && self.prefill == PrefillContract::P2
                 && self.p2_kda_chunked
-                && self.snap_cuts.is_empty())
+                && self.snap_cuts.is_empty()
+                && armed_tail_ok)
         {
-            return Err(ModelError::Request(
-                "a snapshot armed inside a forward is taken by a P2 prompt forward on the chunked KDA recurrence alone".into(),
-            ));
+            return Err(ModelError::Request(format!(
+                "a snapshot armed inside a forward is taken by a P2 prompt forward on the chunked KDA recurrence alone, fewer than {} rows \
+                 before its sequence's end",
+                gb_cuda::kda::P2_CHUNK_ROWS
+            )));
         }
         // under P2 each prompt joins (or opens) its slot's prefill segment, on the segment's 16-row grid (refused otherwise, before any work)
         let segs = if mode == Mode::Prefill && self.prefill == PrefillContract::P2 {

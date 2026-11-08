@@ -52,7 +52,7 @@ impl GlmTp {
     /// leave the one launch's bits; so does a forward of several prompts, whose recurrences never read each other's rows). Without `o`
     /// (the last layer of a forward whose tail runs on the head rows, `ops::plan_forward_head_rows`) it stops at the core output, this
     /// rank's columns of every row ([`GlmTp::kda_head_rows_p2`] gathers the head rows'). After a segment that ends at its slot's armed cut
-    /// (`KdaSeg::cut`) `at_cut(pool, slot)` copies the slot's state out (`snapshot::save_armed`), before the next segment runs on it.
+    /// (`KdaSeg::cut`) `at_cut(pool, slot)` copies the slot's conv history out (`snapshot::save_armed`), before the next segment runs on it.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::families::glm::model) fn kda_split_layer_p2(
         &mut self,

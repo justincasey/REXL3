@@ -14,8 +14,8 @@
 //! the calls of `tp.rs` (`EnableSnapshots`, `Snapshot`, `Restore`, `Release`, `ArmCut`). A snapshot is taken BETWEEN chunks: a slice
 //! ends at each cut (`prefix::plan_slice` with `split_ok` false), which moves no bit; except the cut a prompt's last slice passes within
 //! its last 16 rows (the end cut moved down to the P2 grid, [`GlmTpBackend::inner_cut`]): that slice runs to the prompt's end, every rank
-//! is told the cut before the forward (`ArmCut`), and each KDA layer copies its state out at the cut between the two segments of its
-//! recurrence (`GlmModel::arm_cut`), so the snapshot costs no forward of its own (`REXL3_GLM_TP_INNER_CUT=0`: the slice ends at the cut,
+//! is told the cut before the forward (`ArmCut`), and each KDA layer splits its recurrence at the cut (the state there is kept by the
+//! layer's other state buffer, its conv history copied out: `GlmModel::arm_cut`), so the snapshot costs no forward of its own (`REXL3_GLM_TP_INNER_CUT=0`: the slice ends at the cut,
 //! as before). Rank 0 translates its own handles to the sequence number of the `Snapshot` call that made them, which is what
 //! a follower keys its handle by. The snapshot, restore and release are cache calls (`lockstep::TpLeader::forward_cache_call`): rank 0 waits
 //! for every rank's answer to a snapshot and a restore, keeps every rank's content digest of each snapshot in its `lockstep::SnapshotBook`,
