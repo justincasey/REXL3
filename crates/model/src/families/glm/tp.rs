@@ -10,14 +10,16 @@
 //! combine (`docs/GLM_TP.md` 11).
 //!
 //! **The prefix cache** (`docs/GLM_TP.md` 4.2, Nemotron's protocol 4 made for GLM): rank 0's engine decides every hit; each rank snapshots and
-//! restores ITS OWN state, between two chunks only (a rank of a KDA head split runs each chunk's KDA whole), and nothing but these calls
-//! travels: [`GlmCall::EnableSnapshots`] (kind 48, the pool at boot), [`GlmCall::Snapshot`] (49), [`GlmCall::Restore`] (50) and
-//! [`GlmCall::Release`] (51). A snapshot's handle is keyed by the sequence number of the call that made it ([`apply_prefix`]), never by a
-//! rank-local slot or page id. `Snapshot`, `Restore` and `Release` are cache calls (`lockstep::TpLeader::forward_cache_call`): each rank
-//! answers a snapshot with the content digest of what it captured ([`take_snapshot`], `GlmModel::seal_snapshot`) and a restore with the
-//! digest of the state it restored (`GlmModel::prefix_state_digest`), rank 0 uses a restore only when every rank's digest equals its own
-//! at snapshot time (`lockstep::SnapshotBook`), and anything else falls back to a cold prefill on every rank. The arena is a fact of the
-//! Hello ([`GlmFacts::cache_request`] and the three after it).
+//! restores ITS OWN state, and nothing but these calls travels: [`GlmCall::EnableSnapshots`] (kind 48, the pool at boot),
+//! [`GlmCall::Snapshot`] (49), [`GlmCall::Restore`] (50), [`GlmCall::Release`] (51) and [`GlmCall::ArmCut`] (52). A snapshot is the
+//! state between two chunks, or, armed before the forward ([`GlmCall::ArmCut`], the end cut of a prompt whose last slice runs to its
+//! end), the state at a 16-row boundary inside it, which every KDA layer copies out between the two segments of its recurrence
+//! (`GlmModel::arm_cut`). A snapshot's handle is keyed by the sequence number of the call that made it ([`apply_prefix`]), never by a
+//! rank-local slot or page id. `Snapshot`, `Restore`, `Release` and `ArmCut` are cache calls (`lockstep::TpLeader::forward_cache_call`):
+//! each rank answers a snapshot with the content digest of what it captured ([`take_snapshot`], `GlmModel::seal_snapshot`) and a
+//! restore with the digest of the state it restored (`GlmModel::prefix_state_digest`), rank 0 uses a restore only when every rank's
+//! digest equals its own at snapshot time (`lockstep::SnapshotBook`), and anything else falls back to a cold prefill on every rank. The
+//! arena is a fact of the Hello ([`GlmFacts::cache_request`] and the three after it).
 //!
 //! **Determinism** (`NEMOTRON_TP.md` 5.4, made for GLM in `docs/GLM_TP.md` section 2): every call's result is a pure function of the weights
 //! and the call's arguments. `begin_slot` / `end_slot` / `commit` / `flush` move host books (the page table, the pending keep counts) and
@@ -27,6 +29,7 @@
 //! No clock, RNG or environment read reaches the arithmetic or the stream except those in [`GlmFacts`] and the geometry of the gate.
 
 use super::alloc::{TOKENIZER_VOCAB, WINDOW_ROWS};
+use super::model::snapshot::FinishedCut;
 use super::model::{DraftAsk, Drafts, GlmModel, ModelOptions, TapBook};
 use super::profile_slices::Kind;
 use super::tp_mtp::{self, GlmMtpRuntime};
@@ -51,11 +54,11 @@ pub const K_ENABLE_SNAPSHOTS: u8 = 48;
 pub const K_SNAPSHOT: u8 = 49;
 pub const K_RESTORE: u8 = 50;
 pub const K_RELEASE: u8 = 51;
+pub const K_ARM_CUT: u8 = 52;
 
 /// The family's own commands (kinds `32..=127`): the NextN draft (`tp_mtp`, lane L12: [`GlmCall::MtpDraft`] kind 32,
-/// [`GlmCall::MtpDisable`] kind 33), an image chunk ([`PrefillImage`], kind 40: `tp_vision.rs`, lane L13) and the prefix cache's four
-/// (kinds 48 to 51, [`apply_prefix`]). A snapshot is taken between two chunks only: an in-chunk cut is never a call. Not `Eq`: the draft
-/// call carries sampling settings (`f32`s).
+/// [`GlmCall::MtpDisable`] kind 33), an image chunk ([`PrefillImage`], kind 40: `tp_vision.rs`, lane L13) and the prefix cache's five
+/// (kinds 48 to 52, [`apply_prefix`]). Not `Eq`: the draft call carries sampling settings (`f32`s).
 #[derive(Clone, Debug, PartialEq)]
 pub enum GlmCall {
     /// `GlmModel::mtp_draft_keyed(asks, keyed)`: rank 0's asks (slot, the sequence's tokens, the depth its arbiter chose) and every ask's
@@ -81,7 +84,8 @@ pub enum GlmCall {
     EnableSnapshots { slots: u32 },
     /// `alloc_snapshot`, `prefix_snapshot(slot, snap, len)`, `retain_prefix_pages(slot, len)` and `seal_snapshot` on the rank's OWN state,
     /// all inside the call ([`take_snapshot`]: the retain moves the KV table's references, so it is part of the stream): the state after the
-    /// chunk that ended at `len`. A follower keeps its handle by this call's sequence number. A cache call: answered with
+    /// chunk that ended at `len`, or the one armed at `len` inside the forward that passed it (`finish_cut` instead of the alloc and the
+    /// copy). A follower keeps its handle by this call's sequence number. A cache call: answered with
     /// `lockstep::taken_digest` of the snapshot's content digest, or `lockstep::SNAPSHOT_SKIPPED` when the rank's pool had no free slot.
     Snapshot { slot: u32, len: u32 },
     /// `restore_prefix(slot, snap, pages, len)` of the snapshot the call numbered `of` made (each rank's own handle of it). A cache call:
@@ -90,6 +94,10 @@ pub enum GlmCall {
     /// `release_prefix(snap, pages)` of the snapshot the call numbered `of` made. A follower never evicts on its own: rank 0's engine
     /// decides, and this call carries the decision. A rank that holds no such snapshot (one it skipped) answers Ok.
     Release { of: u64 },
+    /// `GlmModel::arm_cut(slot, at)` on the rank's own state: the snapshot of `slot` after `at` tokens is taken inside its next prompt
+    /// forward, and the `Snapshot { slot, len: at }` after that forward completes it ([`take_snapshot`]). A cache call, not waited for
+    /// (a rank that could not arm it answers that `Snapshot` with an error or a skip, and rank 0 releases whatever any rank took).
+    ArmCut { slot: u32, at: u32 },
 }
 
 impl GlmCall {
@@ -97,7 +105,11 @@ impl GlmCall {
     pub fn is_prefix(&self) -> bool {
         matches!(
             self,
-            GlmCall::EnableSnapshots { .. } | GlmCall::Snapshot { .. } | GlmCall::Restore { .. } | GlmCall::Release { .. }
+            GlmCall::EnableSnapshots { .. }
+                | GlmCall::Snapshot { .. }
+                | GlmCall::Restore { .. }
+                | GlmCall::Release { .. }
+                | GlmCall::ArmCut { .. }
         )
     }
 }
@@ -341,6 +353,7 @@ impl FamilyCall for GlmCall {
             GlmCall::Snapshot { .. } => K_SNAPSHOT,
             GlmCall::Restore { .. } => K_RESTORE,
             GlmCall::Release { .. } => K_RELEASE,
+            GlmCall::ArmCut { .. } => K_ARM_CUT,
         }
     }
     fn name(&self) -> &'static str {
@@ -355,6 +368,7 @@ impl FamilyCall for GlmCall {
             GlmCall::Snapshot { .. } => "prefix_snapshot",
             GlmCall::Restore { .. } => "restore_prefix",
             GlmCall::Release { .. } => "release_prefix",
+            GlmCall::ArmCut { .. } => "arm_cut",
         }
     }
     fn encode(&self, e: &mut Enc) {
@@ -380,6 +394,10 @@ impl FamilyCall for GlmCall {
                 e.u64(*of);
             }
             GlmCall::Release { of } => e.u64(*of),
+            GlmCall::ArmCut { slot, at } => {
+                e.u32(*slot);
+                e.u32(*at);
+            }
         }
     }
     fn decode(kind: u8, d: &mut Dec<'_>) -> Result<Option<Self>, WireError> {
@@ -402,6 +420,7 @@ impl FamilyCall for GlmCall {
                 of: d.u64("glm restore handle")?,
             }),
             K_RELEASE => Some(GlmCall::Release { of: d.u64("glm release handle")? }),
+            K_ARM_CUT => Some(GlmCall::ArmCut { slot: d.u32("glm arm cut slot")?, at: d.u32("glm arm cut length")? }),
             _ => None,
         })
     }
@@ -808,19 +827,34 @@ pub trait PrefixRuntime: LockstepRuntime<Call = GlmCall> {
     fn kv_pages(&self) -> (usize, Vec<usize>);
     /// A follower's handles ([`apply_prefix`]).
     fn snapshot_handles(&mut self) -> &mut SnapHandles;
+    /// `GlmModel::cuts_inside_forwards`: whether the rank takes a snapshot inside a prompt forward ([`GlmCall::ArmCut`]); rank 0 arms
+    /// one only when it does (every rank of a group shares the facts it depends on: the contract, the drafter, the cache).
+    fn cuts_inside_forwards(&self) -> bool;
+    /// `GlmModel::arm_cut(slot, at)`: whether a snapshot slot was free.
+    fn arm_cut(&mut self, slot: usize, at: usize) -> Result<bool, ModelError>;
+    /// `GlmModel::finish_cut(slot, len)`.
+    fn finish_cut(&mut self, slot: usize, len: usize) -> Result<FinishedCut, ModelError>;
 }
 
 /// The snapshot of a [`GlmCall::Snapshot`], on any rank (rank 0 runs it as the local half of the call it forwards, a follower in
-/// [`apply_prefix`]): a free snapshot slot, the copy of `slot`'s state after `len` tokens, then the references to its pages, as
-/// `GlmBackend` takes a snapshot at a slice end. `None`: no free slot (skipped on every rank alike, not an error); the slot is given back
-/// if the copy fails.
+/// [`apply_prefix`]): the snapshot armed at `len` inside the forward that just ran ([`GlmCall::ArmCut`], completed here), or a free
+/// snapshot slot and the copy of `slot`'s state after `len` tokens (a chunk just ended there); then the references to its pages and the
+/// seal, as `GlmBackend` takes a snapshot. `None`: no free slot (skipped on every rank alike, not an error); the slot is given back if
+/// the copy fails.
 pub fn take_snapshot<R: PrefixRuntime + ?Sized>(r: &mut R, slot: usize, len: usize) -> Result<Option<Taken>, ModelError> {
-    let Some(snap) = r.alloc_snapshot() else { return Ok(None) };
-    let mtp_ok = match r.prefix_snapshot(slot, snap, len) {
-        Ok(ok) => ok,
-        Err(e) => {
-            r.release_prefix(snap, &[]);
-            return Err(e);
+    let (snap, mtp_ok) = match r.finish_cut(slot, len)? {
+        // a rank that arms has no NextN layer: there is no drafter book to be unsound (`SnapMeta::mtp_ok`)
+        FinishedCut::Taken(snap) => (snap, true),
+        FinishedCut::Skipped => return Ok(None),
+        FinishedCut::NotArmed => {
+            let Some(snap) = r.alloc_snapshot() else { return Ok(None) };
+            match r.prefix_snapshot(slot, snap, len) {
+                Ok(ok) => (snap, ok),
+                Err(e) => {
+                    r.release_prefix(snap, &[]);
+                    return Err(e);
+                }
+            }
         }
     };
     let pages = r.retain_prefix_pages(slot, len);
@@ -863,6 +897,7 @@ pub fn apply_prefix<R: PrefixRuntime + ?Sized>(r: &mut R, seq: u64, call: GlmCal
             }
             Ok(CallReply::NONE)
         }
+        GlmCall::ArmCut { slot, at } => r.arm_cut(slot as usize, at as usize).map(|took| CallReply::digest(u64::from(took))),
         other => Err(ModelError::Request(format!("{} is not a prefix-cache call", other.name()))),
     }
 }
@@ -911,6 +946,15 @@ impl PrefixRuntime for GlmRank {
     }
     fn snapshot_handles(&mut self) -> &mut SnapHandles {
         &mut self.snaps
+    }
+    fn cuts_inside_forwards(&self) -> bool {
+        self.m.cuts_inside_forwards()
+    }
+    fn arm_cut(&mut self, slot: usize, at: usize) -> Result<bool, ModelError> {
+        self.m.arm_cut(slot, at)
+    }
+    fn finish_cut(&mut self, slot: usize, len: usize) -> Result<FinishedCut, ModelError> {
+        self.m.finish_cut(slot, len)
     }
 }
 
@@ -1048,9 +1092,9 @@ mod tests {
         b.iter().map(|x| format!("{x:02x}")).collect()
     }
 
-    /// The prefix cache's four calls (kinds 48 to 51): their bytes are pinned (length, protocol 5, kind, seq, then the body: `slots`;
-    /// `slot`, `len`; `slot`, `len`, `of`; `of`, little-endian), each round-trips, and the kinds are the family's own, clear of the core's,
-    /// the draft calls' and the image chunk's.
+    /// The prefix cache's five calls (kinds 48 to 52): their bytes are pinned (length, protocol 5, kind, seq, then the body: `slots`;
+    /// `slot`, `len`; `slot`, `len`, `of`; `of`; `slot`, `at`, little-endian), each round-trips, and the kinds are the family's own,
+    /// clear of the core's, the draft calls' and the image chunk's.
     #[test]
     fn the_snapshot_calls_have_these_exact_bytes_and_round_trip() {
         use crate::lockstep::Msg;
@@ -1074,6 +1118,7 @@ mod tests {
                 "1a00000005320d0000000000000002000000100100000c00000000000000",
             ),
             (GlmCall::Release { of: 12 }, K_RELEASE, "release_prefix", "1200000005330e000000000000000c00000000000000"),
+            (GlmCall::ArmCut { slot: 1, at: 272 }, K_ARM_CUT, "arm_cut", "1200000005340f000000000000000100000010010000"),
         ];
         for (i, (c, kind, name, golden)) in calls.iter().enumerate() {
             let seq = 11 + i as u64;

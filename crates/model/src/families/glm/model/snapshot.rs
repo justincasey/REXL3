@@ -20,10 +20,11 @@
 use super::{DevBuf, GlmModel, SpliceOp, TapBook};
 use crate::draft::Draft;
 use crate::error::ModelError;
-use crate::families::glm::alloc::MTP_TAP_CAP;
+use crate::families::glm::alloc::{MTP_TAP_CAP, RING_LEN};
 use crate::families::glm::config::GlmConfig;
 use crate::families::glm::prefix::{self, SnapLayout, MAX_TAIL_ROWS, RING_ROW_BYTES};
 use crate::forward::Candidates;
+use crate::rows::RowBatch;
 use crate::kvtables::BLOCK_TOKENS;
 use gb_cuda::dflash2::DraftCtxLayout;
 use gb_cuda::{dsa, kda, Stream};
@@ -51,6 +52,51 @@ pub struct InChunkCut {
     pub at: usize,
     pub snap: u32,
     pub slot: usize,
+}
+
+/// A snapshot armed inside the slot's next prompt forward that passes `at` ([`GlmModel::arm_cut`]: the tensor-parallel end cut, whose
+/// last slice runs to the prompt's end instead of ending at the cut).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArmedCut {
+    /// Tokens of the prompt the snapshot is the state after.
+    pub at: usize,
+    /// Its snapshot slot; `None`: the pool had no free slot (skipped, as a snapshot between forwards is skipped then).
+    pub snap: Option<u32>,
+    /// KDA layers whose conv history at `at` was copied out so far ([`save_armed`]).
+    pub saved: usize,
+}
+
+/// What [`GlmModel::finish_cut`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FinishedCut {
+    /// Nothing armed at that length: the snapshot is one between forwards ([`GlmModel::prefix_snapshot`]).
+    NotArmed,
+    /// Armed without a free slot: no snapshot.
+    Skipped,
+    /// The snapshot is complete in this slot (not yet sealed: its pages are the caller's to retain).
+    Taken(u32),
+}
+
+/// After a KDA layer's recurrence segment that ends at `slot`'s armed cut (`KdaSeg::cut`): the layer's conv history copied into the
+/// armed snapshot slot (stream-ordered before the next segment shifts it; no sync), and the layer counted. Its state needs no copy now:
+/// the rest of the sequence after the cut is fewer than [`gb_cuda::kda::P2_CHUNK_ROWS`] rows, one piece of the chunked recurrence,
+/// which reads the current state buffer, writes the other one and flips the parity once, so after the forward the state at the cut is
+/// the buffer the parity does NOT name ([`GlmModel::finish_cut`] copies it).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn save_armed(
+    armed: &mut [Option<ArmedCut>],
+    snaps: &mut Option<SnapPool>,
+    ord: usize,
+    pool: &kda::Pool,
+    slot: usize,
+    dims: kda::Dims,
+    st: &Stream,
+) -> Result<(), ModelError> {
+    let Some(a) = armed.get_mut(slot).and_then(|a| a.as_mut()) else { return Ok(()) };
+    let (Some(snap), Some(sp)) = (a.snap, snaps.as_mut()) else { return Ok(()) };
+    sp.save_conv(snap, ord, pool, slot, dims, st)?;
+    a.saved += 1;
+    Ok(())
 }
 
 /// The snapshot slots of the model.
@@ -173,11 +219,42 @@ impl SnapPool {
         st: &Stream,
     ) -> Result<(), ModelError> {
         st.sync()?;
-        let (e, ce) = (dims.s_buf_elems() * 4, dims.conv_slot_elems() * 2);
+        self.save_state(snap, ord, pool, slot, dims, true, st)?;
+        self.save_conv(snap, ord, pool, slot, dims, st)
+    }
+
+    /// Copy one of the two state buffers of KDA layer `ord` for `slot` into snapshot `snap`: the current one (`current`, the one the
+    /// parity word names) or the other. The host reads the parity word: the stream must be quiet.
+    #[allow(clippy::too_many_arguments)]
+    fn save_state(
+        &mut self,
+        snap: u32,
+        ord: usize,
+        pool: &kda::Pool,
+        slot: usize,
+        dims: kda::Dims,
+        current: bool,
+        st: &Stream,
+    ) -> Result<(), ModelError> {
+        let e = dims.s_buf_elems() * 4;
         let mut par = [0i32; 1];
         pool.parity.download_range(slot * 4, &mut par)?;
-        let cur = (par[0] & 1) as usize;
-        self.kda_s[ord].copy_range_from(snap as usize * e, &pool.s, (slot * 2 + cur) * e, e, st)?;
+        let buf = (par[0] & 1) as usize ^ usize::from(!current);
+        self.kda_s[ord].copy_range_from(snap as usize * e, &pool.s, (slot * 2 + buf) * e, e, st)?;
+        Ok(())
+    }
+
+    /// Copy the conv history of KDA layer `ord` for `slot` into snapshot `snap`: one buffer a slot, so a stream-ordered copy, no sync.
+    fn save_conv(
+        &mut self,
+        snap: u32,
+        ord: usize,
+        pool: &kda::Pool,
+        slot: usize,
+        dims: kda::Dims,
+        st: &Stream,
+    ) -> Result<(), ModelError> {
+        let ce = dims.conv_slot_elems() * 2;
         self.kda_conv[ord].copy_range_from(snap as usize * ce, &pool.conv, slot * ce, ce, st)?;
         Ok(())
     }
@@ -468,6 +545,126 @@ impl GlmModel {
         }
         stream.sync()?;
         Ok(c)
+    }
+
+    /// Whether this model takes a snapshot inside a prompt forward that passes its cut ([`GlmModel::arm_cut`]): the prefix cache is on,
+    /// prompt forwards run P2 on the chunked KDA recurrence (whose segments split at any 16-row boundary), and there is no NextN layer
+    /// (whose carry is the tap of the cut's last row, in a tap buffer of the forward's rows). A KDA head split rank takes them too: the
+    /// split happens per sequence inside each layer's recurrence, on the rank's heads.
+    pub fn cuts_inside_forwards(&self) -> bool {
+        self.snaps.is_some()
+            && self.prefill == crate::families::glm::contract::PrefillContract::P2
+            && self.p2_kda_chunked
+            && self.mtp.is_none()
+    }
+
+    /// Arm a snapshot of `slot` after `at` tokens of its prompt, taken INSIDE the slot's next prompt forward that passes `at` (the
+    /// tensor-parallel end cut: a prompt's last slice runs to its end, and the snapshot at its last 16-row boundary costs no forward of
+    /// its own). Every KDA layer of that forward runs the sequence's chunked recurrence in two segments that meet at `at` and copies its
+    /// conv history out between them ([`save_armed`]; the forward must end fewer than 16 rows after `at`, so the state at `at` is the
+    /// buffer the second segment did not write); a segment boundary on the 16-row grid moves no bit. After the forward
+    /// [`GlmModel::finish_cut`] copies what the forward left that the pages do not carry. Takes a snapshot slot now: `Ok(false)` when
+    /// none is free (the snapshot is skipped). Replaces any snapshot armed for the slot; `begin_slot`, `end_slot` and a restore disarm it.
+    pub fn arm_cut(&mut self, slot: usize, at: usize) -> Result<bool, ModelError> {
+        if !self.cuts_inside_forwards() {
+            return Err(ModelError::Request(
+                "a snapshot inside a prompt forward needs the prefix cache, P2 on the chunked KDA recurrence and no NextN layer".into(),
+            ));
+        }
+        if slot >= self.slots || at == 0 {
+            return Err(ModelError::Request(format!("a snapshot of {at} tokens of slot {slot} of a model of {} slots", self.slots)));
+        }
+        self.disarm(slot);
+        let snap = self.alloc_snapshot();
+        self.armed[slot] = Some(ArmedCut { at, snap, saved: 0 });
+        Ok(snap.is_some())
+    }
+
+    /// Forget `slot`'s armed snapshot, giving its slot back.
+    pub(super) fn disarm(&mut self, slot: usize) {
+        if let Some(ArmedCut { snap: Some(s), .. }) = self.armed.get_mut(slot).and_then(|a| a.take()) {
+            if let Some(sp) = self.snaps.as_mut() {
+                sp.free_slot(s);
+            }
+        }
+    }
+
+    /// The row of sequence `i` of `b` (from its first row) at which its slot's armed snapshot is taken, when it falls strictly inside
+    /// the sequence's rows and holds a snapshot slot.
+    pub(super) fn armed_row(&self, b: &RowBatch, i: usize) -> Option<usize> {
+        let a = self.armed.get(b.seq_slot[i] as usize).copied().flatten().filter(|a| a.snap.is_some())?;
+        let r = b.seq_rows(i);
+        let p0 = b.positions[r.start] as usize;
+        (a.at > p0 && a.at < p0 + r.len()).then(|| a.at - p0)
+    }
+
+    /// Complete the snapshot armed for `slot` at `len` after the forward that passed it ([`GlmModel::arm_cut`]): each KDA layer's state at
+    /// `len` (the buffer the parity does not name: the forward's last segment, fewer than 16 rows, wrote the other one and flipped once),
+    /// the ring tails of the indexer layers (the raw rows of positions `len - len % 4 .. len`, still in each ring: the forward went on
+    /// fewer rows past them than a ring holds), the drafter's window before `len` (absorbed by the forward: the backend named the cut,
+    /// `dflash_prompt_end`) and the slot's meta. [`FinishedCut::NotArmed`] when nothing is armed at `len`, or the forward ended exactly
+    /// at it (then the snapshot is [`GlmModel::prefix_snapshot`]'s, between forwards); an error (the slot given back) when a KDA layer's
+    /// conv history at `len` is missing or the slot's P2 segment does not end fewer than 16 rows after `len` on its grid. Synchronises.
+    pub fn finish_cut(&mut self, slot: usize, len: usize) -> Result<FinishedCut, ModelError> {
+        let Some(a) = self.armed.get(slot).copied().flatten().filter(|a| a.at == len) else { return Ok(FinishedCut::NotArmed) };
+        let Some(snap) = a.snap else {
+            self.armed[slot] = None;
+            return Ok(FinishedCut::Skipped);
+        };
+        if a.saved == 0 && self.p2_seg[slot].is_some_and(|(_, next)| next == len) {
+            self.disarm(slot);
+            return Ok(FinishedCut::NotArmed);
+        }
+        self.armed[slot] = None;
+        match self.finish_armed(slot, snap, a) {
+            Ok(()) => Ok(FinishedCut::Taken(snap)),
+            Err(e) => {
+                if let Some(sp) = self.snaps.as_mut() {
+                    sp.free_slot(snap);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn finish_armed(&mut self, slot: usize, snap: u32, a: ArmedCut) -> Result<(), ModelError> {
+        let len = a.at;
+        if a.saved != self.pools.len() {
+            return Err(ModelError::Request(format!(
+                "the snapshot armed at {len} of slot {slot} holds the conv history of {} of {} KDA layers: no forward since passed it whole",
+                a.saved,
+                self.pools.len()
+            )));
+        }
+        let c = gb_cuda::kda::P2_CHUNK_ROWS;
+        let next = match self.p2_seg[slot] {
+            Some((anchor, next)) if anchor <= len && len < next && next - len < c && (len - anchor) % c == 0 => next,
+            seg => {
+                return Err(ModelError::Request(format!(
+                    "a snapshot armed at {len} of slot {slot}: the slot's P2 segment {seg:?} does not end fewer than {c} rows after it on \
+                     its {c}-row grid"
+                )))
+            }
+        };
+        debug_assert!(next - prefix::ring_tail(len).start <= RING_LEN);
+        // the previous window's commits are applied first and the stream is quiet: the state buffers, the rings and the drafter's ring
+        // are the forward's
+        self.flush()?;
+        self.stream.sync()?;
+        let win = self.dflash_window_of(slot, len, next);
+        let GlmModel { pools, planes, snaps, stream, dflash, kda_dims, .. } = self;
+        let sp = snaps.as_mut().ok_or_else(|| ModelError::Request("the prefix cache is not enabled".into()))?;
+        sp.check_dims(*kda_dims)?;
+        for (ord, pool) in pools.iter().enumerate() {
+            sp.save_state(snap, ord, pool, slot, *kda_dims, false, stream)?;
+        }
+        for (i, pl) in planes.iter().enumerate() {
+            sp.save_ring(snap, i, pl, slot, len, stream)?;
+        }
+        let win = sp.save_window(snap, dflash.as_ref().map(|d| &d.draft), slot, win, stream)?;
+        sp.meta[snap as usize] = Some(SnapMeta { len, mtp_ok: true, digest: None, win });
+        stream.sync()?;
+        Ok(())
     }
 
     /// Take references to the KV pages of the first `len` tokens of `slot` (a snapshot at `len` keeps them alive after the slot is gone) and return them.

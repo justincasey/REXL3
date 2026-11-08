@@ -1097,6 +1097,19 @@ impl gb_model::families::glm::tp::PrefixRuntime for StaleRank {
     fn snapshot_handles(&mut self) -> &mut gb_model::families::glm::tp::SnapHandles {
         self.r.snapshot_handles()
     }
+    fn cuts_inside_forwards(&self) -> bool {
+        self.r.cuts_inside_forwards()
+    }
+    fn arm_cut(&mut self, slot: usize, at: usize) -> Result<bool, gb_model::error::ModelError> {
+        self.r.arm_cut(slot, at)
+    }
+    fn finish_cut(
+        &mut self,
+        slot: usize,
+        len: usize,
+    ) -> Result<gb_model::families::glm::model::snapshot::FinishedCut, gb_model::error::ModelError> {
+        self.r.finish_cut(slot, len)
+    }
 }
 
 impl gb_model::families::glm::tp_mtp::GlmMtpRuntime for StaleRank {
