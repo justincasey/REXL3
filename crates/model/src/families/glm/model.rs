@@ -539,7 +539,7 @@ impl GlmModel {
             mhc: MhcWork::new(cr)?,
             hidden: zv(cr * h * 2)?,
             mixer_out: zv(cr * h * 4)?,
-            kda_qkv: zv(cr * 3 * ch * 4)?,
+            kda_qkv: zv(alloc::kda_qkv_bytes(&cfg, r, cr))?,
             kda_out: zv(cr * ch * 2)?,
             kda_ws: {
                 let mut ws = kda::Workspace::alloc(dims, alloc::kda_prefill_rows(r, cr))?;
@@ -781,10 +781,26 @@ impl GlmModel {
     }
 
     /// The benches' switch of step (e): under P2, the chunked KDA recurrence (true, the contract) or P1's row-by-row path (false, the
-    /// "before" arm of an A/B on one load: its bits are not P2's tag). Never a bit of a P1 chunk or a window.
+    /// "before" arm of an A/B on one load: its bits are not P2's tag). Never a bit of a P1 chunk or a window. The row-by-row path takes a
+    /// chunk's fp32 qkv rows: the buffer grows to them ([`GlmModel::grow_kda_qkv_for_p1`]).
     #[doc(hidden)]
-    pub fn set_p2_kda_chunked(&mut self, on: bool) {
+    pub fn set_p2_kda_chunked(&mut self, on: bool) -> Result<(), ModelError> {
+        if !on {
+            self.grow_kda_qkv_for_p1()?;
+        }
         self.p2_kda_chunked = on;
+        Ok(())
+    }
+
+    /// The KDA qkv rows of P1's prompt path (fp32, every head, a whole chunk), which a model built under P2 does not hold
+    /// (`alloc::kda_qkv_bytes`): the buffer grows to them, once, the captured graphs dropped first (they read the old buffer).
+    fn grow_kda_qkv_for_p1(&mut self) -> Result<(), ModelError> {
+        let need = self.s.rows * 3 * self.cfg.kda.heads * self.cfg.kda.head_dim * 4;
+        if self.s.kda_qkv.bytes() < need {
+            self.clear_graphs()?;
+            self.s.kda_qkv = DevBuf::zeroed_view(need)?;
+        }
+        Ok(())
     }
 
     /// Run a prompt forward's last-layer tail on the head rows alone (true) or on every row (false); the bits are the same either way.
@@ -866,6 +882,8 @@ impl GlmModel {
         if c == PrefillContract::P2 {
             super::contract::check_built(c).map_err(ModelError::Config)?;
             self.check_p2()?;
+        } else {
+            self.grow_kda_qkv_for_p1()?;
         }
         self.prefill = c;
         Ok(())

@@ -21,7 +21,7 @@
 //! experts.run_prefill_f32_wts(&x, Dtype::BF16, rows, None, &mut out_f32, &mut s, &st)?;
 //! ```
 //!
-//! Preconditions (violations return an error, never undefined behaviour): `1 <= rows <= s.max_rows <= MAX_ROWS` (4,096); `experts <= 1024`,
+//! Preconditions (violations return an error, never undefined behaviour): `1 <= rows <= s.max_rows <= MAX_ROWS` (8,192); `experts <= 1024`,
 //! `topk <= 16`; hidden and expert width multiples of 128 (the EXL3 format's); `x` in fp16, bf16 or fp32 `[rows, hidden]`; `shared` fp32
 //! `[rows, hidden]` (a family computes its shared expert itself, e.g. with [`SharedExpert::forward_big`]); an expert id outside `[0, E)`
 //! in a pick (a dropped or unrouted slot) contributes nothing, as in the decode path; `MoeDims::limit <= 0` disables the SwiGLU clamps.
@@ -178,8 +178,9 @@ mod ffi {
 
 const INVALID: CudaError = CudaError(1);
 
-/// Most rows one prefill call takes.
-pub const MAX_ROWS: usize = 4096;
+/// Most rows one prefill call takes. Nothing in a call's arithmetic depends on it (a row's bits are its own and its experts'): it bounds
+/// the scratch, whose largest products stay far inside the kernels' size_t offsets (8,192 rows x top-8 x 4,096 x 4 B of `y_pairs` = 1 GiB).
+pub const MAX_ROWS: usize = 8192;
 
 /// Picks per block of the parallel plan (`csrc/moe_prefill.cu` `kPlanChunk`). The parallel plan's histogram and
 /// scatter grids are `ceil(P / PLAN_CHUNK)` blocks; it is only a partitioning constant, never part of an arithmetic.

@@ -286,13 +286,16 @@ pub fn step_sites_for(window_rows: usize) -> Vec<usize> {
 /// Lane T: the P2 part swap's own sites (`tp_roce::SiteUser::PartSwap`), one fp32 row a prompt row (16 KiB a row): 8 MiB (512 rows),
 /// 32 MiB (2,048) and 64 MiB (4,096 = the P2c4096 chunk), eager prefill sites the P2 combine writes into in place
 /// (`tp_roce::RoceTp::zero_copy_swap`); `REXL3_ROCE_MAX_BYTES=1048576` keeps the swap on NCCL. 4 x 104 MiB = 416 MiB of pinned host
-/// memory a rank, registered only under the P2 contract (a Hello fact; the plan is in the collective fact, [`collective_fact`]).
+/// memory a rank, registered only under the P2 contract (a Hello fact; the plan is in the collective fact, [`collective_fact`]). A chunk
+/// of more than 4,096 rows is row-split (`model::tp::RowSplit`): its part and output swaps carry half its rows a way, 64 MiB at 8,192.
 pub const ROCE_SITES_PART_SWAP: [usize; 3] = [8 << 20, 32 << 20, 64 << 20];
 
 /// Lane T, for P5b: the prefill KDA-out gather's own sites (`SiteUser::PrefillGather`: lane E's gathered heads, fp16 halves, 8 KiB a
 /// row): 4 MiB (512 rows), 16 MiB (2,048) and 32 MiB (4,096). Under P2 they would share size classes with the part swap's (32 MiB at
 /// 2,048 / 4,096 rows): separate sites keep each one's order and zero-copy parity. Registered only when P2 runs the KDA split
-/// (`roce_site_plan`'s `kda_gather`, passed by `roce_site_plan_here` since Lane P's P5b): 4 x 52 MiB = 208 MiB a rank.
+/// (`roce_site_plan`'s `kda_gather`, passed by `roce_site_plan_here` since Lane P's P5b): 4 x 52 MiB = 208 MiB a rank. Under the
+/// sequence-parallel residual a chunk of up to 8,192 rows gathers half its rows a way (32 MiB); a chunk of more than 4,096 rows without it
+/// (a snapshot cut inside the chunk) gathers past the top site, over NCCL (the same bytes).
 pub const ROCE_SITES_PREFILL_GATHER: [usize; 3] = [4 << 20, 16 << 20, 32 << 20];
 
 /// The RoCE sites a rank registers, by user (`tp_roce::SitePlan`): the step's [`ROCE_SITES`] always; the part swap's under the P2

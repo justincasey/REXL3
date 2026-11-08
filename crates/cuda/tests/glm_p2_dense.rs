@@ -10,6 +10,8 @@
 //!   path's (`Exl3Weights::forward` in 128-row calls). P2 must be within 1.5x of the decode path's rms error and under 5e-4.
 //! * `p2_rows_are_bit_identical_in_any_call_on_the_glm_shapes`: repeat, slice widths (whole, 256, 129, 128, 100, 17, 1), every tile
 //!   shape, a row permutation, NaN rows after the call's end: bit for bit.
+//! * `p2_rows_of_an_8192_row_call_are_those_of_smaller_calls`: the widest P2 chunk (8,192 rows) on the widest serving shapes equals calls
+//!   of 4,096, 2,731 and 129 rows, bit for bit.
 //! * `glm_chain_has_nemotrons_bits`: GLM's own copy of the kernel in `Chain` order gives Nemotron's `gb_ndm_gemm` bits on every shape
 //!   (the copy is faithful; `Fold128` is the one change).
 //! * `the_p2_gated_mlp_is_row_invariant_and_composes_its_linears`: the gated MLP (shared expert, dense MLP) in pieces of any size
@@ -271,6 +273,40 @@ fn p2_rows_are_bit_identical_in_any_call_on_the_glm_shapes() {
                 "{name:15} {}: bit-identical over runs, tiles {tiles:?}, slices {widths:?}, a permutation and NaN padding",
                 v.id()
             );
+        }
+    }
+}
+
+/// The widest P2 prompt chunk (`moe_prefill::MAX_ROWS`, 8,192 rows: the 128 x 1 tile's 64 row blocks): on the serving shapes whose K or N
+/// is the widest (KDA qkv, MLA o, the dense MLP), an 8,192-row call's rows are bit for bit those of calls of 4,096, 2,731 and 129 rows
+/// (the default tile of each call, so the larger call's tile pick is covered too), in both K orders.
+#[test]
+fn p2_rows_of_an_8192_row_call_are_those_of_smaller_calls() {
+    gpu!();
+    let st = Stream::new().unwrap();
+    let rows = gb_cuda::moe_prefill::MAX_ROWS;
+    assert_eq!(rows, 8192);
+    for (i, &(name, k, n, bits)) in
+        [("kda qkv", 4096usize, 24576usize, 4usize), ("mla o", 16384, 4096, 4), ("dense gate/up", 4096, 12288, 3)].iter().enumerate()
+    {
+        let (w, _) = layer(k, n, bits, 7000 + i as u64);
+        let (xb, _) = activations(700 + i as u64, rows, k, 1.0);
+        let xd = upload(&xb);
+        for v in VARIANTS {
+            let whole = p2v(&w, &xd, rows, v, 0, &st);
+            assert!(whole.iter().all(|v| v.is_finite()) && whole.iter().any(|v| *v != 0.0), "{name}: degenerate");
+            for wd in [4096usize, 2731, 129] {
+                let mut bad = 0;
+                let mut s = 0;
+                while s < rows {
+                    let m = wd.min(rows - s);
+                    let got = p2v(&w, &xd.subview(s * k * 2, m * k * 2), m, v, 0, &st);
+                    bad += got.iter().zip(&whole[s * n..(s + m) * n]).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                    s += m;
+                }
+                assert_eq!(bad, 0, "{name} {}: calls of {wd}: {bad} values differ from the 8,192-row call", v.id());
+            }
+            eprintln!("{name:15} {}: an 8,192-row call == calls of 4,096 / 2,731 / 129 rows, bit for bit", v.id());
         }
     }
 }

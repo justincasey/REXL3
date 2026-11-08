@@ -37,8 +37,9 @@ pub const MAX_PREFILL_CHUNK: usize = 2048;
 pub const SERVER_DEFAULT_PREFILL_CHUNK: usize = 4096;
 
 /// The widest prefill chunk under the P2 prefill contract (Lane P, `contract.rs`): the large-row kernels' own limit
-/// (`gb_cuda::moe_prefill::MAX_ROWS`), Nemotron's P2 slice. P2's prompt rows are chunk-independent, so the width is a speed choice only.
-pub const P2_MAX_PREFILL_CHUNK: usize = 4096;
+/// (`gb_cuda::moe_prefill::MAX_ROWS`, 8,192). P2's prompt rows are chunk-independent, so the width is a speed and memory choice only: a wider
+/// chunk reads every routed expert once for more rows, and its scratch (about 0.6 MiB a row) comes out of what the KV pool may hold.
+pub const P2_MAX_PREFILL_CHUNK: usize = 8192;
 
 /// The prefill chunk a server run takes from `--prefill-chunk N` under the process's prefill contract: see [`prefill_chunk_for_contract`].
 /// Idempotent.
@@ -47,16 +48,15 @@ pub fn prefill_chunk_for(flag: usize) -> usize {
 }
 
 /// [`prefill_chunk_for`] under contract `c`. P1: the server's default (4096, shared by every family) means this family's default (512); any
-/// other value is what was asked for, clamped to `MAX_ROWS..=MAX_PREFILL_CHUNK` (2,048). P2: the server's default means the P2 slice (4,096,
-/// as Nemotron's P2 grants it), any other value clamped to `MAX_ROWS..=P2_MAX_PREFILL_CHUNK` (a value of `MAX_ROWS` or less is refused by
-/// `engine::check_options` before the load: P2's routed experts run in the prefill scratch).
+/// other value is what was asked for, clamped to `MAX_ROWS..=MAX_PREFILL_CHUNK` (2,048). P2: what was asked for (the server's default is
+/// 4,096 rows), clamped to `MAX_ROWS..=P2_MAX_PREFILL_CHUNK` (a value of `MAX_ROWS` or less is refused by `engine::check_options` before the
+/// load: P2's routed experts run in the prefill scratch).
 pub fn prefill_chunk_for_contract(flag: usize, c: super::contract::PrefillContract) -> usize {
     use super::contract::PrefillContract;
-    match (c, flag == SERVER_DEFAULT_PREFILL_CHUNK) {
-        (PrefillContract::P1, true) => DEFAULT_PREFILL_CHUNK,
-        (PrefillContract::P1, false) => flag.clamp(MAX_ROWS, MAX_PREFILL_CHUNK),
-        (PrefillContract::P2, true) => P2_MAX_PREFILL_CHUNK,
-        (PrefillContract::P2, false) => flag.clamp(MAX_ROWS, P2_MAX_PREFILL_CHUNK),
+    match c {
+        PrefillContract::P1 if flag == SERVER_DEFAULT_PREFILL_CHUNK => DEFAULT_PREFILL_CHUNK,
+        PrefillContract::P1 => flag.clamp(MAX_ROWS, MAX_PREFILL_CHUNK),
+        PrefillContract::P2 => flag.clamp(MAX_ROWS, P2_MAX_PREFILL_CHUNK),
     }
 }
 
@@ -83,6 +83,21 @@ pub fn kda_pipe_rows(rows: usize, chunk_rows: usize) -> usize {
     match super::contract::current() {
         super::contract::PrefillContract::P2 if on && chunk_rows > piece => piece,
         _ => 0,
+    }
+}
+
+/// Bytes of the KDA layers' qkv rows (`kda_qkv`) for windows of `rows` and prefill chunks of `chunk_rows`: under P1 a chunk's fp32 rows of
+/// every head (P1's prefill); under the process's P2 contract a window's fp32 rows of every head, or a chunk's bf16 rows of the heads whose
+/// state the model holds (`KdaConfig::state_heads`: a KDA-split rank's half), whichever is larger: all a P2 prompt chunk writes there is
+/// the P2 GEMM's bf16 qkv (a quarter of P1's bytes on a split rank). A model switched to P1, or to P2's row-by-row arm, after its build
+/// grows the buffer then (`GlmModel::set_prefill_contract`, `set_p2_kda_chunked`).
+pub fn kda_qkv_bytes(cfg: &GlmConfig, rows: usize, chunk_rows: usize) -> usize {
+    let ch = cfg.kda.heads * cfg.kda.head_dim;
+    match super::contract::current() {
+        super::contract::PrefillContract::P1 => chunk_rows * 3 * ch * 4,
+        super::contract::PrefillContract::P2 => {
+            (rows * 3 * ch * 4).max(chunk_rows * 3 * cfg.kda.state_heads() * cfg.kda.head_dim * 2)
+        }
     }
 }
 
@@ -343,7 +358,7 @@ impl AllocPlan {
             sc("mhc_work", MhcWork::bytes(chunk_rows) as u64),
             sc("hidden", cr * h * 2),
             sc("mixer_out", cr * h * 4),
-            sc("kda_qkv", cr * 3 * ch * 4),
+            sc("kda_qkv", kda_qkv_bytes(cfg, rows, chunk_rows) as u64),
             sc("kda_out", cr * ch * 2),
             sc("mla_acts", cr * mla_acts),
             sc("indexer_acts", cr * ix_acts),
@@ -551,11 +566,20 @@ mod tests {
             assert!(get(&big, n) > 0, "{n}");
         }
         // the items that scale with a chunk's rows scale by them; the window-scale ones do not move
-        for n in
-            ["streams", "hidden", "mixer_out", "kda_qkv", "kda_out", "mla_acts", "indexer_acts", "moe_shared_out", "mhc_work"]
-        {
+        for n in ["streams", "hidden", "mixer_out", "kda_out", "mla_acts", "indexer_acts", "moe_shared_out", "mhc_work"] {
             assert_eq!(get(&big, n), 8 * get(&base, n), "{n}: 1,024 rows are 8 x 128");
         }
+        // the KDA qkv rows: P1's fp32 rows of the chunk; under P2 the chunk's bf16 rows (every head on one node), 4 x the window's fp32 rows
+        let qkv_scale = match crate::families::glm::contract::current() {
+            crate::families::glm::contract::PrefillContract::P1 => 8,
+            crate::families::glm::contract::PrefillContract::P2 => 4,
+        };
+        assert_eq!(get(&big, "kda_qkv"), qkv_scale * get(&base, "kda_qkv"), "kda_qkv");
+        let split = c.with_kda_rank(0, 2).unwrap();
+        let big_split = AllocPlan::scratch_items_chunked(&split, 128, 1024, 262_144, false).unwrap();
+        // a KDA-split rank's P2 rows are its heads' (half); P1's are every head's
+        let split_div = if qkv_scale == 4 { 2 } else { 1 };
+        assert_eq!(get(&big_split, "kda_qkv"), get(&big, "kda_qkv") / split_div, "kda_qkv of a KDA-split rank");
         for n in ["logits", "topk", "moe_scratch", "shared_scratch", "dense_scratch", "mla_scratch", "dsa_scratch"] {
             assert_eq!(get(&big, n), get(&base, n), "{n} is the window's");
         }
@@ -597,7 +621,7 @@ mod tests {
         // wider chunks cost more, and the whole chunk scratch at 2,048 rows stays under 3 GiB
         let total = |v: &[Item]| v.iter().map(|i| i.bytes).sum::<u64>();
         // (the figures docs/GLM53.md quotes: `cargo test -p gb-model --lib the_chunk_scratch -- --nocapture`)
-        for chunk in [128usize, 256, 512, 1024, 2048] {
+        for chunk in [128usize, 256, 512, 1024, 2048, 4096, 6144, 8192] {
             let v = at(chunk);
             eprintln!(
                 "scratch at a {chunk}-row chunk: total {:.1} MiB (routed experts {:.1}, shared expert {:.1}, dense {:.1}, exl3 workspace {:.1}, mhc {:.1}, activations {:.1})",
@@ -616,9 +640,10 @@ mod tests {
         }
         assert!(total(&base) < total(&at(512)) && total(&at(512)) < total(&big) && total(&big) < total(&at(2048)));
         assert!(total(&at(2048)) < 3 << 30, "{} MiB", total(&at(2048)) >> 20);
+        assert!(total(&at(4096)) < total(&at(6144)) && total(&at(6144)) < total(&at(8192)));
         // refusals
         assert!(AllocPlan::scratch_items_chunked(&c, 128, 127, 262_144, false).is_err());
-        assert!(AllocPlan::scratch_items_chunked(&c, 128, 4097, 262_144, false).is_err());
+        assert!(AllocPlan::scratch_items_chunked(&c, 128, 8193, 262_144, false).is_err());
         // the family's reading of --prefill-chunk, per contract (P2 is the process default since 2026-10-19, `=p1` selects P1): the process's
         // reading is its contract's
         use crate::families::glm::contract::PrefillContract::{P1, P2};
@@ -630,11 +655,13 @@ mod tests {
             assert_eq!(prefill_chunk_for(f), prefill_chunk_for_contract(f, crate::families::glm::contract::current()), "{f}");
         }
         assert_eq!(prefill_chunk_for(prefill_chunk_for(777)), prefill_chunk_for(777));
-        // Lane P: under P2 the server's default is the 4,096-row slice and the clamp reaches 4,096; P1's figures above are unchanged
+        // Lane P: under P2 the server's default is a 4,096-row chunk and the clamp reaches 8,192; P1's figures above are unchanged
         assert_eq!(prefill_chunk_for_contract(4096, P1), DEFAULT_PREFILL_CHUNK);
         assert_eq!(prefill_chunk_for_contract(3000, P1), MAX_PREFILL_CHUNK);
-        assert_eq!(prefill_chunk_for_contract(4096, P2), P2_MAX_PREFILL_CHUNK);
+        assert_eq!(prefill_chunk_for_contract(4096, P2), 4096);
         assert_eq!(prefill_chunk_for_contract(3000, P2), 3000);
+        assert_eq!(prefill_chunk_for_contract(6144, P2), 6144);
+        assert_eq!(prefill_chunk_for_contract(8192, P2), P2_MAX_PREFILL_CHUNK);
         assert_eq!(prefill_chunk_for_contract(9000, P2), P2_MAX_PREFILL_CHUNK);
         assert_eq!(prefill_chunk_for_contract(2048, P2), 2048);
         assert_eq!(prefill_chunk_for_contract(1, P2), MAX_ROWS);

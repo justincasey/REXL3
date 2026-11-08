@@ -250,7 +250,8 @@ mod tests {
     }
 
     /// The server's default `--prefill-chunk` (4,096, shared by every family) is this family's default chunk; any other value is taken as asked
-    /// (128..=2,048), and the scratch of a wider chunk is priced: the items that scale with a chunk's rows at the chunk, the large-row path's own.
+    /// (P1: 128..=2,048; P2: 128..=8,192), and the scratch of a wider chunk is priced: the items that scale with a chunk's rows at the chunk,
+    /// the large-row path's own.
     #[test]
     fn the_chunk_is_priced_and_the_server_default_means_the_family_default() {
         if !gb_cuda::rt::kernels_built() {
@@ -263,10 +264,10 @@ mod tests {
                 .unwrap()
         };
         let generic = memory_profile(&c, &MemoryOptions::serving_defaults()).unwrap();
-        // the family's default chunk and its widest, by the process's contract: P1 512 / 2,048; P2 (the default since 2026-10-19) 4,096 / 4,096
+        // the family's default chunk and its widest, by the process's contract: P1 512 / 2,048; P2 (the default since 2026-10-19) 4,096 / 8,192
         let (family_default, top) = match crate::families::glm::contract::current() {
             crate::families::glm::contract::PrefillContract::P1 => (alloc::DEFAULT_PREFILL_CHUNK, alloc::MAX_PREFILL_CHUNK),
-            crate::families::glm::contract::PrefillContract::P2 => (alloc::P2_MAX_PREFILL_CHUNK, alloc::P2_MAX_PREFILL_CHUNK),
+            crate::families::glm::contract::PrefillContract::P2 => (4096, alloc::P2_MAX_PREFILL_CHUNK),
         };
         assert_eq!(
             generic.scratch_bytes(),

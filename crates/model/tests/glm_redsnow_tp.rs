@@ -753,7 +753,8 @@ fn attach_drafter(m: &mut GlmModel, dir: &Path, taps: &[usize], share: Option<gb
     let dims = gb_model::shapes::read_draft_config(dir).unwrap().dims(gb_model::families::glm::alloc::TOKENIZER_VOCAB);
     let pack = gb_model::pack::Pack::open(dir).unwrap();
     let mut ctx = gb_model::loadctx::LoadCtx::from_env();
-    let (draft, _) = Draft::declare_bf16(&mut ctx, &pack, dims, m.cfg.vocab, SLOTS, m.chunk_rows(), BLOCK, share).unwrap();
+    let rows = gb_model::families::glm::dflash::ctx_rows(m.chunk_rows());
+    let (draft, _) = Draft::declare_bf16(&mut ctx, &pack, dims, m.cfg.vocab, SLOTS, rows, BLOCK, share).unwrap();
     ctx.finish().unwrap();
     m.attach_dflash(draft, taps).unwrap();
 }
@@ -1444,6 +1445,22 @@ fn cache_script(m: &mut GlmModel, cached: bool, bound: usize) -> (Vec<u64>, Vec<
 /// with `draft` (rank 0's whole drafter, or with `split` each rank's half of it; both ranks relaying its taps), the stash of `room` rows
 /// and four snapshot slots on each rank.
 fn serving_ranks(dir: &Path, layers: usize, draft: Option<&Path>, taps: &[usize], room: usize, split: bool) -> (GlmModel, GlmModel) {
+    let mo = ModelOptions { slots: SLOTS, kv_blocks: 64, max_context: 8192, layers };
+    serving_ranks_at(dir, layers, draft, taps, room, split, CHUNK, mo)
+}
+
+/// [`serving_ranks`] with scratch for `chunk`-row prompt chunks, at `mo` (slots, pages, context).
+#[allow(clippy::too_many_arguments)]
+fn serving_ranks_at(
+    dir: &Path,
+    layers: usize,
+    draft: Option<&Path>,
+    taps: &[usize],
+    room: usize,
+    split: bool,
+    chunk: usize,
+    mo: ModelOptions,
+) -> (GlmModel, GlmModel) {
     use gb_model::families::glm::{GlmConfig, GlmPack};
     assert!(gb_model::families::glm::contract::p2_sp_on(), "REXL3_GLM_P2_SP is off: the serving residual would not be tested");
     let bits = gb_model::families::glm::model::tp::split_from_env().unwrap();
@@ -1457,8 +1474,7 @@ fn serving_ranks(dir: &Path, layers: usize, draft: Option<&Path>, taps: &[usize]
             let ck = gb_exl3::checkpoint::scan(dir, false).unwrap();
             let pack = GlmPack::from_checkpoint_with(&ck, cfg, true).unwrap();
             let b = boot_mapped(dir, pack, Some(layers), &LoadOptions::from_env(20 * GIB), 0.0).unwrap();
-            let mo = ModelOptions { slots: SLOTS, kv_blocks: 64, max_context: 8192, layers };
-            let mut m = GlmModel::new_chunked(b.pack.config.clone(), b.device, &mo, CHUNK).unwrap();
+            let mut m = GlmModel::new_chunked(b.pack.config.clone(), b.device, &mo, chunk).unwrap();
             m.set_prefill_contract(PrefillContract::P2).unwrap();
             m
         })
@@ -1485,6 +1501,86 @@ fn serving_ranks(dir: &Path, layers: usize, draft: Option<&Path>, taps: &[usize]
     }
     let b = ms.pop().unwrap();
     (ms.pop().unwrap(), b)
+}
+
+/// The widest P2 chunk the serving group takes (`alloc::P2_MAX_PREFILL_CHUNK`).
+const WIDE: usize = 8192;
+
+/// The script of [`p2_serving_ranks_answer_alike_in_chunks_of_8192_6144_4096_and_512_rows`]: slot 0's 10,000-token prompt (past one
+/// 8,192-row chunk), slot 1's 37 and slot 2's 600, each in `chunk`-row chunks and answered (the drafter told each prompt's end, as the
+/// backend does), four greedy windows of the three slots, and every slot's drafts after. One digest per answering call (the prompt's row
+/// of the candidates and its fp16 logits) and per window, in call order, and the drafts (none without a drafter).
+fn wide_script(m: &mut GlmModel, chunk: usize) -> (Vec<u64>, Vec<Vec<u32>>) {
+    let mut r = Rng(0x6a09_e667_f3bc_c908);
+    let prompts = [r.tokens(10_000), r.tokens(37), r.tokens(600)];
+    let mut sq = Seqs::new();
+    let mut out = Vec::new();
+    for (slot, p) in prompts.iter().enumerate() {
+        m.begin_slot(slot).unwrap();
+        m.dflash_prompt_end(slot, Some(p.len()), None);
+        let mut at = 0;
+        while at < p.len() {
+            let end = (at + chunk).min(p.len());
+            let want = (end == p.len()).then_some(COUNT);
+            let c = m.prefill_chunk(slot, at, &p[at..end], want).unwrap();
+            if let Some(c) = &c {
+                out.push(digest_row(m, c, 0));
+            }
+            sq.prompt(slot, &p[at..end], c.as_ref().map(|x| (x, 0)));
+            at = end;
+        }
+    }
+    out.extend(greedy_windows(m, &mut sq, 4));
+    let drafts = drafts_now(m, &sq);
+    for s in 0..SLOTS {
+        m.end_slot(s);
+    }
+    (out, drafts)
+}
+
+/// The P2 chunk cap at 8,192 rows (`alloc::P2_MAX_PREFILL_CHUNK`, `moe_prefill::MAX_ROWS`): the two ranks of the serving group
+/// ([`serving_ranks`]: the expert width split, the head split, the sequence-parallel residual, the DFlash2 drafter of `REXL3_DFLASH_DIR`
+/// with its taps relayed, split unless `REXL3_GLM_DRAFT_SPLIT=0`), built for 8,192-row chunks, give every answer, every window after and every
+/// draft of [`wide_script`] alike in chunks of 8,192, 6,144, 4,096 and 512 rows: a P2 row's bits are its own, whatever chunk it is in,
+/// so the wider chunks move no bit (the 8,192-row chunk runs the routed experts, the P2 GEMMs, the exchanges and the drafter's absorb
+/// at 8,192 rows, 4,096 a rank's own).
+///
+///     flock -x /tmp/rexl3-gpu.lock env REXL3_REDSNOW_DIR=... REXL3_DFLASH_DIR=... REXL3_GLM_KV=fp8 cargo test --release -p gb-model \
+///         --test glm_redsnow_tp p2_serving_ranks_answer_alike -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+fn p2_serving_ranks_answer_alike_in_chunks_of_8192_6144_4096_and_512_rows() {
+    let Some(dir) = redsnow_dir() else { return };
+    let (layers, draft, taps) = prefix_setup();
+    require_available(if layers <= 8 { 60 } else { 80 } * GIB);
+    let guard = Guard::start(20 * GIB);
+    let split = gb_model::families::glm::dflash::split_on() && draft.is_some();
+    let mo = ModelOptions { slots: SLOTS, kv_blocks: 96, max_context: 16384, layers };
+    let (a, b) = serving_ranks_at(&dir, layers, draft.as_deref(), &taps, PART_ROOM, split, WIDE, mo);
+    assert_eq!((a.chunk_rows(), b.chunk_rows()), (WIDE, WIDE));
+    let chunks = [WIDE, 6144, 4096, 512];
+    let t = std::time::Instant::now();
+    let (r0, r1, a, b) = on_ranks(a, b, |m| chunks.map(|c| wide_script(m, c)));
+    eprintln!("two serving ranks ran the script in chunks of {chunks:?} in {:.1?}", t.elapsed());
+    for (i, &c) in chunks.iter().enumerate() {
+        assert_eq!(r1[i].0, r0[i].0, "chunks of {c}: the two ranks' answers differ");
+        if split {
+            assert_eq!(r1[i].1, r0[i].1, "chunks of {c}: the split drafter's halves drafted differently on the two ranks");
+        }
+        assert_eq!(r0[i].0, r0[0].0, "chunks of {c}: an answer (or a window after) differs from 8,192-row chunks'");
+        assert_eq!(r0[i].1, r0[0].1, "chunks of {c}: the drafts differ from 8,192-row chunks'");
+    }
+    assert!(a.sp_chunks() > 0 && a.sp_chunks() == b.sp_chunks(), "sp chunks {} / {}", a.sp_chunks(), b.sp_chunks());
+    eprintln!(
+        "P2 CHUNKS OF 8,192 / 6,144 / 4,096 / 512 ROWS BYTE-IDENTICAL on the serving ranks: {} answering calls and windows, {} slots' drafts \
+         ({}), {} sp chunks",
+        r0[0].0.len(),
+        r0[0].1.len(),
+        if draft.is_none() { "no drafter" } else if split { "split drafter" } else { "rank 0's drafter" },
+        a.sp_chunks()
+    );
+    drop((a, b));
+    eprintln!("MemAvailable min {:.1} GiB", gib(guard.finish()));
 }
 
 /// The prefix cache under the serving contract (`--prefix-cache on`, P2 with the sequence-parallel residual, the latent cache of
