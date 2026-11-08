@@ -681,12 +681,14 @@ pub(super) struct KdaIo<'a> {
 }
 
 /// One sequence's rows of a P2 prompt forward (`GlmModel::run`): the KDA recurrence runs per sequence, on its own slot's state, over its
-/// own rows `[row0, row0 + rows)` of the forward, with its own descriptor (`kda::prefill_descriptor_pieces`).
+/// own rows `[row0, row0 + rows)` of the forward, with its own descriptor (`kda::prefill_descriptor_pieces`). A sequence with an armed
+/// cut inside it is two of these; `cut`: this one ends at the cut (the slot's state is copied out after it: `GlmModel::arm_cut`).
 pub(in crate::families::glm::model) struct KdaSeg<'a> {
     pub slot: usize,
     pub row0: usize,
     pub rows: usize,
     pub desc: &'a DevBuf,
+    pub cut: bool,
 }
 
 /// Which KDA path a split layer runs.

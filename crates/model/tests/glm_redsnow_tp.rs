@@ -1537,6 +1537,217 @@ fn p2_a_restored_prefix_in_a_batched_and_a_paused_forward_equals_uncached_on_one
     eprintln!("MemAvailable min {:.1} GiB", gib(guard.finish()));
 }
 
+/// [`inner_cut_script`]'s prompts: A of 700 tokens (its end cut 688 on the 16-row grid, inside its last 512-row chunk), B of 230 (end
+/// cut 224), and the 32 and 20 tokens of B's two follow-up turns.
+fn inner_cut_prompts() -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>) {
+    let mut r = Rng(0x7a3c_51e9_04b2_d68f);
+    (r.tokens(700), r.tokens(230), r.tokens(32), r.tokens(20))
+}
+
+/// The snapshot armed at `len` in `slot` completed after the forward that passed it, as every rank completes one (`tp::take_snapshot`
+/// with `GlmModel::finish_cut`): the snapshot slot and the pages it holds.
+fn take_inner(m: &mut GlmModel, slot: usize, len: usize) -> (u32, Vec<u32>) {
+    use gb_model::families::glm::model::snapshot::FinishedCut;
+    let snap = match m.finish_cut(slot, len).unwrap() {
+        FinishedCut::Taken(s) => s,
+        other => panic!("the snapshot armed at {len} of slot {slot}: {other:?}"),
+    };
+    let pages = m.retain_prefix_pages(slot, len);
+    m.seal_snapshot(snap, &pages).unwrap();
+    (snap, pages)
+}
+
+/// The tensor-parallel end cut as the serving group takes it (`GlmTpBackend::inner_cut`: the cut ARMED before the prompt's last slice,
+/// `GlmModel::arm_cut`, the slice running to the prompt's end, the snapshot completed after it), `cached`, or the same requests uncached:
+/// * slot 0, the donor: A in two chunks (0..512, 512..700), the second passing its end cut 688 (cached: armed in it), answered, then a
+///   window of its own;
+/// * slot 1, A again: cached, first prefilled to exactly 688 by chunks (0..512, 512..688), the state a fresh prefill leaves there, then
+///   restored from the in-chunk snapshot over it, which must leave the same state (`prefix_digest`, asserted); uncached, 0..512. Its
+///   rest goes through ONE prompt forward with slot 2's whole B, whose end cut 224 is armed in that forward (cached);
+/// * four greedy windows of the three slots, the drafts after;
+/// * slot 2's follow-up B + C: cached, restored from B's in-chunk snapshot (224), its last 38 rows in a forward paused at layer `bound`
+///   with a window of slots 0 and 1 between its parts, its own end cut 256 armed in it; uncached, all 262 from 0. Three greedy windows,
+///   the drafts after;
+/// * slot 0's turn B + C + D: cached, restored from the follow-up's in-chunk snapshot (256), its last 26 rows; uncached, all 282.
+///   Three greedy windows, the drafts after.
+///
+/// One digest per answering call in call order, and every slot's drafts after the windows (rank 0's, or one model's, drafter). Every
+/// entry is released at the end and every slot ended.
+fn inner_cut_script(m: &mut GlmModel, cached: bool, bound: usize) -> (Vec<u64>, Vec<Vec<u32>>) {
+    const P2: usize = gb_cuda::kda::P2_CHUNK_ROWS;
+    let (a, b, c, d) = inner_cut_prompts();
+    let (cut_a, cut_b, cut_bc) = (a.len() / P2 * P2, b.len() / P2 * P2, 224 + 32);
+    assert!(cut_a > CHUNK && cut_a < a.len() && cut_b < b.len(), "each end cut inside its prompt's last chunk");
+    let mut sq = Seqs::new();
+    let mut out = Vec::new();
+    let mut entries = Vec::new();
+    // slot 0, the donor: its second chunk passes the end cut armed in it
+    m.begin_slot(0).unwrap();
+    m.dflash_prompt_end(0, Some(a.len()), cached.then_some(cut_a));
+    if cached {
+        assert!(m.arm_cut(0, cut_a).unwrap(), "a free snapshot slot");
+    }
+    assert!(m.prefill_chunk(0, 0, &a[..CHUNK], None).unwrap().is_none());
+    sq.prompt(0, &a[..CHUNK], None);
+    let cands = m.prefill_chunk(0, CHUNK, &a[CHUNK..], Some(COUNT)).unwrap().expect("A's candidates");
+    out.push(digest_row(m, &cands, 0));
+    sq.prompt(0, &a[CHUNK..], Some((&cands, 0)));
+    if cached {
+        entries.push(take_inner(m, 0, cut_a));
+    }
+    out.push(window(m, &mut sq, &[(0, Vec::new(), 1)]));
+    // slot 1, A again
+    let from = if cached {
+        m.begin_slot(1).unwrap();
+        assert!(m.prefill_chunk(1, 0, &a[..CHUNK], None).unwrap().is_none());
+        assert!(m.prefill_chunk(1, CHUNK, &a[CHUNK..cut_a], None).unwrap().is_none());
+        let fresh = m.prefix_digest(1, cut_a).unwrap();
+        let (s, pages) = &entries[0];
+        m.restore_prefix(1, *s, pages, cut_a).unwrap();
+        let restored = m.prefix_digest(1, cut_a).unwrap();
+        assert!(
+            restored == fresh,
+            "the state restored from the snapshot taken inside the chunk differs from a prefill that ended at the cut: {}",
+            restored.describe_diff(&fresh)
+        );
+        cut_a
+    } else {
+        m.begin_slot(1).unwrap();
+        m.dflash_prompt_end(1, Some(a.len()), None);
+        assert!(m.prefill_chunk(1, 0, &a[..CHUNK], None).unwrap().is_none());
+        CHUNK
+    };
+    sq.prompt(1, &a[..from], None);
+    m.dflash_prompt_end(1, Some(a.len()), None);
+    m.begin_slot(2).unwrap();
+    m.dflash_prompt_end(2, Some(b.len()), cached.then_some(cut_b));
+    if cached {
+        assert!(m.arm_cut(2, cut_b).unwrap(), "a free snapshot slot");
+    }
+    let reqs = [
+        gb_engine::RowRequest { slot: 1, tokens: a[from..].to_vec(), first_position: from as u64 },
+        gb_engine::RowRequest { slot: 2, tokens: b.clone(), first_position: 0 },
+    ];
+    let cands = m.prefill_rows(&RowBatch::from_requests(&reqs), Some(COUNT), usize::MAX).unwrap().expect("the forward's candidates");
+    for (i, (s, toks)) in [(1usize, &a[from..]), (2, &b[..])].into_iter().enumerate() {
+        out.push(digest_row(m, &cands, i));
+        sq.prompt(s, toks, Some((&cands, i)));
+    }
+    if cached {
+        entries.push(take_inner(m, 2, cut_b));
+    }
+    out.extend(greedy_windows(m, &mut sq, 4));
+    let mut drafts = drafts_now(m, &sq);
+    // slot 2's follow-up turn, a forward in parts with a window of the other two between them, its end cut armed in it
+    let bc: Vec<u32> = b.iter().chain(&c).copied().collect();
+    m.end_slot(2);
+    let from = if cached {
+        let (s, pages) = &entries[1];
+        m.restore_prefix(2, *s, pages, cut_b).unwrap();
+        cut_b
+    } else {
+        m.begin_slot(2).unwrap();
+        0
+    };
+    sq.fed[2] = bc[..from].to_vec();
+    m.dflash_prompt_end(2, Some(bc.len()), cached.then_some(cut_bc));
+    if cached {
+        assert!(cut_bc < bc.len() && bc.len() - cut_bc < P2);
+        assert!(m.arm_cut(2, cut_bc).unwrap(), "a free snapshot slot");
+    }
+    assert!(m.prefill_rows(&slice_of(2, from, &bc[from..]), Some(COUNT), bound).unwrap().is_none(), "the follow-up pauses");
+    out.push(window(m, &mut sq, &[(0, Vec::new(), 1), (1, Vec::new(), 1)]));
+    let cands = m.prefill_resume(usize::MAX).unwrap().expect("the follow-up's candidates");
+    out.push(digest_row(m, &cands, 0));
+    sq.prompt(2, &bc[from..], Some((&cands, 0)));
+    if cached {
+        entries.push(take_inner(m, 2, cut_bc));
+    }
+    out.extend(greedy_windows(m, &mut sq, 3));
+    drafts.extend(drafts_now(m, &sq));
+    // slot 0's turn B + C + D, from the follow-up's snapshot
+    let bcd: Vec<u32> = bc.iter().chain(&d).copied().collect();
+    m.end_slot(0);
+    let from = if cached {
+        let (s, pages) = &entries[2];
+        m.restore_prefix(0, *s, pages, cut_bc).unwrap();
+        cut_bc
+    } else {
+        m.begin_slot(0).unwrap();
+        0
+    };
+    sq.fed[0] = bcd[..from].to_vec();
+    m.dflash_prompt_end(0, Some(bcd.len()), None);
+    let cands = m.prefill_chunk(0, from, &bcd[from..], Some(COUNT)).unwrap().expect("the turn's candidates");
+    out.push(digest_row(m, &cands, 0));
+    sq.prompt(0, &bcd[from..], Some((&cands, 0)));
+    out.extend(greedy_windows(m, &mut sq, 3));
+    drafts.extend(drafts_now(m, &sq));
+    for s in 0..SLOTS {
+        m.end_slot(s);
+    }
+    for (s, pages) in entries {
+        m.release_prefix(s, &pages);
+    }
+    assert_eq!(m.prefix_free_snapshots(), 4, "every snapshot slot back: nothing armed is left");
+    (out, drafts)
+}
+
+/// The tensor-parallel end cut (`GlmTpBackend::inner_cut`, `REXL3_GLM_TP_INNER_CUT`): a snapshot ARMED before a prompt's last slice
+/// (`GlmModel::arm_cut`) and taken at its 16-row boundary INSIDE that forward (every KDA layer's recurrence split there, its state copied
+/// out between the two segments; the ring tails, the pages and the drafter's window after the forward: `finish_cut`) restores the state a
+/// prefill ending at the cut leaves (asserted per model and per rank), and a prompt restored from one and prefilled on (whole, inside a
+/// forward of two prompts, inside a forward in parts), then decoded, answers every call and drafts exactly as the same requests uncached
+/// ([`inner_cut_script`]), under P2 with the sequence-parallel residual, the latent cache of `REXL3_GLM_KV`, the DFlash2 drafter of
+/// `REXL3_DFLASH_DIR` (split with `REXL3_GLM_DRAFT_SPLIT`), on one P2 model and on the two serving ranks.
+///
+///     flock -x /tmp/rexl3-gpu.lock env REXL3_REDSNOW_DIR=... REXL3_DFLASH_DIR=... REXL3_GLM_KV=fp8 cargo test --release -p gb-model \
+///         --test glm_redsnow_tp p2_an_end_cut_inside -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+fn p2_an_end_cut_inside_the_last_chunk_restores_as_uncached_on_one_model_and_the_serving_ranks() {
+    let Some(dir) = redsnow_dir() else { return };
+    let (layers, draft, taps) = prefix_setup();
+    assert!(layers >= 4, "parts need a few layers");
+    require_available(if layers <= 8 { 60 } else { 80 } * GIB);
+    let guard = Guard::start(20 * GIB);
+    let bound = layers / 2;
+    let mut one = one_model(PrefillContract::P2, &dir, layers, draft.as_deref(), &taps, PART_ROOM);
+    one.enable_prefix_cache(4).unwrap();
+    assert!(one.cuts_inside_forwards());
+    let kv = one.cfg.latent_kv.name().to_string();
+    let cold = inner_cut_script(&mut one, false, bound);
+    let warm = inner_cut_script(&mut one, true, bound);
+    assert_eq!(warm.0, cold.0, "one P2 model: a cached answer (or a window after) differs from the uncached run");
+    assert_eq!(warm.1, cold.1, "one P2 model: the drafts after a restore differ from the uncached run's");
+    assert_eq!(inner_cut_script(&mut one, true, bound), warm, "one P2 model: the cached run twice");
+    eprintln!("one P2 model ({kv} latent cache): {} answering calls and {} drafts, cached == uncached", cold.0.len(), cold.1.len());
+    drop(one);
+
+    let split = gb_model::families::glm::dflash::split_on() && draft.is_some();
+    let (a, b) = serving_ranks(&dir, layers, draft.as_deref(), &taps, PART_ROOM, split);
+    assert!(a.cuts_inside_forwards() && b.cuts_inside_forwards());
+    let (r0, r1, a, b) = on_ranks(a, b, |m| (inner_cut_script(m, false, bound), inner_cut_script(m, true, bound)));
+    assert_eq!((&r0.0 .0, &r0.1 .0), (&r1.0 .0, &r1.1 .0), "the two ranks' answers differ");
+    assert_eq!(r0.1 .0, r0.0 .0, "two ranks: a cached answer (or a window after) differs from the uncached run");
+    assert_eq!(r0.1 .1, r0.0 .1, "rank 0: the drafts after a restore differ from the uncached run's");
+    if split {
+        assert_eq!((&r1.0 .1, &r1.1 .1), (&r0.0 .1, &r0.1 .1), "the split drafter's halves drafted differently on the two ranks");
+    }
+    assert!(a.sp_chunks() > 0 && a.sp_chunks() == b.sp_chunks(), "sp chunks {} / {}", a.sp_chunks(), b.sp_chunks());
+    eprintln!(
+        "AN END CUT TAKEN INSIDE THE LAST CHUNK RESTORES AS UNCACHED (P2, {kv}, the drafter {}{}): {} answering calls and {} drafts on one \
+         model and on two width ranks ({} sp forwards); armed in a whole chunk, in a forward of two prompts and in a forward in parts",
+        if draft.is_some() { "on" } else { "off" },
+        if split { ", split" } else { "" },
+        r0.0 .0.len(),
+        r0.0 .1.len(),
+        a.sp_chunks()
+    );
+    drop((a, b));
+    eprintln!("MemAvailable min {:.1} GiB", gib(guard.finish()));
+}
+
 /// The DFlash2 drafter split over the two serving ranks (`REXL3_GLM_DRAFT_SPLIT`, `draft::DraftShare`: each rank its half of the heads,
 /// the intermediate columns and the head's columns, the o / down partials and the head's top-k swapped every round) against rank 0's
 /// whole drafter on the same serving ranks ([`cache_script`] uncached, cached, and uncached again):

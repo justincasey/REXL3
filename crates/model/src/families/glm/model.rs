@@ -240,19 +240,39 @@ fn p2_kda_piece(rec: &kda::Record, ws: &kda::Workspace) -> usize {
     }
 }
 
-/// The chunked KDA recurrence's descriptors of a P2 prompt forward: one per sequence of `b` (`kda::prefill_descriptor_pieces` of its slot
-/// and rows), uploaded by the forward's first KDA layer and kept for the others.
-fn kda_seg_descs(b: &RowBatch, piece: usize) -> Result<Vec<DevBuf>, ModelError> {
-    (0..b.n_seq()).map(|i| Ok(kda::prefill_descriptor_pieces(b.seq_slot[i] as usize, b.seq_rows(i).len(), piece)?)).collect()
+/// The chunked KDA recurrence's descriptors of a P2 prompt forward: one per segment of [`kda_seg_rows`] (`kda::prefill_descriptor_pieces`
+/// of its slot and rows), uploaded by the forward's first KDA layer and kept for the others.
+fn kda_seg_descs(b: &RowBatch, piece: usize, cuts: &[Option<usize>]) -> Result<Vec<DevBuf>, ModelError> {
+    kda_seg_rows(b, cuts)
+        .into_iter()
+        .map(|(i, _, rows, _)| Ok(kda::prefill_descriptor_pieces(b.seq_slot[i] as usize, rows, piece)?))
+        .collect()
 }
 
-/// Each sequence of `b` with its rows and its descriptor (of [`kda_seg_descs`]).
-fn kda_segs<'a>(b: &RowBatch, descs: &'a [DevBuf]) -> Vec<tp::KdaSeg<'a>> {
-    (0..b.n_seq())
-        .map(|i| {
-            let r = b.seq_rows(i);
-            tp::KdaSeg { slot: b.seq_slot[i] as usize, row0: r.start, rows: r.len(), desc: &descs[i] }
-        })
+/// The recurrence's segments of a prompt forward, `(sequence, first row, rows, ends at the armed cut)`: each sequence of `b` whole, or,
+/// with an armed cut inside it (`cuts[i]`: its row in the sequence, [`GlmModel::armed_row`]), in two segments that meet at the cut.
+/// A P2 segment boundary on the 16-row grid changes no row's bits (the second segment's chunks are the ones the whole sequence runs).
+fn kda_seg_rows(b: &RowBatch, cuts: &[Option<usize>]) -> Vec<(usize, usize, usize, bool)> {
+    let mut out = Vec::with_capacity(b.n_seq() + 1);
+    for i in 0..b.n_seq() {
+        let r = b.seq_rows(i);
+        match cuts.get(i).copied().flatten() {
+            Some(c) => {
+                out.push((i, r.start, c, true));
+                out.push((i, r.start + c, r.len() - c, false));
+            }
+            None => out.push((i, r.start, r.len(), false)),
+        }
+    }
+    out
+}
+
+/// Each segment of [`kda_seg_rows`] (`cuts` as there; none for P1's descriptors, one per sequence) with its descriptor.
+fn kda_segs<'a>(b: &RowBatch, cuts: &[Option<usize>], descs: &'a [DevBuf]) -> Vec<tp::KdaSeg<'a>> {
+    kda_seg_rows(b, cuts)
+        .into_iter()
+        .zip(descs)
+        .map(|((i, row0, rows, cut), desc)| tp::KdaSeg { slot: b.seq_slot[i] as usize, row0, rows, desc, cut })
         .collect()
 }
 
@@ -384,6 +404,10 @@ pub struct GlmModel {
     /// Snapshots to take INSIDE the prefill chunk being run (`prefill_chunk_cuts`): the state after the first `row` rows of the chunk goes to snapshot slot
     /// `snap`. Ascending, each strictly inside the chunk, only ever set for a chunk of more than `MAX_ROWS` rows. Empty for every other call.
     snap_cuts: Vec<snapshot::InChunkCut>,
+    /// Per slot, the snapshot to take inside the slot's next P2 prompt forward that passes its length ([`GlmModel::arm_cut`], the
+    /// tensor-parallel end cut: `snapshot.rs`): every KDA layer splits that sequence's chunked recurrence there and copies its state out
+    /// between the two segments; the rest is copied after the forward ([`GlmModel::finish_cut`]). `None` for every slot otherwise.
+    armed: Vec<Option<snapshot::ArmedCut>>,
     /// Under P2, each slot's open prefill SEGMENT (`docs/GLM_PREFILL_P2.md` 8.1): `(anchor, next)`, the segment's first position and the
     /// position after its last prefilled row. The KDA chunks of a segment are 16-row runs from its anchor, so a prompt chunk that continues
     /// the segment (starts at `next`) must start a whole number of chunks after the anchor. `None` after `begin_slot`, `end_slot` and any
@@ -623,6 +647,7 @@ impl GlmModel {
             dump_head: false,
             snaps: None,
             snap_cuts: Vec::new(),
+            armed: vec![None; o.slots],
             p2_seg: vec![None; o.slots],
             tp: None,
             own_s,
@@ -978,6 +1003,7 @@ impl GlmModel {
         self.kv_tab.release(slot);
         self.mtp_begin(slot);
         self.p2_seg[slot] = None;
+        self.disarm(slot);
         self.dflash_prompt_end(slot, None, None);
         Ok(())
     }
@@ -988,6 +1014,7 @@ impl GlmModel {
         self.pending.remove(&slot);
         self.kv_tab.release(slot);
         self.p2_seg[slot] = None;
+        self.disarm(slot);
         self.dflash_prompt_end(slot, None, None);
     }
 
@@ -1221,12 +1248,27 @@ impl GlmModel {
         }
         // a prompt forward paused at a layer boundary keeps its rows of the streams in the stash: what runs meanwhile must fit it
         self.check_room(b)?;
+        // an armed cut inside a sequence is taken by the P2 chunked recurrence alone (`arm_cut` refuses every other model; refused
+        // here too, by name, for any other forward that would pass it, before any work)
+        let armed_inside = (0..b.n_seq()).any(|i| self.armed_row(b, i).is_some());
+        if armed_inside
+            && !(mode == Mode::Prefill
+                && self.prefill == PrefillContract::P2
+                && self.p2_kda_chunked
+                && self.snap_cuts.is_empty())
+        {
+            return Err(ModelError::Request(
+                "a snapshot armed inside a forward is taken by a P2 prompt forward on the chunked KDA recurrence alone".into(),
+            ));
+        }
         // under P2 each prompt joins (or opens) its slot's prefill segment, on the segment's 16-row grid (refused otherwise, before any work)
         let segs = if mode == Mode::Prefill && self.prefill == PrefillContract::P2 {
             let cuts: Vec<usize> = self.snap_cuts.iter().map(|c| c.row).collect();
             (0..b.n_seq())
                 .map(|i| {
                     let slot = b.seq_slot[i] as usize;
+                    let mut cuts = cuts.clone();
+                    cuts.extend(self.armed_row(b, i));
                     Ok((slot, self.p2_segment_of(slot, b.positions[b.seq_rows(i).start] as usize, &cuts)?))
                 })
                 .collect::<Result<Vec<_>, ModelError>>()?
@@ -1346,6 +1388,8 @@ impl GlmModel {
     fn run(&mut self, plan: &[Op], b: &RowBatch, mode: Mode, head: Head, max_pos: usize) -> Result<(), ModelError> {
         let rows = b.rows;
         let sp = self.sp_split(rows, mode);
+        // each sequence's armed cut inside it (`arm_cut`; only a P2 prompt forward on the chunked recurrence has one: `forward_begin`)
+        let kda_cuts: Vec<Option<usize>> = (0..b.n_seq()).map(|i| self.armed_row(b, i)).collect();
         let GlmModel {
             cfg,
             dev,
@@ -1377,6 +1421,7 @@ impl GlmModel {
             dump_head,
             snaps,
             snap_cuts,
+            armed,
             tp,
             own_s,
             prefill,
@@ -1614,9 +1659,9 @@ impl GlmModel {
                                 // the full P2 o_proj (`tp/p2_split.rs`)
                                 let piece = p2_kda_piece(&s.kda_prefill_rec, io.kws);
                                 if kda_descs.is_empty() {
-                                    kda_descs = kda_seg_descs(b, piece)?;
+                                    kda_descs = kda_seg_descs(b, piece, &kda_cuts)?;
                                 }
-                                let segs = kda_segs(b, &kda_descs);
+                                let segs = kda_segs(b, &kda_cuts, &kda_descs);
                                 t.kda_split_layer_p2(
                                     ord,
                                     (!core).then_some(&w.o),
@@ -1631,6 +1676,9 @@ impl GlmModel {
                                     st,
                                     sp,
                                     kda_join,
+                                    &mut |pool: &kda::Pool, slot: usize| {
+                                        snapshot::save_armed(armed, snaps, ord, pool, slot, *kda_dims, st)
+                                    },
                                 )?;
                             } else if big {
                                 // P1: each prompt's row-by-row recurrence on its own slot and rows (one or several prompts)
@@ -1638,7 +1686,7 @@ impl GlmModel {
                                 if kda_descs.is_empty() {
                                     kda_descs = kda_p1_descs(b)?;
                                 }
-                                let segs = kda_segs(b, &kda_descs);
+                                let segs = kda_segs(b, &[], &kda_descs);
                                 let path = tp::KdaPath::Prefill { segs: &segs, rec: &mut s.kda_prefill_rec };
                                 t.kda_split_layer(ord, (!core).then_some(&w.o), *kda_dims, &params, &mut pools[ord], io, path, rows, st)?;
                             } else {
@@ -1661,10 +1709,10 @@ impl GlmModel {
                             let piece = p2_kda_piece(&s.kda_prefill_rec, &s.kda_ws);
                             if snap_cuts.is_empty() {
                                 if kda_descs.is_empty() {
-                                    kda_descs = kda_seg_descs(b, piece)?;
+                                    kda_descs = kda_seg_descs(b, piece, &kda_cuts)?;
                                 }
                                 let (h, ch) = (cfg.hidden, cfg.kda.heads * cfg.kda.head_dim);
-                                for g in kda_segs(b, &kda_descs) {
+                                for g in kda_segs(b, &kda_cuts, &kda_descs) {
                                     let hv = s.hidden.subview(g.row0 * h * 2, g.rows * h * 2);
                                     let qv = s.kda_qkv.subview(g.row0 * 3 * ch * 2, g.rows * 3 * ch * 2);
                                     let mut ov = s.kda_out.subview(g.row0 * ch * 2, g.rows * ch * 2);
@@ -1686,6 +1734,9 @@ impl GlmModel {
                                         g.desc,
                                         piece,
                                     )?;
+                                    if g.cut {
+                                        snapshot::save_armed(armed, snaps, ord, &pools[ord], g.slot, *kda_dims, st)?;
+                                    }
                                 }
                             } else {
                                 let (h, ch) = (cfg.hidden, cfg.kda.heads * cfg.kda.head_dim);
@@ -1741,7 +1792,7 @@ impl GlmModel {
                                     kda_descs = kda_p1_descs(b)?;
                                 }
                                 let (h, ch) = (cfg.hidden, cfg.kda.heads * cfg.kda.head_dim);
-                                for g in kda_segs(b, &kda_descs) {
+                                for g in kda_segs(b, &[], &kda_descs) {
                                     let hv = s.hidden.subview(g.row0 * h * 2, g.rows * h * 2);
                                     let qv = s.kda_qkv.subview(g.row0 * 3 * ch * 4, g.rows * 3 * ch * 4);
                                     let mut ov = s.kda_out.subview(g.row0 * ch * 2, g.rows * ch * 2);

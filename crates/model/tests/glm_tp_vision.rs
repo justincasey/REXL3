@@ -198,6 +198,15 @@ impl PrefixRuntime for Probe {
     fn snapshot_handles(&mut self) -> &mut SnapHandles {
         self.r.snapshot_handles()
     }
+    fn cuts_inside_forwards(&self) -> bool {
+        self.r.cuts_inside_forwards()
+    }
+    fn arm_cut(&mut self, slot: usize, at: usize) -> Result<bool, ModelError> {
+        self.r.arm_cut(slot, at)
+    }
+    fn finish_cut(&mut self, slot: usize, len: usize) -> Result<gb_model::families::glm::model::snapshot::FinishedCut, ModelError> {
+        self.r.finish_cut(slot, len)
+    }
 }
 
 // every runtime of a GLM backend says whether it runs prompt forwards of several prompts or in parts (`GlmTpBackend` is bound on it):

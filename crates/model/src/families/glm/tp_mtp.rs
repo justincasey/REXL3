@@ -373,7 +373,11 @@ pub fn apply<R: GlmMtpRuntime + ?Sized>(r: &mut R, call: GlmCall) -> Result<Call
             Err(ModelError::Request("a prefill call reached the draft calls' dispatch (use tp::apply_family)".into()))
         }
         // the prefix cache's calls key their handles by the call's sequence number (`tp::apply_prefix`): a runtime that reaches here keeps none
-        GlmCall::EnableSnapshots { .. } | GlmCall::Snapshot { .. } | GlmCall::Restore { .. } | GlmCall::Release { .. } => {
+        GlmCall::EnableSnapshots { .. }
+        | GlmCall::Snapshot { .. }
+        | GlmCall::Restore { .. }
+        | GlmCall::Release { .. }
+        | GlmCall::ArmCut { .. } => {
             Err(ModelError::Request("a prefix-cache call reached the draft calls' dispatch (use tp::apply_prefix)".into()))
         }
     }

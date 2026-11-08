@@ -11,9 +11,12 @@
 //! runs what it always ran.
 //!
 //! **The prefix cache** (`docs/GLM_TP.md` 4.2): rank 0's engine decides every hit, each rank snapshots and restores its own state through
-//! the calls of `tp.rs` (`EnableSnapshots`, `Snapshot`, `Restore`, `Release`), and a snapshot is taken only BETWEEN chunks: a slice ends at
-//! each cut (`prefix::plan_slice` with `split_ok` false; a rank of a KDA head split runs each chunk's KDA whole, so no cut is taken inside
-//! one), which moves no bit. Rank 0 translates its own handles to the sequence number of the `Snapshot` call that made them, which is what
+//! the calls of `tp.rs` (`EnableSnapshots`, `Snapshot`, `Restore`, `Release`, `ArmCut`). A snapshot is taken BETWEEN chunks: a slice
+//! ends at each cut (`prefix::plan_slice` with `split_ok` false), which moves no bit; except the cut a prompt's last slice passes within
+//! its last 16 rows (the end cut moved down to the P2 grid, [`GlmTpBackend::inner_cut`]): that slice runs to the prompt's end, every rank
+//! is told the cut before the forward (`ArmCut`), and each KDA layer copies its state out at the cut between the two segments of its
+//! recurrence (`GlmModel::arm_cut`), so the snapshot costs no forward of its own (`REXL3_GLM_TP_INNER_CUT=0`: the slice ends at the cut,
+//! as before). Rank 0 translates its own handles to the sequence number of the `Snapshot` call that made them, which is what
 //! a follower keys its handle by. The snapshot, restore and release are cache calls (`lockstep::TpLeader::forward_cache_call`): rank 0 waits
 //! for every rank's answer to a snapshot and a restore, keeps every rank's content digest of each snapshot in its `lockstep::SnapshotBook`,
 //! and uses a restore only when every rank's digest of what it restored equals its own at snapshot time. A snapshot any rank did not take
@@ -121,6 +124,15 @@ pub struct GlmTpBackend<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRu
     open_ms: f64,
     /// That forward, while it is paused after its first part.
     opening: Option<Opening>,
+    /// The end cut of a prompt's last slice is taken inside its forward ([`GlmTpBackend::inner_cut`]; `REXL3_GLM_TP_INNER_CUT`, on by
+    /// default; off, the slice ends at the cut and a short slice of the rows after it follows). The same bits either way.
+    inner_cuts: bool,
+}
+
+/// `REXL3_GLM_TP_INNER_CUT` (`0`/`off`/`false`/`no` turns it off; on by default): a TP prompt's end cut is taken inside its last
+/// slice's forward instead of ending the slice there. Never a bit: the snapshot and every row are the same either way.
+fn inner_cuts_from_env() -> bool {
+    !matches!(std::env::var("REXL3_GLM_TP_INNER_CUT").as_deref(), Ok("0" | "off" | "false" | "no"))
 }
 
 /// A forward of prompts that all begin there, run with nothing decoding and paused after its first part (`tp_part::OPEN_MS_ENV`): each
@@ -140,11 +152,13 @@ struct OpenJob {
     n: usize,
     end: usize,
     candidates: usize,
-    snap: bool,
+    /// The snapshot after the forward: the slice's end, or the cut inside it ([`GlmTpBackend::snap_len`]).
+    snap: Option<usize>,
 }
 
 /// A prompt slice running in parts: its slot, prompt length and rows `done..end`, the candidates its prompt asks for, the next layer,
-/// whether `end` is a cut (a snapshot is taken once the last part has run), and the layers a part has (0: by the modelled time).
+/// the snapshot taken once the last part has run (at `end` or the cut inside the slice), and the layers a part has (0: by the modelled
+/// time).
 #[derive(Clone, Copy, Debug)]
 struct Inflight {
     slot: usize,
@@ -153,7 +167,7 @@ struct Inflight {
     end: usize,
     candidates: usize,
     next: usize,
-    snap: bool,
+    snap: Option<usize>,
     per: usize,
 }
 
@@ -206,6 +220,7 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> GlmTpBackend
             short: None,
             open_ms: 0.0,
             opening: None,
+            inner_cuts: inner_cuts_from_env(),
         }
     }
 
@@ -300,6 +315,13 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> GlmTpBackend
         self
     }
 
+    /// Take a prompt's end cut inside its last slice's forward (`true`) or end the slice at it (`false`), whatever
+    /// `REXL3_GLM_TP_INNER_CUT` says (the tests that pin either).
+    pub fn with_inner_cuts(mut self, on: bool) -> Self {
+        self.inner_cuts = on;
+        self
+    }
+
     /// Rows of the next slice: the small size while a sequence is decoding (unless long slices run in parts), the chunk otherwise; at most
     /// the room of a paused part while one is; under the engine's deadline limit.
     pub fn slice_rows(&self) -> usize {
@@ -365,10 +387,18 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> GlmTpBackend
         RowBatch::from_requests(&[RowRequest { slot, tokens: tokens.to_vec(), first_position: at as u64 }])
     }
 
-    /// Where the slice from `done` ends: the slice's rows, cut short at the first of `cuts` it would pass (`prefix::plan_slice` with
-    /// `split_ok` false), so a snapshot at a cut is of the state between two chunks. A plan with a cut inside the chunk is refused by name:
-    /// a rank of a KDA head split runs each chunk's KDA whole and would copy the state after the chunk, not at the cut.
+    /// Where the slice from `done` ends: [`GlmTpBackend::slice_end_between`], except that a last slice which would end at the end cut
+    /// ([`GlmTpBackend::inner_cut`]) runs to the prompt's end and takes the cut inside its forward.
     fn slice_end(&self, done: usize, n: usize, cuts: &[usize]) -> Result<usize, ModelError> {
+        let end = self.slice_end_between(done, n, cuts)?;
+        let natural = (done + self.slice_rows()).min(n);
+        Ok(if natural == n && self.inner_cut(done, n, n, cuts) == Some(end) { n } else { end })
+    }
+
+    /// Where the slice from `done` ends with every snapshot between two chunks: the slice's rows, cut short at the first of `cuts` it
+    /// would pass (`prefix::plan_slice` with `split_ok` false), so a snapshot at a cut is of the state between two chunks. A plan with a
+    /// cut inside the chunk is refused by name (the model's own in-chunk cuts are `prefill_chunk_cuts`', which a KDA head split refuses).
+    fn slice_end_between(&self, done: usize, n: usize, cuts: &[usize]) -> Result<usize, ModelError> {
         let plan = prefix::plan_slice(done, n, self.slice_rows(), cuts, false);
         if !plan.interior.is_empty() {
             return Err(ModelError::Request(format!(
@@ -377,6 +407,30 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> GlmTpBackend
             )));
         }
         Ok(plan.end)
+    }
+
+    /// The cut the text slice `done..end` of a prompt of `n` tokens takes INSIDE its forward: the first of `cuts` past `done`, when the
+    /// slice ends the prompt and the cut lies strictly inside it, less than one 16-row KDA chunk before the end (the end cut of a policy
+    /// of no tail, moved down to the P2 grid, `prefix::cuts_for`), with the switch on (`REXL3_GLM_TP_INNER_CUT`), under P2, on ranks
+    /// that take one (`PrefixRuntime::cuts_inside_forwards`). Every rank is told before the forward (`GlmCall::ArmCut`, in
+    /// [`GlmTpBackend::open_slice`]); the `Snapshot` after it completes the snapshot. Otherwise the slice ends at the cut, and a short
+    /// slice of the rows after it follows: one forward more, the same bits.
+    fn inner_cut(&self, done: usize, end: usize, n: usize, cuts: &[usize]) -> Option<usize> {
+        if !self.inner_cuts || end != n || self.contract != super::contract::PrefillContract::P2 {
+            return None;
+        }
+        let c = cuts.iter().copied().find(|&c| c > done)?;
+        (c < end && end - c < gb_cuda::kda::P2_CHUNK_ROWS && self.leader.inner().cuts_inside_forwards()).then_some(c)
+    }
+
+    /// The length of the snapshot taken after the slice `done..end` of a prompt of `n` tokens: its end when that is one of `cuts`, or
+    /// the cut inside it ([`GlmTpBackend::inner_cut`]).
+    fn snap_len(&self, done: usize, end: usize, n: usize, cuts: &[usize]) -> Option<usize> {
+        if cuts.contains(&end) {
+            Some(end)
+        } else {
+            self.inner_cut(done, end, n, cuts)
+        }
     }
 
     /// The cuts a slice of `slot`'s prompt from `done` can take, from the engine's `cuts` (none without a cache): moved to the contract's
@@ -410,7 +464,7 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> GlmTpBackend
             return Err(ModelError::Request(format!("a slice from {done} of a prompt of {n} tokens")));
         }
         let end = self.slice_end(done, n, cuts)?;
-        self.open_slice(slot, done, n, cuts)?;
+        self.open_slice(slot, done, end, n, cuts)?;
         let at = done;
         let want = (end == n).then_some(candidates);
         let t = std::time::Instant::now();
@@ -423,11 +477,13 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> GlmTpBackend
         Ok(PrefillStep { done: end, row })
     }
 
-    /// Before a slice of `slot`'s prompt of `n` tokens from `done` with `cuts` still to take: a prompt's first slice begins the slot on every
-    /// rank (and its drafting state and digests here); the drafter (rank 0's, or both halves of a split one: `tp_mtp::dflash_prompt_end`)
-    /// absorbs only the rows that reach its ring after the prompt, and the window before the next cut (its snapshot keeps the drafter's
-    /// context: `GlmModel::dflash_prompt_end`).
-    fn open_slice(&mut self, slot: usize, done: usize, n: usize, cuts: &[usize]) -> Result<(), ModelError> {
+    /// Before the slice `done..end` of `slot`'s prompt of `n` tokens with `cuts` still to take: a prompt's first slice begins the slot on
+    /// every rank (and its drafting state and digests here); the drafter (rank 0's, or both halves of a split one:
+    /// `tp_mtp::dflash_prompt_end`) absorbs only the rows that reach its ring after the prompt, and the window before the next cut (its
+    /// snapshot keeps the drafter's context: `GlmModel::dflash_prompt_end`); a cut inside the slice ([`GlmTpBackend::inner_cut`]) is
+    /// armed on every rank (`GlmCall::ArmCut`, a cache call not waited for: a rank that could not arm it fails or skips the `Snapshot`
+    /// after the forward, and the snapshot is not used).
+    fn open_slice(&mut self, slot: usize, done: usize, end: usize, n: usize, cuts: &[usize]) -> Result<(), ModelError> {
         if done == 0 {
             self.leader.begin_slot(slot)?;
             if let Some(s) = self.spec.as_mut() {
@@ -437,6 +493,16 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> GlmTpBackend
         }
         let cut = cuts.iter().copied().find(|&c| c > done);
         super::tp_mtp::dflash_prompt_end(&mut self.leader, slot, Some(n), cut);
+        if let Some(at) = self.inner_cut(done, end, n, cuts) {
+            let call = GlmCall::ArmCut {
+                slot: slot as u32,
+                at: u32::try_from(at).map_err(|_| ModelError::Request(format!("a snapshot of {at} tokens")))?,
+            };
+            let out = self.leader.forward_cache_call(call, |r, _| r.arm_cut(slot, at), false)?;
+            if let Err(e) = out.local {
+                eprintln!("rexl3 level=warn event=tp_glm_arm_cut_failed rank=0 call={} slot={slot} at={at} error=\"{e}\"", out.seq);
+            }
+        }
         Ok(())
     }
 
@@ -518,7 +584,8 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> GlmTpBackend
     }
 
     /// The first part of the slice `done..end` of `slot`'s prompt in `lane` (`tp_part`): the forward begins, its first layers run, it
-    /// pauses. With the step, whether the slice ended (it ran whole) at one of `cuts`: its snapshot is the caller's to take.
+    /// pauses. With the step, the snapshot's length when the slice ended (it ran whole) at one of `cuts` or passed the cut inside it:
+    /// its snapshot is the caller's to take.
     #[allow(clippy::too_many_arguments)]
     fn begin_part(
         &mut self,
@@ -529,10 +596,10 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> GlmTpBackend
         end: usize,
         candidates: usize,
         cuts: &[usize],
-    ) -> Result<(PrefillStep, bool), ModelError> {
+    ) -> Result<(PrefillStep, Option<usize>), ModelError> {
         let n = prompt.len();
-        self.open_slice(slot, done, n, cuts)?;
-        let snap = cuts.contains(&end);
+        self.open_slice(slot, done, end, n, cuts)?;
+        let snap = self.snap_len(done, end, n, cuts);
         let per = if lane == Lane::Short { self.short_layers(end - done) } else { 0 };
         let k = if per > 0 { per.min(self.layers) } else { self.part_layers(end - done, 0, self.layers) };
         let until = if k >= self.layers { TO_END } else { k as u32 };
@@ -547,12 +614,12 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> GlmTpBackend
             return Ok((self.slice_done(slot, prompt, end, candidates, c), snap));
         }
         *self.lane(lane) = Some(Inflight { slot, n, done, end, candidates, next: k, snap, per });
-        Ok((PrefillStep { done, row: None }, false))
+        Ok((PrefillStep { done, row: None }, None))
     }
 
     /// The next part of the slice in flight in `lane`: a part's layers while a sequence decodes, the rest otherwise. Its last part ends
-    /// the slice (`done` moves to its end, and the candidates come when it ends the prompt; with `true` when the slice ends at a cut).
-    fn next_part(&mut self, lane: Lane, prompt: &[u32]) -> Result<(PrefillStep, bool), ModelError> {
+    /// the slice (`done` moves to its end, and the candidates come when it ends the prompt; with the snapshot's length when it took one).
+    fn next_part(&mut self, lane: Lane, prompt: &[u32]) -> Result<(PrefillStep, Option<usize>), ModelError> {
         let f = self.lane(lane).expect("a slice in flight");
         let left = self.layers - f.next;
         let k = match (self.decode_waiting, f.per) {
@@ -570,7 +637,7 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> GlmTpBackend
             return Ok((self.slice_done(f.slot, prompt, f.end, f.candidates, c), f.snap));
         }
         *self.lane(lane) = Some(Inflight { next: f.next + k, ..f });
-        Ok((PrefillStep { done: f.done, row: None }, false))
+        Ok((PrefillStep { done: f.done, row: None }, None))
     }
 
     /// A slice of `slot`'s prompt that ended at `end`: its row when it ended the prompt.
@@ -588,7 +655,7 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> GlmTpBackend
     fn batch_slices(&mut self, jobs: &[(&PrefillJob<'_>, usize, &[usize])]) -> Result<Vec<PrefillStep>, ModelError> {
         let mut reqs = Vec::with_capacity(jobs.len());
         for &(j, end, cuts) in jobs {
-            self.open_slice(j.slot, j.done, j.prompt.len(), cuts)?;
+            self.open_slice(j.slot, j.done, end, j.prompt.len(), cuts)?;
             reqs.push(RowRequest { slot: j.slot, tokens: j.prompt[j.done..end].to_vec(), first_position: j.done as u64 });
         }
         let want = jobs.iter().filter(|(j, end, _)| *end == j.prompt.len()).map(|(j, _, _)| j.candidates as u32).max();
@@ -637,7 +704,7 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> GlmTpBackend
     fn begin_opening(&mut self, jobs: &[(&PrefillJob<'_>, usize, &[usize])]) -> Result<(), ModelError> {
         let mut reqs = Vec::with_capacity(jobs.len());
         for &(j, end, cuts) in jobs {
-            self.open_slice(j.slot, 0, j.prompt.len(), cuts)?;
+            self.open_slice(j.slot, 0, end, j.prompt.len(), cuts)?;
             reqs.push(RowRequest { slot: j.slot, tokens: j.prompt[..end].to_vec(), first_position: 0 });
         }
         let want = jobs.iter().filter(|(j, end, _)| *end == j.prompt.len()).map(|(j, _, _)| j.candidates as u32).max();
@@ -649,7 +716,10 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> GlmTpBackend
         self.forward_took(rows, jobs.len(), ran, t.elapsed().as_secs_f64() * 1e3);
         let jobs = jobs
             .iter()
-            .map(|&(j, end, cuts)| OpenJob { slot: j.slot, n: j.prompt.len(), end, candidates: j.candidates, snap: cuts.contains(&end) })
+            .map(|&(j, end, cuts)| {
+                let n = j.prompt.len();
+                OpenJob { slot: j.slot, n, end, candidates: j.candidates, snap: self.snap_len(0, end, n, cuts) }
+            })
             .collect();
         self.opening = Some(Opening { jobs, want, rows, ran });
         Ok(())
@@ -687,11 +757,9 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> GlmTpBackend
                         self.digests.row(q.slot, q.n - 1, jobs[i].prompt[q.n - 1], r);
                     }
                     out[i].step = PrefillStep { done: q.end, row };
-                    if !q.snap {
-                        continue;
-                    }
+                    let Some(len) = q.snap else { continue };
                     let mut captured = Vec::new();
-                    match self.capture(q.slot, q.end, &mut captured) {
+                    match self.capture(q.slot, len, &mut captured) {
                         Ok(()) => out[i].captured = captured,
                         Err(e) => {
                             self.record(&format!("prefix snapshot of slot {} after an opening forward", q.slot), &e);
@@ -770,10 +838,10 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> GlmTpBackend
             return Err(ModelError::Request(format!("a slice from {done} of a prompt of {n} tokens")));
         }
         v.check_images(prompt, images)?;
-        let planned = self.slice_end(done, n, cuts)?;
+        let planned = self.slice_end_between(done, n, cuts)?;
         // the rows are read off the device before anything of the slot is touched: a failure here forwards nothing
         let (call, end) = v.chunk_call(slot, prompt, images, done, planned, candidates)?;
-        self.open_slice(slot, done, n, cuts)?;
+        self.open_slice(slot, done, end, n, cuts)?;
         // set on every slice, as the single node does
         self.images.set(slot, images);
         let c = match call {
@@ -843,8 +911,8 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> GlmTpBackend
                     Some(end) => self.begin_part(lane, slot, prompt, done, end, candidates, &cuts),
                 };
                 r.and_then(|(step, snap)| {
-                    if snap {
-                        self.capture(slot, step.done, &mut captured)?;
+                    if let Some(len) = snap {
+                        self.capture(slot, len, &mut captured)?;
                     }
                     Ok(step)
                 })
@@ -871,7 +939,8 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> GlmTpBackend
     }
 
     /// The body of [`GlmTpBackend::slice_at`] for a slice that runs whole, with `cuts` already on the contract's grid
-    /// ([`GlmTpBackend::cuts_here`]): the slice ENDS at the first one it would pass, and the snapshot is a `Snapshot` call after its chunk.
+    /// ([`GlmTpBackend::cuts_here`]): the slice ENDS at the first one it would pass (or passes the end cut, [`GlmTpBackend::inner_cut`]),
+    /// and the snapshot is a `Snapshot` call after its chunk.
     #[allow(clippy::too_many_arguments)]
     fn cut_slice(
         &mut self,
@@ -892,13 +961,14 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> GlmTpBackend
         } else {
             self.image_slice(slot, prompt, images, done, candidates, cuts)?
         };
-        if cuts.contains(&step.done) {
-            self.capture(slot, step.done, captured)?;
+        if let Some(len) = self.snap_len(done, step.done, prompt.len(), cuts) {
+            self.capture(slot, len, captured)?;
         }
         Ok(step)
     }
 
-    /// The snapshot of `slot` after `len` tokens (a slice just ended at a cut), into `captured` when every rank holds it.
+    /// The snapshot of `slot` after `len` tokens (a slice just ended at a cut, or passed the cut armed inside it), into `captured` when
+    /// every rank holds it.
     fn capture(&mut self, slot: usize, len: usize, captured: &mut Vec<Captured>) -> Result<(), ModelError> {
         if let Some(t) = self.snapshot(slot, len)? {
             captured.push(Captured { len, handle: PrefixHandle { snap: t.snap, pages: t.pages } });
@@ -1104,11 +1174,9 @@ impl<R: GlmMtpRuntime + ImageRuntime + PrefixRuntime + PartRuntime> Backend for 
             Ok(steps) => {
                 for (&(i, end), s) in group.iter().zip(steps) {
                     out[i].step = s;
-                    if !cuts[i].contains(&end) {
-                        continue;
-                    }
+                    let Some(len) = self.snap_len(jobs[i].done, end, jobs[i].prompt.len(), &cuts[i]) else { continue };
                     let mut captured = Vec::new();
-                    match self.capture(jobs[i].slot, end, &mut captured) {
+                    match self.capture(jobs[i].slot, len, &mut captured) {
                         Ok(()) => out[i].captured = captured,
                         Err(e) => {
                             self.record(
@@ -1460,6 +1528,11 @@ pub(crate) mod tests {
         pub(crate) paused: Vec<(RowBatch, Option<u32>)>,
         /// The free pages the runtime reports (`PrefixRuntime::kv_pages`).
         pub(crate) pool_free: usize,
+        /// The runtime takes snapshots inside a prompt forward (`PrefixRuntime::cuts_inside_forwards`; the real model's P2 ranks do).
+        pub(crate) inner: bool,
+        /// Per slot, the snapshot armed inside its next forward (`arm_cut`): its length, its snapshot slot (`None`: skipped) and the
+        /// slot's chain at that length once a forward passed it.
+        pub(crate) armed: Vec<Option<(usize, Option<u32>, Option<u64>)>>,
     }
 
     impl Rec {
@@ -1483,16 +1556,32 @@ pub(crate) mod tests {
                 parts: None,
                 paused: Vec::new(),
                 pool_free: 1 << 20,
+                inner: false,
+                armed: vec![None; 4],
             }
         }
 
-        /// The slot's chain over `tokens` from `start` (a slot starts over at 0).
+        /// The slot's chain over `tokens` from `start` (a slot starts over at 0); the chain at the slot's armed cut when it is inside.
         fn eat(&mut self, slot: usize, start: usize, tokens: &[u32]) {
             let mut h = if start == 0 { 0 } else { self.chain[slot] };
             for (i, &t) in tokens.iter().enumerate() {
+                if let Some((at, Some(_), seen)) = self.armed[slot].as_mut() {
+                    if *at == start + i && i > 0 {
+                        *seen = Some(h);
+                    }
+                }
                 h = gb_cuda::state_digest::mix64(h ^ ((t as u64) << 24) ^ ((start + i) as u64));
             }
             self.chain[slot] = h;
+        }
+
+        /// Forget the slot's armed snapshot, its slot back in the pool.
+        fn disarm(&mut self, slot: usize) {
+            if let Some((_, Some(s), _)) = self.armed[slot].take() {
+                if let Some(p) = self.pool.as_mut() {
+                    p.0.push(s);
+                }
+            }
         }
 
         /// The mock's content digest: the state chain, the length, the drafter flag and the full pages.
@@ -1522,6 +1611,7 @@ pub(crate) mod tests {
             self.anchor[slot] = None;
             self.books[slot].reset();
             self.chain[slot] = 0;
+            self.disarm(slot);
         }
     }
 
@@ -1620,6 +1710,7 @@ pub(crate) mod tests {
             self.log.lock().unwrap().push(format!("end {slot}"));
             self.kv[slot].clear();
             self.anchor[slot] = None;
+            self.disarm(slot);
             self.paused.retain(|(b, _)| !b.seq_slot.contains(&(slot as i32)));
         }
         fn prefill_chunk(&mut self, b: &RowBatch, want: Option<usize>) -> Result<Option<Candidates>, ModelError> {
@@ -1762,6 +1853,38 @@ pub(crate) mod tests {
         }
         fn snapshot_handles(&mut self) -> &mut crate::families::glm::tp::SnapHandles {
             &mut self.handles
+        }
+        fn cuts_inside_forwards(&self) -> bool {
+            self.inner && self.pool.is_some()
+        }
+        /// As `GlmModel::arm_cut`: a snapshot slot now (none: skipped), the slot's chain at `at` taken by the forward that passes it.
+        fn arm_cut(&mut self, slot: usize, at: usize) -> Result<bool, ModelError> {
+            if !self.cuts_inside_forwards() {
+                return Err(ModelError::Request("this rank takes no snapshot inside a forward".into()));
+            }
+            self.disarm(slot);
+            let snap = self.alloc_snapshot();
+            self.armed[slot] = Some((at, snap, None));
+            self.log.lock().unwrap().push(format!("arm {slot} {at} took={}", snap.is_some()));
+            Ok(snap.is_some())
+        }
+        /// As `GlmModel::finish_cut`: the chain the forward left at the cut is the snapshot's state.
+        fn finish_cut(&mut self, slot: usize, len: usize) -> Result<crate::families::glm::model::snapshot::FinishedCut, ModelError> {
+            use crate::families::glm::model::snapshot::FinishedCut;
+            let Some((at, snap, seen)) = self.armed[slot].filter(|a| a.0 == len) else { return Ok(FinishedCut::NotArmed) };
+            let Some(snap) = snap else {
+                self.armed[slot] = None;
+                return Ok(FinishedCut::Skipped);
+            };
+            let Some(chain) = seen else {
+                self.disarm(slot);
+                return Ok(FinishedCut::NotArmed);
+            };
+            self.armed[slot] = None;
+            self.pool.as_mut().expect("armed with a pool").1.insert(snap, (at, true));
+            self.snap_chain.insert(snap, chain);
+            self.log.lock().unwrap().push(format!("snapshot {slot} {at} inside"));
+            Ok(FinishedCut::Taken(snap))
         }
     }
 
@@ -2670,7 +2793,8 @@ pub(crate) mod tests {
 
     /// A P2 leader backend with the pool cache (`with_pool_prefix_cache`: `snapshots` snapshot slots whose entries keep idle pool pages)
     /// over a follower thread, both recording, whose runtimes run forwards of several prompts and in parts (`room` rows meanwhile, `layers`
-    /// layers), with parts of `part_ms` while a sequence decodes. The follower numbers its snapshot slots from 1000.
+    /// layers), with parts of `part_ms` while a sequence decodes. The follower numbers its snapshot slots from 1000. The ranks take no
+    /// snapshot inside a forward ([`pool_group_with`] for ranks that do).
     fn pool_group(
         chunk: usize,
         room: usize,
@@ -2678,15 +2802,29 @@ pub(crate) mod tests {
         part_ms: f64,
         snapshots: usize,
     ) -> (GlmTpBackend<Rec>, Log, Log, std::thread::JoinHandle<FollowerExit>) {
+        pool_group_with(chunk, room, layers, part_ms, snapshots, false)
+    }
+
+    /// [`pool_group`] whose ranks take a snapshot inside a forward when `inner` (`PrefixRuntime::cuts_inside_forwards`, as the real P2
+    /// ranks), the backend taking the end cut there (`with_inner_cuts(true)`, whatever the environment).
+    fn pool_group_with(
+        chunk: usize,
+        room: usize,
+        layers: usize,
+        part_ms: f64,
+        snapshots: usize,
+        inner: bool,
+    ) -> (GlmTpBackend<Rec>, Log, Log, std::thread::JoinHandle<FollowerExit>) {
         let (a, b) = Link::<GlmCall>::pair(Duration::from_secs(30)).unwrap();
         let (l0, l1): (Log, Log) = (Arc::default(), Arc::default());
-        let f = Rec { parts: Some((room, layers)), snap_base: 1000, ..Rec::new(l1.clone()) };
+        let f = Rec { parts: Some((room, layers)), snap_base: 1000, inner, ..Rec::new(l1.clone()) };
         let h = std::thread::spawn(move || run_follower(f, b, FollowerConfig::new(t())).unwrap());
-        let leader = TpLeader::lead(Rec { parts: Some((room, layers)), ..Rec::new(l0.clone()) }, a, t());
+        let leader = TpLeader::lead(Rec { parts: Some((room, layers)), inner, ..Rec::new(l0.clone()) }, a, t());
         let budget = CacheBudget { snapshot_slots: snapshots, page_blocks: 0, snapshot_bytes: 4096, page_bytes: 1 << 20 };
         let be = GlmTpBackend::new(leader, chunk, 4)
             .with_contract(super::super::contract::PrefillContract::P2)
             .with_parts(part_ms)
+            .with_inner_cuts(true)
             .with_pool_prefix_cache(7, budget, 4096)
             .unwrap();
         (be, l0, l1, h)
@@ -2906,17 +3044,81 @@ pub(crate) mod tests {
         assert_eq!(before, ["prefill 0 256 Some(4) / snapshot 0 288 mtp_ok=true", "prefill 1 256 None / snapshot 1 288 mtp_ok=true"]);
     }
 
+    /// The end cut taken inside the last slice (`GlmTpBackend::inner_cut`, ranks that take one): an end cut on the grid is a snapshot
+    /// after the last slice as before; one off the grid (300 -> 288) is ARMED on every rank before the last slice (`arm_cut`), which
+    /// runs to the prompt's end and answers, and the snapshot of 288 follows that forward in the same step: no short slice. A turn
+    /// restored from it answers with the cold row and state. With the switch off (`with_inner_cuts(false)`, `REXL3_GLM_TP_INNER_CUT=0`)
+    /// the same ranks end the slice at the cut, as before. Both ranks saw the same stream.
+    #[test]
+    fn an_end_cut_inside_the_last_slice_is_armed_before_it_and_costs_no_short_slice() {
+        let off_grid: Vec<u32> = (0..300).map(|i| (i * 5 + 2) % 1000).collect();
+        let on_grid: Vec<u32> = (0..288).map(|i| (i * 3 + 7) % 1000).collect();
+        let steps_of_end_cut = |be: &mut GlmTpBackend<Rec>, slot: usize, prompt: &[u32]| {
+            let (mut done, mut steps, mut caps) = (0, Vec::new(), Vec::new());
+            loop {
+                let s = be.prefill_slice_cuts(slot, prompt, &[], done, 4, &[prompt.len()]);
+                done = s.step.done;
+                let answered = s.step.row.is_some();
+                steps.push((done, answered, s.captured.iter().map(|c| c.len).collect::<Vec<_>>()));
+                caps.extend(s.captured);
+                if answered {
+                    return (steps, caps);
+                }
+            }
+        };
+        let (mut be, l0, l1, h) = pool_group_with(128, 32, 6, 300.0, 4, true);
+        let (steps, on_caps) = steps_of_end_cut(&mut be, 0, &on_grid);
+        assert_eq!(steps, [(128, false, vec![]), (256, false, vec![]), (288, true, vec![288])], "on the grid: after the last slice");
+        let (steps, off_caps) = steps_of_end_cut(&mut be, 1, &off_grid);
+        assert_eq!(steps, [(128, false, vec![]), (256, false, vec![]), (300, true, vec![288])], "off the grid: inside the last slice");
+        be.release(0);
+        be.release(1);
+        assert_eq!(be.prefix_free_snapshots(), 2, "the two entries hold one slot each; nothing armed is left");
+        let grown: Vec<u32> = off_grid.iter().copied().chain(900..920).collect();
+        be.prefix_restore(2, &off_caps[0].handle, 288).unwrap();
+        let (grown_row, _) = cut_slices(&mut be, 2, &grown, 288, &[]);
+        be.prefix_restore(3, &off_caps[0].handle, 288).unwrap();
+        let (warm_row, _) = cut_slices(&mut be, 3, &off_grid, 288, &[]);
+        for (slot, prompt, row) in [(2, &grown, &grown_row), (3, &off_grid, &warm_row)] {
+            let (chain, want) = cold(128, prompt);
+            assert_eq!(row, &want, "slot {slot}: the row is the cold prefill's");
+            assert_eq!(chain_of(&be, slot), chain, "slot {slot}: the state is the cold prefill's");
+        }
+        drop(on_caps);
+        assert!(be.take_error().is_none());
+        be.quiesce().unwrap();
+        drop(be);
+        assert!(matches!(h.join().unwrap(), FollowerExit::Shutdown(_)));
+        let (a, b) = (l0.lock().unwrap().clone(), l1.lock().unwrap().clone());
+        assert_eq!(a, b, "the follower's call stream is rank 0's");
+        // slot 1: armed before its last slice, which runs 256..300, then the snapshot of 288 completed after it
+        let i = a.iter().position(|x| x == "arm 1 288 took=true").expect("slot 1's end cut armed");
+        assert!(a[i + 1].starts_with("prefill 1 256 ") && a[i + 1].ends_with("Some(4)"), "{:?}", &a[i..]);
+        assert_eq!(a[i + 2], "snapshot 1 288 inside");
+        assert!(!a.iter().any(|x| x.starts_with("arm 0 ")), "an end cut on the grid is not armed");
+        assert_eq!(a.iter().filter(|x| x.starts_with("prefill 1 ")).count(), 3, "three slices, no short one");
+
+        // the switch off: the same ranks end the slice at the cut
+        let (be, _l0, _l1, h) = pool_group_with(128, 32, 6, 300.0, 4, true);
+        let mut be = be.with_inner_cuts(false);
+        let (steps, _) = steps_of_end_cut(&mut be, 1, &off_grid);
+        assert_eq!(steps, [(128, false, vec![]), (256, false, vec![]), (288, false, vec![288]), (300, true, vec![])]);
+        be.quiesce().unwrap();
+        drop(be);
+        h.join().unwrap();
+    }
+
     /// The ENGINE over rank 0's backend with the pool cache and the policy of no tail (`REXL3_PREFIX_TAIL=0`), prefill batching on as the
     /// boot serves it: a first turn leaves its end cut (moved down to the 16-row grid); the follow-up turn (the first prompt, its reply, a
     /// question) resumes from all of it while a fresh prompt shares its forwards (the batched call with a restored slot); both reply as
     /// uncached. Then the pool runs short (rank 0 reports no free page): the engine gives every entry back before anything allocates
-    /// (`evicted_for_pool`), and the next turn finds nothing and replies as uncached too. Both ranks saw the same stream.
-    #[test]
-    fn the_engine_resumes_a_follow_up_turn_from_the_end_cut_beside_a_fresh_prompt_through_the_group() {
+    /// (`evicted_for_pool`), and the next turn finds nothing and replies as uncached too. Both ranks saw the same stream. With `inner`,
+    /// the ranks take the end cuts inside the last slices (the batched forward arms two: the follow-up's and the fresh prompt's).
+    fn engine_resumes_a_follow_up_turn(inner: bool) {
         use crate::families::glm::tp_boot::engine_over;
         use gb_engine::{PrefillPolicy, Request};
         use gb_sched::{Admission, ModelMemory};
-        let (be, l0, l1, h) = pool_group(256, 32, 6, 300.0, 4);
+        let (be, l0, l1, h) = pool_group_with(256, 32, 6, 300.0, 4, inner);
         let mm = ModelMemory { weights_bytes: 0, kv_bytes_per_token: 1, state_bytes_per_slot: 1, activation_reserve: 0 };
         let cfg = crate::serve::interactive_prefix_config_from(&|n| (n == "REXL3_PREFIX_TAIL").then(|| "0".to_string())).unwrap();
         let mut e = engine_over(be, Admission::new(1 << 30, 0, mm, 4).unwrap(), false)
@@ -2969,7 +3171,25 @@ pub(crate) mod tests {
         assert_eq!(d.tokens, serve(&mut e, &t3, false).unwrap().tokens, "the turn after the evictions replies as uncached");
         drop(e);
         h.join().unwrap();
-        assert_eq!(*l0.lock().unwrap(), *l1.lock().unwrap(), "the follower's call stream is rank 0's");
+        let a = l0.lock().unwrap().clone();
+        assert_eq!(a, *l1.lock().unwrap(), "the follower's call stream is rank 0's");
+        let inside = a.iter().filter(|x| x.ends_with(" inside")).count();
+        assert_eq!(inside > 0, inner, "snapshots taken inside a forward: {inside}");
+        // the first turn's slice 1024..1100: with `inner` it runs whole (the cut 1088 armed before it), else it ends at 1088 and a
+        // short slice 1088..1100 follows
+        let starts_at_cut = a.iter().filter(|x| x.starts_with("prefill ") && x.split(' ').nth(2) == Some("1088")).count();
+        assert_eq!(starts_at_cut, usize::from(!inner), "{:?}", cache_calls(&l0));
+        assert_eq!(a.iter().any(|x| x.starts_with("arm ") && x.contains(" 1088 ")), inner);
+    }
+
+    #[test]
+    fn the_engine_resumes_a_follow_up_turn_from_the_end_cut_beside_a_fresh_prompt_through_the_group() {
+        engine_resumes_a_follow_up_turn(false);
+    }
+
+    #[test]
+    fn the_engine_resumes_a_follow_up_turn_from_an_end_cut_taken_inside_the_last_slice() {
+        engine_resumes_a_follow_up_turn(true);
     }
 
     // ---------------------------------------------------------------------------------------- the restore verified per rank, cold otherwise
