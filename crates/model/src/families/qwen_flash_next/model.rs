@@ -836,6 +836,33 @@ fn g_embed(
     Ok(())
 }
 
+/// Two `g_small_linear`s of one input in one launch: `(w, y, n)` of each (the very bits of two calls, the second never waits for the first).
+fn g_small_linear_pair(
+    x: &DevBuf,
+    a: (&DevBuf, &DevBuf, usize),
+    b: (&DevBuf, &DevBuf, usize),
+    rows: usize,
+    k: usize,
+    st: &Stream,
+) -> Result<(), ModelError> {
+    // SAFETY: bf16 x `[rows, k]`, f16 weights `[n, k]`, bf16 outputs `[rows, n]`.
+    unsafe {
+        glue::small_linear_f16w_pair(
+            x.ptr().cast_const(),
+            a.0.ptr().cast_const(),
+            a.1.ptr(),
+            a.2,
+            b.0.ptr().cast_const(),
+            b.1.ptr(),
+            b.2,
+            rows,
+            k,
+            st,
+        )
+    }?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn g_small_linear(x: &DevBuf, w: &DevBuf, y: &DevBuf, rows: usize, k: usize, n: usize, st: &Stream) -> Result<(), ModelError> {
     // SAFETY: bf16 x `[rows, k]`, f16 w `[n, k]`, bf16 y `[rows, n]`.
@@ -2049,8 +2076,14 @@ impl FlashNextModel {
                 if !fork {
                     lin(&m.in_proj_z, &self.x_mixed, &mut self.z, rows, mode, &mut self.ws, &mut self.prefill_ws, st)?;
                 }
-                g_small_linear(&self.x_mixed, &m.in_proj_a, &self.ga, rows, h, gdn::VALUE_HEADS, st)?;
-                g_small_linear(&self.x_mixed, &m.in_proj_b, &self.gb, rows, h, gdn::VALUE_HEADS, st)?;
+                g_small_linear_pair(
+                    &self.x_mixed,
+                    (&m.in_proj_a, &self.ga, gdn::VALUE_HEADS),
+                    (&m.in_proj_b, &self.gb, gdn::VALUE_HEADS),
+                    rows,
+                    h,
+                    st,
+                )?;
 
                 let batch =
                     Batch { seq_start: &self.seq_start, slot: &self.seq_slot, n_seq: b.n_seq(), rows, n_slots: self.pools.slots };
@@ -2275,8 +2308,14 @@ impl FlashNextModel {
 
         // 5. router and shared-expert gate: per row on every path, so a chunk's routing never depends on its row count
         let st = &self.stream;
-        g_small_linear(&self.x_mixed, &layer.moe.router, &self.router_logits, rows, h, num_experts, st)?;
-        g_small_linear(&self.x_mixed, &layer.moe.shared_gate, &self.sh_gate_scalar, rows, h, 1, st)?;
+        g_small_linear_pair(
+            &self.x_mixed,
+            (&layer.moe.router, &self.router_logits, num_experts),
+            (&layer.moe.shared_gate, &self.sh_gate_scalar, 1),
+            rows,
+            h,
+            st,
+        )?;
 
         // 6. the experts. A window groups them across its rows (FrostMoE); a prefill chunk always routes on the device
         // and runs the CoopMK decode, the shared expert riding along as slot `num_experts`.

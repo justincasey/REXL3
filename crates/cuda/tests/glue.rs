@@ -803,6 +803,32 @@ fn small_linear_rows_kernel_is_bit_identical_to_the_per_row_kernel() {
     st.sync().unwrap();
 }
 
+/// `small_linear_f16w_pair` (the router and the shared gate, the GDN gate projections: one launch of two weights on one input) leaves the
+/// very bits of two `small_linear_f16w` calls, for the model's widths (512 + 1, 48 + 48) and ragged ones, at window and chunk row counts.
+#[test]
+fn small_linear_pair_is_bit_identical_to_two_calls() {
+    gpu!();
+    let st = Stream::new().unwrap();
+    let mut rng = Rng(12);
+    for &(k, n1, n2) in &[(2560usize, 512usize, 1usize), (2560, 48, 48), (2048, 256, 1), (2056, 5, 11), (64, 24, 3)] {
+        let (w1, w2) = (f16_bits(&rng.vec(n1 * k, -0.2, 0.2)), f16_bits(&rng.vec(n2 * k, -0.2, 0.2)));
+        let (d1, d2) = (up(&w1), up(&w2));
+        for &rows in &[1usize, 2, 3, 7, 8, 9, 17, 64, 200] {
+            let dx = up(&rand_bf16(&mut rng, rows * k));
+            let (a1, a2) = (zeros(rows * n1 * 2), zeros(rows * n2 * 2));
+            let (b1, b2) = (zeros(rows * n1 * 2), zeros(rows * n2 * 2));
+            unsafe {
+                glue::small_linear_f16w(cp(&dx), cp(&d1), mp(&a1), rows, k, n1, &st).unwrap();
+                glue::small_linear_f16w(cp(&dx), cp(&d2), mp(&a2), rows, k, n2, &st).unwrap();
+                glue::small_linear_f16w_pair(cp(&dx), cp(&d1), mp(&b1), n1, cp(&d2), mp(&b2), n2, rows, k, &st).unwrap();
+            }
+            assert_eq!(dl::<u16>(&a1), dl::<u16>(&b1), "first output, rows {rows} k {k} n {n1}+{n2}");
+            assert_eq!(dl::<u16>(&a2), dl::<u16>(&b2), "second output, rows {rows} k {k} n {n1}+{n2}");
+        }
+    }
+    st.sync().unwrap();
+}
+
 /// A timing lane (run alone under `flock -x`): the per-row and the many-row kernel at a prefill chunk's widths (MiniCPM-V-4.7's router,
 /// delta-net a/b and shared-expert gate at 4,096 rows).
 ///

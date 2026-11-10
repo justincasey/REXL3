@@ -306,9 +306,8 @@ constexpr int SL_RT = 8;  // rows per block; a row's accumulation never depends 
 // y[r, j] = sum_k x[r, k] * w[j, k]. Block (j, row tile); thread t owns 8-vectors t, t+256, ...; acc = fmaf(x, w, acc)
 // in element order; then the block_sum order (butterfly, warps 0..7). The product of a bf16 and an fp16 is exact in fp32.
 template <bool F32OUT>
-__global__ void __launch_bounds__(SL_NT) small_linear_k(const u16* x, const __half* w, void* y, int rows, int k, int n) {
-    __shared__ float sm[SL_RT][SL_NT / 32];
-    const int j = blockIdx.x;
+__device__ __forceinline__ void small_linear_block(const u16* x, const __half* w, void* y, int rows, int k, int n, int j,
+                                                   float (&sm)[SL_RT][SL_NT / 32]) {
     // the weight row is no kernel's output: bring it toward L2 while the predecessor still runs
     if (threadIdx.x < (unsigned)((k + 63) / 64)) prefetch_l2(w + (size_t)j * k + (size_t)threadIdx.x * 64);
     pdl_wait();
@@ -353,6 +352,24 @@ __global__ void __launch_bounds__(SL_NT) small_linear_k(const u16* x, const __ha
         if (F32OUT) ((float*)y)[o] = s;
         else ((u16*)y)[o] = f2bf(s);
     }
+}
+
+template <bool F32OUT>
+__global__ void __launch_bounds__(SL_NT) small_linear_k(const u16* x, const __half* w, void* y, int rows, int k, int n) {
+    __shared__ float sm[SL_RT][SL_NT / 32];
+    small_linear_block<F32OUT>(x, w, y, rows, k, n, blockIdx.x, sm);
+}
+
+// Two small linears of one input in one launch (bf16 out): blocks [0, n1) are small_linear_k's of (w1, y1), the rest of (w2, y2), so
+// the second never waits for the first. Each output is computed by the very block code of small_linear_k.
+__global__ void __launch_bounds__(SL_NT) small_linear_pair_k(const u16* x, const __half* w1, void* y1, int n1, const __half* w2,
+                                                             void* y2, int n2, int rows, int k) {
+    __shared__ float sm[SL_RT][SL_NT / 32];
+    const int j = blockIdx.x;
+    if (j < n1)
+        small_linear_block<false>(x, w1, y1, rows, k, n1, j, sm);
+    else
+        small_linear_block<false>(x, w2, y2, rows, k, n2, j - n1, sm);
 }
 
 // The same arithmetic as small_linear_k, bit for bit, for MANY rows (a prefill chunk): a block is R rows by J columns, SLR_R x SLR_J
@@ -900,6 +917,17 @@ static int small_linear(const void* x, const void* w, void* y, int rows, int k, 
 }
 GB_EXPORT int gb_small_linear_f16w(const void* x, const void* w, void* y, int rows, int k, int n, void* stream) {
     return small_linear(x, w, y, rows, k, n, false, stream);
+}
+// y1 [rows, n1] = x w1^T and y2 [rows, n2] = x w2^T, both bf16, in one launch (see small_linear_pair_k).
+GB_EXPORT int gb_small_linear_f16w_pair(const void* x, const void* w1, void* y1, int n1, const void* w2, void* y2, int n2, int rows,
+                                        int k, void* stream) {
+    if (rows < 0 || k <= 0 || n1 < 0 || n2 < 0 || k % 8 != 0) return ERR_INVALID;
+    if (!aligned16(x) || !aligned16(w1) || !aligned16(w2)) return ERR_INVALID;
+    if (rows == 0 || n1 + n2 == 0) return 0;
+    const dim3 grid(n1 + n2, (rows + SL_RT - 1) / SL_RT);
+    gbp_pdl::launch_pdl(flash_pdl(), small_linear_pair_k, grid, dim3(SL_NT), 0, gb_stream(stream), (const u16*)x, (const __half*)w1, y1,
+                        n1, (const __half*)w2, y2, n2, rows, k);
+    return GB_CHECK_LAUNCH();
 }
 GB_EXPORT int gb_small_linear_f16w_f32out(const void* x, const void* w, void* y, int rows, int k, int n, void* stream) {
     return small_linear(x, w, y, rows, k, n, true, stream);

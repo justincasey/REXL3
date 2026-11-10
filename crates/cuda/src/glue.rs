@@ -159,6 +159,18 @@ mod ffi {
             n: i32,
             s: *mut c_void,
         ) -> i32;
+        pub fn gb_small_linear_f16w_pair(
+            x: *const c_void,
+            w1: *const c_void,
+            y1: *mut c_void,
+            n1: i32,
+            w2: *const c_void,
+            y2: *mut c_void,
+            n2: i32,
+            rows: i32,
+            k: i32,
+            s: *mut c_void,
+        ) -> i32;
         pub fn gb_small_linear_f16w_f32out(
             x: *const c_void,
             w: *const c_void,
@@ -419,6 +431,23 @@ pub unsafe fn small_linear_f16w(
     stream: &Stream,
 ) -> Result<(), CudaError> {
     CudaError::check(ffi::gb_small_linear_f16w(x, w, y, i(rows)?, i(k)?, i(n)?, stream.raw()))
+}
+
+/// [`small_linear_f16w`] of two weights `w1` `[n1, k]` and `w2` `[n2, k]` on the same `x` in ONE launch (`y1` `[rows, n1]`, `y2`
+/// `[rows, n2]`): the very bits of two separate calls, without the second waiting for the first.
+pub unsafe fn small_linear_f16w_pair(
+    x: *const c_void,
+    w1: *const c_void,
+    y1: *mut c_void,
+    n1: usize,
+    w2: *const c_void,
+    y2: *mut c_void,
+    n2: usize,
+    rows: usize,
+    k: usize,
+    stream: &Stream,
+) -> Result<(), CudaError> {
+    CudaError::check(ffi::gb_small_linear_f16w_pair(x, w1, y1, i(n1)?, w2, y2, i(n2)?, i(rows)?, i(k)?, stream.raw()))
 }
 
 /// Same as [`small_linear_f16w`] but `y` is f32 `[rows, n]` (the unrounded accumulator).
