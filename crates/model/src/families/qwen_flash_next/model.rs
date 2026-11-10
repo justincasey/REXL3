@@ -813,9 +813,20 @@ fn g_embed(
 #[allow(clippy::too_many_arguments)]
 fn g_small_linear(x: &DevBuf, w: &DevBuf, y: &DevBuf, rows: usize, k: usize, n: usize, st: &Stream) -> Result<(), ModelError> {
     // SAFETY: bf16 x `[rows, k]`, f16 w `[n, k]`, bf16 y `[rows, n]`.
-    unsafe { glue::small_linear_f16w(x.ptr().cast_const(), w.ptr().cast_const(), y.ptr(), rows, k, n, st) }?;
+    unsafe {
+        // a prefill chunk (many rows) takes the 8-row x 8-column kernel, which leaves the per-row kernel's bits
+        // (`small_linear_rows_kernel_is_bit_identical_to_the_per_row_kernel`) and reads each weight row once per 8-row group
+        if rows >= SMALL_LINEAR_ROWS_MIN {
+            glue::small_linear_f16w_rows(x.ptr().cast_const(), w.ptr().cast_const(), y.ptr(), rows, k, n, st)
+        } else {
+            glue::small_linear_f16w(x.ptr().cast_const(), w.ptr().cast_const(), y.ptr(), rows, k, n, st)
+        }
+    }?;
     Ok(())
 }
+
+/// Rows from which [`g_small_linear`] runs the many-row kernel (decode windows and short chunks keep the per-row one).
+const SMALL_LINEAR_ROWS_MIN: usize = 64;
 
 /// `out = out * sigmoid(gate)` in place over `n` elements.
 fn g_gate_mul(out: &DevBuf, gate: &DevBuf, n: usize, st: &Stream) -> Result<(), ModelError> {
