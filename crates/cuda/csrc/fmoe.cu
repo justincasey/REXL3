@@ -44,6 +44,7 @@ struct Route {
     int* s_tok;   // [emax] token of entry slot
     float* s_w;   // [emax] routing weight of entry slot
     int* e_slot;  // [emax] (token * per_tok + k) -> entry slot
+    int* ready;   // [emax] per group: column blocks of its activation gate_up has finished (zeroed by the route kernel)
 };
 
 __host__ __device__ inline Route route_view(void* base, int emax) {
@@ -56,10 +57,11 @@ __host__ __device__ inline Route route_view(void* base, int emax) {
     r.s_tok = r.g_off + emax;
     r.s_w = reinterpret_cast<float*>(r.s_tok + emax);
     r.e_slot = reinterpret_cast<int*>(r.s_w + emax);
+    r.ready = r.e_slot + emax;
     return r;
 }
 
-inline size_t route_bytes(int emax) { return (size_t)(4 + 6 * emax) * 4; }
+inline size_t route_bytes(int emax) { return (size_t)(4 + 7 * emax) * 4; }
 
 // ---------------------------------------------------------------------------------------------------------------
 // Device helpers
@@ -403,6 +405,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) route_kernel(const __nv_bfloat1
     const int KT = K + (shared_gate ? 1 : 0);
     const int E = T * KT;
     Route r = route_view(route_base, emax);
+    for (int i = tid; i < emax; i += blockDim.x) r.ready[i] = 0;  // the previous layer's down kernel is complete
 
     // 1. top-k a token, one warp a token (value DESC, index ASC). NE <= 512: lane holds experts lane + 32 i. Each round the warp's best is
     // the max key (one reduction), the lowest index among the lanes that hold it (a second); lane k keeps round k's winner, so the
@@ -527,6 +530,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) route_group_kernel(const __nv_b
     const int E = T * KT;
     constexpr int GS = 64;  // experts a group (must equal NE / n_group)
     Route r = route_view(route_base, emax);
+    for (int i = tid; i < emax; i += blockDim.x) r.ready[i] = 0;
 
     for (int tok = warp; tok < T; tok += nwarp) {
         float sb[16], su[16];
@@ -771,7 +775,12 @@ __global__ void __launch_bounds__(WARPS * 32, 4) gate_up_kernel(GateUpArgs a) {
         for (int i = 0; i < 4; ++i) act[i] *= RS128;
         st_f16x4(a.xd + (size_t)slot * a.I + col, act);
     }
-    if (lane == 0) a.cnt[grp * NB + nb] = 0;
+    // the activation columns of this block are written: publish them to the group's down warps
+    __threadfence();
+    if (lane == 0) {
+        a.cnt[grp * NB + nb] = 0;
+        atomicAdd(r.ready + grp, 1);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -820,7 +829,20 @@ __global__ void __launch_bounds__(WARPS * 32, 4) down_kernel(DownArgs a) {
     const size_t stride_k = (size_t)(a.H >> 4) * tw;
     const uint32_t* base = T + (size_t)(kc * 8) * stride_k + (size_t)nb * 8 * tw;
     if (lane < 8) prefetch_l2_bulk(base + (size_t)lane * stride_k, (unsigned)(8 * tw * 4));
-    pdl_wait();
+    // Only this group's activation is waited for, not gate_up's whole grid: gate_up waited for the route and every one of its blocks
+    // has started (they trigger first thing) by the time this kernel runs, so nothing is left that needs a block of this kernel to
+    // make room. Everything else down writes (partials, y, out) is no input of gate_up and no layer before is still running.
+    if (lane == 0) {
+        const int* flag = r.ready + grp;
+        int v;
+        for (;;) {
+            asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(flag) : "memory");
+            if (v >= (a.I >> 7)) break;
+            __nanosleep(40);
+        }
+    }
+    __syncwarp();
+    asm volatile("fence.acq_rel.gpu;" ::: "memory");
     pdl_trigger();
 
     // the group's token column g: 8 k tiles of the rotated activations
