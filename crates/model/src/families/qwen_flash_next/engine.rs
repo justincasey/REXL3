@@ -20,17 +20,87 @@ use std::path::Path;
 
 const WINDOW_ROWS: usize = super::memory::WINDOW_ROWS;
 /// The verify step by rows of ONE stream, in milliseconds as the engine thread waits for it (`step_verified` wall: the window's
-/// graphs, the commit it folds in, the greedy gather and the readback). MEASURED on the head (`rexl3_round_rows_*` counters of
-/// the server's `/metrics`, one GB10, the six decode-screen prompts at short context, 2026-11-10): 28.60 / 32.54 / 35.96 / 39.13 /
-/// 42.71 / 46.05 / 49.50 ms for 1..7 rows (8 extended by the last step), a row costing 3.3 to 3.9 ms over the first. The rows from 16
-/// are the earlier hand-coded table's (no one-stream round reaches them: a stream's window is at most 8 rows).
-const STEP_MS: &[(usize, f64)] =
-    &[(1, 28.6), (2, 32.54), (3, 35.96), (4, 39.13), (5, 42.71), (6, 46.05), (7, 49.5), (8, 53.0), (16, 85.0), (32, 130.0), (64, 220.0)];
-/// A draft chain of `k` MTP steps costs `MTP_CHAIN_BASE_MS + MTP_CHAIN_STEP_MS * k` in the draft phase (the catch-up rows, the replay
-/// and the host read, then one head step each). MEASURED: draft-phase wall per round at fixed k = 1..7 (`REXL3_MTP_ADAPT=0
-/// REXL3_MTP_CONF=0`, one GB10, 1,600 tokens over four prompts): 1.49 / 2.75 / 3.90 / 5.08 / 6.34 / 7.39 / 8.66 ms.
+/// graphs, the commit it folds in, the greedy gather and the readback), for `EngineConfig::cost` (the `legacy` policy's table).
+/// MEASURED on the head (`rexl3_round_rows_*` counters of the server's `/metrics`, nodes A and B, the decode screen's six prompts at
+/// short context, 2026-11-10; K = 7 and 12 runs for the rows past 7): 28.6 / 32.4 / 35.9 / 39.2 / 42.7 / 46.1 / 49.8 / 53.0 / 57.4 /
+/// 63.5 / 69.7 ms for 1..11 rows. The rows from 16 are the earlier hand-coded table's (not measured: the one-stream rounds stop at
+/// 11, and `STEP_GRID` prices the streams' rows).
+const STEP_MS: &[(usize, f64)] = &[
+    (1, 28.6),
+    (2, 32.4),
+    (3, 35.9),
+    (4, 39.2),
+    (5, 42.7),
+    (6, 46.1),
+    (7, 49.8),
+    (8, 53.0),
+    (9, 57.4),
+    (10, 63.5),
+    (11, 69.7),
+    (16, 90.0),
+    (32, 130.0),
+    (64, 220.0),
+];
+/// The verify step by (streams, total rows) in milliseconds as the engine thread waits for it, for the policies that price a round
+/// (`RoundCost::verify`). MEASURED the same way (`rexl3_round_rows_*` of `/metrics`: the decode screen for one stream, the 2- and
+/// 4-stream concurrency sweep for the rest, one GB10, five runs each over 4 policies), cells with at least 4 rounds; the
+/// few cells with fewer (a stream's first rows, 3 streams past 10 rows) are read along their neighbours. A window past 8 rows costs
+/// a step more (8 to 9 rows: +4.4 ms at one stream, +7 to +9 at two or more, the second 8-row tile of the decode kernels), then
+/// about 3.5 ms a row at several streams (up to 6 at one).
+const STEP_GRID: &[(usize, usize, f64)] = &[
+    (1, 1, 28.6),
+    (1, 2, 32.4),
+    (1, 3, 35.9),
+    (1, 4, 39.2),
+    (1, 5, 42.7),
+    (1, 6, 46.1),
+    (1, 7, 49.8),
+    (1, 8, 53.0),
+    (1, 9, 57.4),
+    (1, 10, 63.5),
+    (1, 11, 69.7),
+    (2, 2, 36.0),
+    (2, 3, 40.0),
+    (2, 4, 43.6),
+    (2, 5, 48.0),
+    (2, 6, 49.5),
+    (2, 7, 53.4),
+    (2, 8, 57.2),
+    (2, 9, 64.3),
+    (2, 10, 67.8),
+    (3, 3, 41.5),
+    (3, 4, 46.0),
+    (3, 5, 50.4),
+    (3, 6, 54.9),
+    (3, 7, 57.3),
+    (3, 8, 61.1),
+    (3, 9, 69.8),
+    (3, 10, 73.8),
+    (3, 12, 78.6),
+    (4, 4, 45.0),
+    (4, 5, 50.0),
+    (4, 6, 55.0),
+    (4, 7, 60.0),
+    (4, 8, 62.3),
+    (4, 9, 70.4),
+    (4, 10, 74.8),
+    (4, 11, 77.6),
+    (4, 12, 81.3),
+    (4, 13, 83.9),
+    (4, 14, 87.6),
+    (4, 15, 90.5),
+    (4, 17, 96.5),
+    (4, 18, 100.2),
+    (4, 19, 106.8),
+];
+/// A draft chain of `k` MTP steps for one stream costs `MTP_CHAIN_BASE_MS + 1.2 * k` ms in the draft phase (the catch-up rows, the
+/// replay and the host read, then one head step each). MEASURED: draft-phase wall per round at fixed k = 1..7 (`REXL3_MTP_ADAPT=0
+/// REXL3_MTP_CONF=0`, one GB10, 1,600 tokens over four prompts): 1.49 / 2.75 / 3.90 / 5.08 / 6.34 / 7.39 / 8.66 ms. A chain of several
+/// streams runs every stream's row in each step, about 0.2 ms more a step for each stream past the first (2 streams, 4 asked: 5 to
+/// 6 ms; 4 streams, 5 asked: 9 to 10 ms): the planner prices a draft by its streams (`layers`) and the picks asked in all
+/// (`MTP_HEAD_MS`, 1.2 ms a pick to 6, concave past it: several streams share each step).
 const MTP_CHAIN_BASE_MS: f64 = 0.28;
-const MTP_CHAIN_STEP_MS: f64 = 1.20;
+const MTP_HEAD_MS: &[(usize, f64)] = &[(1, 1.2), (2, 2.4), (3, 3.6), (4, 4.8), (5, 6.0), (6, 7.2), (8, 8.6), (12, 10.5), (16, 12.5), (32, 19.0)];
 /// The budget policy a Flash-Next server runs unless `REXL3_SPEC_BUDGET` says otherwise: `scored` (the plan decides before the chain
 /// whether a round drafts, the head's own probabilities decide after it how many drafts ride). Decode screen, six prompts, replies
 /// exact: 65.2 to 65.7 tok/s against 64.5 for `legacy` with the old table.
@@ -40,11 +110,11 @@ const DEFAULT_BUDGET: BudgetPolicy = BudgetPolicy::Scored;
 /// MTP chain as a draft whose head rows are the steps. Measured at a short context and not corrected for a longer one (the context
 /// terms are 0): at the lengths the decode screen runs, the attention of 12 of the 48 layers is not what a window waits for.
 pub(super) fn round_cost(mtp: bool) -> RoundCost {
-    let steps: Vec<(usize, f64)> = (1..=WINDOW_ROWS).map(|k| (k, MTP_CHAIN_STEP_MS * k as f64)).collect();
+    let layers: Vec<(usize, f64)> = (1..=4).map(|n| (n, MTP_CHAIN_BASE_MS + 0.2 * (n - 1) as f64)).collect();
     RoundCost {
-        verify: StepCost::rows_only(CostModel::from_table(STEP_MS.to_vec())),
+        verify: StepCost::from_grid(STEP_GRID.to_vec()),
         tree_verify: None,
-        draft: mtp.then(|| DraftCost::new(vec![(1, MTP_CHAIN_BASE_MS)], steps, 0.0)),
+        draft: mtp.then(|| DraftCost::new(layers, MTP_HEAD_MS.to_vec(), 0.0)),
         kv_ms_per_token: 0.0,
         kv_pass_ms_per_token: 0.0,
         fixed_ms: 0.0,
