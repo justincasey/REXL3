@@ -13,6 +13,9 @@
 // - k1b uses 8-warp blocks (the same per-job math and reduction order);
 // - k2c gives each block 16 warps (512 threads) covering 16 columns, so the k2 grid halves (320 -> 160 blocks) with
 //   the reference's per-column body untouched;
+// - k2t (hc = 4, rank <= 512, the Flash-Next shape) replaces k2c: one warp owns four columns, the low chunks are read from
+//   shared memory once for the four streams, and the 4 x rows per-lane partial sums are reduce-scattered (same xor tree as
+//   warp_sum) so the exp/divide tail runs once a warp instead of once a (stream, row) per lane; see the block comment above it;
 // - hc_post is regridded over the whole [t, s, d] volume (elementwise, so any grid gives the same bits).
 // The fast path is unconditional: the gate needs the bit-exact fast kernels always on. The reference launches are
 // still reachable through gb_hcx_pre_ref / gb_hcx_pre_z_ref (used by the bit-exact GPU tests in tests/hcx_perf.rs).
@@ -37,6 +40,67 @@ __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
     return v;
+}
+
+__device__ __forceinline__ float dot8_acc(float acc, const float (&w)[8], const float4 a, const float4 b) {
+    acc += w[0] * a.x + w[1] * a.y + w[2] * a.z + w[3] * a.w + w[4] * b.x + w[5] * b.y + w[6] * b.z + w[7] * b.w;
+    return acc;
+}
+
+__device__ __forceinline__ void dec_half8(const uint4 u, float (&v)[8]) {
+    const half2* h = reinterpret_cast<const half2*>(&u);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float2 f = __half22float2(h[i]);
+        v[2 * i] = f.x;
+        v[2 * i + 1] = f.y;
+    }
+}
+
+// 32 values a lane in, lane l out: warp_sum of element l (the sum over the 32 lanes of v[l]), same pairing tree as warp_sum.
+__device__ __forceinline__ float scatter_sum32(const float (&v)[32], int lane) {
+    constexpr unsigned FULL = 0xffffffffu;
+    float b[16], c[8], d[4], e[2];
+    {
+        const bool hi = lane & 16;
+#pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            const float mine = hi ? v[k + 16] : v[k];
+            const float send = hi ? v[k] : v[k + 16];
+            b[k] = mine + __shfl_xor_sync(FULL, send, 16);
+        }
+    }
+    {
+        const bool hi = lane & 8;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const float mine = hi ? b[k + 8] : b[k];
+            const float send = hi ? b[k] : b[k + 8];
+            c[k] = mine + __shfl_xor_sync(FULL, send, 8);
+        }
+    }
+    {
+        const bool hi = lane & 4;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float mine = hi ? c[k + 4] : c[k];
+            const float send = hi ? c[k] : c[k + 4];
+            d[k] = mine + __shfl_xor_sync(FULL, send, 4);
+        }
+    }
+    {
+        const bool hi = lane & 2;
+#pragma unroll
+        for (int k = 0; k < 2; ++k) {
+            const float mine = hi ? d[k + 2] : d[k];
+            const float send = hi ? d[k] : d[k + 2];
+            e[k] = mine + __shfl_xor_sync(FULL, send, 2);
+        }
+    }
+    const bool hi = lane & 1;
+    const float mine = hi ? e[1] : e[0];
+    const float send = hi ? e[0] : e[1];
+    return mine + __shfl_xor_sync(FULL, send, 1);
 }
 
 // K1. Jobs: (s, r) for r < R (rank down rows, then ninj inject rows), r fastest; then (t, s) sum-of-squares jobs.
@@ -306,6 +370,145 @@ __global__ void __launch_bounds__(512) k2c_kernel(const float* __restrict__ x, c
     }
 }
 
+// ---- k2t: the decode fast k2 for hc = 4 (the Flash-Next family) ------------------------------------------------------
+// Same arithmetic as k2c bit for bit, restructured for the 1..8-row window (at 7 rows k2c is issue-bound, not DRAM-bound:
+// every warp ran 28 warp_sum + exp + IEEE divide chains redundantly across its 32 lanes):
+// - a warp owns K2T_CPW consecutive columns; for each column the four streams' weight chunks are loaded once, and each
+//   low chunk is read from shared memory once for the four streams;
+// - low lives in shared memory swizzled so a lane's two float4 are conflict free;
+// - the 4 x NT per-lane partial sums are reduced by scatter_sum32 (a reduce-scatter with the same xor 16/8/4/2/1 pairings
+//   as warp_sum, so each element is bit-identical to warp_sum of it), after which lane s*8+t owns z[s][t] and evaluates the
+//   sigmoid mix once; the four streams' terms are added in the reference order s = 0..3 through three shuffles.
+// rank <= 512 and a multiple of 8 (at most two 256-column chunks a lane). H % 256 == 0 is enforced by the launcher.
+constexpr int K2T_CPW = 4;  // columns a warp
+constexpr int K2T_WPB = 8;  // warps a block
+
+// low[t][r] position in the swizzled shared array: chunk 0 (r < 256) as [t][half][lane*4 + i], chunk 1 after it.
+__device__ __forceinline__ int k2t_low_pos(int t, int r, int base1, int stride1) {
+    const int it = r >> 8, c = r & 255, l = c >> 3, h = (c >> 2) & 1, i = c & 3;
+    return it == 0 ? (t * 2 + h) * 128 + l * 4 + i : base1 + (t * 2 + h) * stride1 + l * 4 + i;
+}
+
+template <int NT>
+__global__ void __launch_bounds__(K2T_WPB * 32, 2) k2t_kernel(const float* __restrict__ x, const half* __restrict__ nw,
+                                                              const half* __restrict__ up, const float* __restrict__ P,
+                                                              const float* __restrict__ ss, __nv_bfloat16* __restrict__ y,
+                                                              float* __restrict__ inj_out, int t0, int H, int rank,
+                                                              int ninj, float eps, float* __restrict__ dbg_z) {
+    constexpr int HCN = 4;
+    extern __shared__ float s_low[];  // swizzled low [NT][rank]
+    __shared__ float s_rms[NT * HCN];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int R = rank + ninj;
+    const float inv_hc = 1.f / (float)HCN;
+    const int col0 = (blockIdx.x * K2T_WPB + warp) * K2T_CPW;
+    const size_t HC = (size_t)HCN * H;
+    const bool has0 = 8 * lane < rank, has1 = 8 * lane + 256 < rank;
+    const int base1 = NT * 2 * 128;
+    const int stride1 = rank > 320 ? 128 : 32;
+
+    // the first column's weights are independent of k1: issue them before the low computation
+    uint4 q0[HCN], q1[HCN];
+    if (col0 < H) {
+#pragma unroll
+        for (int s = 0; s < HCN; ++s) {
+            const half* row = up + ((size_t)s * H + col0) * rank;
+            if (has0) q0[s] = __ldg(reinterpret_cast<const uint4*>(row + 8 * lane));
+            if (has1) q1[s] = __ldg(reinterpret_cast<const uint4*>(row + 8 * lane + 256));
+        }
+    }
+    if (tid < NT * HCN) s_rms[tid] = rsqrtf(ss[tid] / (float)H + eps);
+    __syncthreads();
+    for (int i = tid; i < NT * rank; i += K2T_WPB * 32) {
+        const int t = i / rank, r = i % rank;
+        const float4 p = *reinterpret_cast<const float4*>(P + ((size_t)t * R + r) * HCN);
+        float a = 0.f;
+        a += s_rms[t * HCN + 0] * p.x;
+        a += s_rms[t * HCN + 1] * p.y;
+        a += s_rms[t * HCN + 2] * p.z;
+        a += s_rms[t * HCN + 3] * p.w;
+        a *= inv_hc;
+        s_low[k2t_low_pos(t, r, base1, stride1)] = a / (1.f + __expf(-a));
+    }
+    if (blockIdx.x == 0 && inj_out != nullptr) {
+        for (int i = tid; i < NT * ninj; i += K2T_WPB * 32) {
+            const int t = i / ninj, qq = i % ninj;
+            const float* p = P + ((size_t)t * R + rank + qq) * HCN;
+            float a = 0.f;
+#pragma unroll
+            for (int s = 0; s < HCN; ++s) a += s_rms[t * HCN + s] * p[s];
+            inj_out[(size_t)(t0 + t) * ninj + qq] = 2.f / (1.f + __expf(-a * inv_hc));
+        }
+    }
+    __syncthreads();
+
+    const int se = lane >> 3, te = lane & 7;  // this lane's (stream, row) once the partial sums are scattered
+#pragma unroll 1
+    for (int k = 0; k < K2T_CPW; ++k) {
+        const int col = col0 + k;
+        if (col >= H) break;
+        if (k > 0) {
+#pragma unroll
+            for (int s = 0; s < HCN; ++s) {
+                const half* row = up + ((size_t)s * H + col) * rank;
+                if (has0) q0[s] = __ldg(reinterpret_cast<const uint4*>(row + 8 * lane));
+                if (has1) q1[s] = __ldg(reinterpret_cast<const uint4*>(row + 8 * lane + 256));
+            }
+        }
+        float acc[HCN][NT];
+#pragma unroll
+        for (int s = 0; s < HCN; ++s)
+#pragma unroll
+            for (int t = 0; t < NT; ++t) acc[s][t] = 0.f;
+        if (has0) {
+            float wv[HCN][8];
+#pragma unroll
+            for (int s = 0; s < HCN; ++s) dec_half8(q0[s], wv[s]);
+#pragma unroll
+            for (int t = 0; t < NT; ++t) {
+                const float4 a = *reinterpret_cast<const float4*>(s_low + (t * 2 + 0) * 128 + lane * 4);
+                const float4 b = *reinterpret_cast<const float4*>(s_low + (t * 2 + 1) * 128 + lane * 4);
+#pragma unroll
+                for (int s = 0; s < HCN; ++s) acc[s][t] = dot8_acc(acc[s][t], wv[s], a, b);
+            }
+        }
+        if (has1) {
+            float wv[HCN][8];
+#pragma unroll
+            for (int s = 0; s < HCN; ++s) dec_half8(q1[s], wv[s]);
+#pragma unroll
+            for (int t = 0; t < NT; ++t) {
+                const float4 a = *reinterpret_cast<const float4*>(s_low + base1 + (t * 2 + 0) * stride1 + lane * 4);
+                const float4 b = *reinterpret_cast<const float4*>(s_low + base1 + (t * 2 + 1) * stride1 + lane * 4);
+#pragma unroll
+                for (int s = 0; s < HCN; ++s) acc[s][t] = dot8_acc(acc[s][t], wv[s], a, b);
+            }
+        }
+        float v[32];
+#pragma unroll
+        for (int s = 0; s < HCN; ++s)
+#pragma unroll
+            for (int t = 0; t < 8; ++t) v[s * 8 + t] = (t < NT) ? acc[s][t < NT ? t : 0] : 0.f;
+        const float z = scatter_sum32(v, lane);
+        float term = 0.f;
+        if (te < NT) {
+            if (dbg_z) dbg_z[((size_t)se * NT + te) * H + col] = z;
+            const float nv = 1.f + __half2float(nw[(size_t)se * H + col]);
+            const float xv = x[(size_t)(t0 + te) * HC + (size_t)se * H + col];
+            term = xv * s_rms[te * HCN + se] * nv / (1.f + __expf(-z));
+        }
+        const float t1 = __shfl_sync(0xffffffffu, term, (lane + 8) & 31);
+        const float t2 = __shfl_sync(0xffffffffu, term, (lane + 16) & 31);
+        const float t3 = __shfl_sync(0xffffffffu, term, (lane + 24) & 31);
+        float o = 0.f;
+        o += term;
+        o += t1;
+        o += t2;
+        o += t3;
+        if (lane < NT) y[(size_t)(t0 + lane) * H + col] = __float2bfloat16(o * inv_hc);
+    }
+}
+
 }  // namespace hcx
 
 using namespace hcx;
@@ -315,10 +518,28 @@ GB_EXPORT size_t gb_hcx_scratch_bytes(int hc, int rank, int ninj) {
     return ((size_t)TMAX * (rank + ninj) * hc + (size_t)TMAX * hc) * sizeof(float);
 }
 
+// k2t launch for 1..8 rows (rows are a template parameter: the per-lane partial sums live in registers).
+static void launch_k2t(int nt, const float* x, const half* nw, const half* up, const float* P, const float* ss,
+                       __nv_bfloat16* y, float* inj_out, int t0, int H, int rank, int ninj, float eps, float* dbg_z,
+                       cudaStream_t st) {
+    const int blocks = (H + K2T_WPB * K2T_CPW - 1) / (K2T_WPB * K2T_CPW);
+    const int stride1 = rank > 320 ? 128 : 32;
+    const size_t smem = (size_t)nt * (256 + (rank > 256 ? 2 * stride1 : 0)) * sizeof(float);
+    switch (nt) {
+#define K2T_CASE(N)                                                                                                    \
+    case N:                                                                                                            \
+        k2t_kernel<N><<<blocks, K2T_WPB * 32, smem, st>>>(x, nw, up, P, ss, y, inj_out, t0, H, rank, ninj, eps, dbg_z); \
+        break;
+        K2T_CASE(1) K2T_CASE(2) K2T_CASE(3) K2T_CASE(4) K2T_CASE(5) K2T_CASE(6) K2T_CASE(7) K2T_CASE(8)
+#undef K2T_CASE
+        default: break;
+    }
+}
+
 // y [T][H] bf16 (and inj [T][hc] when inject_w != null) from streams [T][hc][H] fp32. Same contract as gb_hc_pre.
-// `ref=false` (gb_hcx_pre / gb_hcx_pre_z) launches the decode fast kernels k1b/k2c unconditionally, bit-identical to
-// k1/k2; `ref=true` (gb_hcx_pre_ref / gb_hcx_pre_z_ref) launches the reference k1_kernel/k2_kernel directly for the
-// bit-exact GPU tests.
+// `ref=false` (gb_hcx_pre / gb_hcx_pre_z) launches the decode fast kernels (k1b, then k2t for hc = 4 with rank <= 512, k2c
+// otherwise) unconditionally, bit-identical to k1/k2; `ref=true` (gb_hcx_pre_ref / gb_hcx_pre_z_ref) launches the reference
+// k1_kernel/k2_kernel directly for the bit-exact GPU tests.
 static int hcx_pre_impl(const void* streams, const void* hc_norm_w, const void* down_w, const void* up_w,
                         const void* inject_w, void* y_out, float* inj_out, void* scratch, unsigned int hidden_size,
                         unsigned int hc_mult, unsigned int rank, float eps, unsigned int num_tokens, void* stream,
@@ -336,6 +557,7 @@ static int hcx_pre_impl(const void* streams, const void* hc_norm_w, const void* 
         const int jobs = R * hc + nt * hc;
         const bool use_k1b = !ref;
         const bool use_k2b = !ref;
+        const bool use_k2t = !ref && hc == 4 && rk <= 512;
         if (use_k1b) {
             k1b_kernel<<<(jobs + 7) / 8, 256, 0, st>>>((const float*)streams, (const half*)hc_norm_w,
                                                        (const half*)down_w, (const half*)inject_w, P, ss, t0, nt, H,
@@ -347,7 +569,10 @@ static int hcx_pre_impl(const void* streams, const void* hc_norm_w, const void* 
         }
         int rc = GB_CHECK_LAUNCH();
         if (rc) return rc;
-        if (use_k2b) {
+        if (use_k2t) {
+            launch_k2t(nt, (const float*)streams, (const half*)hc_norm_w, (const half*)up_w, P, ss, (__nv_bfloat16*)y_out,
+                       inject_w ? inj_out : nullptr, t0, H, rk, ninj, eps, dbg_z, st);
+        } else if (use_k2b) {
             k2c_kernel<<<(H + 15) / 16, 512, (size_t)nt * rk * sizeof(float), st>>>(
                 (const float*)streams, (const half*)hc_norm_w, (const half*)up_w, P, ss, (__nv_bfloat16*)y_out,
                 inject_w ? inj_out : nullptr, t0, nt, H, hc, rk, ninj, eps, dbg_z);
