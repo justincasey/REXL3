@@ -303,7 +303,9 @@ __global__ void __launch_bounds__(1024) topk_k(const float* __restrict__ scores,
     if (t == 0) sel_n[r] = TOPK;
 }
 
-constexpr int TB = 8;  // tokens a warp works on at once
+constexpr int TB = 8;  // tokens a warp works on at once. Part of the arithmetic: the running max moves once per TB tokens
+constexpr int ATTEND_HPW = 4;           // query heads a warp of attend_h serves (MEASURED at 4,096 rows: 90.9 ms -> 50.2 ms a layer)
+constexpr int ATTEND_H_MIN_ROWS = 64;  // rows from which gb_qsa_attend runs attend_h
 
 // grid (rows, NKV, parts), block 32 * GRP: warp w is q head kvh * GRP + w
 __global__ void __launch_bounds__(32 * GRP) attend_k(const __nv_bfloat16* __restrict__ qm, const __nv_bfloat16* __restrict__ kc,
@@ -394,6 +396,123 @@ __global__ void __launch_bounds__(32 * GRP) attend_k(const __nv_bfloat16* __rest
     }
 }
 
+// attend_k with HPW query heads a warp (block 32 * GRP / HPW): the 8-token K/V loads, their address arithmetic and the bf16 widening are
+// done once for the warp's heads instead of once per head. Every head's own arithmetic is attend_k's, expression for expression and in
+// the same order (this file is --fmad=false), so a head's part_o / part_m / part_l are attend_k's bit for bit; only the number of
+// instructions and L1 loads a (token, head) costs changes. Grid as attend_k: (rows, NKV, parts).
+template <int HPW, int TBH>
+__global__ void __launch_bounds__(32 * (GRP / HPW))
+    attend_h(const __nv_bfloat16* __restrict__ qm, const __nv_bfloat16* __restrict__ kc, const __nv_bfloat16* __restrict__ vc,
+             const int* __restrict__ table, int max_blocks, const int* __restrict__ row_slot, const int* __restrict__ positions,
+             const int* __restrict__ sel, const int* __restrict__ sel_n, float* __restrict__ part_o, float* __restrict__ part_m,
+             float* __restrict__ part_l, int parts) {
+    static_assert(GRP % HPW == 0, "heads a warp must divide the group");
+    const int r = blockIdx.x, kvh = blockIdx.y, part = blockIdx.z;
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int head0 = kvh * GRP + w * HPW;
+    const int p = positions[r], nbq = (p + 1) / CR, n = sel_n[r];
+    const int total = CR * n + (p - CR * nbq + 1);
+    const int a = (int)((long long)total * part / parts), b = (int)((long long)total * (part + 1) / parts);
+    const int slot = row_slot[r];
+    const int* sl = sel + (size_t)r * TOPK;
+    const int* tb = table + (size_t)slot * max_blocks;
+    float qv[HPW][8];
+#pragma unroll
+    for (int h = 0; h < HPW; ++h) {
+        const uint4 u = reinterpret_cast<const uint4*>(qm + ((size_t)r * NQ + head0 + h) * D)[lane];
+        const __nv_bfloat162* h2 = reinterpret_cast<const __nv_bfloat162*>(&u);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const float2 f = __bfloat1622float2(h2[e]);
+            qv[h][2 * e] = f.x * (0.0625f * LOG2E);
+            qv[h][2 * e + 1] = f.y * (0.0625f * LOG2E);
+        }
+    }
+    float m[HPW], l[HPW], o[HPW][8];
+#pragma unroll
+    for (int h = 0; h < HPW; ++h) {
+        m[h] = -INFINITY;
+        l[h] = 0.f;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) o[h][e] = 0.f;
+    }
+    for (int i0 = a; i0 < b; i0 += TBH) {
+        uint4 ku[TBH], vu[TBH];
+#pragma unroll
+        for (int k = 0; k < TBH; ++k) {
+            const int i = i0 + k;
+            const int ii = i < b ? i : a;
+            const int tok = ii < CR * n ? CR * sl[ii / CR] + ii % CR : CR * nbq + (ii - CR * n);
+            const size_t off = (((size_t)tb[tok / PAGE] * PAGE + tok % PAGE) * NKV + kvh) * D;
+            ku[k] = reinterpret_cast<const uint4*>(kc + off)[lane];
+            vu[k] = reinterpret_cast<const uint4*>(vc + off)[lane];
+        }
+        float sc[HPW][TBH];
+#pragma unroll
+        for (int k = 0; k < TBH; ++k) {
+            const __nv_bfloat162* h2 = reinterpret_cast<const __nv_bfloat162*>(&ku[k]);
+            float kf[8];
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const float2 f = __bfloat1622float2(h2[e]);
+                kf[2 * e] = f.x;
+                kf[2 * e + 1] = f.y;
+            }
+#pragma unroll
+            for (int h = 0; h < HPW; ++h) {
+                float d = 0.f;
+#pragma unroll
+                for (int e = 0; e < 4; ++e) d = d + qv[h][2 * e] * kf[2 * e] + qv[h][2 * e + 1] * kf[2 * e + 1];
+                sc[h][k] = warp_sum(d);
+            }
+        }
+        float mx[HPW];
+#pragma unroll
+        for (int h = 0; h < HPW; ++h) {
+            mx[h] = m[h];
+#pragma unroll
+            for (int k = 0; k < TBH; ++k)
+                if (i0 + k < b) mx[h] = fmaxf(mx[h], sc[h][k]);
+            const float corr = exp2f(m[h] - mx[h]);
+            l[h] = l[h] * corr;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) o[h][e] = o[h][e] * corr;
+        }
+#pragma unroll
+        for (int k = 0; k < TBH; ++k) {
+            if (i0 + k >= b) continue;
+            const __nv_bfloat162* h2 = reinterpret_cast<const __nv_bfloat162*>(&vu[k]);
+            float vf[8];
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const float2 f = __bfloat1622float2(h2[e]);
+                vf[2 * e] = f.x;
+                vf[2 * e + 1] = f.y;
+            }
+#pragma unroll
+            for (int h = 0; h < HPW; ++h) {
+                const float pk = exp2f(sc[h][k] - mx[h]);
+                l[h] = l[h] + pk;
+#pragma unroll
+                for (int e = 0; e < 8; ++e) o[h][e] = o[h][e] + pk * vf[e];
+            }
+        }
+#pragma unroll
+        for (int h = 0; h < HPW; ++h) m[h] = mx[h];
+    }
+#pragma unroll
+    for (int h = 0; h < HPW; ++h) {
+        const size_t pi = ((size_t)r * NQ + head0 + h) * parts + part;
+        float* po = part_o + pi * D + lane * 8;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) po[e] = o[h][e];
+        if (lane == 0) {
+            part_m[pi] = m[h];
+            part_l[pi] = l[h];
+        }
+    }
+}
+
 // grid (rows, NQ), block D
 __global__ void __launch_bounds__(D) merge_k(const float* __restrict__ part_o, const float* __restrict__ part_m,
                                              const float* __restrict__ part_l, __nv_bfloat16* __restrict__ out, int parts) {
@@ -467,6 +586,14 @@ GB_EXPORT int gb_qsa_attend(const void* q, const void* k_cache, const void* v_ca
     if (rows < 0 || parts <= 0) return (int)cudaErrorInvalidValue;
     if (rows == 0) return 0;
     const dim3 grid(rows, qsa::NKV, parts);
+    // many rows (a prefill chunk): four heads a warp, the same bits as one head a warp (see attend_h); the decode windows' few rows
+    // keep the twelve-warp block, whose grid fills the SMs through `parts`
+    if (rows >= qsa::ATTEND_H_MIN_ROWS) {
+        qsa::attend_h<qsa::ATTEND_HPW, qsa::TB><<<grid, 32 * (qsa::GRP / qsa::ATTEND_HPW), 0, gb_stream(stream)>>>(
+            (const __nv_bfloat16*)q, (const __nv_bfloat16*)k_cache, (const __nv_bfloat16*)v_cache, table, max_blocks, row_slot,
+            positions, sel, sel_n, (float*)part_o, (float*)part_m, (float*)part_l, parts);
+        return GB_CHECK_LAUNCH();
+    }
     qsa::attend_k<<<grid, 32 * qsa::GRP, 0, gb_stream(stream)>>>(
         (const __nv_bfloat16*)q, (const __nv_bfloat16*)k_cache, (const __nv_bfloat16*)v_cache, table, max_blocks, row_slot,
         positions, sel, sel_n, (float*)part_o, (float*)part_m, (float*)part_l, parts);
