@@ -427,21 +427,142 @@ __global__ void __launch_bounds__(32 * GRP) attend_k(const __nv_bfloat16* __rest
     }
 }
 
-// attend_k with HPW query heads a warp (block 32 * GRP / HPW): the 8-token K/V loads, their address arithmetic and the bf16 widening are
-// done once for the warp's heads instead of once per head. Every head's own arithmetic is attend_k's, expression for expression and in
-// the same order (this file is --fmad=false), so a head's part_o / part_m / part_l are attend_k's bit for bit; only the number of
-// instructions and L1 loads a (token, head) costs changes. Grid as attend_k: (rows, NKV, parts).
-template <int HPW, int TBH>
+// attend_k with HPW query heads a warp (block 32 * GRP / HPW). Every head's own arithmetic is attend_k's, operation for operation with
+// the same operands (this file is --fmad=false), so a head's part_o / part_m / part_l are attend_k's bit for bit; what changes is how
+// many instructions a (token, head) costs, by regrouping work that is the same value in every lane:
+//  * The 8-token group's K and V rows are gathered through offsets computed lane-parallel, 32 tokens at a time (one lane a token), and
+//    widened once for the warp's four heads.
+//  * A token's score is warp_sum of the lanes' partial dots: butterfly over lane bits 4, 3, 2, 1, 0 in that order. The eight tokens of
+//    a group (and the four heads) are reduced together instead of one warp_sum each: at each step a lane forwards the half of its
+//    values its partner keeps and adds the half it keeps, so the additions and their grouping are warp_sum's exactly (a sum's operands
+//    commute) and a step costs half the shuffles and adds of the step before. To make "the half the partner keeps" the same registers
+//    in both lanes without selects, lane L loads token (k ^ (L >> 2)) as its k-th K row and takes the query of head (s ^ (L & 3)) as
+//    its s-th query. After the five steps lane L holds the score of token L >> 2, head L & 3, as warp_sum would give every lane.
+//  * That lane alone takes the group's max of its head (max is exact: a butterfly of fmaxf over lane bits 4, 3, 2) and computes
+//    pk = exp2f(score - max), which attend_k computes in every lane from the same two numbers; pk goes to the other lanes through
+//    shared memory. Lane L also keeps the running max m and the sum l of its own head L & 3 (l's additions are attend_k's, in token
+//    order); only the o accumulators are per head in every lane.
+//  * The rescale of l and o by exp2f(m - mx) only matters when the max moved; o * 1.0f is o and l * 1.0f is l, so the multiplies are
+//    skipped (warp-uniformly) when no head's max changed.
+//  * `d = 0.f + q * k` is one fma (see dot8) and a bf16 widens in one instruction (see widen8).
+// Prefill chunks run one part: grid (rows, NKV, parts) as attend_k, block 96.
+constexpr int HPW = ATTEND_HPW;
+static_assert(GRP % HPW == 0 && HPW == 4 && TB == 8, "the lane layout of attend_h is built for 8 tokens and 4 heads a warp");
+
+// bf16 pairs to f32 (a bf16 is the high half of an f32): one instruction an element
+__device__ __forceinline__ void widen8(const uint4& u, float (&f)[8]) {
+    f[0] = __uint_as_float(u.x << 16);
+    f[1] = __uint_as_float(u.x & 0xffff0000u);
+    f[2] = __uint_as_float(u.y << 16);
+    f[3] = __uint_as_float(u.y & 0xffff0000u);
+    f[4] = __uint_as_float(u.z << 16);
+    f[5] = __uint_as_float(u.z & 0xffff0000u);
+    f[6] = __uint_as_float(u.w << 16);
+    f[7] = __uint_as_float(u.w & 0xffff0000u);
+}
+
+// attend_k's `d = 0.f; for e: d = d + q[2e] * k[2e] + q[2e + 1] * k[2e + 1]`. Its first term is 0.f + q[0] * k[0]: the product rounded
+// once, then a zero added (which only turns a -0 product into +0): exactly fma(q[0], k[0], 0.f), one instruction instead of two.
+__device__ __forceinline__ float dot8(const float (&q)[8], const float (&k)[8]) {
+    float d = __fmaf_rn(q[0], k[0], 0.f);
+    d = d + q[1] * k[1];
+#pragma unroll
+    for (int e = 1; e < 4; ++e) d = d + q[2 * e] * k[2 * e] + q[2 * e + 1] * k[2 * e + 1];
+    return d;
+}
+
+// Scores of one group of TB tokens: `ku[k]` is the lane's K row of token (k ^ g) (g = lane >> 2, qs = lane & 3), qv[s] the query of head
+// (s ^ qs). Returns the score of token g, head qs: warp_sum's value of that (token, head) pair, from the tree described above.
+__device__ __forceinline__ float group_scores(const uint4 (&ku)[TB], const float (&qv)[HPW][8]) {
+    constexpr unsigned FULLMASK = 0xffffffffu;
+    // partial dots of this lane's 8 dims, then step 16 of the butterfly (tokens k and k + 4 meet in w[s][k])
+    float w[HPW][4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        float k0[8], k1[8];
+        widen8(ku[j], k0);
+        widen8(ku[j + 4], k1);
+#pragma unroll
+        for (int s = 0; s < HPW; ++s) {
+            const float d0 = dot8(qv[s], k0), d1 = dot8(qv[s], k1);
+            w[s][j] = d0 + __shfl_xor_sync(FULLMASK, d1, 16);
+        }
+    }
+    // steps 8 and 4 over the tokens, then steps 2 and 1 over the heads
+    float t[HPW];
+#pragma unroll
+    for (int s = 0; s < HPW; ++s) {
+        const float u0 = w[s][0] + __shfl_xor_sync(FULLMASK, w[s][2], 8);
+        const float u1 = w[s][1] + __shfl_xor_sync(FULLMASK, w[s][3], 8);
+        t[s] = u0 + __shfl_xor_sync(FULLMASK, u1, 4);
+    }
+    const float a0 = t[0] + __shfl_xor_sync(FULLMASK, t[2], 2);
+    const float a1 = t[1] + __shfl_xor_sync(FULLMASK, t[3], 2);
+    return a0 + __shfl_xor_sync(FULLMASK, a1, 1);
+}
+
+// The softmax update and the PV products of one group: `vu[k]` is the V row of token k; `nv` valid tokens (all TB when FULL). m and l are
+// the running max and sum of head qs (the lane's own head: only lane h < 4 writes head h's, and no other lane needs another's), o is
+// per head. `spk` is the warp's 32 floats of scratch.
+template <bool FULL>
+__device__ __forceinline__ void group_pv(float sc, const uint4 (&vu)[TB], float& m, float& l, float (&o)[HPW][8], int nv, int g, int qs,
+                                         float* spk) {
+    constexpr unsigned FULLMASK = 0xffffffffu;
+    // the group's max of head qs
+    float x = FULL || g < nv ? sc : -INFINITY;
+    x = fmaxf(x, __shfl_xor_sync(FULLMASK, x, 16));
+    x = fmaxf(x, __shfl_xor_sync(FULLMASK, x, 8));
+    x = fmaxf(x, __shfl_xor_sync(FULLMASK, x, 4));
+    const float mx = fmaxf(m, x);
+    if (__any_sync(FULLMASK, mx != m)) {
+        const float corr = exp2f(m - mx);
+        l = l * corr;
+#pragma unroll
+        for (int h = 0; h < HPW; ++h) {
+            const float c = __shfl_sync(FULLMASK, corr, h);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) o[h][e] = o[h][e] * c;
+        }
+    }
+    m = mx;
+    // pk of (token g, head qs) lands at spk[lane] = spk[4 g + qs]: token k's four heads are one 16-byte read
+    __syncwarp();
+    spk[4 * g + qs] = exp2f(sc - mx);
+    __syncwarp();
+#pragma unroll
+    for (int k = 0; k < TB; ++k) {
+        if (!FULL && k >= nv) continue;
+        float vf[8];
+        widen8(vu[k], vf);
+        const float4 pv = *reinterpret_cast<const float4*>(spk + 4 * k);
+        const float pp[HPW] = {pv.x, pv.y, pv.z, pv.w};
+        l = l + spk[4 * k + qs];
+#pragma unroll
+        for (int h = 0; h < HPW; ++h) {
+#pragma unroll
+            for (int e = 0; e < 8; ++e) o[h][e] = o[h][e] + pp[h] * vf[e];
+        }
+    }
+}
+
+constexpr int SOFF_ROW = 36;  // words a row of the offset tables: a multiple of 4 (uint4 reads) that spreads the 8 copies over the banks
+
+// grid (rows, NKV, parts), block 32 * (GRP / HPW): warp w serves q heads kvh * GRP + w * HPW .. + HPW - 1
 __global__ void __launch_bounds__(32 * (GRP / HPW))
     attend_h(const __nv_bfloat16* __restrict__ qm, const __nv_bfloat16* __restrict__ kc, const __nv_bfloat16* __restrict__ vc,
              const int* __restrict__ table, int max_blocks, const int* __restrict__ row_slot, const int* __restrict__ positions,
              const int* __restrict__ sel, const int* __restrict__ sel_n, float* __restrict__ part_o, float* __restrict__ part_m,
              float* __restrict__ part_l, int parts) {
     static_assert(GRP % HPW == 0, "heads a warp must divide the group");
+    // Per warp, 8 copies of the row offsets (in uint4 units) of 32 consecutive tokens: in copy c, token 8j + k's offset is at position
+    // 8j + (k ^ c), so lane g's K rows come from copy g in token order k ^ g and every lane's V rows from copy 0.
+    __shared__ __align__(16) unsigned soff[GRP / HPW][8][SOFF_ROW];
+    __shared__ __align__(16) float spk[GRP / HPW][32];
     pdl_trigger();
     pdl_wait();  // q, the selection and the positions are earlier kernels' outputs
     const int r = blockIdx.x, kvh = blockIdx.y, part = blockIdx.z;
     const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, qs = lane & 3;
     const int head0 = kvh * GRP + w * HPW;
     const int p = positions[r], nbq = (p + 1) / CR, n = sel_n[r];
     const int total = CR * n + (p - CR * nbq + 1);
@@ -451,97 +572,69 @@ __global__ void __launch_bounds__(32 * (GRP / HPW))
     const int* tb = table + (size_t)slot * max_blocks;
     float qv[HPW][8];
 #pragma unroll
-    for (int h = 0; h < HPW; ++h) {
-        const uint4 u = reinterpret_cast<const uint4*>(qm + ((size_t)r * NQ + head0 + h) * D)[lane];
+    for (int s = 0; s < HPW; ++s) {
+        const uint4 u = reinterpret_cast<const uint4*>(qm + ((size_t)r * NQ + head0 + (s ^ qs)) * D)[lane];
         const __nv_bfloat162* h2 = reinterpret_cast<const __nv_bfloat162*>(&u);
 #pragma unroll
         for (int e = 0; e < 4; ++e) {
             const float2 f = __bfloat1622float2(h2[e]);
-            qv[h][2 * e] = f.x * (0.0625f * LOG2E);
-            qv[h][2 * e + 1] = f.y * (0.0625f * LOG2E);
+            qv[s][2 * e] = f.x * (0.0625f * LOG2E);
+            qv[s][2 * e + 1] = f.y * (0.0625f * LOG2E);
         }
     }
-    float m[HPW], l[HPW], o[HPW][8];
+    float m = -INFINITY, l = 0.f, o[HPW][8];
 #pragma unroll
     for (int h = 0; h < HPW; ++h) {
-        m[h] = -INFINITY;
-        l[h] = 0.f;
 #pragma unroll
         for (int e = 0; e < 8; ++e) o[h][e] = 0.f;
     }
-    for (int i0 = a; i0 < b; i0 += TBH) {
-        uint4 ku[TBH], vu[TBH];
+    const char* kp = reinterpret_cast<const char*>(kc) + lane * 16;
+    const char* vp = reinterpret_cast<const char*>(vc) + lane * 16;
+    // the row offset of this lane's token among the 32 starting at `base`
+    auto token_offset = [&](int base) {
+        const int i = base + lane;
+        const int ii = i < b ? i : a;
+        const int tok = ii < CR * n ? CR * sl[ii / CR] + ii % CR : CR * nbq + (ii - CR * n);
+        return (((unsigned)tb[tok / PAGE] * PAGE + tok % PAGE) * NKV + kvh) * (D / 8);
+    };
+    const unsigned* krow = soff[w][g];
+    const unsigned* vrow = soff[w][0];
+    for (int base = a; base < b; base += 4 * TB) {
+        {
+            const unsigned off = token_offset(base);
+            const int lo = lane & 7, hi = lane & 24;
+            __syncwarp();
 #pragma unroll
-        for (int k = 0; k < TBH; ++k) {
-            const int i = i0 + k;
-            const int ii = i < b ? i : a;
-            const int tok = ii < CR * n ? CR * sl[ii / CR] + ii % CR : CR * nbq + (ii - CR * n);
-            const size_t off = (((size_t)tb[tok / PAGE] * PAGE + tok % PAGE) * NKV + kvh) * D;
-            ku[k] = reinterpret_cast<const uint4*>(kc + off)[lane];
-            vu[k] = reinterpret_cast<const uint4*>(vc + off)[lane];
+            for (int c = 0; c < 8; ++c) soff[w][c][hi + (lo ^ c)] = off;
+            __syncwarp();
         }
-        float sc[HPW][TBH];
+#pragma unroll 1
+        for (int j = 0; j < 4; ++j) {
+            const int i0 = base + TB * j;
+            if (i0 >= b) break;
+            uint4 ku[TB], vu[TB];
 #pragma unroll
-        for (int k = 0; k < TBH; ++k) {
-            const __nv_bfloat162* h2 = reinterpret_cast<const __nv_bfloat162*>(&ku[k]);
-            float kf[8];
-#pragma unroll
-            for (int e = 0; e < 4; ++e) {
-                const float2 f = __bfloat1622float2(h2[e]);
-                kf[2 * e] = f.x;
-                kf[2 * e + 1] = f.y;
+            for (int k = 0; k < TB; ++k) {
+                ku[k] = *reinterpret_cast<const uint4*>(kp + (size_t)krow[TB * j + k] * 16);
+                vu[k] = *reinterpret_cast<const uint4*>(vp + (size_t)vrow[TB * j + k] * 16);
             }
-#pragma unroll
-            for (int h = 0; h < HPW; ++h) {
-                float d = 0.f;
-#pragma unroll
-                for (int e = 0; e < 4; ++e) d = d + qv[h][2 * e] * kf[2 * e] + qv[h][2 * e + 1] * kf[2 * e + 1];
-                sc[h][k] = warp_sum(d);
-            }
+            const float sc = group_scores(ku, qv);
+            const int nv = b - i0;
+            if (nv >= TB)
+                group_pv<true>(sc, vu, m, l, o, TB, g, qs, spk[w]);
+            else
+                group_pv<false>(sc, vu, m, l, o, nv, g, qs, spk[w]);
         }
-        float mx[HPW];
-#pragma unroll
-        for (int h = 0; h < HPW; ++h) {
-            mx[h] = m[h];
-#pragma unroll
-            for (int k = 0; k < TBH; ++k)
-                if (i0 + k < b) mx[h] = fmaxf(mx[h], sc[h][k]);
-            const float corr = exp2f(m[h] - mx[h]);
-            l[h] = l[h] * corr;
-#pragma unroll
-            for (int e = 0; e < 8; ++e) o[h][e] = o[h][e] * corr;
-        }
-#pragma unroll
-        for (int k = 0; k < TBH; ++k) {
-            if (i0 + k >= b) continue;
-            const __nv_bfloat162* h2 = reinterpret_cast<const __nv_bfloat162*>(&vu[k]);
-            float vf[8];
-#pragma unroll
-            for (int e = 0; e < 4; ++e) {
-                const float2 f = __bfloat1622float2(h2[e]);
-                vf[2 * e] = f.x;
-                vf[2 * e + 1] = f.y;
-            }
-#pragma unroll
-            for (int h = 0; h < HPW; ++h) {
-                const float pk = exp2f(sc[h][k] - mx[h]);
-                l[h] = l[h] + pk;
-#pragma unroll
-                for (int e = 0; e < 8; ++e) o[h][e] = o[h][e] + pk * vf[e];
-            }
-        }
-#pragma unroll
-        for (int h = 0; h < HPW; ++h) m[h] = mx[h];
     }
 #pragma unroll
     for (int h = 0; h < HPW; ++h) {
         const size_t pi = ((size_t)r * NQ + head0 + h) * parts + part;
-        float* po = part_o + pi * D + lane * 8;
-#pragma unroll
-        for (int e = 0; e < 8; ++e) po[e] = o[h][e];
-        if (lane == 0) {
-            part_m[pi] = m[h];
-            part_l[pi] = l[h];
+        float4* po = reinterpret_cast<float4*>(part_o + pi * D + lane * 8);
+        po[0] = make_float4(o[h][0], o[h][1], o[h][2], o[h][3]);
+        po[1] = make_float4(o[h][4], o[h][5], o[h][6], o[h][7]);
+        if (lane == h) {
+            part_m[pi] = m;
+            part_l[pi] = l;
         }
     }
 }
@@ -625,10 +718,9 @@ GB_EXPORT int gb_qsa_attend(const void* q, const void* k_cache, const void* v_ca
     // many rows (a prefill chunk): four heads a warp, the same bits as one head a warp (see attend_h); the decode windows' few rows
     // keep the twelve-warp block, whose grid fills the SMs through `parts`
     if (rows >= qsa::ATTEND_H_MIN_ROWS) {
-        gbp_pdl::launch_pdl(flash_pdl(), qsa::attend_h<qsa::ATTEND_HPW, qsa::TB>, grid, dim3(32 * (qsa::GRP / qsa::ATTEND_HPW)), 0,
-                            gb_stream(stream), (const __nv_bfloat16*)q, (const __nv_bfloat16*)k_cache, (const __nv_bfloat16*)v_cache,
-                            table, max_blocks, row_slot, positions, sel, sel_n, (float*)part_o, (float*)part_m, (float*)part_l,
-                            parts);
+        gbp_pdl::launch_pdl(flash_pdl(), qsa::attend_h, grid, dim3(32 * (qsa::GRP / qsa::ATTEND_HPW)), 0, gb_stream(stream),
+                            (const __nv_bfloat16*)q, (const __nv_bfloat16*)k_cache, (const __nv_bfloat16*)v_cache, table, max_blocks,
+                            row_slot, positions, sel, sel_n, (float*)part_o, (float*)part_m, (float*)part_l, parts);
         return GB_CHECK_LAUNCH();
     }
     gbp_pdl::launch_pdl(flash_pdl(), qsa::attend_k, grid, dim3(32 * qsa::GRP), 0, gb_stream(stream), (const __nv_bfloat16*)q,
