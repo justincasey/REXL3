@@ -126,6 +126,36 @@ __device__ __forceinline__ void st_bf16x4(__nv_bfloat16* p, const float (&v)[4])
 
 __device__ __forceinline__ float4 ldcg4(const float* p) { return __ldcg(reinterpret_cast<const float4*>(p)); }
 
+// L2 eviction priorities. A layer streams tens of MB of expert weights through the 24 MB L2 once; the fp32 chunk partials (a few MB
+// the kernels write and read back within the layer) must not be pushed out to DRAM and fetched again by them: weights are loaded
+// evict_first, partials stored and loaded evict_last.
+__device__ __forceinline__ uint64_t pol_evict_first() {
+    uint64_t p;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(p));
+    return p;
+}
+__device__ __forceinline__ uint64_t pol_evict_last() {
+    uint64_t p;
+    asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(p));
+    return p;
+}
+__device__ __forceinline__ uint32_t ldg_pol(const uint32_t* p, uint64_t pol) {
+    uint32_t v;
+    asm("ld.global.nc.L2::cache_hint.u32 %0, [%1], %2;" : "=r"(v) : "l"(p), "l"(pol));
+    return v;
+}
+__device__ __forceinline__ void st_pol(float* p, float v, uint64_t pol) {
+    asm volatile("st.global.L2::cache_hint.f32 [%0], %1, %2;" ::"l"(p), "f"(v), "l"(pol) : "memory");
+}
+__device__ __forceinline__ float4 ldcg4_pol(const float* p, uint64_t pol) {
+    float4 v;
+    asm volatile("ld.global.cg.L2::cache_hint.v4.f32 {%0, %1, %2, %3}, [%4], %5;"
+                 : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w)
+                 : "l"(p), "l"(pol)
+                 : "memory");
+    return v;
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // Tile decoder (integer bits B = 1..8). A lane decodes the 8 values 8 * lane .. 8 * lane + 7 of the tile; they are
 // the W^T A fragment of mma.m16n8k16: reg0 (n = g, k = 2t, 2t+1) = values 0, 1; reg1 (n = g + 8) = values 4, 5;
@@ -147,6 +177,17 @@ __device__ __forceinline__ void lane_origin(int lane, int& i0, int& off0) {
     const int s0 = (gbx::stream_end<K2>(8 * lane) - 16 + RING) % RING;
     i0 = s0 >> 5;
     off0 = s0 & 31;
+}
+
+// The words of the lane's windows, loaded through `pol` (an L2 eviction policy).
+template <int K2>
+__device__ __forceinline__ void tile_load_pol(const uint32_t* __restrict__ tile, int i0, uint32_t (&w)[GeoK<K2>::NL], uint64_t pol) {
+#pragma unroll
+    for (int q = 0; q < GeoK<K2>::NL; ++q) {
+        int idx = i0 + q;
+        if (idx >= GeoK<K2>::NW) idx -= GeoK<K2>::NW;
+        w[q] = ldg_pol(tile + idx, pol);
+    }
 }
 
 template <int K2>
@@ -190,19 +231,19 @@ __device__ __forceinline__ void tile_decode(const uint32_t* w, int off0, uint32_
 // getb(kt, b0, b1) supplies the B fragment (the group's tokens) of k tile kt.
 template <int K2, class GetB>
 __device__ __forceinline__ void run_tiles(const uint32_t* __restrict__ base, size_t stride_k, int nkt, int lane,
-                                          float (&acc)[8][4], GetB getb) {
+                                          float (&acc)[8][4], GetB getb, uint64_t pol) {
     constexpr int NW = GeoK<K2>::NW, NL = GeoK<K2>::NL;
     int i0, off0;
     lane_origin<K2>(lane, i0, off0);
     uint32_t cur[8][NL], nxt[8][NL];
 #pragma unroll
-    for (int j = 0; j < 8; ++j) tile_load<K2>(base + j * NW, i0, cur[j]);
+    for (int j = 0; j < 8; ++j) tile_load_pol<K2>(base + j * NW, i0, cur[j], pol);
 #pragma unroll 1
     for (int kt = 0; kt < nkt; ++kt) {
         if (kt + 1 < nkt) {
             const uint32_t* row = base + (size_t)(kt + 1) * stride_k;
 #pragma unroll
-            for (int j = 0; j < 8; ++j) tile_load<K2>(row + j * NW, i0, nxt[j]);
+            for (int j = 0; j < 8; ++j) tile_load_pol<K2>(row + j * NW, i0, nxt[j], pol);
         }
         uint32_t b0, b1;
         getb(kt, b0, b1);
@@ -221,19 +262,19 @@ __device__ __forceinline__ void run_tiles(const uint32_t* __restrict__ base, siz
 
 template <class GetB>
 __device__ __forceinline__ bool run_tiles_bits(int k2, const uint32_t* base, size_t stride_k, int nkt, int lane,
-                                               float (&acc)[8][4], GetB getb) {
+                                               float (&acc)[8][4], GetB getb, uint64_t pol) {
     switch (k2) {
-        case 2: run_tiles<2>(base, stride_k, nkt, lane, acc, getb); return true;
-        case 3: run_tiles<3>(base, stride_k, nkt, lane, acc, getb); return true;
-        case 4: run_tiles<4>(base, stride_k, nkt, lane, acc, getb); return true;
-        case 5: run_tiles<5>(base, stride_k, nkt, lane, acc, getb); return true;
-        case 6: run_tiles<6>(base, stride_k, nkt, lane, acc, getb); return true;
-        case 7: run_tiles<7>(base, stride_k, nkt, lane, acc, getb); return true;
-        case 8: run_tiles<8>(base, stride_k, nkt, lane, acc, getb); return true;
-        case 10: run_tiles<10>(base, stride_k, nkt, lane, acc, getb); return true;
-        case 12: run_tiles<12>(base, stride_k, nkt, lane, acc, getb); return true;
-        case 14: run_tiles<14>(base, stride_k, nkt, lane, acc, getb); return true;
-        case 16: run_tiles<16>(base, stride_k, nkt, lane, acc, getb); return true;
+        case 2: run_tiles<2>(base, stride_k, nkt, lane, acc, getb, pol); return true;
+        case 3: run_tiles<3>(base, stride_k, nkt, lane, acc, getb, pol); return true;
+        case 4: run_tiles<4>(base, stride_k, nkt, lane, acc, getb, pol); return true;
+        case 5: run_tiles<5>(base, stride_k, nkt, lane, acc, getb, pol); return true;
+        case 6: run_tiles<6>(base, stride_k, nkt, lane, acc, getb, pol); return true;
+        case 7: run_tiles<7>(base, stride_k, nkt, lane, acc, getb, pol); return true;
+        case 8: run_tiles<8>(base, stride_k, nkt, lane, acc, getb, pol); return true;
+        case 10: run_tiles<10>(base, stride_k, nkt, lane, acc, getb, pol); return true;
+        case 12: run_tiles<12>(base, stride_k, nkt, lane, acc, getb, pol); return true;
+        case 14: run_tiles<14>(base, stride_k, nkt, lane, acc, getb, pol); return true;
+        case 16: run_tiles<16>(base, stride_k, nkt, lane, acc, getb, pol); return true;
         default: return false;
     }
 }
@@ -241,7 +282,7 @@ __device__ __forceinline__ bool run_tiles_bits(int k2, const uint32_t* base, siz
 // Partial tile outputs of the warp: acc[j][c] belongs to column nb * 128 + j * 16 + g (+8 for c = 2, 3) and token
 // column 2t (c = 0, 2) or 2t + 1 (c = 1, 3) of the group. dst(col_token) -> float* row of 128 columns.
 template <class Dst>
-__device__ __forceinline__ void store_partials(const float (&acc)[8][4], int lane, int ntok, Dst dst) {
+__device__ __forceinline__ void store_partials(const float (&acc)[8][4], int lane, int ntok, Dst dst, uint64_t pol) {
     const int g = lane >> 2, t = lane & 3;
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
@@ -250,8 +291,8 @@ __device__ __forceinline__ void store_partials(const float (&acc)[8][4], int lan
             float* row = dst(c);
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
-                row[j * 16 + g] = acc[j][h];
-                row[j * 16 + g + 8] = acc[j][2 + h];
+                st_pol(row + j * 16 + g, acc[j][h], pol);
+                st_pol(row + j * 16 + g + 8, acc[j][2 + h], pol);
             }
         }
     }
@@ -667,12 +708,13 @@ __global__ void __launch_bounds__(WARPS * 32, 4) gate_up_kernel(GateUpArgs a) {
     for (int j = 0; j < 8; ++j)
 #pragma unroll
         for (int c = 0; c < 4; ++c) acc[j][c] = 0.f;
-    run_tiles_bits(bits, base, stride_k, kblocks * 8, lane, acc, getb);
+    run_tiles_bits(bits, base, stride_k, kblocks * 8, lane, acc, getb, pol_evict_first());
 
     const size_t pstride_mat = (size_t)a.KC * a.I;
+    const uint64_t pol_keep = pol_evict_last();
     store_partials(acc, lane, ntok, [&](int c) {
         return a.part + ((size_t)(off + c) * 2 + mat) * pstride_mat + (size_t)kc * a.I + nb * 128;
-    });
+    }, pol_keep);
     __threadfence();
     int last = 0;
     if (lane == 0) last = atomicAdd(a.cnt + grp * NB + nb, 1) == 2 * a.KC - 1;
@@ -701,8 +743,8 @@ __global__ void __launch_bounds__(WARPS * 32, 4) gate_up_kernel(GateUpArgs a) {
 #pragma unroll
             for (int j = 0; j < KB; ++j)
                 if (k0 + j < a.KC) {
-                    x0[j] = ldcg4(pg + (size_t)(k0 + j) * a.I);
-                    x1[j] = ldcg4(pu + (size_t)(k0 + j) * a.I);
+                    x0[j] = ldcg4_pol(pg + (size_t)(k0 + j) * a.I, pol_keep);
+                    x1[j] = ldcg4_pol(pu + (size_t)(k0 + j) * a.I, pol_keep);
                 }
 #pragma unroll
             for (int j = 0; j < KB; ++j)
@@ -806,11 +848,12 @@ __global__ void __launch_bounds__(WARPS * 32, 4) down_kernel(DownArgs a) {
     for (int j = 0; j < 8; ++j)
 #pragma unroll
         for (int c = 0; c < 4; ++c) acc[j][c] = 0.f;
-    run_tiles_bits(bits, base, stride_k, 8, lane, acc, getb);
+    run_tiles_bits(bits, base, stride_k, 8, lane, acc, getb, pol_evict_first());
 
+    const uint64_t pol_keep = pol_evict_last();
     store_partials(acc, lane, ntok, [&](int c) {
         return a.partd + ((size_t)(off + c) * KCD + kc) * a.H + nb * 128;
-    });
+    }, pol_keep);
     __threadfence();
     int last = 0;
     if (lane == 0) last = atomicAdd(a.cntd + grp * NBD + nb, 1) == KCD - 1;
@@ -830,7 +873,7 @@ __global__ void __launch_bounds__(WARPS * 32, 4) down_kernel(DownArgs a) {
             float4 x[KB];
 #pragma unroll
             for (int j = 0; j < KB; ++j)
-                if (k0 + j < KCD) x[j] = ldcg4(a.partd + ((size_t)slot * KCD + k0 + j) * a.H + col);
+                if (k0 + j < KCD) x[j] = ldcg4_pol(a.partd + ((size_t)slot * KCD + k0 + j) * a.H + col, pol_keep);
 #pragma unroll
             for (int j = 0; j < KB; ++j)
                 if (k0 + j < KCD) { v[0] += x[j].x; v[1] += x[j].y; v[2] += x[j].z; v[3] += x[j].w; }
