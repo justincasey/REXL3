@@ -257,7 +257,8 @@ fn sparse_rows(positions: &[i32], qsa: bool) -> u64 {
 /// A verify / decode window. Sequence boundaries matter even with the same number of rows and sequences: GDN and PLE
 /// receive per-sequence grids, and QSA runs are partitioned by the absolute row order. `par` is the record set the window
 /// fills (`recs[par]`; the other holds what the previous window owes) and `owed` whether its GDN window kernels fold that owed
-/// replay in: both are baked into the launches.
+/// replay in: both are baked into the launches. `part` is which graph of the window: the whole of it (0), or, when it is split in
+/// front of the PLE stage, the layers before it (1) and the rest (2).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct WindowKey {
     rows: usize,
@@ -267,6 +268,7 @@ struct WindowKey {
     sparse: u64,
     par: usize,
     owed: bool,
+    part: u8,
     features: GraphFeatures,
     grid: AttnGrid,
 }
@@ -282,6 +284,7 @@ impl WindowKey {
             sparse: sparse_rows(&b.positions, features.qsa_trunk),
             par: 0,
             owed: false,
+            part: 0,
             features,
             grid,
         }
@@ -290,6 +293,11 @@ impl WindowKey {
     /// The same window in record set `par`, with or without an owed replay folded in.
     fn in_round(self, par: usize, owed: bool) -> Self {
         Self { par, owed, ..self }
+    }
+
+    /// The same window, one graph of it (see `part`).
+    fn part(self, part: u8) -> Self {
+        Self { part, ..self }
     }
 }
 
@@ -1217,12 +1225,8 @@ impl FlashNextModel {
         let (par, owed) = self.begin_window(b)?;
         self.last_window = Some(b.clone());
         self.prepare_batch(b)?;
-        self.prepare_ple(b)?;
         self.note_stack(b);
-        let live = Self::live_of(b);
-        let key = WindowKey::for_batch(b, count, AttnGrid::cover(live, self.opts.max_context), self.graph_features())
-            .in_round(par, owed);
-        self.run_graph(Self::window_graphs, key, live, |m| m.window_body(b, count))?;
+        self.run_window(b, count, par, owed)?;
         self.mixed_rows = rows;
         self.sync()?;
         let mut ids = vec![0i32; rows * count];
@@ -1256,12 +1260,8 @@ impl FlashNextModel {
         let (par, owed) = self.begin_window(b)?;
         self.last_window = Some(b.clone());
         self.prepare_batch(b)?;
-        self.prepare_ple(b)?;
         self.note_stack(b);
-        let live = Self::live_of(b);
-        let key = WindowKey::for_batch(b, count, AttnGrid::cover(live, self.opts.max_context), self.graph_features())
-            .in_round(par, owed);
-        self.run_graph(Self::window_graphs, key, live, |m| m.window_body(b, count))?;
+        self.run_window(b, count, par, owed)?;
         self.mixed_rows = rows;
         self.sync()?;
         // the window's top-k table is on the device: pack its argmax column and read back only that
@@ -2180,15 +2180,34 @@ impl FlashNextModel {
     }
 
     fn compute_layers(&mut self, b: &RowBatch, mode: Mode) -> Result<(), ModelError> {
+        self.layers_head(b, mode, 0)?;
+        self.layers_tail(b, mode, 0)
+    }
+
+    /// The embedding, the stream expansion and the layers before layer `upto`.
+    fn layers_head(&mut self, b: &RowBatch, mode: Mode, upto: usize) -> Result<(), ModelError> {
         let rows = b.rows;
         let (h, hc) = (self.cfg.hidden, self.cfg.hc_streams);
         let w = Arc::clone(&self.w);
-
         g_embed(&w.embed, &self.ids, &self.block_out, rows, h, self.cfg.vocab, &self.stream)?;
         fn_mhc::hc_expand(&self.block_out, &mut self.x_streams, h, hc, rows, &self.stream)?;
+        self.run_layers(b, mode, 0, upto)
+    }
 
-        let (mut li, mut fi) = (0usize, 0usize);
-        for (i, layer) in w.layers.iter().enumerate() {
+    /// The layers from layer `from` (the PLE stage rides in front of its own layer) and the collapse of the streams.
+    fn layers_tail(&mut self, b: &RowBatch, mode: Mode, from: usize) -> Result<(), ModelError> {
+        let w = Arc::clone(&self.w);
+        self.run_layers(b, mode, from, w.layers.len())?;
+        self.collapse(&w.head_hc.mixer(), mode, b.rows)
+    }
+
+    /// Layers `from..to`; the recurrent and the attention layers before `from` are counted for their pool indices.
+    fn run_layers(&mut self, b: &RowBatch, mode: Mode, from: usize, to: usize) -> Result<(), ModelError> {
+        let w = Arc::clone(&self.w);
+        let linear = |layer: &FlashNextLayer| matches!(layer.mixer, MixerWeights::Linear(_));
+        let mut li = w.layers[..from].iter().filter(|l| linear(l)).count();
+        let mut fi = from - li;
+        for (i, layer) in w.layers.iter().enumerate().take(to).skip(from) {
             if let Some(p) = w.ple.as_ref().filter(|p| p.before_layer == i) {
                 self.run_ple(p, b, mode)?;
             }
@@ -2204,13 +2223,49 @@ impl FlashNextModel {
                 }
             }
         }
-        self.collapse(&w.head_hc.mixer(), mode, rows)
+        Ok(())
     }
 
-    /// The device work of one window: every layer, the full LM head, top-`count` per row. No host sync, no upload.
-    fn window_body(&mut self, b: &RowBatch, count: usize) -> Result<(), ModelError> {
+    /// The layer the PLE stage runs in front of, when the window's launches are split there: everything before it needs no
+    /// PLE rows, so the host gathers them while the GPU runs that part (`None`: no PLE stage, one graph).
+    fn ple_split(&self) -> Option<usize> {
+        self.w.ple.as_ref().map(|p| p.before_layer)
+    }
+
+    /// Launch a window whose batch and index arrays are staged: one graph, or, with a PLE stage, two with the host gather of the PLE rows
+    /// between them. The first graph (the embedding and the layers before the PLE stage) needs no PLE row, so the GPU runs it while
+    /// the host reads the n-gram table (hundreds of microseconds of page faults for a drafted window), and the second graph is
+    /// launched behind the rows' upload. The kernels, their order and their arguments are those of the one-graph window.
+    fn run_window(&mut self, b: &RowBatch, count: usize, par: usize, owed: bool) -> Result<(), ModelError> {
+        let live = Self::live_of(b);
+        let key = WindowKey::for_batch(b, count, AttnGrid::cover(live, self.opts.max_context), self.graph_features())
+            .in_round(par, owed);
+        match self.ple_split() {
+            Some(split) => {
+                self.run_graph(Self::window_graphs, key.part(1), live, |m| m.window_head(b, split))?;
+                self.prepare_ple(b)?;
+                self.run_graph(Self::window_graphs, key.part(2), live, |m| m.window_tail(b, count, split))
+            }
+            None => {
+                let all = self.w.layers.len();
+                self.run_graph(Self::window_graphs, key, live, |m| {
+                    m.window_head(b, all)?;
+                    m.window_tail(b, count, all)
+                })
+            }
+        }
+    }
+
+    /// The device work of a window up to its PLE stage: the embedding, the stream expansion and the layers before it.
+    fn window_head(&mut self, b: &RowBatch, split: usize) -> Result<(), ModelError> {
+        self.layers_head(b, Mode::Window, split)
+    }
+
+    /// The rest of a window from its PLE stage on (`split == 0` and no PLE: the whole window): the remaining layers, the full
+    /// LM head and top-`count` per row. No host sync, no upload.
+    fn window_tail(&mut self, b: &RowBatch, count: usize, split: usize) -> Result<(), ModelError> {
         let rows = b.rows;
-        self.compute_layers(b, Mode::Window)?;
+        self.layers_tail(b, Mode::Window, split)?;
         self.w.lm_head.forward(&self.x_mixed, &mut self.logits, rows, Dtype::BF16, Dtype::BF16, &mut self.ws, &self.stream)?;
         g_topk(&self.logits, rows, self.cfg.vocab, count, &self.topk_ids, &self.topk_vals, &self.topk_ws, &self.stream)
     }
