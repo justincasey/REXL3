@@ -1,0 +1,3 @@
+## New features and improvements
+
+- The MTP drafter's pick of the next draft token (the argmax and its probability over the 65,536 candidate logits, once per draft step) runs in 512 threads that load all of their logits up front instead of in two sequential passes of dependent loads. It selects the same token and computes the same probability bit for bit (32 recorded rows and 120 aligned-versus-reference rows agree on every index and every bit). Measured on one GB10 in the decode screen (nsys, six prompts): the kernel takes 36.1 us per draft step before and 7.4 to 8.8 us after; on a warm cache, back to back, 24.8 us before and 6.2 us after.

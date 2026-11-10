@@ -78,7 +78,12 @@ __global__ void stage_kernel(int* __restrict__ ids, int* __restrict__ positions,
     if (s == 0) seq_start[n] = n;
 }
 
-// Draft j from one row of bf16 logits [n]: argmax (lowest id on ties) and its softmax probability.
+// Draft j from one row of bf16 logits [n], any n >= 1: argmax (lowest id on ties) and its softmax probability. One block of 1024 threads;
+// thread t owns the elements t, t + 1024, ... and walks them twice (the argmax, then the sum of exps) with one dependent global load per
+// element. `pick_wide_kernel` below is the same function for the n of the production draft head.
+// The result is defined by the arithmetic order of this kernel, and pick_wide_kernel reproduces it exactly: out_p = 1 / t, t = the 32 warp
+// sums added in order by thread 0, a warp sum = the xor-shuffle tree over the 32 per-thread sums, a thread's sum = __expf(x - max) added in
+// increasing element order starting from 0. The argmax is the lowest index of the maximum whatever the reduction order.
 __global__ void __launch_bounds__(1024) pick_kernel(const __nv_bfloat16* __restrict__ logits, int n,
                                                     int* __restrict__ out_id, float* __restrict__ out_p, int j) {
     __shared__ float sv[32];
@@ -126,6 +131,76 @@ __global__ void __launch_bounds__(1024) pick_kernel(const __nv_bfloat16* __restr
     }
 }
 
+// pick_kernel for n == 64 * 1024 (the draft head's domain) and a 4-byte aligned row, in 512 threads. Thread t owns the 64 words
+// (two bf16 each) k * 512 + t: the elements 1024 k + 2 t and 1024 k + 2 t + 1, which are elements k of pick_kernel's threads 2 t and 2 t + 1.
+// It keeps those two threads' sequences apart (two argmax scans, two sums, each over k in increasing order from 0: the same additions of
+// the same __expf values), so a thread's sum is pick_kernel's bit for bit. pick_kernel's warp w adds the 32 sums of its threads 32 w ..
+// 32 w + 31 with an xor tree over distances 16, 8, 4, 2, 1; here those 32 sums are the even and odd chains of a half warp (lanes 16 h ..
+// 16 h + 15), and the same tree is xor shuffles over 8, 4, 2, 1 lanes of each chain followed by the even chain plus the odd one: the
+// same additions in the same association (the operands of an add commute exactly). The 32 group sums are added in order by thread 0
+// as before. Every one of a thread's 64 words is loaded up front (independent loads into 64 registers; the block is 512 threads, so a
+// thread may use 128), where pick_kernel waits for one load after another, twice. The scans remember the k of the best element, not
+// its index (a constant of each unrolled step, so no index registers), and the index is made after the loop. The cross-warp argmax is
+// reduced by every warp (the result is unique: the maximum with the lowest index, whatever the order), which saves a barrier.
+__global__ void __launch_bounds__(512) pick_wide_kernel(const uint32_t* __restrict__ logits, int* __restrict__ out_id,
+                                                        float* __restrict__ out_p, int j) {
+    constexpr int T = 512, K = 64;
+    __shared__ float sv[16];
+    __shared__ int si[16];
+    __shared__ float ss[32];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    uint32_t w[K];
+#pragma unroll
+    for (int k = 0; k < K; ++k) w[k] = logits[k * T + tid];
+    float bv0 = -INFINITY, bv1 = -INFINITY;
+    int bk0 = -1, bk1 = -1;
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+        const float v0 = __uint_as_float(w[k] << 16), v1 = __uint_as_float(w[k] & 0xffff0000u);
+        if (v0 > bv0) { bv0 = v0; bk0 = k; }
+        if (v1 > bv1) { bv1 = v1; bk1 = k; }
+    }
+    float bv = bv0;
+    int bi = bk0 < 0 ? 0x7fffffff : 2 * (bk0 * T + tid);
+    const int bi1 = bk1 < 0 ? 0x7fffffff : 2 * (bk1 * T + tid) + 1;
+    if (bv1 > bv || (bv1 == bv && bi1 < bi)) { bv = bv1; bi = bi1; }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    }
+    if (lane == 0) { sv[warp] = bv; si[warp] = bi; }
+    __syncthreads();
+    float mx = sv[lane & 15];
+    int ix = si[lane & 15];
+#pragma unroll
+    for (int o = 8; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, mx, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, ix, o);
+        if (ov > mx || (ov == mx && oi < ix)) { mx = ov; ix = oi; }
+    }
+    float a0 = 0.f, a1 = 0.f;
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+        a0 += __expf(__uint_as_float(w[k] << 16) - mx);
+        a1 += __expf(__uint_as_float(w[k] & 0xffff0000u) - mx);
+    }
+#pragma unroll
+    for (int o = 8; o > 0; o >>= 1) {
+        a0 += __shfl_xor_sync(0xffffffffu, a0, o);
+        a1 += __shfl_xor_sync(0xffffffffu, a1, o);
+    }
+    if ((lane & 15) == 0) ss[2 * warp + (lane >> 4)] = a0 + a1;
+    __syncthreads();
+    if (tid == 0) {
+        float t = 0.f;
+        for (int q = 0; q < 32; ++q) t += ss[q];
+        out_id[j] = ix;
+        out_p[j] = 1.f / t;
+    }
+}
+
 }  // namespace mtpk
 
 using namespace mtpk;
@@ -164,6 +239,10 @@ GB_EXPORT int gb_mtp_stage(void* ids, void* positions, void* row_pos, void* row_
 
 GB_EXPORT int gb_mtp_pick(const void* logits, int n, void* out_id, void* out_p, int j, void* stream) {
     if (n < 1) return (int)cudaErrorInvalidValue;
-    pick_kernel<<<1, 1024, 0, gb_stream(stream)>>>((const __nv_bfloat16*)logits, n, (int*)out_id, (float*)out_p, j);
+    if (n == 64 * 1024 && ((uintptr_t)logits & 3) == 0) {
+        pick_wide_kernel<<<1, 512, 0, gb_stream(stream)>>>((const uint32_t*)logits, (int*)out_id, (float*)out_p, j);
+    } else {
+        pick_kernel<<<1, 1024, 0, gb_stream(stream)>>>((const __nv_bfloat16*)logits, n, (int*)out_id, (float*)out_p, j);
+    }
     return GB_CHECK_LAUNCH();
 }
