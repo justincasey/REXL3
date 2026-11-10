@@ -505,3 +505,131 @@ fn pick_is_repeatable_and_timed() {
         assert_eq!((ids[j], ps[j].to_bits()), first, "launch result {j} differs from the first");
     }
 }
+
+// ---- the draft chain's kernels under plain and programmatic-dependent launches ---------------------------------------------------
+
+const PDL_FLASH: i32 = 8; // gbp_pdl::kFlash
+
+/// `steps` draft steps of `n` one-row sequences, each kernel launched right after the one whose output it reads (pick -> stage -> embed ->
+/// input -> combine -> the next step's input ...) and every buffer one kernel writes the next step's kernel overwrites (the staged ids, the
+/// embedding, the normed stacks, the head's stack, the drafts): read-after-write and write-after-read between neighbours, `reps` times
+/// over. Returns one hash line per buffer, all of them from the last repetition's end state.
+fn chain_state(st: &Stream, n: usize, h: usize, steps: usize, reps: usize) -> String {
+    const HC: usize = 4;
+    const MAXD: usize = 8;
+    const VOCAB: usize = 4096;
+    const WIDTH: usize = 65536;
+    let mut r = Rng(0xc4a1 + h as u64);
+    let stack0: Vec<f32> = (0..n * HC * h).map(|_| r.uniform(-1., 1.)).collect();
+    let nh: Vec<u16> = (0..HC * h).map(|_| hf(r.uniform(-0.2, 0.2))).collect();
+    let ne: Vec<f32> = (0..h).map(|_| r.uniform(0.8, 1.2)).collect();
+    let table: Vec<u16> = (0..VOCAB * h).map(|_| bf(r.uniform(-1., 1.))).collect();
+    // one logits row per (step, sequence): noise below 1, a few spikes (ties among them) at ids below the vocabulary
+    let mut logits = vec![0u16; (steps + 1) * n * WIDTH];
+    for row in logits.chunks_mut(WIDTH) {
+        for v in row.iter_mut() {
+            *v = bf(r.uniform(-4., 1.));
+        }
+        for _ in 0..3 {
+            let at = (r.next_u64() % VOCAB as u64) as usize;
+            row[at] = bf(6.);
+        }
+    }
+    let chain_pos: Vec<i32> = (0..n * MAXD).map(|i| 100 + (i % MAXD) as i32 + 40 * (i / MAXD) as i32).collect();
+    let dl_ = |b: &DevBuf| dl::<u8>(b, st);
+    let (d_stack0, d_nh, d_ne, d_table) = (
+        DevBuf::from_slice(&stack0).unwrap(),
+        DevBuf::from_slice(&nh).unwrap(),
+        DevBuf::from_slice(&ne).unwrap(),
+        DevBuf::from_slice(&table).unwrap(),
+    );
+    let (d_logits, d_chain_pos, d_slot) =
+        (DevBuf::from_slice(&logits).unwrap(), DevBuf::from_slice(&chain_pos).unwrap(), DevBuf::from_slice(&(0..n as i32).collect::<Vec<_>>()).unwrap());
+    let mut drafts = DevBuf::zeroed(n * MAXD * 4).unwrap();
+    let mut conf = DevBuf::zeroed(n * MAXD * 4).unwrap();
+    let (mut ids, mut positions, mut row_pos, mut row_slot, mut seq_start) = (
+        DevBuf::zeroed(n * 4).unwrap(),
+        DevBuf::zeroed(n * 4).unwrap(),
+        DevBuf::zeroed(n * 4).unwrap(),
+        DevBuf::zeroed(n * 4).unwrap(),
+        DevBuf::zeroed((n + 1) * 4).unwrap(),
+    );
+    let block_out = DevBuf::zeroed(n * h * 2).unwrap();
+    let (mut xs, mut xe) = (DevBuf::zeroed(n * HC * h * 2).unwrap(), DevBuf::zeroed(n * h * 2).unwrap());
+    let (mut stack_a, mut stack_b) = (DevBuf::zeroed(n * HC * h * 4).unwrap(), DevBuf::zeroed(n * HC * h * 4).unwrap());
+    for _ in 0..reps {
+        stack_a.copy_from(&d_stack0, n * HC * h * 4, st).unwrap();
+        for s in 0..n {
+            mtpk::pick(&d_logits, s * WIDTH, WIDTH, &mut drafts, &mut conf, s * MAXD, st).unwrap();
+        }
+        for j in 1..=steps {
+            let io = mtpk::StepInputs {
+                ids: &mut ids,
+                positions: &mut positions,
+                row_pos: &mut row_pos,
+                row_slot: &mut row_slot,
+                seq_start: &mut seq_start,
+            };
+            mtpk::stage(io, &d_slot, &drafts, &d_chain_pos, n, MAXD, j, st).unwrap();
+            unsafe { gb_cuda::glue::embed(d_table.ptr(), ids.ptr(), block_out.ptr(), n, h, VOCAB, st) }.unwrap();
+            mtpk::input(&stack_a, &d_nh, &block_out, &d_ne, &mut xs, &mut xe, n, HC, h, 1e-6, st).unwrap();
+            mtpk::combine(&xs, &xe, &mut stack_b, n, HC, h, st).unwrap();
+            std::mem::swap(&mut stack_a, &mut stack_b);
+            for s in 0..n {
+                mtpk::pick(&d_logits, (j * n + s) * WIDTH, WIDTH, &mut drafts, &mut conf, s * MAXD + j, st).unwrap();
+            }
+        }
+    }
+    let mut text = String::new();
+    for (name, b) in [
+        ("ids", &ids),
+        ("positions", &positions),
+        ("row_pos", &row_pos),
+        ("row_slot", &row_slot),
+        ("seq_start", &seq_start),
+        ("block_out", &block_out),
+        ("xs", &xs),
+        ("xe", &xe),
+        ("stack", &stack_a),
+        ("drafts", &drafts),
+        ("conf", &conf),
+    ] {
+        text += &format!("{name} {:016x}\n", fnv(&dl_(b)));
+    }
+    text
+}
+
+/// FNV-1a of the `chain_state` text of the kernels as they were before they carried the programmatic-launch attribute, per (rows, hidden).
+const CHAIN_GOLDEN: &[((usize, usize), u64)] = &[
+    ((1, 2560), 0xa429d0f2c9b32e66),
+    ((3, 2560), 0x4257ba8bab7bce5f),
+    ((2, 3328), 0xbc6c0400de534fcc),
+    ((5, 100), 0x985585967d6c61ed),
+];
+
+#[test]
+fn draft_chain_kernels_are_exact_under_programmatic_launches() {
+    let Some(st) = gpu() else { return };
+    let mut failures = Vec::new();
+    // hidden 2560 is the model's (ten weights a thread in registers); 3328 is past the twelve a thread the input kernel keeps in
+    // registers across the wait; 100 is narrower than a block
+    for shape in [(1usize, 2560usize), (3, 2560), (2, 3328), (5, 100)] {
+        let (n, h) = shape;
+        let mut texts = Vec::new();
+        for mask in [0, PDL_FLASH] {
+            gb_cuda::exl3_linear::set_pdl_mask(mask).unwrap();
+            texts.push(chain_state(&st, n, h, 4, 24));
+        }
+        gb_cuda::exl3_linear::set_pdl_mask(0).unwrap();
+        let hash = fnv(texts[0].as_bytes());
+        println!("    (({n}, {h}), 0x{hash:016x}),");
+        if texts[0] != texts[1] {
+            failures.push(format!("rows {n} hidden {h}: programmatic launches changed the state:\nplain\n{}pdl\n{}", texts[0], texts[1]));
+        }
+        let want = CHAIN_GOLDEN.iter().find(|g| g.0 == shape).map(|g| g.1);
+        if want != Some(hash) {
+            failures.push(format!("rows {n} hidden {h}: plain launches give 0x{hash:016x}, recorded {want:x?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
