@@ -1,0 +1,3 @@
+## New features and improvements
+
+- The routed-expert prefill GEMMs (gate/up and down) of Qwen3.8-Flash-Next have a second form that gives every warp 16 output columns and runs the decode path's four K chains one after the other in the warp, folded in warp order, so the cross-warp reduction and its barriers are gone and A and the trellis stream through a cp.async ring. It computes the same fp32 sums as the first form (hash-identical on real routing) and is taken for SK = 1, WK = 4, MUL1 layers whose shared memory fits. A 4,096-row layer takes 8.2 + 5.8 ms (gate/up + down) before and about 6.9 + 4.5 ms after; cold 8K / 32K prefill 1,254 / 1,257 tok/s before, 1,311 / 1,302 after (one GB10). `REXL3_MOE_PF_V1=1` forces the first form.

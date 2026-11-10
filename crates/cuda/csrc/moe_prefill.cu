@@ -31,6 +31,7 @@
 // ExLlamaV3's decode: MIT, pinned 9cd52ab, Copyright (c) 2025 Turboderp; see THIRD_PARTY_NOTICES.md). The tile decode is csrc/exl3_linear_decode.cuh.
 
 #include <stdint.h>
+#include <stdlib.h>
 
 #include "common.cuh"
 #include "exl3_grouped.cuh"
@@ -440,6 +441,8 @@ __global__ void __launch_bounds__(kWK * 32, 1) down_kernel(const uint32_t* __res
     }
 }
 
+#include "moe_prefill_v2.cuh"
+
 // One warp a (row, 128 columns): out = the slots' y in slot order, acc = fmaf(w_k, y_k, acc) from 0, and the shared expert's output last.
 __global__ void __launch_bounds__(32) combine_kernel(const float* __restrict__ y, const int* __restrict__ pick, const half* __restrict__ wts,
                                                      const float* __restrict__ shared, float* __restrict__ out, int D, int E, int topk) {
@@ -613,6 +616,50 @@ int launch_down(const DnArgs& a, cudaStream_t st) {
     return launch_down_pa<K2, CB, NT, 1, kAp<K2, CB>>(a, st);
 }
 
+// The second form (moe_prefill_v2.cuh): one launch per class as the first form's, the same grid and item lists.
+template <int K2, int CB, int MT>
+int launch_gateup2(const GuArgs& a, cudaStream_t st) {
+    constexpr size_t smem = smem_gateup2<K2, MT>();
+    auto kernel = gateup2_kernel<K2, CB, MT, kGuKps, gu_st(MT)>;
+    set_smem(kernel, smem);
+    const dim3 grid((unsigned)(a.N / 128), (unsigned)a.cap);
+    kernel<<<grid, 512, smem, st>>>(a.xs0, a.xs1, a.tp0, a.tp1, a.items, a.nitems, a.svh_g, a.svh_u, a.suh_d, a.xd, a.K, a.N, a.limit);
+    return GB_CHECK_LAUNCH();
+}
+
+template <int K2, int CB, int MT>
+int launch_down2(const DnArgs& a, cudaStream_t st) {
+    constexpr size_t smem = smem_down2<K2, MT>();
+    auto kernel = down2_kernel<K2, CB, MT, kDnKps, dn_st(MT)>;
+    set_smem(kernel, smem);
+    const dim3 grid((unsigned)(a.N / 128), (unsigned)a.cap);
+    kernel<<<grid, 256, smem, st>>>(a.xs, a.tp, a.items, a.nitems, a.svh_d, a.spair, a.y, a.K, a.N);
+    return GB_CHECK_LAUNCH();
+}
+
+// Which form runs a class: the second where its preconditions hold (it computes the same bits), else the first. `REXL3_MOE_PF_V1=1` forces the first form
+// (A/B runs and tests).
+inline bool force_v1() {
+    static const bool v = [] { const char* e = getenv("REXL3_MOE_PF_V1"); return e && e[0] == '1'; }();
+    return v;
+}
+
+template <int K2, int CB, int NT>
+int launch_gateup_any(const GuArgs& a, cudaStream_t st) {
+    if constexpr (v2_gu_fits<K2, CB, NT>()) {
+        if (v2_gu_shape(a.K, a.SK) && !force_v1()) return launch_gateup2<K2, CB, NT>(a, st);
+    }
+    return launch_gateup<K2, CB, NT>(a, st);
+}
+
+template <int K2, int CB, int NT>
+int launch_down_any(const DnArgs& a, cudaStream_t st) {
+    if constexpr (v2_dn_fits<K2, CB, NT>()) {
+        if (v2_dn_shape(a.K, a.SK) && !force_v1()) return launch_down2<K2, CB, NT>(a, st);
+    }
+    return launch_down<K2, CB, NT>(a, st);
+}
+
 #define GB_PF_FOR_CB(X, K2) X(K2, 0) X(K2, 1) X(K2, 2)
 #define GB_PF_FOR_ALL(X)                                                                                                \
     GB_PF_FOR_CB(X, 2) GB_PF_FOR_CB(X, 4) GB_PF_FOR_CB(X, 6) GB_PF_FOR_CB(X, 8) GB_PF_FOR_CB(X, 10) GB_PF_FOR_CB(X, 12)  \
@@ -728,13 +775,13 @@ GB_EXPORT int gb_moe_pf_gateup(const void* xs0, const void* xs1, const void* tp0
         GuArgs c = a;                                                                                                   \
         c.items = a.items + 2 * cap;                                                                                    \
         c.nitems = a.nitems + 2;                                                                                        \
-        rc = launch_gateup<K2_, CB_, 4>(c, st);                                                                         \
+        rc = launch_gateup_any<K2_, CB_, 4>(c, st);                                                                       \
         c.items = a.items + cap;                                                                                        \
         c.nitems = a.nitems + 1;                                                                                        \
-        if (!rc) rc = launch_gateup<K2_, CB_, 2>(c, st);                                                                \
+        if (!rc) rc = launch_gateup_any<K2_, CB_, 2>(c, st);                                                              \
         c.items = a.items;                                                                                              \
         c.nitems = a.nitems;                                                                                            \
-        if (!rc) rc = launch_gateup<K2_, CB_, 1>(c, st);                                                                \
+        if (!rc) rc = launch_gateup_any<K2_, CB_, 1>(c, st);                                                              \
         return rc;                                                                                                      \
     }
     GB_PF_FOR_ALL(GB_G)
@@ -758,13 +805,13 @@ GB_EXPORT int gb_moe_pf_down(const void* xd, const void* tp, const void* items, 
         DnArgs c = a;                                                                                                   \
         c.items = a.items + 2 * cap;                                                                                    \
         c.nitems = a.nitems + 2;                                                                                        \
-        rc = launch_down<K2_, CB_, 4>(c, st);                                                                           \
+        rc = launch_down_any<K2_, CB_, 4>(c, st);                                                                         \
         c.items = a.items + cap;                                                                                        \
         c.nitems = a.nitems + 1;                                                                                        \
-        if (!rc) rc = launch_down<K2_, CB_, 2>(c, st);                                                                  \
+        if (!rc) rc = launch_down_any<K2_, CB_, 2>(c, st);                                                                \
         c.items = a.items;                                                                                              \
         c.nitems = a.nitems;                                                                                            \
-        if (!rc) rc = launch_down<K2_, CB_, 1>(c, st);                                                                  \
+        if (!rc) rc = launch_down_any<K2_, CB_, 1>(c, st);                                                                \
         return rc;                                                                                                      \
     }
     GB_PF_FOR_ALL(GB_G)
