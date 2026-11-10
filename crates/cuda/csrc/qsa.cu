@@ -239,14 +239,15 @@ __global__ void __launch_bounds__(256) scores_k(const __half* __restrict__ q, co
     }
 }
 
-// grid rows, block 1024. Scores are >= 0, so their bit patterns order like the values.
+// grid rows, block 1024. Scores are >= 0, so their bit patterns order like the values. The selection is the radix select of the TOPK-th
+// largest bit pattern (8 bits a pass from the top, one block-wide histogram a pass, its bins scanned by one warp) followed by one
+// ordered pass that takes every greater pattern and the first `need` equal ones, in index order; the warps' counts of that pass are
+// combined by every warp itself (a shuffle scan over the 32 warps' counts), so a pass of 1,024 elements costs one barrier.
 __global__ void __launch_bounds__(1024) topk_k(const float* __restrict__ scores, const int* __restrict__ positions,
                                                int nb_cap, int* __restrict__ sel, int* __restrict__ sel_n) {
-    __shared__ unsigned hist[256];
-    __shared__ unsigned whist[32][256];
+    __shared__ __align__(16) unsigned hist[4][256];
     __shared__ unsigned sh_prefix, sh_need;
-    __shared__ int wsum[32], weq[32];
-    __shared__ int sh_base_gt, sh_base_eq;
+    __shared__ int wgt[2][32], weq[2][32];
     pdl_trigger();
     pdl_wait();  // scores and positions are earlier kernels' outputs; the early exit below is after it
     const int r = blockIdx.x, t = threadIdx.x;
@@ -258,76 +259,102 @@ __global__ void __launch_bounds__(1024) topk_k(const float* __restrict__ scores,
         return;
     }
     const unsigned* s = reinterpret_cast<const unsigned*>(scores + (size_t)r * nb_cap);
-    // radix select of the TOPK-th largest bit pattern, 8 bits a pass from the top
+    const int wid = t >> 5, ln = t & 31;
+    (&hist[0][0])[t] = 0;
+    __syncthreads();
+    // radix select of the TOPK-th largest bit pattern: `prefix` is its decided high bits, `need` the rank wanted among the patterns that
+    // share them
     unsigned prefix = 0, need = TOPK;
-    const int nwarps = blockDim.x >> 5, wid = t >> 5, ln = t & 31;
-    for (int shift = 24; shift >= 0; shift -= 8) {
-        for (int i = t; i < 32 * 256; i += blockDim.x) whist[i / 256][i % 256] = 0;
-        __syncthreads();
+    for (int pass = 0; pass < 4; ++pass) {
+        const int shift = 24 - 8 * pass;
         const unsigned hi_mask = shift == 24 ? 0u : (0xffffffffu << (shift + 8));
-        // scores cluster in a few bins: lanes with the same digit add once (warp-private bins, no cross-warp contention)
+        // scores cluster in a few bins: lanes with the same digit add once
         const int span = (nbq + 31) / 32 * 32;
-        for (int i = t; i < span; i += blockDim.x) {
+        for (int i = t; i < span; i += 1024) {
             const unsigned v = i < nbq ? s[i] : 0u;
             const bool in = i < nbq && (v & hi_mask) == prefix;
             const unsigned dgt = in ? ((v >> shift) & 255u) : 256u;
             const unsigned peers = __match_any_sync(0xffffffffu, dgt);
-            if (in && ln == __ffs(peers) - 1) whist[wid][dgt] += __popc(peers);
+            if (in && ln == __ffs(peers) - 1) atomicAdd(&hist[pass][dgt], (unsigned)__popc(peers));
         }
         __syncthreads();
-        for (int b = t; b < 256; b += blockDim.x) {
-            unsigned c = 0;
-            for (int w = 0; w < nwarps; ++w) c += whist[w][b];
-            hist[b] = c;
-        }
-        __syncthreads();
-        if (t == 0) {
-            unsigned acc = 0;
-            int dgt = 255;
-            for (; dgt > 0; --dgt) {
-                if (acc + hist[dgt] >= need) break;
-                acc += hist[dgt];
+        if (wid == 0) {
+            // lane l owns bins 8 l .. 8 l + 7; S is the count of the bins from 8 l up
+            const uint4 h0 = reinterpret_cast<const uint4*>(&hist[pass][8 * ln])[0];
+            const uint4 h1 = reinterpret_cast<const uint4*>(&hist[pass][8 * ln])[1];
+            const unsigned h[8] = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
+            unsigned ls = 0;
+#pragma unroll
+            for (int b = 0; b < 8; ++b) ls += h[b];
+            unsigned S = ls;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const unsigned up = __shfl_down_sync(0xffffffffu, S, o);
+                if (ln + o < 32) S += up;
             }
-            sh_prefix = prefix | ((unsigned)dgt << shift);
-            sh_need = need - acc;
+            // the answer is the highest bin whose count from there up reaches `need`: it lies in the highest lane whose S does
+            const unsigned ge = __ballot_sync(0xffffffffu, S >= need);
+            const int lane_star = ge ? 31 - __clz(ge) : 0;
+            if (ln == lane_star) {
+                unsigned acc = S - ls;  // the bins above this lane
+                int dgt = 8 * ln;
+                bool found = false;
+#pragma unroll
+                for (int b = 7; b > 0; --b) {
+                    if (found) continue;
+                    if (acc + h[b] >= need) {
+                        dgt = 8 * ln + b;
+                        found = true;
+                    } else {
+                        acc += h[b];
+                    }
+                }
+                sh_prefix = prefix | ((unsigned)dgt << shift);
+                sh_need = need - acc;
+            }
         }
         __syncthreads();
         prefix = sh_prefix;
         need = sh_need;
     }
     // prefix is the threshold pattern; take every greater one and the first `need` equal ones, in index order
-    if (t == 0) { sh_base_gt = 0; sh_base_eq = 0; }
-    __syncthreads();
-    const int lane = ln, w = wid, nw = nwarps;
-    const unsigned lt = (1u << lane) - 1u;
-    for (int i0 = 0; i0 < nbq; i0 += blockDim.x) {
+    const unsigned lt = (1u << ln) - 1u;
+    int base_gt = 0, base_eq = 0;  // taken so far, equal so far (every thread tracks them: the totals are the same in every warp)
+    int buf = 0;
+    for (int i0 = 0; i0 < nbq; i0 += 1024, buf ^= 1) {
         const int i = i0 + t;
         const unsigned v = i < nbq ? s[i] : 0u;
         const bool gt = i < nbq && v > prefix, eq = i < nbq && v == prefix;
-        // rank of an equal pattern among the equal ones before it, to keep exactly `need` of them
-        const unsigned beq = __ballot_sync(0xffffffffu, eq);
-        if (lane == 0) weq[w] = __popc(beq);
-        __syncthreads();
-        int eq_before = sh_base_eq + __popc(beq & lt);
-        for (int k = 0; k < w; ++k) eq_before += weq[k];
-        const bool take = gt || (eq && eq_before < (int)need);
-        const unsigned bt = __ballot_sync(0xffffffffu, take);
-        if (lane == 0) wsum[w] = __popc(bt);
-        __syncthreads();
-        int at = sh_base_gt + __popc(bt & lt);
-        for (int k = 0; k < w; ++k) at += wsum[k];
-        if (take) out[at] = i;
-        __syncthreads();
-        if (t == 0) {
-            int tk = 0, te = 0;
-            for (int k = 0; k < nw; ++k) {
-                tk += wsum[k];
-                te += weq[k];
-            }
-            sh_base_gt += tk;
-            sh_base_eq += te;
+        const unsigned bg = __ballot_sync(0xffffffffu, gt), be = __ballot_sync(0xffffffffu, eq);
+        if (ln == 0) {
+            wgt[buf][wid] = __popc(bg);
+            weq[buf][wid] = __popc(be);
         }
         __syncthreads();
+        // lane k now stands for warp k: its greater and equal counts, the equal ones before it, and what it takes
+        const int cg = wgt[buf][ln], ce = weq[buf][ln];
+        int ie = ce;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int up = __shfl_up_sync(0xffffffffu, ie, o);
+            if (ln >= o) ie += up;
+        }
+        const int ex_eq = ie - ce;
+        const int room = (int)need - (base_eq + ex_eq);
+        const int tk = cg + min(max(room, 0), ce);
+        int it = tk;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int up = __shfl_up_sync(0xffffffffu, it, o);
+            if (ln >= o) it += up;
+        }
+        const int eq_before = base_eq + __shfl_sync(0xffffffffu, ex_eq, wid) + __popc(be & lt);
+        const bool take = gt || (eq && eq_before < (int)need);
+        const unsigned bt = __ballot_sync(0xffffffffu, take);
+        const int at = base_gt + __shfl_sync(0xffffffffu, it - tk, wid) + __popc(bt & lt);
+        if (take) out[at] = i;
+        base_gt += __shfl_sync(0xffffffffu, it, 31);
+        base_eq += __shfl_sync(0xffffffffu, ie, 31);
     }
     if (t == 0) sel_n[r] = TOPK;
 }
