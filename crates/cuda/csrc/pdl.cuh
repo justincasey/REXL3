@@ -20,7 +20,7 @@
 
 namespace gbp_pdl {
 
-enum : int { kExl3 = 1, kMhc = 2, kMoe = 4, kFlash = 8, kAll = 31 };
+enum : int { kExl3 = 1, kMhc = 2, kMoe = 4, kFlash = 8, kHcx = 16, kAll = 31 };
 
 inline int g_mask = -1;
 inline int mask() {

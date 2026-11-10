@@ -1,6 +1,7 @@
 // Multi-HyperConnection (mHC) low-rank mixer for Qwen4_Exp / Flash-Next
 // Optimized warp-cooperative coalesced implementation for sm_121 / DGX Spark (GB10).
 #include "common.cuh"
+#include "pdl.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -184,6 +185,8 @@ __global__ void hc_post_kernel(
     float* out,                                  // [T, hc, H]
     const unsigned int hidden_size
 ) {
+    gbp_pdl::pdl_trigger();  // the next pre-mix may start loading its weights now; it waits for this grid before reading x
+    gbp_pdl::pdl_wait();     // block_out and inj are the previous kernels' output, and `out` may still be read by them
     const unsigned int t = blockIdx.y;
     const unsigned int H = hidden_size;
     const __nv_bfloat16* x = block_out + (size_t)t * H;
@@ -346,12 +349,17 @@ GB_EXPORT int gb_fn_hc_post(
     // loaded once for all HC streams.
     const unsigned int blocks_x = (hidden_size + QHC_BLOCK - 1) / QHC_BLOCK;
     const dim3 grid(blocks_x, num_tokens);
+    // Under gbp_pdl::kHcx the launch carries the programmatic-dependent-launch attribute (the kernel waits before it reads).
+    const bool pdl = gbp_pdl::on(gbp_pdl::kHcx);
+    int rc = 0;
     switch (hc_mult) {
-#define GB_HC_POST(N) \
-    case N: hc_post_kernel<N><<<grid, QHC_BLOCK, 0, st>>>(bo, res, inj, o, hidden_size); break;
+#define GB_HC_POST(N)                                                                                                  \
+    case N:                                                                                                            \
+        rc = gbp_pdl::launch_pdl(pdl, hc_post_kernel<N>, grid, dim3(QHC_BLOCK), 0, st, bo, res, inj, o, hidden_size);  \
+        break;
         GB_HC_POST(1) GB_HC_POST(2) GB_HC_POST(3) GB_HC_POST(4) GB_HC_POST(5) GB_HC_POST(6) GB_HC_POST(7) GB_HC_POST(8)
 #undef GB_HC_POST
         default: return (int)cudaErrorInvalidValue;  // per-thread stream arrays are sized at compile time, up to 8
     }
-    return GB_CHECK_LAUNCH();
+    return rc;
 }

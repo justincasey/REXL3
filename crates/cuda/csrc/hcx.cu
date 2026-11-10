@@ -19,9 +19,14 @@
 //   shared memory once for the four streams, and the 4 x rows per-lane partial sums are reduce-scattered (same xor tree as
 //   warp_sum) so the exp/divide tail runs once a warp instead of once a (stream, row) per lane; see the block comment above it;
 // - hc_post is regridded over the whole [t, s, d] volume (elementwise, so any grid gives the same bits).
+// - with the gbp_pdl::kHcx bit of the PDL mask (pdl.cuh) k1u, k2t (and hc_post, fn_mhc.cu) launch with the
+//   programmatic-dependent-launch attribute: each triggers its successor at its start and waits for its predecessor before it
+//   reads anything an earlier kernel wrote, after issuing what depends on nothing (k1u its first weight chunk, k2t its first
+//   column's weights). Timing only: with the bit off every launch is a plain launch and the calls are no-ops.
 // The fast path is unconditional: the gate needs the bit-exact fast kernels always on. The reference launches are
 // still reachable through gb_hcx_pre_ref / gb_hcx_pre_z_ref (used by the bit-exact GPU tests in tests/hcx_perf.rs).
 #include "common.cuh"
+#include "pdl.cuh"
 
 namespace hcx {
 
@@ -268,13 +273,17 @@ __global__ void __launch_bounds__(32) k1u_kernel(const float* __restrict__ x, co
         for (int j = 0; j < NJ; ++j)
 #pragma unroll
             for (int t = 0; t < NT; ++t) acc[j][t] = 0.f;
+        // The first chunk's weights are constants of the call: issue them before waiting for the predecessor (a successor of
+        // hc_post or of an early-triggering kernel starts streaming while the previous kernel still drains).
+        uint4 wq[NJ];
+        float nv[8];
+#pragma unroll
+        for (int j = 0; j < NJ; ++j) wq[j] = __ldg(reinterpret_cast<const uint4*>(w[j] + 8 * lane));
+        h8(n + 8 * lane, nv);
+        gbp_pdl::pdl_trigger();
+        gbp_pdl::pdl_wait();  // x (and P/ss, last read by the previous call's k2) belong to earlier kernels of the stream
 #pragma unroll 1
         for (int d = 8 * lane; d < H; d += 256) {
-            uint4 wq[NJ];
-#pragma unroll
-            for (int j = 0; j < NJ; ++j) wq[j] = __ldg(reinterpret_cast<const uint4*>(w[j] + d));
-            float nv[8];
-            h8(n + d, nv);
             float4 xa[NT], xb[NT];
 #pragma unroll
             for (int t = 0; t < NT; ++t) {
@@ -294,6 +303,11 @@ __global__ void __launch_bounds__(32) k1u_kernel(const float* __restrict__ x, co
 #pragma unroll
                 for (int t = 0; t < NT; ++t) acc[j][t] = dot8_acc(acc[j][t], wv, xa[t], xb[t]);
             }
+            if (d + 256 < H) {  // next chunk
+#pragma unroll
+                for (int j = 0; j < NJ; ++j) wq[j] = __ldg(reinterpret_cast<const uint4*>(w[j] + d + 256));
+                h8(n + d + 256, nv);
+            }
         }
         constexpr int NEL = NJ * NT;
 #pragma unroll
@@ -310,6 +324,8 @@ __global__ void __launch_bounds__(32) k1u_kernel(const float* __restrict__ x, co
         }
         return;
     }
+    gbp_pdl::pdl_trigger();
+    gbp_pdl::pdl_wait();
     const int q = (int)blockIdx.x - gps * hc;
     if (q >= NT * hc) return;
     const int t = q / hc, s = q % hc;
@@ -438,7 +454,8 @@ __global__ void __launch_bounds__(K2T_WPB * 32, 2) k2t_kernel(const float* __res
     const int base1 = NT * 2 * 128;
     const int stride1 = rank > 320 ? 128 : 32;
 
-    // the first column's weights are independent of k1: issue them before the low computation
+    gbp_pdl::pdl_trigger();  // a successor may launch now; it waits for this grid before touching anything
+    // the first column's weights are independent of k1: issue them before waiting for it
     uint4 q0[HCN], q1[HCN];
     if (col0 < H) {
 #pragma unroll
@@ -448,6 +465,7 @@ __global__ void __launch_bounds__(K2T_WPB * 32, 2) k2t_kernel(const float* __res
             if (has1) q1[s] = __ldg(reinterpret_cast<const uint4*>(row + 8 * lane + 256));
         }
     }
+    gbp_pdl::pdl_wait();  // P and ss are k1's output (and y / inj_out were last read by earlier kernels)
     if (tid < NT * HCN) s_rms[tid] = rsqrtf(ss[tid] / (float)H + eps);
     __syncthreads();
     for (int i = tid; i < NT * rank; i += K2T_WPB * 32) {
@@ -549,40 +567,43 @@ GB_EXPORT size_t gb_hcx_scratch_bytes(int hc, int rank, int ninj) {
     return ((size_t)TMAX * (rank + ninj) * hc + (size_t)TMAX * hc) * sizeof(float);
 }
 
-// k2t launch for 1..8 rows (rows are a template parameter: the per-lane partial sums live in registers).
-static void launch_k2t(int nt, const float* x, const half* nw, const half* up, const float* P, const float* ss,
-                       __nv_bfloat16* y, float* inj_out, int t0, int H, int rank, int ninj, float eps, float* dbg_z,
-                       cudaStream_t st) {
+// k2t launch for 1..8 rows (rows are a template parameter: the per-lane partial sums live in registers). With the kHcx PDL bit
+// the launch carries the programmatic-dependent-launch attribute (k2t waits before it reads k1's output).
+static int launch_k2t(int nt, const float* x, const half* nw, const half* up, const float* P, const float* ss,
+                      __nv_bfloat16* y, float* inj_out, int t0, int H, int rank, int ninj, float eps, float* dbg_z,
+                      cudaStream_t st) {
     const int blocks = (H + K2T_WPB * K2T_CPW - 1) / (K2T_WPB * K2T_CPW);
     const int stride1 = rank > 320 ? 128 : 32;
     const size_t smem = (size_t)nt * (256 + (rank > 256 ? 2 * stride1 : 0)) * sizeof(float);
+    const bool pdl = gbp_pdl::on(gbp_pdl::kHcx);
     switch (nt) {
 #define K2T_CASE(N)                                                                                                    \
     case N:                                                                                                            \
-        k2t_kernel<N><<<blocks, K2T_WPB * 32, smem, st>>>(x, nw, up, P, ss, y, inj_out, t0, H, rank, ninj, eps, dbg_z); \
-        break;
+        return gbp_pdl::launch_pdl(pdl, k2t_kernel<N>, dim3(blocks), dim3(K2T_WPB * 32), smem, st, x, nw, up, P, ss,   \
+                                   y, inj_out, t0, H, rank, ninj, eps, dbg_z);
         K2T_CASE(1) K2T_CASE(2) K2T_CASE(3) K2T_CASE(4) K2T_CASE(5) K2T_CASE(6) K2T_CASE(7) K2T_CASE(8)
 #undef K2T_CASE
-        default: break;
+        default: return (int)cudaErrorInvalidValue;
     }
 }
 
 // k1u launch for 1..8 rows: NJ rows of a stream a warp. 9 keeps the registers inside what a thread has up to 7 rows (the
-// 324 = 320 + 4 rows of the real mixers split into 36 groups a stream); 8 rows use 6.
-static void launch_k1u(int nt, const float* x, const half* nw, const half* down, const half* inj, float* P, float* ss,
-                       int t0, int H, int hc, int rank, int ninj, cudaStream_t st) {
+// 324 = 320 + 4 rows of the real mixers split into 36 groups a stream); 8 rows use 6. Same PDL attribute rule as k2t.
+static int launch_k1u(int nt, const float* x, const half* nw, const half* down, const half* inj, float* P, float* ss,
+                      int t0, int H, int hc, int rank, int ninj, cudaStream_t st) {
     const int R = rank + ninj;
+    const bool pdl = gbp_pdl::on(gbp_pdl::kHcx);
     switch (nt) {
 #define K1U_CASE(NJ, N)                                                                                                \
     case N: {                                                                                                          \
         const int warps = ((R + NJ - 1) / NJ) * hc + N * hc;                                                           \
-        k1u_kernel<NJ, N><<<warps, 32, 0, st>>>(x, nw, down, inj, P, ss, t0, H, hc, rank, ninj);                       \
-        break;                                                                                                         \
+        return gbp_pdl::launch_pdl(pdl, k1u_kernel<NJ, N>, dim3(warps), dim3(32), 0, st, x, nw, down, inj, P, ss, t0,  \
+                                   H, hc, rank, ninj);                                                                 \
     }
         K1U_CASE(9, 1) K1U_CASE(9, 2) K1U_CASE(9, 3) K1U_CASE(9, 4) K1U_CASE(9, 5) K1U_CASE(9, 6) K1U_CASE(9, 7)
         K1U_CASE(6, 8)
 #undef K1U_CASE
-        default: break;
+        default: return (int)cudaErrorInvalidValue;
     }
 }
 
@@ -606,30 +627,33 @@ static int hcx_pre_impl(const void* streams, const void* hc_norm_w, const void* 
         const int nt = min(TMAX, (int)num_tokens - t0);
         const bool use_k2b = !ref;
         const bool use_k2t = !ref && hc == 4 && rk <= 512;
+        int rc;
         if (!ref) {
-            launch_k1u(nt, (const float*)streams, (const half*)hc_norm_w, (const half*)down_w, (const half*)inject_w, P,
-                       ss, t0, H, hc, rk, ninj, st);
+            rc = launch_k1u(nt, (const float*)streams, (const half*)hc_norm_w, (const half*)down_w, (const half*)inject_w,
+                            P, ss, t0, H, hc, rk, ninj, st);
         } else {
             const int jobs = R * hc + nt * hc;
             k1_kernel<<<(jobs + 3) / 4, 128, 0, st>>>((const float*)streams, (const half*)hc_norm_w,
                                                        (const half*)down_w, (const half*)inject_w, P, ss, t0, nt, H,
                                                        hc, rk, ninj);
+            rc = GB_CHECK_LAUNCH();
         }
-        int rc = GB_CHECK_LAUNCH();
         if (rc) return rc;
         if (use_k2t) {
-            launch_k2t(nt, (const float*)streams, (const half*)hc_norm_w, (const half*)up_w, P, ss, (__nv_bfloat16*)y_out,
-                       inject_w ? inj_out : nullptr, t0, H, rk, ninj, eps, dbg_z, st);
-        } else if (use_k2b) {
-            k2c_kernel<<<(H + 15) / 16, 512, (size_t)nt * rk * sizeof(float), st>>>(
-                (const float*)streams, (const half*)hc_norm_w, (const half*)up_w, P, ss, (__nv_bfloat16*)y_out,
-                inject_w ? inj_out : nullptr, t0, nt, H, hc, rk, ninj, eps, dbg_z);
+            rc = launch_k2t(nt, (const float*)streams, (const half*)hc_norm_w, (const half*)up_w, P, ss,
+                            (__nv_bfloat16*)y_out, inject_w ? inj_out : nullptr, t0, H, rk, ninj, eps, dbg_z, st);
         } else {
-            k2_kernel<<<(H + 7) / 8, 256, (size_t)nt * rk * sizeof(float), st>>>(
-                (const float*)streams, (const half*)hc_norm_w, (const half*)up_w, P, ss, (__nv_bfloat16*)y_out,
-                inject_w ? inj_out : nullptr, t0, nt, H, hc, rk, ninj, eps, dbg_z);
+            if (use_k2b) {
+                k2c_kernel<<<(H + 15) / 16, 512, (size_t)nt * rk * sizeof(float), st>>>(
+                    (const float*)streams, (const half*)hc_norm_w, (const half*)up_w, P, ss, (__nv_bfloat16*)y_out,
+                    inject_w ? inj_out : nullptr, t0, nt, H, hc, rk, ninj, eps, dbg_z);
+            } else {
+                k2_kernel<<<(H + 7) / 8, 256, (size_t)nt * rk * sizeof(float), st>>>(
+                    (const float*)streams, (const half*)hc_norm_w, (const half*)up_w, P, ss, (__nv_bfloat16*)y_out,
+                    inject_w ? inj_out : nullptr, t0, nt, H, hc, rk, ninj, eps, dbg_z);
+            }
+            rc = GB_CHECK_LAUNCH();
         }
-        rc = GB_CHECK_LAUNCH();
         if (rc) return rc;
     }
     return 0;
