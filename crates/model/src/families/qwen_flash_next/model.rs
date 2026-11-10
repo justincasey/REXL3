@@ -3203,6 +3203,18 @@ mod tests {
         assert_eq!(key(2048), key(2200), "positions inside one stable sparse pattern reuse a graph");
     }
 
+    /// A retired graph may still be running (the first part of a split window is launched and not waited for when its second part
+    /// captures), so the one place a graph leaves the cache waits for the stream first.
+    #[test]
+    fn a_graph_is_retired_only_after_the_stream_has_drained() {
+        let code = include_str!("model.rs").split("#[cfg(test)]").next().unwrap();
+        assert_eq!(code.matches(".retire_oldest()").count(), 1, "graphs leave the caches at one site");
+        let before = &code[..code.find(".retire_oldest()").unwrap()];
+        let branch = &before[before.rfind("cache.is_full()").expect("the retirement is the full-cache branch")..];
+        assert!(branch.contains("self.sync()?"), "the stream is waited for before a graph is dropped:\n{branch}");
+        assert!(code.matches("graphs(self).0.insert(").count() == 1, "graphs enter the caches at one site");
+    }
+
     #[test]
     fn graph_keys_cover_host_dispatch_decisions() {
         let f = GraphFeatures { qsa_trunk: true, qsa_mtp: true, ple: true, mtp: true, fast: true };
@@ -3312,6 +3324,11 @@ mod tests {
         m.use_graphs = false;
         let eager: Vec<_> = [2046, 2047, 2051].map(|n| run(&mut m, n)).into();
         m.use_graphs = true;
+        // every shape is captured at its first sighting here, as before the caches were bounded: the parity below is about the
+        // graphs, so no shape may run eagerly in the "captured" pass
+        m.sync().unwrap();
+        m.graphs = GraphCache::new(graph_cache::DEFAULT_WINDOW_GRAPHS, true);
+        m.mtp_graphs = GraphCache::new(graph_cache::DEFAULT_CHAIN_GRAPHS, true);
         let captured: Vec<_> = [2046, 2047, 2051].map(|n| run(&mut m, n)).into();
         assert!(m.use_graphs && !m.graphs.is_empty() && !m.mtp_graphs.is_empty(), "capture refused; parity would be vacuous");
         assert_eq!(captured, eager, "capture differs bit for bit from eager");
@@ -3319,6 +3336,27 @@ mod tests {
         let replayed: Vec<_> = [2046, 2047, 2051].map(|n| run(&mut m, n)).into();
         assert_eq!((m.graphs.len(), m.mtp_graphs.len()), sizes, "expected replay, not new captures");
         assert_eq!(replayed, eager, "replayed windows / MTP chains differ bit for bit from eager");
+
+        // The bounded caches under churn: two window graphs and one chain graph, a shape captured at its second sighting and a graph
+        // retired whenever a capture finds the cache full. Every pass must still equal the eager one bit for bit.
+        m.sync().unwrap();
+        m.graphs = GraphCache::with_generation(2, 64, false);
+        m.mtp_graphs = GraphCache::with_generation(1, 64, false);
+        let before = m.graph_stats();
+        let mut churned = Vec::new();
+        for _ in 0..4 {
+            churned.extend([2046, 2047, 2051].map(|n| run(&mut m, n)));
+        }
+        for (pass, got) in churned.iter().enumerate() {
+            assert_eq!(got, &eager[pass % 3], "pass {pass} under churn differs bit for bit from eager");
+        }
+        let after = m.graph_stats();
+        assert!(m.graphs.len() <= 2 && m.mtp_graphs.len() <= 1, "the caches kept their bound");
+        assert!(
+            after.window.evictions > before.window.evictions && after.chain.evictions > before.chain.evictions,
+            "the run did not retire a graph from each cache: {before:?} -> {after:?}"
+        );
+        assert!(after.window.eager > before.window.eager, "first sightings ran eagerly");
     }
 
     /// The one switch a prefill chunk is allowed to make, and the row counts that must not change it.

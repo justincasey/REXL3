@@ -86,7 +86,9 @@ impl<K: Copy + Eq + Hash, V> GraphCache<K, V> {
         Self::with_generation(limit, limit, capture_first)
     }
 
-    fn with_generation(limit: usize, generation: usize, capture_first: bool) -> Self {
+    /// A cache whose memory of first sightings is two generations of `generation` shapes each (tests make it larger than the
+    /// limit, so a small cache still captures the shapes that come back).
+    pub fn with_generation(limit: usize, generation: usize, capture_first: bool) -> Self {
         Self {
             ready: HashMap::new(),
             young: HashSet::new(),
@@ -336,5 +338,174 @@ mod tests {
         assert_eq!((c.replays, c.captures, c.eager_windows), (7, 2, 1));
         assert_eq!((c.draft_replays, c.draft_captures, c.draft_eager), (5, 3, 4));
         assert_eq!((c.capture_ms, c.evictions, c.capture_failures), (9.5, 8, 0));
+    }
+
+    // ---- the cache policy (host only: the graphs are tokens that count their drops)
+
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// A stand-in for an instantiated graph: it counts the drops of its kind and knows which shape it was made for.
+    struct Token {
+        shape: u32,
+        drops: Rc<Cell<usize>>,
+    }
+
+    impl Drop for Token {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    /// What one sighting of a shape did.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Outcome {
+        Replayed,
+        Eager,
+        Captured { retired: Option<u32> },
+    }
+
+    /// The model's sequence for one launch (`capture_and_launch`): replay a graph that exists, else the cache's verdict, a
+    /// retirement when the cache is full, then the capture.
+    fn sight(cache: &mut GraphCache<u32, Token>, shape: u32, drops: &Rc<Cell<usize>>) -> Outcome {
+        if cache.get(&shape).is_some() {
+            return Outcome::Replayed;
+        }
+        if cache.admit(shape) == Admit::Eager {
+            return Outcome::Eager;
+        }
+        let retired = if cache.is_full() {
+            let gone = cache.retire_oldest().expect("a full cache has a graph to retire");
+            let shape = gone.shape;
+            drop(gone);
+            Some(shape)
+        } else {
+            None
+        };
+        cache.insert(shape, Token { shape, drops: Rc::clone(drops) });
+        Outcome::Captured { retired }
+    }
+
+    fn drops() -> Rc<Cell<usize>> {
+        Rc::new(Cell::new(0))
+    }
+
+    #[test]
+    fn a_shape_runs_eagerly_once_then_is_captured_and_then_replays() {
+        let d = drops();
+        let mut c = GraphCache::new(4, false);
+        assert_eq!(sight(&mut c, 7, &d), Outcome::Eager);
+        assert!(c.is_empty(), "the first sighting makes no graph");
+        assert_eq!(sight(&mut c, 7, &d), Outcome::Captured { retired: None });
+        assert_eq!(c.len(), 1);
+        for _ in 0..5 {
+            assert_eq!(sight(&mut c, 7, &d), Outcome::Replayed);
+        }
+        assert_eq!((c.len(), d.get()), (1, 0));
+    }
+
+    #[test]
+    fn captures_at_first_sighting_when_asked_to() {
+        let d = drops();
+        let mut c = GraphCache::new(4, true);
+        assert_eq!(sight(&mut c, 7, &d), Outcome::Captured { retired: None });
+        assert_eq!(sight(&mut c, 7, &d), Outcome::Replayed);
+    }
+
+    #[test]
+    fn shapes_seen_once_cost_no_graph() {
+        let d = drops();
+        let mut c = GraphCache::new(8, false);
+        for shape in 0..1000 {
+            assert_eq!(sight(&mut c, shape, &d), Outcome::Eager);
+        }
+        assert_eq!((c.len(), d.get()), (0, 0), "a thousand one-off shapes captured nothing");
+    }
+
+    #[test]
+    fn the_least_recently_launched_graph_goes_first_and_is_dropped_once() {
+        let d = drops();
+        let mut c = GraphCache::new(3, false);
+        for shape in [1, 2, 3] {
+            sight(&mut c, shape, &d);
+            assert_eq!(sight(&mut c, shape, &d), Outcome::Captured { retired: None });
+        }
+        assert!(c.is_full());
+        // 1 was captured first, but launching it again makes 2 the oldest
+        assert_eq!(sight(&mut c, 1, &d), Outcome::Replayed);
+        sight(&mut c, 4, &d);
+        assert_eq!(sight(&mut c, 4, &d), Outcome::Captured { retired: Some(2) });
+        assert_eq!((c.len(), d.get()), (3, 1));
+        assert_eq!(sight(&mut c, 1, &d), Outcome::Replayed);
+        assert_eq!(sight(&mut c, 3, &d), Outcome::Replayed);
+        // the retired shape starts over: an eager run, then a capture, which retires the then oldest (4)
+        assert_eq!(sight(&mut c, 2, &d), Outcome::Eager);
+        assert_eq!(sight(&mut c, 2, &d), Outcome::Captured { retired: Some(4) });
+        assert_eq!((c.len(), d.get()), (3, 2));
+    }
+
+    #[test]
+    fn the_limit_is_at_least_one_and_a_full_cache_refuses_an_insert() {
+        let c: GraphCache<u32, ()> = GraphCache::new(0, false);
+        assert_eq!(c.limit(), 1);
+        let mut c: GraphCache<u32, ()> = GraphCache::new(1, true);
+        c.insert(1, ());
+        assert!(c.is_full());
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.insert(2, ())));
+        assert!(refused.is_err(), "a capture into a full cache must be a bug, not a silent overflow");
+    }
+
+    #[test]
+    fn a_long_churn_never_exceeds_the_limit_and_drops_every_retired_graph_exactly_once() {
+        // a shape space much wider than the cache, hot shapes (small numbers) far more often than cold ones
+        let (limit, mut x) = (16usize, 0x9E37_79B9_7F4A_7C15u64);
+        let d = drops();
+        let mut c = GraphCache::new(limit, false);
+        let (mut captured, mut replayed, mut eager) = (0usize, 0usize, 0usize);
+        for _ in 0..200_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let u = (x >> 11) as f64 / (1u64 << 53) as f64;
+            let shape = (4096.0 * u * u * u) as u32;
+            match sight(&mut c, shape, &d) {
+                Outcome::Replayed => replayed += 1,
+                Outcome::Eager => eager += 1,
+                Outcome::Captured { .. } => captured += 1,
+            }
+            assert!(c.len() <= limit, "{} graphs alive, limit {limit}", c.len());
+            assert_eq!(captured - d.get(), c.len(), "every graph is alive or was dropped exactly once");
+        }
+        assert!(captured > limit && replayed > 0 && eager > 4 * captured, "the run exercised churn: {captured} {replayed} {eager}");
+    }
+
+    #[test]
+    fn the_memory_of_shapes_seen_once_is_bounded_and_fades() {
+        let mut c: GraphCache<u32, ()> = GraphCache::with_generation(2, 8, false);
+        for shape in 0..1000 {
+            assert_eq!(c.admit(shape), Admit::Eager);
+            assert!(c.seen_len() <= 16, "{} shapes remembered", c.seen_len());
+        }
+        // a shape older than two generations of other first sightings is new again: one more eager run, never a wrong answer
+        assert_eq!(c.admit(0), Admit::Eager);
+        assert_eq!(c.admit(0), Admit::Capture);
+        // one that comes back soon is remembered
+        assert_eq!(c.admit(5000), Admit::Eager);
+        for shape in 0..3 {
+            assert_eq!(c.admit(6000 + shape), Admit::Eager);
+        }
+        assert_eq!(c.admit(5000), Admit::Capture, "three other first sightings later, inside a generation of 8");
+    }
+
+    #[test]
+    fn the_environment_values_parse_to_a_limit_and_a_policy() {
+        assert_eq!(parse_limit(None, 96), 96);
+        assert_eq!(parse_limit(Some("12"), 96), 12);
+        assert_eq!(parse_limit(Some(" 7 "), 96), 7);
+        for bad in ["0", "-3", "many", ""] {
+            assert_eq!(parse_limit(Some(bad), 96), 96, "{bad:?}");
+        }
+        assert!(parse_capture_first(Some("0")) && parse_capture_first(Some(" 0")));
+        assert!(!parse_capture_first(None) && !parse_capture_first(Some("1")) && !parse_capture_first(Some("")));
     }
 }
