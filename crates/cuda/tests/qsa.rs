@@ -229,6 +229,20 @@ impl Rig {
 
     /// Sparse attention outputs (bf16 bits [rows][24][256]) for main-attention queries `qm`.
     fn attend(&self, rows: &[(usize, usize)], qm: &[u16], sel: &[i32], sel_n: &[i32], parts: usize, st: &Stream) -> Vec<u16> {
+        self.attend_ws(rows, qm, sel, sel_n, parts, st).0
+    }
+
+    /// As [`Rig::attend`], also returning the partial sums the attend kernel wrote (the workspace as f32 words: part_o
+    /// [rows][24][parts][256], then part_m and part_l [rows][24][parts], each section 256-byte aligned).
+    fn attend_ws(
+        &self,
+        rows: &[(usize, usize)],
+        qm: &[u16],
+        sel: &[i32],
+        sel_n: &[i32],
+        parts: usize,
+        st: &Stream,
+    ) -> (Vec<u16>, Vec<f32>) {
         let n = rows.len();
         let slot: Vec<i32> = rows.iter().map(|&(s, _)| s as i32).collect();
         let pos: Vec<i32> = rows.iter().map(|&(_, p)| p as i32).collect();
@@ -239,7 +253,7 @@ impl Rig {
         let mut out = DevBuf::zeroed(n * N_Q_HEADS * HEAD_DIM * 2).unwrap();
         qsa::attend(&q, &self.kv, &self.table, &rr, &sd, &nd, parts, &mut ws, &mut out, st).unwrap();
         st.sync().unwrap();
-        out.to_vec().unwrap()
+        (out.to_vec().unwrap(), ws.to_vec().unwrap())
     }
 
     fn pool_key(&self, plane: &[u16], s: usize, j: usize) -> Vec<f32> {
@@ -568,4 +582,94 @@ fn qsa_kernels_are_exact_under_programmatic_launches() {
     println!("QSA golden hash of the plain launches: 0x{hash:016x}");
     assert_eq!(texts[0], texts[1], "programmatic launches changed a result");
     assert_eq!(hash, QSA_GOLDEN_HASH, "the plain launches differ from the recorded results:\n{}", texts[0]);
+}
+
+/// One row's partial sums out of an [`Rig::attend_ws`] workspace, as bit patterns: (part_o, part_m, part_l) of its 24 heads.
+fn row_partials(ws: &[f32], rows: usize, parts: usize, r: usize) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let pairs = rows * N_Q_HEADS * parts;
+    let a = |x: usize| x.div_ceil(256) * 256;
+    let (m_at, l_at) = (a(pairs * HEAD_DIM * 4) / 4, (a(pairs * HEAD_DIM * 4) + a(pairs * 4)) / 4);
+    let bits = |s: &[f32]| s.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+    let per_row = N_Q_HEADS * parts;
+    (
+        bits(&ws[r * per_row * HEAD_DIM..(r + 1) * per_row * HEAD_DIM]),
+        bits(&ws[m_at + r * per_row..m_at + (r + 1) * per_row]),
+        bits(&ws[l_at + r * per_row..l_at + (r + 1) * per_row]),
+    )
+}
+
+/// The chunk-sized kernel's partial sums (part_o, part_m, part_l, before the merge) are bit-identical to the one-row kernel's, row by row,
+/// for every selection length from a handful of tokens (dense rows near the start: totals 1..71, every residue of the 8-token group and of
+/// the 32-token super group) up to a full 512 selected blocks plus the tail block, and for both the single part and the window's 32 parts
+/// (whose ranges start off the group grid).
+#[test]
+#[ignore]
+fn qsa_attend_many_rows_partials_equal_one_row_calls_bit_for_bit() {
+    let Some(st) = gpu() else { return };
+    let rig = Rig::new(&LENS, 7, 97, &st);
+    for rows in [
+        (0..70).map(|i| (0, i)).collect::<Vec<_>>(),
+        (0..70).map(|i| (0, 30 + 31 * i)).collect::<Vec<_>>(),
+        (0..70).map(|i| (1, 2020 + i)).collect::<Vec<_>>(),
+        (0..70).map(|i| (2, 8930 + i)).collect::<Vec<_>>(),
+        (0..66).map(|i| (i % 3, 1000 + 20 * i)).collect::<Vec<_>>(),
+    ] {
+        assert!(rows.len() >= 64, "the chunk-sized kernel needs 64 rows or more");
+        let q = rig.queries(&rows, &st);
+        let (_, sel, sel_n, _) = rig.select(&rows, &q, &st);
+        let qm = main_queries(rows.len(), 321);
+        let width = N_Q_HEADS * HEAD_DIM;
+        for parts in [1, qsa::WINDOW_PARTS] {
+            let (_, many) = rig.attend_ws(&rows, &qm, &sel, &sel_n, parts, &st);
+            for r in 0..rows.len() {
+                let (_, one) =
+                    rig.attend_ws(&rows[r..r + 1], &qm[r * width..(r + 1) * width], &sel[r * TOPK..(r + 1) * TOPK], &sel_n[r..r + 1], parts, &st);
+                let (want, got) = (row_partials(&one, 1, parts, 0), row_partials(&many, rows.len(), parts, r));
+                assert!(want.0 == got.0, "row {r} {:?} parts {parts}: part_o", rows[r]);
+                assert!(want.1 == got.1, "row {r} {:?} parts {parts}: part_m", rows[r]);
+                assert!(want.2 == got.2, "row {r} {:?} parts {parts}: part_l", rows[r]);
+            }
+        }
+    }
+}
+
+/// A prefill chunk's attention at the real shape: 4,096 rows of positions 4,200.. of one sequence, 512 selected blocks each. Prints the
+/// time of the attend + merge calls and the FNV hashes of the partial sums and of the output.
+///     cargo test --release -p gb-cuda --test qsa -- --ignored --nocapture bench_qsa_attend_chunk
+#[test]
+#[ignore]
+fn bench_qsa_attend_chunk() {
+    let Some(st) = gpu() else { return };
+    let rig = Rig::new(&[8400], 11, 1000, &st);
+    let rows: Vec<(usize, usize)> = (0..4096).map(|i| (0, 4200 + i)).collect();
+    let q = rig.queries(&rows, &st);
+    let (_, sel, sel_n, _) = rig.select(&rows, &q, &st);
+    let qm = main_queries(rows.len(), 5);
+    let n = rows.len();
+    let slot = DevBuf::from_slice(&vec![0i32; n]).unwrap();
+    let pos = DevBuf::from_slice(&rows.iter().map(|&(_, p)| p as i32).collect::<Vec<_>>()).unwrap();
+    let rr = qsa::Rows { slot: &slot, pos: &pos, rows: n };
+    let (qd, sd, nd) = (DevBuf::from_slice(&qm).unwrap(), DevBuf::from_slice(&sel).unwrap(), DevBuf::from_slice(&sel_n).unwrap());
+    let mut ws = DevBuf::zeroed(qsa::attend_workspace_bytes(n, 1)).unwrap();
+    let mut out = DevBuf::zeroed(n * N_Q_HEADS * HEAD_DIM * 2).unwrap();
+    let mut best = f64::MAX;
+    for it in 0..8 {
+        st.sync().unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..4 {
+            qsa::attend(&qd, &rig.kv, &rig.table, &rr, &sd, &nd, 1, &mut ws, &mut out, &st).unwrap();
+        }
+        st.sync().unwrap();
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / 4.0;
+        eprintln!("iter {it}: {ms:.3} ms per attend + merge");
+        if it > 0 {
+            best = best.min(ms);
+        }
+    }
+    let (w, o): (Vec<f32>, Vec<u16>) = (ws.to_vec().unwrap(), out.to_vec().unwrap());
+    let (hw, ho) = (fnv(bytes_of(&w)), fnv(bytes_of(&o)));
+    eprintln!("BENCH best {best:.3} ms  partials {hw:016x}  out {ho:016x}");
+    // hashes of the partial sums and the output of the four-heads-a-warp kernel before its reduction was regrouped (the one-head-a-warp
+    // kernel's, which it equals bit for bit): any change of the kernel's arithmetic changes them
+    assert_eq!((hw, ho), (0xec1c23cff5f9aedf, 0x05f69ee410812893), "attend partial sums or output changed");
 }
