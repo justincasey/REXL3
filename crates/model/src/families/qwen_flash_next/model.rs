@@ -28,7 +28,7 @@
 
 use super::config::FlashNextConfig;
 use super::device::{FlashNextLayer, FlashNextWeights, MixerWeights, PleWeights};
-use super::ngram::TokContext;
+use super::ngram::{Ahead, TokContext};
 use crate::error::ModelError;
 use crate::forward::{Candidates, Mode, PrefillPath};
 use crate::kvtables::{KvTables, BLOCK_TOKENS};
@@ -333,6 +333,22 @@ enum StackSrc {
     Head(usize),
 }
 
+/// An announced next prefill chunk: where it is and the token history its rows hash.
+struct PleNext {
+    slot: usize,
+    first: usize,
+    rows: usize,
+    hist: Vec<u32>,
+}
+
+/// The gather of the next prefill chunk's PLE rows, started early ([`FlashNextModel::ple_prefetch_next`]).
+struct PleAhead {
+    slot: usize,
+    first: usize,
+    rows: usize,
+    ahead: Ahead,
+}
+
 pub struct FlashNextModel {
     pub cfg: FlashNextConfig,
     pub opts: ModelOptions,
@@ -417,6 +433,10 @@ pub struct FlashNextModel {
     dv_vals: DevBuf,
     /// PLE stage scratch (1-byte buffers when the model has no PLE stage).
     ple_host: Vec<u16>,
+    /// The PLE rows of the next prefill chunk, being gathered on a worker while the GPU runs this one.
+    ple_ahead: Option<PleAhead>,
+    /// An announced next chunk whose gather has not started yet.
+    ple_next: Option<PleNext>,
     ple_packed: DevBuf,
     ple_emb: DevBuf,
     ple_key: DevBuf,
@@ -986,6 +1006,8 @@ impl FlashNextModel {
             dv_ids: DevBuf::zeroed(WINDOW_ROWS * 4)?,
             dv_vals: DevBuf::zeroed(WINDOW_ROWS * 4)?,
             ple_host: Vec::new(),
+            ple_ahead: None,
+            ple_next: None,
             ple_packed: DevBuf::zeroed(one(ple_on, rows * ple_words * 2))?,
             ple_emb: DevBuf::zeroed(one(ple_on, rows * pd * 2))?,
             ple_key: DevBuf::zeroed(one(ple_on, rows * ch * 2))?,
@@ -1538,6 +1560,27 @@ impl FlashNextModel {
         self.ensure_pages(b)
     }
 
+    /// Announce that the prefill chunk after the one about to run is `prompt[first..end]`. Its PLE rows are then gathered
+    /// on a worker thread, started once the chunk about to run has its own rows (end of `prepare_ple`), so they are
+    /// ready when the next chunk's `prepare_ple` runs and the GPU never waits for the table. The rows depend only on the
+    /// prompt's tokens (and the EOS before position 0): this changes when table bytes are read, not which.
+    /// `prepare_ple` uses the result only when the chunk's slot, first position and complete token history (context
+    /// included) are exactly what was hashed here, and gathers inline otherwise.
+    pub fn ple_prefetch_next(&mut self, slot: usize, prompt: &[u32], first: usize, end: usize) {
+        self.ple_next = None;
+        let Some(p) = &self.w.ple else { return };
+        if first >= end || end > prompt.len() || !p.table.tuning().ahead {
+            return;
+        }
+        let eos = p.table.eos;
+        let at = |q: isize| if q < 0 { eos } else { prompt[q as usize] };
+        let mut hist = Vec::with_capacity(end - first + 2);
+        hist.push(at(first as isize - 2));
+        hist.push(at(first as isize - 1));
+        hist.extend(prompt[first..end].iter().copied());
+        self.ple_next = Some(PleNext { slot, first, rows: end - first, hist });
+    }
+
     /// The PLE stage's host work for a trunk batch: hash every row's n-grams, gather their packed table rows and upload
     /// them, and record the rows' tokens as context for later batches.
     fn prepare_ple(&mut self, b: &RowBatch) -> Result<(), ModelError> {
@@ -1548,15 +1591,27 @@ impl FlashNextModel {
         if self.ple_host.len() < b.rows * per {
             self.ple_host.resize(b.rows * per, 0);
         }
+        let mut direct: Option<Vec<u16>> = None;
         for i in 0..b.n_seq() {
             let r = b.seq_rows(i);
             let slot = b.seq_slot[i] as usize;
             let first = b.positions[r.start] as usize;
             let hist = self.ple_tok.history(slot, first, &b.ids[r.clone()], t.eos);
-            t.gather(&hist, 2, &mut self.ple_host[r.start * per..r.end * per]).map_err(ModelError::Request)?;
+            // a worker's gather is for exactly one single-sequence chunk; any other batch leaves it where it is
+            let this = |a: &PleAhead| b.n_seq() == 1 && a.slot == slot && a.first == first && a.rows == r.len();
+            let ready = if self.ple_ahead.as_ref().is_some_and(this) { self.ple_ahead.take() } else { None };
+            direct = ready.and_then(|a| a.ahead.take(&hist, 2)).filter(|v| v.len() == b.rows * per);
+            if direct.is_none() {
+                t.gather(&hist, 2, &mut self.ple_host[r.start * per..r.end * per]).map_err(ModelError::Request)?;
+            }
             self.ple_tok.store(slot, first, &b.ids[r.clone()]);
         }
-        put(&mut self.stage, &mut self.ple_packed, &self.ple_host[..b.rows * per], &self.stream)?;
+        let rows = direct.as_deref().unwrap_or(&self.ple_host[..b.rows * per]);
+        put(&mut self.stage, &mut self.ple_packed, rows, &self.stream)?;
+        // this chunk is staged: the next one's rows are gathered while its layers run on the GPU
+        if let Some(n) = self.ple_next.take() {
+            self.ple_ahead = t.gather_ahead(n.hist, 2).ok().map(|ahead| PleAhead { slot: n.slot, first: n.first, rows: n.rows, ahead });
+        }
         Ok(())
     }
 

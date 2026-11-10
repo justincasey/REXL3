@@ -395,6 +395,10 @@ pub fn slice_with_cuts(m: &mut FlashNextModel, a: &mut SnapshotArena, req: Slice
     let cuts = if path(prompt.len()).is_some() { cuts } else { &[] };
     let end = slice_end(done, prompt.len(), chunk.min(m.opts.prefill_rows), cuts);
     let ids = prompt[done..end].to_vec();
+    // the next slice's PLE rows are gathered on a worker while this chunk runs (same end rule as the next call's)
+    if end < prompt.len() {
+        m.ple_prefetch_next(slot, prompt, end, slice_end(end, prompt.len(), chunk.min(m.opts.prefill_rows), cuts));
+    }
     let b = RowBatch::from_requests(&[RowRequest { slot, first_position: done as u64, tokens: ids }]);
     let row = m.prefill_chunk(&b, PrefillPath::for_prompt(prompt.len()), (end == prompt.len()).then_some(candidates))?;
     m.mtp_after_prefill(slot, done, &prompt[done..end], prompt.get(end).copied(), PrefillPath::for_prompt(prompt.len()))?;

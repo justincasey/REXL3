@@ -33,6 +33,9 @@ pub trait FlashNextRuntime {
     fn window_candidates_dv(&mut self, _b: &RowBatch, _count: usize) -> Result<Option<Candidates>, ModelError> {
         Ok(None)
     }
+    /// The next prefill chunk is `prompt[first..end]`: its PLE rows may be gathered now, off the critical path
+    /// (changes when table bytes are read, never which). A runtime without a PLE stage ignores it.
+    fn ple_prefetch_next(&mut self, _slot: usize, _prompt: &[u32], _first: usize, _end: usize) {}
     fn commit(&mut self, slot: usize, keep: usize);
     fn flush(&mut self) -> Result<(), ModelError>;
     fn mtp_propose(&mut self, slot: usize, tokens: &[u32], k: usize) -> Result<Vec<u32>, ModelError>;
@@ -84,6 +87,9 @@ impl FlashNextRuntime for FlashNextModel {
     }
     fn window_candidates_dv(&mut self, b: &RowBatch, count: usize) -> Result<Option<Candidates>, ModelError> {
         self.window_candidates_dv(b, count)
+    }
+    fn ple_prefetch_next(&mut self, slot: usize, prompt: &[u32], first: usize, end: usize) {
+        self.ple_prefetch_next(slot, prompt, first, end)
     }
     fn commit(&mut self, slot: usize, keep: usize) {
         self.commit(slot, keep)
@@ -236,6 +242,9 @@ impl<M: FlashNextRuntime> FlashNextBackend<M> {
         }
         self.m.flush()?;
         let end = next_chunk_end(done, prompt.len(), self.effective_chunk());
+        if end < prompt.len() {
+            self.m.ple_prefetch_next(slot, prompt, end, next_chunk_end(end, prompt.len(), self.effective_chunk()));
+        }
         let c = self.run_chunk(
             slot,
             done,
