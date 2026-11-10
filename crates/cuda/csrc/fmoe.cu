@@ -769,15 +769,21 @@ struct DownArgs {
     int H, I;
 };
 
+// Brings `bytes` (a multiple of 16) at `p` (16-byte aligned) into L2 without a register or a wait.
+__device__ __forceinline__ void prefetch_l2_bulk(const void* p, unsigned bytes) {
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(p), "r"(bytes) : "memory");
+}
+
 __global__ void __launch_bounds__(WARPS * 32, 4) down_kernel(DownArgs a) {
-    pdl_wait();
-    pdl_trigger();
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const Route r = route_view(const_cast<void*>(a.route), a.emax);
     const int NBD = a.H >> 7, KCD = a.I >> 7;
     const int jobs = NBD * KCD;
     const int job = blockIdx.x * WARPS + warp;
     const int grp = job / jobs;
+    // The route is no predecessor's output here: it was complete before gate_up (this grid's predecessor, which waits for the route
+    // kernel before it triggers) passed its own pdl_wait, so the warp's job and its expert's weights are known while gate_up still
+    // runs. The weights bring themselves into L2 now (gate_up's tail and the activation finish leave the DRAM idle); only xd waits.
     const int U = r.hdr[0];
     if (grp >= U) return;
     const int q = job - grp * jobs;
@@ -787,6 +793,12 @@ __global__ void __launch_bounds__(WARPS * 32, 4) down_kernel(DownArgs a) {
     const int bits = a.ktab[e * 3 + 2];
     const uint32_t* T = reinterpret_cast<const uint32_t*>(a.dT[e]);
     const int g = lane >> 2, t = lane & 3;
+    const size_t tw = 4 * (size_t)bits;  // K2 words a tile (4 * K2)
+    const size_t stride_k = (size_t)(a.H >> 4) * tw;
+    const uint32_t* base = T + (size_t)(kc * 8) * stride_k + (size_t)nb * 8 * tw;
+    if (lane < 8) prefetch_l2_bulk(base + (size_t)lane * stride_k, (unsigned)(8 * tw * 4));
+    pdl_wait();
+    pdl_trigger();
 
     // the group's token column g: 8 k tiles of the rotated activations
     uint32_t bx[8][2];
@@ -799,9 +811,6 @@ __global__ void __launch_bounds__(WARPS * 32, 4) down_kernel(DownArgs a) {
             bx[kt][1] = g < ntok ? __ldcg(reinterpret_cast<const unsigned int*>(src + kt * 16 + 8)) : 0u;
         }
     }
-    const size_t tw = 4 * (size_t)bits;  // K2 words a tile (4 * K2)
-    const size_t stride_k = (size_t)(a.H >> 4) * tw;
-    const uint32_t* base = T + (size_t)(kc * 8) * stride_k + (size_t)nb * 8 * tw;
     auto getb = [&](int kt, uint32_t& b0, uint32_t& b1) {
         // kt is a loop counter: select without dynamic register indexing
         uint32_t x0 = bx[0][0], x1 = bx[0][1];
