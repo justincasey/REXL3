@@ -257,9 +257,9 @@ impl FlashNextRuntime for CpuRuntime {
     fn flush(&mut self) -> Result<(), ModelError> {
         Ok(())
     }
-    fn mtp_propose(&mut self, _: usize, _: &[u32], k: usize) -> Result<Vec<u32>, ModelError> {
+    fn mtp_propose(&mut self, _: usize, _: &[u32], k: usize) -> Result<(Vec<u32>, Vec<f32>), ModelError> {
         self.mtp_asks += 1;
-        Ok(vec![7; k])
+        Ok((vec![7; k], vec![0.5; k]))
     }
 }
 
@@ -413,9 +413,9 @@ impl FlashNextRuntime for DivergentRuntime {
     fn flush(&mut self) -> Result<(), ModelError> {
         Ok(())
     }
-    fn mtp_propose(&mut self, _: usize, _: &[u32], k: usize) -> Result<Vec<u32>, ModelError> {
+    fn mtp_propose(&mut self, _: usize, _: &[u32], k: usize) -> Result<(Vec<u32>, Vec<f32>), ModelError> {
         self.mtp_asks += 1;
-        Ok(vec![7; k])
+        Ok((vec![7; k], vec![0.5; k]))
     }
 }
 

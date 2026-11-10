@@ -135,6 +135,20 @@ pub fn render(s: &SpecStats) -> String {
         "Engine-thread wall seconds in each phase of a decode round (draft, verify, commit; plan: a tree round's search and row allocation), by streams in the round.",
         rows,
     );
+    // the same rounds by (stream class, rows of the verify step): the served cost of a window of each width
+    let mut by_rows: [Vec<(String, String)>; 3] = Default::default();
+    for (c, row) in ph.by_rows.iter().enumerate() {
+        for (r, cell) in row.iter().enumerate().filter(|(_, cell)| cell.rounds > 0) {
+            let labels = format!("streams=\"{}\",rows=\"{r}\"", if c + 1 == ph.by_rows.len() { "4+".to_string() } else { (c + 1).to_string() });
+            by_rows[0].push((labels.clone(), cell.rounds.to_string()));
+            by_rows[1].push((labels.clone(), format!("{:.6}", cell.verify_ns as f64 / 1e9)));
+            by_rows[2].push((labels, format!("{:.6}", cell.draft_ns as f64 / 1e9)));
+        }
+    }
+    let [rounds, verify, draft] = by_rows;
+    emit(&mut out, "rexl3_round_rows_total", "Decode rounds by streams and rows of the verify step (the last rows label also counts wider steps).", rounds);
+    emit(&mut out, "rexl3_round_rows_verify_seconds_total", "Verify-phase wall seconds of those rounds.", verify);
+    emit(&mut out, "rexl3_round_rows_draft_seconds_total", "Draft-phase wall seconds of those rounds.", draft);
     render_trees(&mut out, s);
     out
 }

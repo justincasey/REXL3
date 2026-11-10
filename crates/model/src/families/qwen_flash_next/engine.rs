@@ -12,15 +12,44 @@ use crate::memory::MemoryOptions;
 use crate::pack::Pack;
 use crate::plan::{choose_slots, plan_memory_cached_windowed, MIN_TOKENS_PER_SLOT};
 use crate::serve::{gib, PrefixCacheOption, ServeOptions};
-use gb_engine::{boot, Drafter, Engine, EngineConfig, NoDrafts};
+use gb_engine::{boot, BudgetPolicy, Drafter, Engine, EngineConfig, NoDrafts};
 use gb_exl3::checkpoint::{read_header_checked, scan};
-use gb_sched::{CostModel, ModelMemory};
+use gb_sched::{CostModel, DraftCost, ModelMemory, RoundCost, StepCost};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
 const WINDOW_ROWS: usize = super::memory::WINDOW_ROWS;
+/// The verify step by rows of ONE stream, in milliseconds as the engine thread waits for it (`step_verified` wall: the window's
+/// graphs, the commit it folds in, the greedy gather and the readback). MEASURED on the head (`rexl3_round_rows_*` counters of
+/// the server's `/metrics`, one GB10, the six decode-screen prompts at short context, 2026-11-10): 28.60 / 32.54 / 35.96 / 39.13 /
+/// 42.71 / 46.05 / 49.50 ms for 1..7 rows (8 extended by the last step), a row costing 3.3 to 3.9 ms over the first. The rows from 16
+/// are the earlier hand-coded table's (no one-stream round reaches them: a stream's window is at most 8 rows).
 const STEP_MS: &[(usize, f64)] =
-    &[(1, 29.0), (2, 34.1), (3, 38.7), (4, 43.6), (5, 47.9), (6, 52.0), (8, 59.2), (16, 85.0), (32, 130.0), (64, 220.0)];
+    &[(1, 28.6), (2, 32.54), (3, 35.96), (4, 39.13), (5, 42.71), (6, 46.05), (7, 49.5), (8, 53.0), (16, 85.0), (32, 130.0), (64, 220.0)];
+/// A draft chain of `k` MTP steps costs `MTP_CHAIN_BASE_MS + MTP_CHAIN_STEP_MS * k` in the draft phase (the catch-up rows, the replay
+/// and the host read, then one head step each). MEASURED: draft-phase wall per round at fixed k = 1..7 (`REXL3_MTP_ADAPT=0
+/// REXL3_MTP_CONF=0`, one GB10, 1,600 tokens over four prompts): 1.49 / 2.75 / 3.90 / 5.08 / 6.34 / 7.39 / 8.66 ms.
+const MTP_CHAIN_BASE_MS: f64 = 0.28;
+const MTP_CHAIN_STEP_MS: f64 = 1.20;
+/// The budget policy a Flash-Next server runs unless `REXL3_SPEC_BUDGET` says otherwise: `scored` (the plan decides before the chain
+/// whether a round drafts, the head's own probabilities decide after it how many drafts ride). Decode screen, six prompts, replies
+/// exact: 65.2 to 65.7 tok/s against 64.5 for `legacy` with the old table.
+const DEFAULT_BUDGET: BudgetPolicy = BudgetPolicy::Scored;
+
+/// What a round costs, as the engine's budget policies read it (`Engine::with_budget`): the one-stream verify table above, and the
+/// MTP chain as a draft whose head rows are the steps. Measured at a short context and not corrected for a longer one (the context
+/// terms are 0): at the lengths the decode screen runs, the attention of 12 of the 48 layers is not what a window waits for.
+pub(super) fn round_cost(mtp: bool) -> RoundCost {
+    let steps: Vec<(usize, f64)> = (1..=WINDOW_ROWS).map(|k| (k, MTP_CHAIN_STEP_MS * k as f64)).collect();
+    RoundCost {
+        verify: StepCost::rows_only(CostModel::from_table(STEP_MS.to_vec())),
+        tree_verify: None,
+        draft: mtp.then(|| DraftCost::new(vec![(1, MTP_CHAIN_BASE_MS)], steps, 0.0)),
+        kv_ms_per_token: 0.0,
+        kv_pass_ms_per_token: 0.0,
+        fixed_ms: 0.0,
+    }
+}
 
 /// Budget from reclaimable MemAvailable, not the smaller CUDA MemFree. The model
 /// has not been loaded yet, so its weight regions must be deducted before the KV plan
@@ -344,7 +373,7 @@ pub fn build_engine(o: &ServeOptions) -> Result<Engine<FlashNextBackend>, ModelE
         )
     })?;
     let mtp_k = if o.drafting && o.spec.uses_mtp() && model.has_mtp() {
-        std::env::var("REXL3_MTP_K").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(6).min(WINDOW_ROWS - 1)
+        std::env::var("REXL3_MTP_K").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(7).min(WINDOW_ROWS - 1)
     } else {
         0
     };
@@ -368,10 +397,17 @@ pub fn build_engine(o: &ServeOptions) -> Result<Engine<FlashNextBackend>, ModelE
     let engine = Engine::new(
         backend,
         admission,
-        EngineConfig { max_rows: WINDOW_ROWS, max_drafts: 7, cost: CostModel::from_table(STEP_MS.to_vec()), drafting },
+        EngineConfig { max_rows: WINDOW_ROWS, max_drafts: mtp_k.max(7), cost: CostModel::from_table(STEP_MS.to_vec()), drafting },
         make,
     );
-    Ok(engine.with_prefix_cache(flash_next_prefix_config(&|name| std::env::var(name).ok())?))
+    let engine = engine.with_prefix_cache(flash_next_prefix_config(&|name| std::env::var(name).ok())?);
+    // REXL3_SPEC_BUDGET picks the policy that trims each round's verify rows (`legacy`, `curve`, `plan`, `margin`, `scored`), and
+    // REXL3_SPEC_LEARN=1 lets it learn its priors from the traffic; only how many drafts ride a window depends on them, never
+    // which token is committed
+    let policy = crate::costs::budget_policy_from_env(DEFAULT_BUDGET)?;
+    let learn = crate::costs::spec_learn_from_env()?;
+    boot::fact("spec_budget", format!("{policy:?}").to_lowercase());
+    Ok(engine.with_budget(policy, round_cost(mtp_k > 0)).with_learning(learn))
 }
 
 /// The Flash-Next prefix config: the interactive cut policy (cuts that serve a second question about a long document and a short tool

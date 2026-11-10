@@ -80,9 +80,9 @@ impl FlashNextRuntime for Fake {
     fn flush(&mut self) -> Result<(), ModelError> {
         Ok(())
     }
-    fn mtp_propose(&mut self, _: usize, _: &[u32], k: usize) -> Result<Vec<u32>, ModelError> {
+    fn mtp_propose(&mut self, _: usize, _: &[u32], k: usize) -> Result<(Vec<u32>, Vec<f32>), ModelError> {
         self.drafts.push(k);
-        Ok(vec![7; k])
+        Ok((vec![7; k], vec![0.5; k]))
     }
 }
 

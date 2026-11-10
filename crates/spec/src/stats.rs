@@ -378,6 +378,19 @@ impl MarginTable {
     }
 }
 
+/// Stream classes of the by-rows round table of [`PhaseStats`]: 1, 2, 3 and 4 or more streams.
+pub const ROW_CLASSES: usize = 4;
+/// Row counts of that table (index = rows of the verify step, the last slot also takes wider steps).
+pub const ROW_BUCKETS: usize = 33;
+
+/// Rounds of one (stream class, verify rows) cell, with the wall time their draft and verify phases took.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RowCell {
+    pub rounds: u64,
+    pub draft_ns: u64,
+    pub verify_ns: u64,
+}
+
 /// Wall time of a decode round's phases, by how many streams the round ran. Host clocks around the backend calls: the draft and
 /// the verify step each end in a device sync, so these are the milliseconds the engine thread waited for each.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -394,6 +407,9 @@ pub struct PhaseStats {
     /// Tree rounds only: the host's time between the draft and the verify step (the best-first search, the copy continuation and the row
     /// allocation), which none of the phases above holds.
     pub plan_ns: [u64; MAX_STREAMS],
+    /// The same rounds by (stream class, rows of the verify step): what a window of each width cost as served, the table the engine's
+    /// cost model is read from (`[streams.min(4) - 1][rows.min(32)]`).
+    pub by_rows: [[RowCell; ROW_BUCKETS]; ROW_CLASSES],
 }
 
 impl Default for PhaseStats {
@@ -406,6 +422,7 @@ impl Default for PhaseStats {
             verify_ns: [0; MAX_STREAMS],
             commit_ns: [0; MAX_STREAMS],
             plan_ns: [0; MAX_STREAMS],
+            by_rows: [[RowCell::default(); ROW_BUCKETS]; ROW_CLASSES],
         }
     }
 }
@@ -424,6 +441,10 @@ impl PhaseStats {
         self.draft_ns[i] += draft_ns;
         self.verify_ns[i] += verify_ns;
         self.commit_ns[i] += commit_ns;
+        let cell = &mut self.by_rows[streams.clamp(1, ROW_CLASSES) - 1][rows.min(ROW_BUCKETS - 1)];
+        cell.rounds += 1;
+        cell.draft_ns += draft_ns;
+        cell.verify_ns += verify_ns;
     }
     /// Mean milliseconds per round of `n` streams for each phase: (draft, verify, commit); None when no such round ran.
     pub fn mean_ms(&self, n: usize) -> Option<(f64, f64, f64)> {

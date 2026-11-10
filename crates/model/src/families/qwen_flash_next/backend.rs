@@ -38,7 +38,8 @@ pub trait FlashNextRuntime {
     fn ple_prefetch_next(&mut self, _slot: usize, _prompt: &[u32], _first: usize, _end: usize) {}
     fn commit(&mut self, slot: usize, keep: usize);
     fn flush(&mut self) -> Result<(), ModelError>;
-    fn mtp_propose(&mut self, slot: usize, tokens: &[u32], k: usize) -> Result<Vec<u32>, ModelError>;
+    /// Up to `k` drafts with the head's probability of each (see `FlashNextModel::mtp_propose_scored`).
+    fn mtp_propose(&mut self, slot: usize, tokens: &[u32], k: usize) -> Result<(Vec<u32>, Vec<f32>), ModelError>;
     fn cached_slice(&mut self, _arena: &mut SnapshotArena, _req: SliceRequest<'_>) -> Result<SliceResult, ModelError> {
         Err(ModelError::Config("prefix snapshots need the device model".into()))
     }
@@ -97,8 +98,8 @@ impl FlashNextRuntime for FlashNextModel {
     fn flush(&mut self) -> Result<(), ModelError> {
         self.flush()
     }
-    fn mtp_propose(&mut self, slot: usize, tokens: &[u32], k: usize) -> Result<Vec<u32>, ModelError> {
-        self.mtp_propose(slot, tokens, k)
+    fn mtp_propose(&mut self, slot: usize, tokens: &[u32], k: usize) -> Result<(Vec<u32>, Vec<f32>), ModelError> {
+        self.mtp_propose_scored(slot, tokens, k)
     }
     fn cached_slice(&mut self, arena: &mut SnapshotArena, req: SliceRequest<'_>) -> Result<SliceResult, ModelError> {
         prefix::slice_with_cuts(self, arena, req)
@@ -501,9 +502,14 @@ impl<M: FlashNextRuntime> Backend for FlashNextBackend<M> {
         }
         let result = self.m.mtp_propose(r.slot, r.tokens, k);
         match result {
-            Ok(mut tokens) if !tokens.is_empty() => {
+            Ok((mut tokens, mut accept)) if !tokens.is_empty() => {
                 tokens.truncate(k);
-                vec![Some(Proposal { tokens, ..Default::default() })]
+                accept.truncate(tokens.len());
+                // the head's own probability for each pick is what the budget's `Margin`/`Scored` policies spend rows by (the engine
+                // keeps it honest per stream with its calibration factor); the score histogram (`rexl3_spec_conf_*`, bins 2.0 wide
+                // from -8) reads it on the logit scale, which spreads probabilities near 1 over several bins
+                let conf = accept.iter().map(|&p| logit(p)).collect();
+                vec![Some(Proposal { tokens, conf, accept, ..Default::default() })]
             }
             Ok(_) => vec![None],
             Err(e) => {
@@ -512,6 +518,12 @@ impl<M: FlashNextRuntime> Backend for FlashNextBackend<M> {
             }
         }
     }
+}
+
+/// `ln(p / (1 - p))`, with `p` held inside `1e-6..=1 - 1e-6` (and NaN taken as 0.5).
+fn logit(p: f32) -> f32 {
+    let p = if p.is_nan() { 0.5 } else { p.clamp(1e-6, 1.0 - 1e-6) };
+    (p / (1.0 - p)).ln()
 }
 
 #[cfg(test)]

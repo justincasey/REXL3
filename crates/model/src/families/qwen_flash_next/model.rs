@@ -1593,9 +1593,15 @@ impl FlashNextModel {
     /// it), then chains on its own output with the token and position of every step staged on the device, so the whole
     /// chain is one replayable graph and one host read. Drafts after the first one below `REXL3_MTP_CONF` are dropped.
     pub fn mtp_propose(&mut self, slot: usize, tokens: &[u32], k: usize) -> Result<Vec<u32>, ModelError> {
+        Ok(self.mtp_propose_scored(slot, tokens, k)?.0)
+    }
+
+    /// [`FlashNextModel::mtp_propose`] with the head's probability of each draft it keeps (the first is always kept, its
+    /// probability reported like the others'): what the engine's budget reads to decide how many of them ride the window.
+    pub fn mtp_propose_scored(&mut self, slot: usize, tokens: &[u32], k: usize) -> Result<(Vec<u32>, Vec<f32>), ModelError> {
         let k = k.min(MAX_DRAFTS);
         if !self.has_mtp() || k == 0 || tokens.len() < 2 || self.stack_rows == 0 || self.stack_slot != slot {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         // the draft chain reads no recurrent state: the conv history of a pending commit is made now, its rows of S ride the
         // next window
@@ -1604,7 +1610,7 @@ impl FlashNextModel {
         let start = self.mtp_done.get(&slot).copied().unwrap_or(0).max(self.stack_pos0);
         if end <= start || end > self.stack_pos0 + self.stack_rows || end - start > WINDOW_ROWS || end + k > self.opts.max_context
         {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         if !self.mtp_done.contains_key(&slot) {
             self.zero_mtp_row0(slot)?;
@@ -1633,13 +1639,15 @@ impl FlashNextModel {
         self.drafts_dev.download_range(0, &mut ids)?;
         self.conf_dev.download_range(0, &mut conf)?;
         let mut drafts = Vec::with_capacity(k);
+        let mut kept = Vec::with_capacity(k);
         for j in 0..k {
             if j > 0 && conf[j] < self.mtp_conf {
                 break;
             }
             drafts.push(ids[j] as u32);
+            kept.push(conf[j]);
         }
-        Ok(drafts)
+        Ok((drafts, kept))
     }
 
     /// Upload the host page table (`kv_tab`) to the device table after a change made outside a forward.
