@@ -3353,7 +3353,7 @@ mod tests {
         let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/families/qwen_flash_next/model.rs")).unwrap();
         assert!(!src.contains(stateless_switch));
         assert!(!src.contains(planner_switch));
-        assert!(src.contains("self.mtp_prefill_body(&b, StackSrc::Trunk(0), mode)?;"));
+        assert!(src.contains("self.mtp_prefill_body(&b, StackSrc::Trunk(seg.row0), mode)?;"));
         assert!(src.contains("p.use_parallel_plan(true);"));
         let registry = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/switch_registry.json")).unwrap();
         assert!(!registry.contains(stateless_switch));
