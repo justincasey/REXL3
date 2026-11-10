@@ -263,7 +263,9 @@ pub fn build_engine(o: &ServeOptions) -> Result<Engine<FlashNextBackend>, ModelE
     boot::fact("plan_free_gib", format!("{:.1}", gib(free)));
     boot::fact("ngram_warm", warm_word(want_warm, mode));
     boot::fact("prefill_contract", prefill_contract);
-    let kv_tokens_cap = o.kv_tokens.unwrap_or(max_context).min(max_context) as u64;
+    // an explicit `--kv-tokens` is the pool the operator asked for: every slot's full window and any padding on top (for example
+    // 4 x 262,144 plus 128 pages). A cap at one window left four slots sharing a single window of pages.
+    let kv_tokens_cap = o.kv_tokens.unwrap_or(max_context) as u64;
     let snapshot_bytes = prefix::snapshot_bytes(&cfg, with_mtp);
     // the cache is sized from the window, for `auto` and an explicit `--prefix-cache-mib` alike (`docs/PREFIX_CACHE_SIZING.md` section 5)
     let plan_at = |slots: usize| {
