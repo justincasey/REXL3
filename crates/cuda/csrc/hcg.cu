@@ -103,6 +103,147 @@ __global__ void __launch_bounds__(256) mix_kernel(const float* __restrict__ x, c
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------------------------
+// up + mix in one kernel (the Flash-Next shape: hc = 4, rank % 32 == 0, H % 32 == 0).
+//
+//   G[t][s * H + d] = (chain over k of low_hi[t][k] * up[s * H + d][k]) + (chain over k of low_lo[t][k] * up[s * H + d][k])
+//   y[t][d]         = bf16(sum_s sigmoid(G) * x * rms * (1 + nw))        in stream order, exactly mix_kernel's expression
+//
+// The two products of the slab loop are plain sequential m16n8k16 chains over k from +0.0 (no split-K at K = rank; every tile and
+// every GEMM M of every cuBLAS algorithm measured gives these bits), the lo GEMM's beta = 1 epilogue adds the hi sum once
+// (fl(lo + hi), commutative), and mix_kernel's per-stream terms follow in the same order: fusing them moves where G is held (registers
+// and shared memory instead of 168 MB of fp32 round trips through DRAM), never what it is. A CTA is 64 rows by 32 d of ALL four streams:
+// warp w owns stream w's 32 columns (the up rows w * H + d0 .. + 31), both chains, so the epilogue sums the four streams of a (row, d)
+// from shared memory in stream order.
+constexpr int kUmRows = 64, kUmD = 32, kUmKB = 32, kUmPad = kUmKB + 8, kUmThreads = 128;
+constexpr size_t kUmStageHalves = (size_t)(2 * kUmRows + 4 * kUmD) * kUmPad;
+constexpr size_t kUmSmem = 2 * kUmStageHalves * sizeof(half);
+
+__device__ __forceinline__ void um_cp16(void* smem, const void* g) {
+    const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(a), "l"(g));
+}
+__device__ __forceinline__ void um_ldsm4(uint32_t (&r)[4], const half* p) {
+    const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(p));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+__device__ __forceinline__ void um_mma(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// grid (H / 32, padded / 64), block 128, dynamic smem kUmSmem
+__global__ void __launch_bounds__(kUmThreads, 2)
+    up_mix_kernel(const half* __restrict__ low_hi, const half* __restrict__ low_lo, const half* __restrict__ up_w,
+                  const float* __restrict__ x, const float* __restrict__ rms, const half* __restrict__ nw,
+                  __nv_bfloat16* __restrict__ y, int T, int H, int rank) {
+    extern __shared__ __align__(16) unsigned char um_smem[];
+    half* sm = reinterpret_cast<half*>(um_smem);
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, t4 = lane & 3;
+    const int d0 = blockIdx.x * kUmD, r0 = blockIdx.y * kUmRows;
+    const int nk = rank / kUmKB;
+    auto stage = [&](int st) { return sm + (size_t)st * kUmStageHalves; };
+    auto load_stage = [&](int st, int c) {
+        half* base = stage(st);
+        const int k0 = c * kUmKB;
+        constexpr int kChunks = kUmKB / 8;  // 16-byte pieces a row of the tile
+        for (int i = tid; i < (2 * kUmRows + 4 * kUmD) * kChunks; i += kUmThreads) {
+            const int row = i / kChunks, ch = i % kChunks;
+            const half* src;
+            if (row < kUmRows) src = low_hi + (size_t)(r0 + row) * rank + k0 + ch * 8;
+            else if (row < 2 * kUmRows) src = low_lo + (size_t)(r0 + row - kUmRows) * rank + k0 + ch * 8;
+            else {
+                const int n = row - 2 * kUmRows;  // 0..127: stream n / 32, column n % 32
+                src = up_w + (size_t)((n / kUmD) * H + d0 + n % kUmD) * rank + k0 + ch * 8;
+            }
+            um_cp16(base + (size_t)row * kUmPad + ch * 8, src);
+        }
+    };
+    float acc_hi[4][4][4], acc_lo[4][4][4];
+#pragma unroll
+    for (int a = 0; a < 4; ++a)
+#pragma unroll
+        for (int b = 0; b < 4; ++b)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc_hi[a][b][e] = acc_lo[a][b][e] = 0.f;
+
+    load_stage(0, 0);
+    asm volatile("cp.async.commit_group;\n" ::);
+    for (int c = 0; c < nk; ++c) {
+        asm volatile("cp.async.wait_group 0;\n" ::);
+        __syncthreads();
+        if (c + 1 < nk) load_stage((c + 1) & 1, c + 1);
+        asm volatile("cp.async.commit_group;\n" ::);
+        const half* ahi = stage(c & 1);
+        const half* alo = ahi + (size_t)kUmRows * kUmPad;
+        const half* bt = alo + (size_t)kUmRows * kUmPad + (size_t)w * kUmD * kUmPad;
+#pragma unroll
+        for (int kk = 0; kk < kUmKB / 16; ++kk) {
+            uint32_t bf[4][2];
+#pragma unroll
+            for (int p = 0; p < 2; ++p) {
+                uint32_t r[4];
+                um_ldsm4(r, bt + (size_t)(16 * p + (lane & 7) + ((lane >> 4) << 3)) * kUmPad + kk * 16 + ((lane >> 3) & 1) * 8);
+                bf[2 * p][0] = r[0]; bf[2 * p][1] = r[1]; bf[2 * p + 1][0] = r[2]; bf[2 * p + 1][1] = r[3];
+            }
+#pragma unroll
+            for (int mt = 0; mt < 4; ++mt) {
+                uint32_t ah[4], al[4];
+                const size_t off = (size_t)(mt * 16 + (lane & 15)) * kUmPad + kk * 16 + (lane >> 4) * 8;
+                um_ldsm4(ah, ahi + off);
+                um_ldsm4(al, alo + off);
+#pragma unroll
+                for (int nt = 0; nt < 4; ++nt) {
+                    um_mma(acc_hi[mt][nt], ah, bf[nt][0], bf[nt][1]);
+                    um_mma(acc_lo[mt][nt], al, bf[nt][0], bf[nt][1]);
+                }
+            }
+        }
+    }
+    asm volatile("cp.async.wait_group 0;\n" ::);
+    __syncthreads();
+    // G = hi chain + lo chain, per stream into shared memory [stream][row][d], row stride 33 floats
+    float* gs = reinterpret_cast<float*>(um_smem);
+#pragma unroll
+    for (int mt = 0; mt < 4; ++mt)
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int row = mt * 16 + g + (e >> 1) * 8, col = nt * 8 + 2 * t4 + (e & 1);
+                gs[((size_t)w * kUmRows + row) * 33 + col] = acc_lo[mt][nt][e] + acc_hi[mt][nt][e];
+            }
+    __syncthreads();
+    // epilogue: thread = (row tid / 2, 16 d from (tid & 1) * 16); the sum over the four streams in stream order (mix_kernel's expression)
+    const int row = tid >> 1, dh = (tid & 1) * 16;
+    const int t = r0 + row;
+    if (t >= T) return;
+    const float inv = 1.f / 4.f;
+    float acc[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) acc[i] = 0.f;
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+        const float rs = rms[(size_t)t * 4 + s];
+        const float* xr = x + ((size_t)t * 4 + s) * H + d0 + dh;
+        const half* nwr = nw + (size_t)s * H + d0 + dh;
+#pragma unroll
+        for (int i = 0; i < 16; i += 4) {
+            const float4 xv = *reinterpret_cast<const float4*>(xr + i);
+            const float xs[4] = {xv.x, xv.y, xv.z, xv.w};
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float gv = 1.f / (1.f + __expf(-gs[((size_t)s * kUmRows + row) * 33 + dh + i + j]));
+                acc[i + j] += gv * xs[j] * rs * (1.f + __half2float(nwr[i + j]));
+            }
+        }
+    }
+    __nv_bfloat16* yr = y + (size_t)t * H + d0 + dh;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) yr[i] = __float2bfloat16_rn(acc[i] * inv);
+}
+
 // One cuBLAS handle per host thread, created on first use and never destroyed (destroying it at thread exit can run
 // after the CUDA context is gone). The static handle it replaces was a cross-thread cublasSetStream race if the server
 // ever overlaps prefill and decode threads (same fix as exl3_linear.cu's cublas_handle).
@@ -311,16 +452,14 @@ static int hcg_pre(const void* streams, const void* norm_w, const void* down_w, 
         }
         mix_kernel<<<T, 256, 0, st>>>((const float*)streams, G, rms, (const half*)norm_w, (__nv_bfloat16*)y_out, H, hc);
     } else {
-        constexpr int kSlab = 128;
-        for (int row = 0; row < padded; row += kSlab) {
-            const int m = padded - row < kSlab ? padded - row : kSlab;
-            if ((rc = gemm_abt(h, low_hi + (size_t)row * rank, (const half*)up_w, G + (size_t)row * K, m, K, rank, 0.f))) return rc;
-            if ((rc = gemm_abt(h, low_lo + (size_t)row * rank, (const half*)up_w, G + (size_t)row * K, m, K, rank, 1.f))) return rc;
-            const int rows = (row + m < T ? row + m : T) - row;  // the padding rows' mix is never needed
-            if (rows > 0)
-                mix_kernel<<<rows, 256, 0, st>>>((const float*)streams + (size_t)row * K, G + (size_t)row * K, rms + (size_t)row * hc,
-                                                 (const half*)norm_w, (__nv_bfloat16*)y_out + (size_t)row * H, H, hc);
+        // up + mix as one kernel: G never reaches DRAM
+        static bool attr = false;
+        if (!attr) {
+            if (cudaFuncSetAttribute(up_mix_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kUmSmem) != cudaSuccess) return (int)cudaErrorUnknown;
+            attr = true;
         }
+        up_mix_kernel<<<dim3(H / kUmD, padded / kUmRows), kUmThreads, kUmSmem, st>>>(
+            low_hi, low_lo, (const half*)up_w, (const float*)streams, rms, (const half*)norm_w, (__nv_bfloat16*)y_out, T, H, rank);
     }
     return GB_CHECK_LAUNCH();
 }
