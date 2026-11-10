@@ -1,5 +1,6 @@
 //! The engine's text-only Flash-Next backend. The model owns all device state; this layer
 //! chooses prompt-wide arithmetic, slices on an absolute grid and translates errors.
+use super::graph_cache::GraphStats;
 use super::model::{FlashNextModel, MtpAsk};
 use super::prefix::{self, SliceRequest, SliceResult, SnapshotArena};
 use crate::error::ModelError;
@@ -55,6 +56,10 @@ pub trait FlashNextRuntime {
     }
     fn release_snapshot(&mut self, _arena: &mut SnapshotArena, _handle: PrefixHandle) -> Result<(), ModelError> {
         Err(ModelError::Config("prefix snapshots need the device model".into()))
+    }
+    /// What the runtime's window and chain graph caches have done; `None` (the default) for a runtime without graphs.
+    fn graph_stats(&self) -> Option<GraphStats> {
+        None
     }
 }
 
@@ -116,6 +121,9 @@ impl FlashNextRuntime for FlashNextModel {
     }
     fn release_snapshot(&mut self, arena: &mut SnapshotArena, handle: PrefixHandle) -> Result<(), ModelError> {
         prefix::release(self, arena, handle)
+    }
+    fn graph_stats(&self) -> Option<GraphStats> {
+        Some(FlashNextModel::graph_stats(self))
     }
 }
 
@@ -266,6 +274,9 @@ impl<M: FlashNextRuntime> Backend for FlashNextBackend<M> {
     fn set_prefill_row_limit(&mut self, rows: Option<usize>) -> bool {
         self.deadline_rows = rows.map(|r| r.max(1));
         true
+    }
+    fn graph_counters(&self) -> Option<gb_engine::GraphCounters> {
+        self.m.graph_stats().map(|g| g.counters())
     }
     fn prefix_caps(&self) -> Option<PrefixCaps> {
         self.prefix

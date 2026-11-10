@@ -28,6 +28,7 @@
 
 use super::config::FlashNextConfig;
 use super::device::{FlashNextLayer, FlashNextWeights, MixerWeights, PleWeights};
+use super::graph_cache::{self, GraphKind, GraphStats};
 use super::ngram::{Ahead, TokContext};
 use crate::error::ModelError;
 use crate::forward::{Candidates, Mode, PrefillPath};
@@ -230,6 +231,8 @@ impl AttnGrid {
 
 /// The shape a captured graph was recorded for; replaying it on any other shape would be wrong.
 trait GraphKey: Copy + Eq + std::hash::Hash + std::fmt::Debug {
+    /// Which cache the key's graphs live in (for the counters).
+    const KIND: GraphKind;
     fn grid(&self) -> AttnGrid;
 }
 
@@ -345,11 +348,13 @@ impl ChainKey {
 }
 
 impl GraphKey for WindowKey {
+    const KIND: GraphKind = GraphKind::Window;
     fn grid(&self) -> AttnGrid {
         self.grid
     }
 }
 impl GraphKey for ChainKey {
+    const KIND: GraphKind = GraphKind::Chain;
     fn grid(&self) -> AttnGrid {
         self.grid
     }
@@ -553,6 +558,8 @@ pub struct FlashNextModel {
     /// Replayable windows and draft chains, and the context the grid of the one being run covers.
     graphs: HashMap<WindowKey, Graph>,
     mtp_graphs: HashMap<ChainKey, Graph>,
+    /// What the two maps above have done (`/metrics`, the `flash_next_graphs` event).
+    graph_stats: GraphStats,
     attn_ctx: Option<usize>,
     use_graphs: bool,
     /// The fused hyper-connection pre-mix (`REXL3_FAST=0` takes the reference kernels instead).
@@ -1223,6 +1230,7 @@ impl FlashNextModel {
             pending: BTreeMap::new(),
             graphs: HashMap::new(),
             mtp_graphs: HashMap::new(),
+            graph_stats: GraphStats::default(),
             attn_ctx: None,
             use_graphs: graphs_enabled(),
             fast,
@@ -1749,6 +1757,11 @@ impl FlashNextModel {
     fn sync(&mut self) -> Result<(), ModelError> {
         self.stage.sync(&self.stream)?;
         Ok(())
+    }
+
+    /// What the window and chain graph caches have done so far.
+    pub fn graph_stats(&self) -> GraphStats {
+        self.graph_stats
     }
 
     /// Device bytes allocated per category, for the plan == allocations test: (weights, kv pages, per-slot state,
@@ -2948,6 +2961,7 @@ impl FlashNextModel {
             *graphs(self) = map;
             r
         } else {
+            self.graph_stats.of(K::KIND).eager += 1;
             body(self)
         };
         self.attn_ctx = None;
@@ -2963,12 +2977,14 @@ impl FlashNextModel {
         body: impl Fn(&mut Self) -> Result<(), ModelError>,
     ) -> Result<(), ModelError> {
         if !map.contains_key(&key) {
+            let (free_before, began) = (gb_cuda::rt::mem_info().ok().map(|m| m.0), std::time::Instant::now());
             let cap = match Graph::begin(&self.stream) {
                 Ok(c) => c,
                 Err(e) if e.is_fatal() => return Err(ModelError::Cuda(e)),
                 Err(e) => {
                     eprintln!("rexl3 level=warn graph capture refused ({e}): running Flash-Next windows eagerly");
                     self.use_graphs = false;
+                    self.graph_stats.of(K::KIND).eager += 1;
                     return body(self);
                 }
             };
@@ -2976,6 +2992,19 @@ impl FlashNextModel {
             match cap.finish(ran) {
                 Ok(g) => {
                     map.insert(key, g);
+                    let st = &mut self.graph_stats;
+                    st.of(K::KIND).captures += 1;
+                    st.capture_ms += began.elapsed().as_secs_f64() * 1e3;
+                    if let (Some(before), Ok((after, _))) = (free_before, gb_cuda::rt::mem_info()) {
+                        st.free_drop_bytes += before as i64 - after as i64;
+                    }
+                    if st.captures() % graph_cache::EVENT_EVERY == 0 {
+                        let live = match K::KIND {
+                            GraphKind::Window => (map.len(), self.mtp_graphs.len()),
+                            GraphKind::Chain => (self.graphs.len(), map.len()),
+                        };
+                        eprintln!("{}", st.event_line(live, graph_cache::HostSample::take()));
+                    }
                 }
                 Err(CaptureError::Closure(e)) => return Err(e),
                 Err(e) => {
@@ -2984,9 +3013,12 @@ impl FlashNextModel {
                     }
                     eprintln!("rexl3 level=warn {e}: running Flash-Next windows eagerly");
                     self.use_graphs = false;
+                    self.graph_stats.of(K::KIND).eager += 1;
                     return body(self);
                 }
             }
+        } else {
+            self.graph_stats.of(K::KIND).replays += 1;
         }
         map[&key].launch(&self.stream)?;
         Ok(())
