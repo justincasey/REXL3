@@ -80,9 +80,9 @@ impl FlashNextRuntime for Fake {
     fn flush(&mut self) -> Result<(), ModelError> {
         Ok(())
     }
-    fn mtp_propose(&mut self, _: usize, _: &[u32], k: usize) -> Result<(Vec<u32>, Vec<f32>), ModelError> {
-        self.drafts.push(k);
-        Ok((vec![7; k], vec![0.5; k]))
+    fn mtp_propose_batch(&mut self, asks: &[MtpAsk<'_>]) -> Result<Vec<Option<(Vec<u32>, Vec<f32>)>>, ModelError> {
+        self.drafts.extend(asks.iter().map(|a| a.k));
+        Ok(asks.iter().map(|a| Some((vec![7; a.k], vec![0.5; a.k]))).collect())
     }
 }
 
@@ -128,12 +128,14 @@ fn mtp_depth_grows_with_acceptance_and_is_bounded_by_request() {
     b.release(1);
     b.propose_batch_scored(&req);
     assert_eq!(b.m.drafts[3], 4);
+    // two streams share one chain, each with the depth its own last round earned
+    b.commit(2, 5);
     let multi = [
         ProposeRequest { slot: 1, tokens: &[3], sampling: &sampling, max: 6 },
         ProposeRequest { slot: 2, tokens: &[3], sampling: &sampling, max: 6 },
     ];
-    assert_eq!(b.propose_batch(&multi), vec![None, None]);
-    assert_eq!(b.m.drafts.len(), 4);
+    assert_eq!(b.propose_batch(&multi), vec![Some(vec![7; 4]), Some(vec![7; 6])]);
+    assert_eq!(b.m.drafts[4..], [4, 6]);
 }
 
 #[test]

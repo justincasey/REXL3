@@ -19,8 +19,9 @@ mod ffi {
                             xs: *mut c_void, xe: *mut c_void, rows: i32, hc: i32, h: i32, eps: f32, stream: *mut c_void) -> i32;
         pub fn gb_mtp_combine(h: *const c_void, e: *const c_void, dst: *mut c_void, rows: i32, hc: i32, hd: i32, stream: *mut c_void) -> i32;
         pub fn gb_copy_i32(dst: *mut c_void, src: *const c_void, n: i32, stream: *mut c_void) -> i32;
-        pub fn gb_mtp_stage(ids: *mut c_void, positions: *mut c_void, row_pos: *mut c_void, seq_start: *mut c_void,
-                            drafts: *const c_void, chain_pos: *const c_void, j: i32, stream: *mut c_void) -> i32;
+        pub fn gb_mtp_stage(ids: *mut c_void, positions: *mut c_void, row_pos: *mut c_void, row_slot: *mut c_void,
+                            seq_start: *mut c_void, seq_slot: *const c_void, drafts: *const c_void, chain_pos: *const c_void,
+                            n: i32, stride: i32, j: i32, stream: *mut c_void) -> i32;
         pub fn gb_mtp_pick(logits: *const c_void, n: i32, out_id: *mut c_void, out_p: *mut c_void, j: i32, stream: *mut c_void) -> i32;
     }
 }
@@ -90,38 +91,63 @@ pub fn copy_i32(dst: &mut DevBuf, src: &DevBuf, n: usize, st: &Stream) -> Result
     CudaError::check(unsafe { ffi::gb_copy_i32(dp, src.ptr(), n as i32, st.raw()) })
 }
 
-/// The one-row window buffers a draft step writes on the device.
+/// The window buffers a draft step writes on the device: `n` sequences of one row each.
 pub struct StepInputs<'a> {
     pub ids: &'a mut DevBuf,
     pub positions: &'a mut DevBuf,
     pub row_pos: &'a mut DevBuf,
+    pub row_slot: &'a mut DevBuf,
     pub seq_start: &'a mut DevBuf,
 }
 
-/// Draft step `j`'s inputs from device state: token = `drafts[j - 1]`, position = `chain_pos[j]`, one sequence of one row.
-pub fn stage(io: StepInputs<'_>, drafts: &DevBuf, chain_pos: &DevBuf, j: usize, st: &Stream) -> Result<(), CudaError> {
-    if j == 0 {
+/// Draft step `j`'s inputs from device state, for `n` sequences of one row (sequence `s`'s arrays start at `s * stride`): token =
+/// `drafts[s * stride + j - 1]`, position = `chain_pos[s * stride + j]`, slot = `seq_slot[s]`; `seq_start` = `0..=n`.
+pub fn stage(
+    io: StepInputs<'_>,
+    seq_slot: &DevBuf,
+    drafts: &DevBuf,
+    chain_pos: &DevBuf,
+    n: usize,
+    stride: usize,
+    j: usize,
+    st: &Stream,
+) -> Result<(), CudaError> {
+    if j == 0 || n == 0 || n > 32 || stride <= j {
         return Err(CudaError(1));
     }
-    need(drafts, j * 4, "mtp stage drafts")?;
-    need(chain_pos, (j + 1) * 4, "mtp stage chain_pos")?;
-    need(io.ids, 4, "mtp stage ids")?;
+    need(drafts, ((n - 1) * stride + j) * 4, "mtp stage drafts")?;
+    need(chain_pos, ((n - 1) * stride + j + 1) * 4, "mtp stage chain_pos")?;
+    need(seq_slot, n * 4, "mtp stage seq_slot")?;
+    need(io.ids, n * 4, "mtp stage ids")?;
     let ip = io.ids.ptr();
-    need(io.positions, 4, "mtp stage positions")?;
+    need(io.positions, n * 4, "mtp stage positions")?;
     let pp = io.positions.ptr();
-    need(io.row_pos, 4, "mtp stage row_pos")?;
+    need(io.row_pos, n * 4, "mtp stage row_pos")?;
     let rp = io.row_pos.ptr();
-    need(io.seq_start, 8, "mtp stage seq_start")?;
+    need(io.row_slot, n * 4, "mtp stage row_slot")?;
+    let lp = io.row_slot.ptr();
+    need(io.seq_start, (n + 1) * 4, "mtp stage seq_start")?;
     let sp = io.seq_start.ptr();
-    CudaError::check(unsafe { ffi::gb_mtp_stage(ip, pp, rp, sp, drafts.ptr(), chain_pos.ptr(), j as i32, st.raw()) })
+    CudaError::check(unsafe {
+        ffi::gb_mtp_stage(ip, pp, rp, lp, sp, seq_slot.ptr(), drafts.ptr(), chain_pos.ptr(), n as i32, stride as i32, j as i32, st.raw())
+    })
 }
 
-/// `out_id[j]` = argmax of bf16 `logits [n]` (lowest id on ties), `out_p[j]` its softmax probability.
-pub fn pick(logits: &DevBuf, n: usize, out_id: &mut DevBuf, out_p: &mut DevBuf, j: usize, st: &Stream) -> Result<(), CudaError> {
-    need(logits, n * 2, "mtp pick logits")?;
+/// `out_id[j]` = argmax of the `n` bf16 logits starting `at` elements into `logits` (lowest id on ties), `out_p[j]` its softmax
+/// probability: row `r` of a `[rows][width]` logits buffer is `at = r * width`.
+pub fn pick(
+    logits: &DevBuf,
+    at: usize,
+    n: usize,
+    out_id: &mut DevBuf,
+    out_p: &mut DevBuf,
+    j: usize,
+    st: &Stream,
+) -> Result<(), CudaError> {
+    need(logits, (at + n) * 2, "mtp pick logits")?;
     need(out_id, (j + 1) * 4, "mtp pick out_id")?;
     let ip = out_id.ptr();
     need(out_p, (j + 1) * 4, "mtp pick out_p")?;
     let pp = out_p.ptr();
-    CudaError::check(unsafe { ffi::gb_mtp_pick(logits.ptr(), n as i32, ip, pp, j as i32, st.raw()) })
+    CudaError::check(unsafe { ffi::gb_mtp_pick(logits.ptr_at(at * 2), n as i32, ip, pp, j as i32, st.raw()) })
 }

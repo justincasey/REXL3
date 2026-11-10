@@ -1,5 +1,6 @@
 use super::*;
 use crate::families::qwen_flash_next::backend::FlashNextRuntime;
+use crate::families::qwen_flash_next::model::MtpAsk;
 use crate::families::qwen_flash_next::ngram::warm_preflight;
 use crate::forward::{Candidates, PrefillPath};
 use crate::hostmem::MemInfo;
@@ -207,14 +208,12 @@ fn probed_flash_next_plan_counts_prefix_arena_outside_admission() {
 // ---------------------------------------------------------------------------
 // Batched speculative decoding: a multi-request decode step must still speculate.
 //
-// The Flash-Next MTP head proposes for one sequence at a time
-// (`propose_batch_scored` returns None whenever `reqs.len() != 1`, backend.rs:480),
-// so a multi-request batch gets no native drafts. The engine's per-sequence Drafter
-// fills that gap: when drafting is on, `make_drafter(true)` installs a CopyDrafter
-// per stream, so a full round still speculates even though no native MTP proposal
-// exists. These tests drive the real engine over the CPU Fake runtime with several
-// concurrent requests and assert that drafts are proposed/verified/accepted per
-// request and that greedy output is identical to the no-speculation path.
+// The Flash-Next MTP head drafts for up to `MTP_MAX_SEQS` sequences in one chain (`propose_batch_scored`); a stream it does not
+// carry (no MTP head, a fifth stream, no trunk rows on the stack) is answered `None`, and the engine's per-sequence Drafter fills
+// that gap: when drafting is on, `make_drafter(true)` installs a CopyDrafter per stream, so a full round still speculates. The
+// tests below that run with no native head (`mtp_k = 0`) drive that fallback through the real engine over the CPU Fake runtime
+// with several concurrent requests and assert that drafts are proposed/verified/accepted per request and that greedy output is
+// identical to the no-speculation path.
 
 #[derive(Default)]
 struct CpuRuntime {
@@ -257,9 +256,9 @@ impl FlashNextRuntime for CpuRuntime {
     fn flush(&mut self) -> Result<(), ModelError> {
         Ok(())
     }
-    fn mtp_propose(&mut self, _: usize, _: &[u32], k: usize) -> Result<(Vec<u32>, Vec<f32>), ModelError> {
+    fn mtp_propose_batch(&mut self, asks: &[MtpAsk<'_>]) -> Result<Vec<Option<(Vec<u32>, Vec<f32>)>>, ModelError> {
         self.mtp_asks += 1;
-        Ok((vec![7; k], vec![0.5; k]))
+        Ok(asks.iter().map(|a| Some((vec![7; a.k], vec![0.5; a.k]))).collect())
     }
 }
 
@@ -274,7 +273,8 @@ fn batched_engine(drafting: bool) -> Engine<FlashNextBackend<CpuRuntime>> {
         activation_reserve: 1 << 30,
     };
     let admission = Admission::new(64 << 30, 6 << 30, mm, 8).unwrap();
-    let backend = FlashNextBackend::with_runtime(CpuRuntime::default(), 64, 6, true);
+    // no native head: the CopyDrafter fallback is what ships for a stream the MTP chain does not carry
+    let backend = FlashNextBackend::with_runtime(CpuRuntime::default(), 64, 0, true);
     let make = make_drafter(drafting);
     Engine::new(
         backend,
@@ -303,19 +303,25 @@ fn repetitive_requests(n: usize) -> Vec<gb_engine::Request> {
         .collect()
 }
 
-/// The native MTP head still proposes for one sequence only: a 2-request batch gets no
-/// native drafts. This is the precondition the engine fallback must cover.
+/// The native MTP head drafts for every request of a batch in one chain: a 2-request batch gets one call and a proposal each,
+/// every one with the head's probabilities as its accept chances.
 #[test]
-fn native_mtp_still_skips_multi_request_batches() {
+fn native_mtp_drafts_every_request_of_a_batch_in_one_call() {
     use gb_engine::Backend;
     let mut b = FlashNextBackend::with_runtime(CpuRuntime::default(), 64, 6, true);
     let sampling = Sampling::default();
     let multi = [
         ProposeRequest { slot: 1, tokens: &[3], sampling: &sampling, max: 6 },
-        ProposeRequest { slot: 2, tokens: &[3], sampling: &sampling, max: 6 },
+        ProposeRequest { slot: 2, tokens: &[3], sampling: &sampling, max: 3 },
     ];
-    assert_eq!(b.propose_batch_scored(&multi), vec![None, None]);
-    assert_eq!(b.m.mtp_asks, 0, "native MTP must not run for a multi-request batch");
+    let got = b.propose_batch_scored(&multi);
+    assert_eq!(b.m.mtp_asks, 1, "one chain for the whole batch");
+    let lens: Vec<usize> = got.iter().map(|p| p.as_ref().unwrap().tokens.len()).collect();
+    assert_eq!(lens, vec![4, 3], "each stream keeps its own ask (the adaptive depth, bounded by its own max)");
+    for p in got.iter().flatten() {
+        assert_eq!(p.accept.len(), p.tokens.len());
+        assert_eq!(p.conf.len(), p.tokens.len());
+    }
 }
 
 /// With 2 and 4 concurrent requests, drafts are proposed, verified and accepted per
@@ -413,9 +419,9 @@ impl FlashNextRuntime for DivergentRuntime {
     fn flush(&mut self) -> Result<(), ModelError> {
         Ok(())
     }
-    fn mtp_propose(&mut self, _: usize, _: &[u32], k: usize) -> Result<(Vec<u32>, Vec<f32>), ModelError> {
+    fn mtp_propose_batch(&mut self, asks: &[MtpAsk<'_>]) -> Result<Vec<Option<(Vec<u32>, Vec<f32>)>>, ModelError> {
         self.mtp_asks += 1;
-        Ok((vec![7; k], vec![0.5; k]))
+        Ok(asks.iter().map(|a| Some((vec![7; a.k], vec![0.5; a.k]))).collect())
     }
 }
 

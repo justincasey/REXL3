@@ -301,29 +301,39 @@ impl WindowKey {
     }
 }
 
-/// An MTP draft chain: catch-up rows read from trunk stack row `src_row`, then `drafts - 1` chained steps. Both the
-/// catch-up mask AND the one-row mask of every step are needed: a chain can cross the QSA threshold between drafts.
+/// Most sequences one MTP draft chain carries (a round with more has the copy drafter for the rest).
+pub const MTP_MAX_SEQS: usize = 4;
+
+/// An MTP draft chain over up to [`MTP_MAX_SEQS`] sequences: the catch-up rows of each (one sequence reads them from trunk stack row
+/// `src_row`; several are gathered into one contiguous stack first, `src_row` 0), then `drafts - 1` chained one-row steps of every
+/// sequence. Both the catch-up mask AND the one-row mask of every step are needed: a chain can cross the QSA threshold between drafts.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct ChainKey {
-    catchup_rows: usize,
+    seqs: usize,
+    catchup_rows: [u8; MTP_MAX_SEQS],
     src_row: usize,
     drafts: usize,
     sparse_catchup: u64,
-    sparse_steps: u16,
+    sparse_steps: [u16; MTP_MAX_SEQS],
     features: GraphFeatures,
     grid: AttnGrid,
 }
 
 impl ChainKey {
     fn for_chain(b: &RowBatch, src_row: usize, drafts: usize, grid: AttnGrid, features: GraphFeatures) -> Self {
-        let last = b.positions[b.rows - 1] as usize;
-        let sparse_steps = if features.qsa_mtp {
-            (1..drafts).fold(0, |bits, j| bits | (u16::from(last + j >= QSA_DENSE_CTX) << (j - 1)))
-        } else {
-            0
-        };
+        let mut catchup_rows = [0u8; MTP_MAX_SEQS];
+        let mut sparse_steps = [0u16; MTP_MAX_SEQS];
+        for s in 0..b.n_seq() {
+            let r = b.seq_rows(s);
+            catchup_rows[s] = r.len() as u8;
+            let last = b.positions[r.end - 1] as usize;
+            if features.qsa_mtp {
+                sparse_steps[s] = (1..drafts).fold(0, |bits, j| bits | (u16::from(last + j >= QSA_DENSE_CTX) << (j - 1)));
+            }
+        }
         Self {
-            catchup_rows: b.rows,
+            seqs: b.n_seq(),
+            catchup_rows,
             src_row,
             drafts,
             sparse_catchup: sparse_rows(&b.positions, features.qsa_mtp),
@@ -350,6 +360,24 @@ impl GraphKey for ChainKey {
 enum StackSrc {
     Trunk(usize),
     Head(usize),
+}
+
+/// A sequence's request for drafts ([`FlashNextModel::mtp_propose_batch`]): its slot, its committed tokens (the last one not yet
+/// run through the trunk) and the most drafts wanted.
+pub struct MtpAsk<'a> {
+    pub slot: usize,
+    pub tokens: &'a [u32],
+    pub k: usize,
+}
+
+/// Where one sequence's rows of the last window (or prefill chunk) lie in `x_streams`: positions `pos0..pos0 + rows` are the stack
+/// rows `row0..row0 + rows`.
+#[derive(Clone, Copy, Debug)]
+struct StackSeg {
+    slot: usize,
+    pos0: usize,
+    row0: usize,
+    rows: usize,
 }
 
 /// An announced next prefill chunk: where it is and the token history its rows hash.
@@ -511,10 +539,8 @@ pub struct FlashNextModel {
     one_row: RowIndex,
     /// Drafts after the first one whose probability is below this are not verified.
     mtp_conf: f32,
-    /// Trunk positions of the rows now in `x_streams` (the last window or prefill chunk of one sequence).
-    stack_pos0: usize,
-    stack_rows: usize,
-    stack_slot: usize,
+    /// Where the rows now in `x_streams` (the last window or prefill chunk) lie, one segment per sequence.
+    stack: Vec<StackSeg>,
     /// Rows of the last prefill chunk or window whose collapsed trunk rows are still in `x_mixed` (0 once the MTP head
     /// has overwritten them).
     mixed_rows: usize,
@@ -1184,15 +1210,13 @@ impl FlashNextModel {
             mtp_xe: DevBuf::zeroed_view(one(has_mtp, rows * h * 2))?,
             mtp_h: DevBuf::zeroed_view(one(has_mtp, rows * ch * 2))?,
             mtp_e: DevBuf::zeroed_view(one(has_mtp, rows * h * 2))?,
-            chain_pos: DevBuf::zeroed(MAX_DRAFTS * 4)?,
-            drafts_dev: DevBuf::zeroed(MAX_DRAFTS * 4)?,
-            conf_dev: DevBuf::zeroed(MAX_DRAFTS * 4)?,
+            chain_pos: DevBuf::zeroed(MTP_MAX_SEQS * MAX_DRAFTS * 4)?,
+            drafts_dev: DevBuf::zeroed(MTP_MAX_SEQS * MAX_DRAFTS * 4)?,
+            conf_dev: DevBuf::zeroed(MTP_MAX_SEQS * MAX_DRAFTS * 4)?,
             zero_kv: DevBuf::zeroed(one(has_mtp, KvHeads::Two.token_elems() * 2))?,
             one_row: RowIndex { slot: DevBuf::zeroed(4)?, pos: DevBuf::zeroed(4)?, rows: 1 },
             mtp_conf: std::env::var("REXL3_MTP_CONF").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0),
-            stack_pos0: 0,
-            stack_rows: 0,
-            stack_slot: 0,
+            stack: Vec::new(),
             mixed_rows: 0,
             last_window: None,
             pending_post: None,
@@ -1245,7 +1269,7 @@ impl FlashNextModel {
         self.flush()?;
         self.mtp_done.remove(&slot);
         self.pending.remove(&slot);
-        self.stack_rows = 0;
+        self.stack.clear();
         self.mixed_rows = 0;
         self.pools.reset_slot(slot, &self.stream)?;
         let ch = self.cfg.hc_streams * self.cfg.hidden;
@@ -1570,9 +1594,10 @@ impl FlashNextModel {
         }
         let rows = ids.len();
         // the head reads the trunk's stack, which must still hold exactly this chunk
-        if rows == 0 || self.stack_slot != slot || self.stack_pos0 != first || self.stack_rows < rows {
+        let Some(seg) = self.stack.iter().find(|s| s.slot == slot && s.pos0 == first && s.rows >= rows).copied().filter(|_| rows > 0)
+        else {
             return Ok(());
-        }
+        };
         if !self.mtp_done.contains_key(&slot) {
             self.zero_mtp_row0(slot)?;
         }
@@ -1582,72 +1607,134 @@ impl FlashNextModel {
         // The stateless prefill body is the only path for supported prefill calls: it writes the persistent MTP KV
         // and QSA indexer state, skipping the head's attention output / MoE / collapse / LM head, which the draft
         // chain re-derives from trunk rows (and falls back to the full `mtp_body` for unsupported mixer/mode).
-        self.mtp_prefill_body(&b, StackSrc::Trunk(0), mode)?;
+        self.mtp_prefill_body(&b, StackSrc::Trunk(seg.row0), mode)?;
         self.sync()?;
         self.mtp_done.insert(slot, first + rows);
         Ok(())
     }
 
-    /// Up to `k` MTP drafts for `slot`, whose history is `tokens` (the last one not yet run through the trunk). The head
-    /// first catches up on every trunk row still in `x_streams` it has not seen (each paired with the token that followed
-    /// it), then chains on its own output with the token and position of every step staged on the device, so the whole
-    /// chain is one replayable graph and one host read. Drafts after the first one below `REXL3_MTP_CONF` are dropped.
+    /// Up to `k` MTP drafts for `slot`, whose history is `tokens` (the last one not yet run through the trunk): the one-sequence
+    /// form of [`FlashNextModel::mtp_propose_batch`].
     pub fn mtp_propose(&mut self, slot: usize, tokens: &[u32], k: usize) -> Result<Vec<u32>, ModelError> {
-        Ok(self.mtp_propose_scored(slot, tokens, k)?.0)
+        Ok(self.mtp_propose_batch(&[MtpAsk { slot, tokens, k }])?.pop().flatten().map(|d| d.0).unwrap_or_default())
     }
 
-    /// [`FlashNextModel::mtp_propose`] with the head's probability of each draft it keeps (the first is always kept, its
-    /// probability reported like the others'): what the engine's budget reads to decide how many of them ride the window.
-    pub fn mtp_propose_scored(&mut self, slot: usize, tokens: &[u32], k: usize) -> Result<(Vec<u32>, Vec<f32>), ModelError> {
-        let k = k.min(MAX_DRAFTS);
-        if !self.has_mtp() || k == 0 || tokens.len() < 2 || self.stack_rows == 0 || self.stack_slot != slot {
-            return Ok((Vec::new(), Vec::new()));
+    /// Drafts for up to [`MTP_MAX_SEQS`] sequences in one chain, each with the head's probability of every draft it keeps (the first is
+    /// always kept; the engine's budget reads the probabilities to decide how many ride the window). A sequence the chain does not
+    /// carry (its trunk rows are not on the stack, it has no catch-up rows, it is past the window or the context, or it is the fifth)
+    /// gets `None` and the engine's own drafter. The head first catches up on every trunk row still in `x_streams` it has not seen
+    /// (each paired with the token that followed it), then chains on its own output with the token and position of every step staged
+    /// on the device, so the whole chain is one replayable graph and one host read; every sequence runs the longest ask's steps and
+    /// keeps its own first `k` drafts. Drafts after the first one below `REXL3_MTP_CONF` are dropped.
+    pub fn mtp_propose_batch(&mut self, asks: &[MtpAsk<'_>]) -> Result<Vec<Option<(Vec<u32>, Vec<f32>)>>, ModelError> {
+        let mut out: Vec<Option<(Vec<u32>, Vec<f32>)>> = vec![None; asks.len()];
+        if !self.has_mtp() || self.stack.is_empty() {
+            return Ok(out);
+        }
+        struct Lane {
+            ask: usize,
+            slot: usize,
+            start: usize,
+            end: usize,
+            k: usize,
+            src_row: usize,
+        }
+        let mut lanes: Vec<Lane> = Vec::new();
+        let mut rows = 0;
+        for (i, a) in asks.iter().enumerate() {
+            let k = a.k.min(MAX_DRAFTS);
+            if k == 0 || a.tokens.len() < 2 || lanes.len() == MTP_MAX_SEQS {
+                continue;
+            }
+            let Some(seg) = self.stack.iter().find(|s| s.slot == a.slot) else { continue };
+            let end = a.tokens.len() - 1; // trunk positions [start, end) still need their MTP rows
+            let start = self.mtp_done.get(&a.slot).copied().unwrap_or(0).max(seg.pos0);
+            if end <= start
+                || end > seg.pos0 + seg.rows
+                || rows + (end - start) > WINDOW_ROWS
+                || end + k > self.opts.max_context
+            {
+                continue;
+            }
+            rows += end - start;
+            lanes.push(Lane { ask: i, slot: a.slot, start, end, k, src_row: seg.row0 + (start - seg.pos0) });
+        }
+        // every sequence runs the longest chain: its positions must fit the context too
+        let k_max = lanes.iter().map(|l| l.k).max().unwrap_or(0);
+        lanes.retain(|l| l.end + k_max <= self.opts.max_context);
+        let n = lanes.len();
+        if n == 0 {
+            return Ok(out);
         }
         // the draft chain reads no recurrent state: the conv history of a pending commit is made now, its rows of S ride the
         // next window
         self.flush_conv()?;
-        let end = tokens.len() - 1; // trunk positions [start, end) still need their MTP rows
-        let start = self.mtp_done.get(&slot).copied().unwrap_or(0).max(self.stack_pos0);
-        if end <= start || end > self.stack_pos0 + self.stack_rows || end - start > WINDOW_ROWS || end + k > self.opts.max_context
-        {
-            return Ok((Vec::new(), Vec::new()));
+        for l in &lanes {
+            if !self.mtp_done.contains_key(&l.slot) {
+                self.zero_mtp_row0(l.slot)?;
+            }
         }
-        if !self.mtp_done.contains_key(&slot) {
-            self.zero_mtp_row0(slot)?;
-        }
-        let b = RowBatch::from_requests(&[RowRequest {
-            slot,
-            first_position: (start + 1) as u64,
-            tokens: tokens[start + 1..=end].to_vec(),
-        }]);
+        let catch_up: Vec<RowRequest> = lanes
+            .iter()
+            .map(|l| RowRequest {
+                slot: l.slot,
+                first_position: (l.start + 1) as u64,
+                tokens: asks[l.ask].tokens[l.start + 1..=l.end].to_vec(),
+            })
+            .collect();
+        let b = RowBatch::from_requests(&catch_up);
         self.prepare_batch(&b)?;
-        // pages for the whole chain, and its step positions
-        let tail = RowBatch::from_requests(&[RowRequest { slot, first_position: (end + k - 1) as u64, tokens: vec![0] }]);
-        self.ensure_pages(&tail)?;
-        let pos: Vec<i32> = (0..k).map(|j| (end + j) as i32).collect();
+        // pages for the whole chain, and every sequence's step positions
+        let tail: Vec<RowRequest> =
+            lanes.iter().map(|l| RowRequest { slot: l.slot, first_position: (l.end + k_max - 1) as u64, tokens: vec![0] }).collect();
+        self.ensure_pages(&RowBatch::from_requests(&tail))?;
+        let mut pos = vec![0i32; n * MAX_DRAFTS];
+        for (s, l) in lanes.iter().enumerate() {
+            for j in 0..k_max {
+                pos[s * MAX_DRAFTS + j] = (l.end + j) as i32;
+            }
+        }
         put(&mut self.stage, &mut self.chain_pos, &pos, &self.stream)?;
-        let live = end + k;
-        let src_row = start - self.stack_pos0;
-        let key = ChainKey::for_chain(&b, src_row, k, AttnGrid::cover(live, self.opts.max_context), self.graph_features());
-        self.run_graph(Self::chain_graphs, key, live, |m| m.mtp_chain(&b, src_row, k))?;
+        let live = lanes.iter().map(|l| l.end).max().unwrap_or(0) + k_max;
+        // One sequence reads its catch-up rows from the trunk's stack where they lie. Several are gathered into the head's own stack
+        // first (a few device copies ahead of the graph), so what the graph is keyed by does not include where each one's rows lie.
+        let (src, src_row) = if n == 1 {
+            (StackSrc::Trunk(lanes[0].src_row), lanes[0].src_row)
+        } else {
+            let row = self.cfg.hc_streams * self.cfg.hidden * 4;
+            let mut at = 0;
+            for l in &lanes {
+                let c = l.end - l.start;
+                self.mtp_streams.copy_range_from(at * row, &self.x_streams, l.src_row * row, c * row, &self.stream)?;
+                at += c;
+            }
+            (StackSrc::Head(0), 0)
+        };
+        let key = ChainKey::for_chain(&b, src_row, k_max, AttnGrid::cover(live, self.opts.max_context), self.graph_features());
+        let ends: Vec<usize> = lanes.iter().map(|l| l.end).collect();
+        self.run_graph(Self::chain_graphs, key, live, |m| m.mtp_chain(&b, src, &ends, k_max))?;
         // `mtp_body` does this during capture/eager, but replay does not execute its host bookkeeping.
         self.mixed_rows = 0;
-        self.mtp_done.insert(slot, end);
+        for l in &lanes {
+            self.mtp_done.insert(l.slot, l.end);
+        }
         self.sync()?;
-        let mut ids = vec![0i32; k];
-        let mut conf = vec![0f32; k];
+        let mut ids = vec![0i32; n * MAX_DRAFTS];
+        let mut conf = vec![0f32; n * MAX_DRAFTS];
         self.drafts_dev.download_range(0, &mut ids)?;
         self.conf_dev.download_range(0, &mut conf)?;
-        let mut drafts = Vec::with_capacity(k);
-        let mut kept = Vec::with_capacity(k);
-        for j in 0..k {
-            if j > 0 && conf[j] < self.mtp_conf {
-                break;
+        for (s, l) in lanes.iter().enumerate() {
+            let (mut drafts, mut kept) = (Vec::with_capacity(l.k), Vec::with_capacity(l.k));
+            for j in 0..l.k {
+                if j > 0 && conf[s * MAX_DRAFTS + j] < self.mtp_conf {
+                    break;
+                }
+                drafts.push(ids[s * MAX_DRAFTS + j] as u32);
+                kept.push(conf[s * MAX_DRAFTS + j]);
             }
-            drafts.push(ids[j] as u32);
-            kept.push(conf[j]);
+            out[l.ask] = Some((drafts, kept));
         }
-        Ok((drafts, kept))
+        Ok(out)
     }
 
     /// Upload the host page table (`kv_tab`) to the device table after a change made outside a forward.
@@ -2544,20 +2631,23 @@ impl FlashNextModel {
     }
 
     fn note_stack(&mut self, b: &RowBatch) {
-        if b.n_seq() == 1 {
-            self.stack_pos0 = b.positions[0] as usize;
-            self.stack_rows = b.rows;
-            self.stack_slot = b.seq_slot[0] as usize;
-        } else {
-            self.stack_rows = 0;
+        self.stack.clear();
+        for i in 0..b.n_seq() {
+            let r = b.seq_rows(i);
+            self.stack.push(StackSeg {
+                slot: b.seq_slot[i] as usize,
+                pos0: b.positions[r.start] as usize,
+                row0: r.start,
+                rows: r.len(),
+            });
         }
     }
 
     /// The MTP head on `b` (tokens = the next tokens, positions = their positions) with input stacks read from `src`
-    /// (`[rows][hc][h]` f32). Leaves the head's output stack in `mtp_streams` and the last row's draft (argmax over the
-    /// first [`MTP_HEAD_N`] ids of the shared LM head) and its probability in slot `j` of the draft arrays. Device work
-    /// only.
-    fn mtp_body(&mut self, b: &RowBatch, src: StackSrc, mode: Mode, j: usize) -> Result<(), ModelError> {
+    /// (`[rows][hc][h]` f32). Leaves the head's output stack in `mtp_streams` and, for each sequence, the draft (argmax over the
+    /// first [`MTP_HEAD_N`] ids of the shared LM head) and its probability of its last row (`last[s]`, a row of `b`) in slot
+    /// `s * MAX_DRAFTS + j` of the draft arrays. Device work only.
+    fn mtp_body(&mut self, b: &RowBatch, src: StackSrc, mode: Mode, j: usize, last: &[usize]) -> Result<(), ModelError> {
         let rows = b.rows;
         let (h, hc) = (self.cfg.hidden, self.cfg.hc_streams);
         let w = Arc::clone(&self.w);
@@ -2624,10 +2714,23 @@ impl FlashNextModel {
         // still the one used for target verification). The strip copy is a device copy of the same packed weights, so the
         // retained logits are bit-identical.
         let nv = draft_head_nv(self.cfg.vocab);
-        let last = self.x_mixed.subview((rows - 1) * h * 2, h * 2);
+        // the head's logits are `[rows][width]`: the strip copy's width is the pick domain, the full head's the vocabulary
+        let width = if self.draft_lm_head.is_some() { nv } else { self.cfg.vocab };
         let head = self.draft_lm_head.as_ref().unwrap_or(&self.w.lm_head);
-        head.forward(&last, &mut self.logits, 1, Dtype::BF16, Dtype::BF16, &mut self.ws, &self.stream)?;
-        mtpk::pick(&self.logits, nv, &mut self.drafts_dev, &mut self.conf_dev, j, &self.stream)?;
+        // the last row of each sequence, side by side: consecutive rows are read where they lie, scattered ones are copied together
+        let n = last.len();
+        let rows_in = if last.iter().enumerate().all(|(s, &r)| r == last[0] + s) {
+            self.x_mixed.subview(last[0] * h * 2, n * h * 2)
+        } else {
+            for (s, &r) in last.iter().enumerate() {
+                self.mtp_e.copy_range_from(s * h * 2, &self.x_mixed, r * h * 2, h * 2, &self.stream)?;
+            }
+            self.mtp_e.subview(0, n * h * 2)
+        };
+        head.forward(&rows_in, &mut self.logits, n, Dtype::BF16, Dtype::BF16, &mut self.ws, &self.stream)?;
+        for s in 0..n {
+            mtpk::pick(&self.logits, s * width, nv, &mut self.drafts_dev, &mut self.conf_dev, s * MAX_DRAFTS + j, &self.stream)?;
+        }
         Ok(())
     }
 
@@ -2638,7 +2741,7 @@ impl FlashNextModel {
     /// written for.
     fn mtp_prefill_body(&mut self, b: &RowBatch, src: StackSrc, mode: Mode) -> Result<(), ModelError> {
         if !matches!(self.w.mtp.as_ref().map(|m| &m.layer.mixer), Some(MixerWeights::Full(_))) {
-            return self.mtp_body(b, src, mode, 0);
+            return self.mtp_body(b, src, mode, 0, &[b.rows - 1]);
         }
         let rows = b.rows;
         let (h, hc) = (self.cfg.hidden, self.cfg.hc_streams);
@@ -2757,25 +2860,42 @@ impl FlashNextModel {
         r
     }
 
-    /// Device work of a draft chain: the catch-up rows (draft 0 from the last of them), then `k - 1` one-row steps whose
-    /// token and position are staged on the device from the previous step.
-    fn mtp_chain(&mut self, b: &RowBatch, src_row: usize, k: usize) -> Result<(), ModelError> {
-        self.mtp_body(b, StackSrc::Trunk(src_row), Mode::Window, 0)?;
-        let mut prev_rows = b.rows;
-        let slot = b.seq_slot[0] as usize;
-        let p0 = b.positions[b.rows - 1] as usize;
+    /// Device work of a draft chain over the sequences of `b` (`ends[s]`: the position of sequence `s`'s last catch-up row): the
+    /// catch-up rows (draft 0 of each sequence from the last of its rows), then `k - 1` steps of one row per sequence whose tokens
+    /// and positions are staged on the device from the previous step.
+    fn mtp_chain(&mut self, b: &RowBatch, src: StackSrc, ends: &[usize], k: usize) -> Result<(), ModelError> {
+        let n = b.n_seq();
+        let last: Vec<usize> = (0..n).map(|s| b.seq_rows(s).end - 1).collect();
+        self.mtp_body(b, src, Mode::Window, 0, &last)?;
+        // step 1 reads the last row of each sequence's catch-up, which lie apart: side by side first, in place (row `s` is
+        // written before any row after it is read, and `last[s] >= s`)
+        let row = self.cfg.hc_streams * self.cfg.hidden * 4;
+        let first = if last.iter().enumerate().all(|(s, &r)| r == last[0] + s) {
+            last[0]
+        } else {
+            for (s, &r) in last.iter().enumerate().filter(|&(s, &r)| s != r) {
+                self.mtp_streams.copy_within(s * row, r * row, row, &self.stream)?;
+            }
+            0
+        };
+        let rows: Vec<usize> = (0..n).collect();
         for j in 1..k {
             let io = mtpk::StepInputs {
                 ids: &mut self.ids,
                 positions: &mut self.positions,
                 row_pos: &mut self.rowidx.pos,
+                row_slot: &mut self.rowidx.slot,
                 seq_start: &mut self.seq_start,
             };
-            mtpk::stage(io, &self.drafts_dev, &self.chain_pos, j, &self.stream)?;
-            // the host-side view of the step: only its shape and position are read on the host
-            let b1 = RowBatch::from_requests(&[RowRequest { slot, first_position: (p0 + j) as u64, tokens: vec![0] }]);
-            self.mtp_body(&b1, StackSrc::Head(prev_rows - 1), Mode::Window, j)?;
-            prev_rows = 1;
+            mtpk::stage(io, &self.seq_slot, &self.drafts_dev, &self.chain_pos, n, MAX_DRAFTS, j, &self.stream)?;
+            // the host-side view of the step: only its shape and positions are read on the host
+            let step: Vec<RowRequest> = (0..n)
+                .map(|s| RowRequest { slot: b.seq_slot[s] as usize, first_position: (ends[s] + j) as u64, tokens: vec![0] })
+                .collect();
+            let b1 = RowBatch::from_requests(&step);
+            // step 1 reads the rows gathered above, the later ones the previous step's, side by side
+            let from = if j == 1 { StackSrc::Head(first) } else { StackSrc::Head(0) };
+            self.mtp_body(&b1, from, Mode::Window, j, &rows)?;
         }
         Ok(())
     }

@@ -61,18 +61,21 @@ __global__ void copy_i32_kernel(int* __restrict__ dst, const int* __restrict__ s
     if (i < n) dst[i] = src[i];
 }
 
-// One draft step's inputs from device state: the previous step's draft becomes the token, and the step's position is
-// written everywhere a 1-row window reads it.
+// One draft step's inputs from device state for `n` sequences of one row each (sequence s drafts into `drafts[s * stride + ...]`): the
+// previous step's draft becomes the token, and the step's position is written everywhere a window of `n` one-row sequences reads it.
 __global__ void stage_kernel(int* __restrict__ ids, int* __restrict__ positions, int* __restrict__ row_pos,
-                             int* __restrict__ seq_start, const int* __restrict__ drafts, const int* __restrict__ chain_pos,
-                             int j) {
-    if (threadIdx.x == 0) {
-        ids[0] = drafts[j - 1];
-        positions[0] = chain_pos[j];
-        row_pos[0] = chain_pos[j];
-        seq_start[0] = 0;
-        seq_start[1] = 1;
+                             int* __restrict__ row_slot, int* __restrict__ seq_start, const int* __restrict__ seq_slot,
+                             const int* __restrict__ drafts, const int* __restrict__ chain_pos, int n, int stride, int j) {
+    const int s = threadIdx.x;
+    if (s < n) {
+        ids[s] = drafts[s * stride + j - 1];
+        const int p = chain_pos[s * stride + j];
+        positions[s] = p;
+        row_pos[s] = p;
+        row_slot[s] = seq_slot[s];
+        seq_start[s] = s;
     }
+    if (s == 0) seq_start[n] = n;
 }
 
 // Draft j from one row of bf16 logits [n]: argmax (lowest id on ties) and its softmax probability.
@@ -151,11 +154,11 @@ GB_EXPORT int gb_copy_i32(void* dst, const void* src, int n, void* stream) {
     return GB_CHECK_LAUNCH();
 }
 
-GB_EXPORT int gb_mtp_stage(void* ids, void* positions, void* row_pos, void* seq_start, const void* drafts,
-                           const void* chain_pos, int j, void* stream) {
-    if (j < 1) return (int)cudaErrorInvalidValue;
-    stage_kernel<<<1, 32, 0, gb_stream(stream)>>>((int*)ids, (int*)positions, (int*)row_pos, (int*)seq_start,
-                                                   (const int*)drafts, (const int*)chain_pos, j);
+GB_EXPORT int gb_mtp_stage(void* ids, void* positions, void* row_pos, void* row_slot, void* seq_start, const void* seq_slot,
+                           const void* drafts, const void* chain_pos, int n, int stride, int j, void* stream) {
+    if (j < 1 || n < 1 || n > 32 || stride < j + 1) return (int)cudaErrorInvalidValue;
+    stage_kernel<<<1, 32, 0, gb_stream(stream)>>>((int*)ids, (int*)positions, (int*)row_pos, (int*)row_slot, (int*)seq_start,
+                                                   (const int*)seq_slot, (const int*)drafts, (const int*)chain_pos, n, stride, j);
     return GB_CHECK_LAUNCH();
 }
 

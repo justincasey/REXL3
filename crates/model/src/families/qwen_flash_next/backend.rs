@@ -1,6 +1,6 @@
 //! The engine's text-only Flash-Next backend. The model owns all device state; this layer
 //! chooses prompt-wide arithmetic, slices on an absolute grid and translates errors.
-use super::model::FlashNextModel;
+use super::model::{FlashNextModel, MtpAsk};
 use super::prefix::{self, SliceRequest, SliceResult, SnapshotArena};
 use crate::error::ModelError;
 use crate::forward::{Candidates, PrefillPath};
@@ -38,8 +38,9 @@ pub trait FlashNextRuntime {
     fn ple_prefetch_next(&mut self, _slot: usize, _prompt: &[u32], _first: usize, _end: usize) {}
     fn commit(&mut self, slot: usize, keep: usize);
     fn flush(&mut self) -> Result<(), ModelError>;
-    /// Up to `k` drafts with the head's probability of each (see `FlashNextModel::mtp_propose_scored`).
-    fn mtp_propose(&mut self, slot: usize, tokens: &[u32], k: usize) -> Result<(Vec<u32>, Vec<f32>), ModelError>;
+    /// Drafts for each ask with the head's probability of each (see `FlashNextModel::mtp_propose_batch`); `None` for an ask the
+    /// runtime does not carry in its chain.
+    fn mtp_propose_batch(&mut self, asks: &[MtpAsk<'_>]) -> Result<Vec<Option<(Vec<u32>, Vec<f32>)>>, ModelError>;
     fn cached_slice(&mut self, _arena: &mut SnapshotArena, _req: SliceRequest<'_>) -> Result<SliceResult, ModelError> {
         Err(ModelError::Config("prefix snapshots need the device model".into()))
     }
@@ -98,8 +99,8 @@ impl FlashNextRuntime for FlashNextModel {
     fn flush(&mut self) -> Result<(), ModelError> {
         self.flush()
     }
-    fn mtp_propose(&mut self, slot: usize, tokens: &[u32], k: usize) -> Result<(Vec<u32>, Vec<f32>), ModelError> {
-        self.mtp_propose_scored(slot, tokens, k)
+    fn mtp_propose_batch(&mut self, asks: &[MtpAsk<'_>]) -> Result<Vec<Option<(Vec<u32>, Vec<f32>)>>, ModelError> {
+        self.mtp_propose_batch(asks)
     }
     fn cached_slice(&mut self, arena: &mut SnapshotArena, req: SliceRequest<'_>) -> Result<SliceResult, ModelError> {
         prefix::slice_with_cuts(self, arena, req)
@@ -487,34 +488,39 @@ impl<M: FlashNextRuntime> Backend for FlashNextBackend<M> {
     }
 
     fn propose_batch_scored(&mut self, reqs: &[ProposeRequest<'_>]) -> Vec<Option<Proposal>> {
-        if self.dead() || self.mtp_k == 0 || reqs.len() != 1 {
+        if self.dead() || self.mtp_k == 0 || reqs.is_empty() {
             return vec![None; reqs.len()];
         }
-        let r = &reqs[0];
-        let k = if self.adaptive {
-            self.last_acc.get(&r.slot).copied().unwrap_or(2).saturating_add(2).min(self.mtp_k)
-        } else {
-            self.mtp_k
-        };
-        let k = k.min(r.max);
-        if k == 0 {
-            return vec![None];
-        }
-        let result = self.m.mtp_propose(r.slot, r.tokens, k);
-        match result {
-            Ok((mut tokens, mut accept)) if !tokens.is_empty() => {
-                tokens.truncate(k);
-                accept.truncate(tokens.len());
-                // the head's own probability for each pick is what the budget's `Margin`/`Scored` policies spend rows by (the engine
-                // keeps it honest per stream with its calibration factor); the score histogram (`rexl3_spec_conf_*`, bins 2.0 wide
-                // from -8) reads it on the logit scale, which spreads probabilities near 1 over several bins
-                let conf = accept.iter().map(|&p| logit(p)).collect();
-                vec![Some(Proposal { tokens, conf, accept, ..Default::default() })]
-            }
-            Ok(_) => vec![None],
+        // one chain for every stream asked: each keeps its own first `k` drafts (the depth its last round earned, plus two)
+        let asks: Vec<MtpAsk<'_>> = reqs
+            .iter()
+            .map(|r| {
+                let k = if self.adaptive {
+                    self.last_acc.get(&r.slot).copied().unwrap_or(2).saturating_add(2).min(self.mtp_k)
+                } else {
+                    self.mtp_k
+                };
+                MtpAsk { slot: r.slot, tokens: r.tokens, k: k.min(r.max) }
+            })
+            .collect();
+        match self.m.mtp_propose_batch(&asks) {
+            Ok(drafts) => drafts
+                .into_iter()
+                .zip(&asks)
+                .map(|(d, a)| {
+                    let (mut tokens, mut accept) = d.filter(|d| !d.0.is_empty())?;
+                    tokens.truncate(a.k);
+                    accept.truncate(tokens.len());
+                    // the head's own probability for each pick is what the budget's `Margin`/`Scored` policies spend rows by (the
+                    // engine keeps it honest per stream with its calibration factor); the score histogram (`rexl3_spec_conf_*`, bins
+                    // 2.0 wide from -8) reads it on the logit scale, which spreads probabilities near 1 over several bins
+                    let conf = accept.iter().map(|&p| logit(p)).collect();
+                    Some(Proposal { tokens, conf, accept, ..Default::default() })
+                })
+                .collect(),
             Err(e) => {
-                self.record(&format!("draft of slot {}", r.slot), &e);
-                vec![None]
+                self.record(&format!("draft of slots {:?}", reqs.iter().map(|r| r.slot).collect::<Vec<_>>()), &e);
+                vec![None; reqs.len()]
             }
         }
     }

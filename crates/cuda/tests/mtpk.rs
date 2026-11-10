@@ -208,30 +208,73 @@ fn mtp_draft_copy_stage_pick_reference() {
     mtpk::copy_i32(&mut dst, &src, 5, &st).unwrap();
     assert_eq!(dl::<i32>(&dst, &st), vec![4, 8, 12, 16, 20]);
     let chain = DevBuf::from_slice(&[100i32, 101, 102, 103, 104, 105]).unwrap();
-    let mut ids = DevBuf::zeroed(4).unwrap();
-    let mut positions = DevBuf::zeroed(4).unwrap();
-    let mut row_pos = DevBuf::zeroed(4).unwrap();
-    let mut seq_start = DevBuf::zeroed(8).unwrap();
+    let mut ids = DevBuf::zeroed(8).unwrap();
+    let mut positions = DevBuf::zeroed(8).unwrap();
+    let mut row_pos = DevBuf::zeroed(8).unwrap();
+    let mut row_slot = DevBuf::zeroed(8).unwrap();
+    let mut seq_start = DevBuf::zeroed(12).unwrap();
+    let seq_slot = DevBuf::from_slice(&[5i32, 9]).unwrap();
+    // one sequence, arrays of stride 6: token = drafts[2], position = chain[3]
     mtpk::stage(
-        mtpk::StepInputs { ids: &mut ids, positions: &mut positions, row_pos: &mut row_pos, seq_start: &mut seq_start },
+        mtpk::StepInputs {
+            ids: &mut ids,
+            positions: &mut positions,
+            row_pos: &mut row_pos,
+            row_slot: &mut row_slot,
+            seq_start: &mut seq_start,
+        },
+        &seq_slot,
         &dst,
         &chain,
+        1,
+        6,
         3,
         &st,
     )
     .unwrap();
-    assert_eq!(dl::<i32>(&ids, &st), vec![12]);
-    assert_eq!(dl::<i32>(&positions, &st), vec![103]);
-    assert_eq!(dl::<i32>(&row_pos, &st), vec![103]);
-    assert_eq!(dl::<i32>(&seq_start, &st), vec![0, 1]);
-    let logits = DevBuf::from_slice(&[bf(-1.), bf(2.), bf(2.), bf(0.)]).unwrap();
+    assert_eq!(dl::<i32>(&ids, &st)[..1], [12]);
+    assert_eq!(dl::<i32>(&positions, &st)[..1], [103]);
+    assert_eq!(dl::<i32>(&row_pos, &st)[..1], [103]);
+    assert_eq!(dl::<i32>(&row_slot, &st)[..1], [5]);
+    assert_eq!(dl::<i32>(&seq_start, &st)[..2], [0, 1]);
+    // two sequences, stride 3: sequence s drafts into [3s, 3s + 3), its positions likewise
+    let drafts2 = DevBuf::from_slice(&[1i32, 2, 3, 11, 12, 13]).unwrap();
+    let chain2 = DevBuf::from_slice(&[100i32, 101, 102, 200, 201, 202]).unwrap();
+    mtpk::stage(
+        mtpk::StepInputs {
+            ids: &mut ids,
+            positions: &mut positions,
+            row_pos: &mut row_pos,
+            row_slot: &mut row_slot,
+            seq_start: &mut seq_start,
+        },
+        &seq_slot,
+        &drafts2,
+        &chain2,
+        2,
+        3,
+        2,
+        &st,
+    )
+    .unwrap();
+    assert_eq!(dl::<i32>(&ids, &st)[..2], [2, 12]);
+    assert_eq!(dl::<i32>(&positions, &st)[..2], [102, 202]);
+    assert_eq!(dl::<i32>(&row_pos, &st)[..2], [102, 202]);
+    assert_eq!(dl::<i32>(&row_slot, &st)[..2], [5, 9]);
+    assert_eq!(dl::<i32>(&seq_start, &st)[..3], [0, 1, 2]);
+    let logits = DevBuf::from_slice(&[bf(-1.), bf(2.), bf(2.), bf(0.), bf(5.), bf(1.)]).unwrap();
     let mut id = DevBuf::zeroed(16).unwrap();
     let mut p = DevBuf::zeroed(16).unwrap();
-    mtpk::pick(&logits, 4, &mut id, &mut p, 3, &st).unwrap();
+    mtpk::pick(&logits, 0, 4, &mut id, &mut p, 3, &st).unwrap();
     assert_eq!(dl::<i32>(&id, &st)[3], 1, "ties select smallest id");
     let want = 1.0 / ((-3.0f32).exp() + 1. + 1. + (-2.0f32).exp());
     assert!((dl::<f32>(&p, &st)[3] - want).abs() < 2e-6);
-    assert!(mtpk::pick(&logits, 4, &mut id, &mut p, 4, &st).is_err(), "short buffer must fail before launch");
+    // a row further into the buffer: the two logits at offset 4
+    mtpk::pick(&logits, 4, 2, &mut id, &mut p, 2, &st).unwrap();
+    assert_eq!(dl::<i32>(&id, &st)[2], 0);
+    assert!((dl::<f32>(&p, &st)[2] - 1.0 / (1.0 + (-4.0f32).exp())).abs() < 2e-6);
+    assert!(mtpk::pick(&logits, 0, 4, &mut id, &mut p, 16, &st).is_err(), "short buffer must fail before launch");
+    assert!(mtpk::pick(&logits, 4, 4, &mut id, &mut p, 0, &st).is_err(), "an offset past the logits must fail before launch");
 }
 #[test]
 #[ignore]
