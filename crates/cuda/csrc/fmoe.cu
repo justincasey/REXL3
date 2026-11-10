@@ -262,24 +262,110 @@ __device__ __forceinline__ void store_partials(const float (&acc)[8][4], int lan
 // ---------------------------------------------------------------------------------------------------------------
 constexpr int ROUTE_THREADS = 512;
 constexpr int ROUTE_EMAX = 64 * 11 + 64;   // smem capacity (64 tokens, top-k <= 11 with the shared expert)
+constexpr int ROUTE_NEXP = 512 + 1;        // expert ids 0..511 and the shared expert (id NE <= 512)
+constexpr int ROUTE_MAXG = 8;              // groups of one expert (at most 64 entries of an expert, 8 tokens a group)
+
+struct RouteSmem {
+    int exp[ROUTE_EMAX];    // expert of entry
+    float wt[ROUTE_EMAX];   // routing weight of entry
+    int rank[ROUTE_EMAX];   // rank of the entry among the entries of its expert
+    int gid[ROUTE_EMAX];    // group id of a leader entry (rank % 8 == 0)
+    int ntok[ROUTE_EMAX];   // tokens of group
+    int goff[ROUTE_EMAX];   // first slot of group
+    int cnt[ROUTE_NEXP];    // entries of expert
+    int tab[ROUTE_NEXP * ROUTE_MAXG];  // group id of (expert, rank / 8)
+};
+
+// Entries (token-major: tokens ascend inside a group) -> groups of one expert and at most 8 tokens, ids in leader-entry order, slots
+// in group order, written into the route buffer. Warp 0 walks the entries 32 at a time (match_any gives each its rank among the entries
+// of its expert, ballot the group ids), then the rest of the block scatters the slots. Needs sm.exp / sm.wt filled, sm.cnt zero and a
+// __syncthreads since.
+__device__ __forceinline__ void route_groups(const Route& r, RouteSmem& sm, int E, int KT, int T) {
+    const int tid = threadIdx.x, lane = tid & 31;
+    if (tid < 32) {
+        const unsigned lt = (1u << lane) - 1u;
+        int running = 0;
+        for (int c0 = 0; c0 < E; c0 += 32) {
+            const int i = c0 + lane;
+            const bool valid = i < E;
+            const int e = valid ? sm.exp[i] : -1 - lane;
+            const unsigned m = __match_any_sync(0xffffffffu, e);
+            const int base = valid ? sm.cnt[e] : 0;
+            const int rank = base + __popc(m & lt);
+            if (valid && (m >> lane) == 1u) sm.cnt[e] = base + __popc(m);  // the last lane of the expert's entries in this chunk
+            const bool leader = valid && (rank & (GT - 1)) == 0;
+            const unsigned bal = __ballot_sync(0xffffffffu, leader);
+            if (valid) sm.rank[i] = rank;
+            if (leader) {
+                const int gid = running + __popc(bal & lt);
+                sm.gid[i] = gid;
+                sm.tab[e * ROUTE_MAXG + (rank >> 3)] = gid;
+            }
+            running += __popc(bal);
+            __syncwarp();
+        }
+        int carry = 0;
+        for (int c0 = 0; c0 < E; c0 += 32) {
+            const int i = c0 + lane;
+            const bool valid = i < E;
+            const int e = valid ? sm.exp[i] : 0, rank = valid ? sm.rank[i] : 1;
+            const bool leader = valid && (rank & (GT - 1)) == 0;
+            const int n = leader ? min(GT, sm.cnt[e] - rank) : 0;
+            int incl = n;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const int v = __shfl_up_sync(0xffffffffu, incl, o);
+                if (lane >= o) incl += v;
+            }
+            if (leader) {
+                const int gid = sm.gid[i], off = carry + incl - n;
+                sm.ntok[gid] = n;
+                sm.goff[gid] = off;
+                r.g_exp[gid] = e;
+                r.g_ntok[gid] = n;
+                r.g_off[gid] = off;
+            }
+            carry += __shfl_sync(0xffffffffu, incl, 31);
+        }
+        if (lane == 0) {
+            r.hdr[0] = running;
+            r.hdr[1] = E;
+            r.hdr[2] = T;
+            r.hdr[3] = KT;
+        }
+    }
+    __syncthreads();
+    for (int i = tid; i < E; i += blockDim.x) {
+        const int e = sm.exp[i], rk = sm.rank[i];
+        const int gid = (rk & (GT - 1)) == 0 ? sm.gid[i] : sm.tab[e * ROUTE_MAXG + (rk >> 3)];
+        const int slot = sm.goff[gid] + (rk & (GT - 1));
+        r.s_tok[slot] = i / KT;
+        r.s_w[slot] = sm.wt[i];
+        r.e_slot[i] = slot;
+    }
+}
+
+// Monotone unsigned key of a float (-0 = +0).
+__device__ __forceinline__ unsigned ord_key(float v) {
+    const unsigned u = __float_as_uint(v + 0.0f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
 
 __global__ void __launch_bounds__(ROUTE_THREADS) route_kernel(const __nv_bfloat16* __restrict__ logits,
                                                               const __nv_bfloat16* __restrict__ shared_gate,
                                                               void* route_base, int emax, int T, int NE, int K) {
+    __shared__ RouteSmem sm;
+    for (int i = threadIdx.x; i < ROUTE_NEXP; i += blockDim.x) sm.cnt[i] = 0;
     pdl_wait();     // the logits and the shared gate are the router linears' outputs
     pdl_trigger();  // gate_up may launch: it reads the route only after its own pdl_wait
-    __shared__ int s_exp[ROUTE_EMAX];
-    __shared__ float s_wt[ROUTE_EMAX];
-    __shared__ int s_rank[ROUTE_EMAX];
-    __shared__ int s_gid[ROUTE_EMAX];
-    __shared__ int s_ntok[ROUTE_EMAX];
-    __shared__ int s_goff[ROUTE_EMAX];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, nwarp = blockDim.x >> 5;
     const int KT = K + (shared_gate ? 1 : 0);
     const int E = T * KT;
     Route r = route_view(route_base, emax);
 
-    // 1. top-k a token, one warp a token. NE <= 512: lane holds experts lane + 32 i.
+    // 1. top-k a token, one warp a token (value DESC, index ASC). NE <= 512: lane holds experts lane + 32 i. Each round the warp's best is
+    // the max key (one reduction), the lowest index among the lanes that hold it (a second); lane k keeps round k's winner, so the
+    // weights (exp of the winner minus the top, summed in k order) come from one parallel exp and K shuffles.
     for (int tok = warp; tok < T; tok += nwarp) {
         float l[16];
 #pragma unroll
@@ -287,101 +373,58 @@ __global__ void __launch_bounds__(ROUTE_THREADS) route_kernel(const __nv_bfloat1
             const int e = lane + 32 * i;
             l[i] = e < NE ? __bfloat162float(logits[(size_t)tok * NE + e]) : -INFINITY;
         }
-        float top_v = 0.f;
-        float vk[16];
-        int ik[16];
+        float top_v = 0.f, my_v = 0.f;
+        int my_i = 0;
         for (int k = 0; k < K; ++k) {
-            float bv = -INFINITY;
-            int bi = 0x7fffffff;
+            // the lane's best (the lower index wins a tie): a tournament in index order
+            float v8[8];
+            int i8[8];
+#pragma unroll
+            for (int m = 0; m < 8; ++m) {
+                const bool b = l[2 * m + 1] > l[2 * m];
+                v8[m] = b ? l[2 * m + 1] : l[2 * m];
+                i8[m] = b ? 2 * m + 1 : 2 * m;
+            }
+#pragma unroll
+            for (int m = 0; m < 4; ++m) {
+                const bool b = v8[2 * m + 1] > v8[2 * m];
+                v8[m] = b ? v8[2 * m + 1] : v8[2 * m];
+                i8[m] = b ? i8[2 * m + 1] : i8[2 * m];
+            }
+#pragma unroll
+            for (int m = 0; m < 2; ++m) {
+                const bool b = v8[2 * m + 1] > v8[2 * m];
+                v8[m] = b ? v8[2 * m + 1] : v8[2 * m];
+                i8[m] = b ? i8[2 * m + 1] : i8[2 * m];
+            }
+            const bool b = v8[1] > v8[0];
+            const float bv = b ? v8[1] : v8[0];
+            const int bi = lane + 32 * (b ? i8[1] : i8[0]);
+            const unsigned key = ord_key(bv);
+            const unsigned mk = __reduce_max_sync(0xffffffffu, key);
+            const int win = (int)__reduce_min_sync(0xffffffffu, key == mk ? (unsigned)bi : 0xffffffffu);
+            const float wv = __shfl_sync(0xffffffffu, bv, win & 31);
+            if (k == 0) top_v = wv;
+            if (lane == k) { my_v = wv; my_i = win; }
 #pragma unroll
             for (int i = 0; i < 16; ++i)
-                if (l[i] > bv) { bv = l[i]; bi = lane + 32 * i; }
-#pragma unroll
-            for (int o = 16; o > 0; o >>= 1) {
-                const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
-                const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
-                if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
-            }
-#pragma unroll
-            for (int i = 0; i < 16; ++i)
-                if (lane + 32 * i == bi) l[i] = -INFINITY;
-            if (k == 0) top_v = bv;
-            if (k < 16) { vk[k] = bv; ik[k] = bi; }
+                if (lane + 32 * i == win) l[i] = -INFINITY;
         }
-        if (lane == 0) {
-            float sum = 0.f;
-            for (int k = 0; k < K; ++k) sum += expf(vk[k] - top_v);
-            const float inv = 1.f / sum;
-            for (int k = 0; k < K; ++k) {
-                s_exp[tok * KT + k] = ik[k];
-                s_wt[tok * KT + k] = expf(vk[k] - top_v) * inv;
-            }
-            if (shared_gate) {
-                s_exp[tok * KT + K] = NE;
-                s_wt[tok * KT + K] = 1.f / (1.f + expf(-__bfloat162float(shared_gate[tok])));
-            }
+        const float ev = lane < K ? expf(my_v - top_v) : 0.f;
+        float sum = 0.f;
+        for (int k = 0; k < K; ++k) sum += __shfl_sync(0xffffffffu, ev, k);
+        const float inv = 1.f / sum;
+        if (lane < K) {
+            sm.exp[tok * KT + lane] = my_i;
+            sm.wt[tok * KT + lane] = ev * inv;
+        }
+        if (shared_gate && lane == K) {
+            sm.exp[tok * KT + K] = NE;
+            sm.wt[tok * KT + K] = 1.f / (1.f + expf(-__bfloat162float(shared_gate[tok])));
         }
     }
     __syncthreads();
-
-    // 2. rank of every entry among the entries of its expert (entries are token-major, so tokens ascend in a group)
-    for (int i = tid; i < E; i += blockDim.x) {
-        const int e = s_exp[i];
-        int rank = 0;
-        for (int j = 0; j < i; ++j) rank += s_exp[j] == e;
-        s_rank[i] = rank;
-    }
-    __syncthreads();
-    // 3. group leaders (rank % 8 == 0) get ids in entry order; their size; then offsets in group order
-    for (int i = tid; i < E; i += blockDim.x) {
-        if (s_rank[i] % GT == 0) {
-            int gid = 0;
-            for (int j = 0; j < i; ++j) gid += (s_rank[j] % GT) == 0;
-            const int e = s_exp[i];
-            int n = 0;
-            for (int j = i; j < E; ++j) n += (s_exp[j] == e && s_rank[j] >= s_rank[i] && s_rank[j] < s_rank[i] + GT);
-            s_gid[i] = gid;
-            s_ntok[gid] = n;
-        }
-    }
-    __syncthreads();
-    for (int i = tid; i < E; i += blockDim.x) {
-        if (s_rank[i] % GT == 0) {
-            const int gid = s_gid[i];
-            int off = 0;
-            for (int q = 0; q < gid; ++q) off += s_ntok[q];
-            s_goff[gid] = off;
-        }
-    }
-    __syncthreads();
-    // 4. every entry: its group (the leader with the same expert and chunk), slot = group offset + rank % 8
-    for (int i = tid; i < E; i += blockDim.x) {
-        const int e = s_exp[i], rk = s_rank[i];
-        int lead = i;
-        if (rk % GT) {
-            const int want = rk - rk % GT;
-            for (int j = 0; j < i; ++j)
-                if (s_exp[j] == e && s_rank[j] == want) { lead = j; break; }
-        }
-        const int gid = s_gid[lead];
-        const int slot = s_goff[gid] + rk % GT;
-        r.s_tok[slot] = i / KT;
-        r.s_w[slot] = s_wt[i];
-        r.e_slot[i] = slot;
-        if (lead == i) {
-            r.g_exp[gid] = e;
-            r.g_ntok[gid] = s_ntok[gid];
-            r.g_off[gid] = s_goff[gid];
-        }
-    }
-    if (tid == 0) {
-        int U = 0;
-        for (int i = 0; i < E; ++i) U += (s_rank[i] % GT) == 0;
-        r.hdr[0] = U;
-        r.hdr[1] = E;
-        r.hdr[2] = T;
-        r.hdr[3] = KT;
-    }
+    route_groups(r, sm, E, KT, T);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -432,14 +475,12 @@ __global__ void __launch_bounds__(ROUTE_THREADS) route_group_kernel(const __nv_b
                                                                     const float* __restrict__ expert_bias, float scale,
                                                                     void* route_base, int emax, int T, int NE, int K,
                                                                     int n_group, int topk_group) {
+    __shared__ RouteSmem sm;
+    for (int i = threadIdx.x; i < ROUTE_NEXP; i += blockDim.x) sm.cnt[i] = 0;
     pdl_wait();
     pdl_trigger();
-    __shared__ int s_exp[ROUTE_EMAX];
-    __shared__ float s_wt[ROUTE_EMAX];
-    __shared__ int s_rank[ROUTE_EMAX];
-    __shared__ int s_gid[ROUTE_EMAX];
-    __shared__ int s_ntok[ROUTE_EMAX];
-    __shared__ int s_goff[ROUTE_EMAX];
+    int* const s_exp = sm.exp;
+    float* const s_wt = sm.wt;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, nwarp = blockDim.x >> 5;
     const int KT = K + (shared_gate ? 1 : 0);
     const int E = T * KT;
@@ -542,67 +583,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) route_group_kernel(const __nv_b
     }
     __syncthreads();
 
-    // 2. rank of every entry among the entries of its expert (entries are token-major, so tokens ascend in a group)
-    for (int i = tid; i < E; i += blockDim.x) {
-        const int e = s_exp[i];
-        int rank = 0;
-        for (int j = 0; j < i; ++j) rank += s_exp[j] == e;
-        s_rank[i] = rank;
-    }
-    __syncthreads();
-    // 3. group leaders (rank % 8 == 0) get ids in entry order; their size; then offsets in group order
-    for (int i = tid; i < E; i += blockDim.x) {
-        if (s_rank[i] % GT == 0) {
-            int gid = 0;
-            for (int j = 0; j < i; ++j) gid += (s_rank[j] % GT) == 0;
-            const int e = s_exp[i];
-            int n = 0;
-            for (int j = i; j < E; ++j) n += (s_exp[j] == e && s_rank[j] >= s_rank[i] && s_rank[j] < s_rank[i] + GT);
-            s_gid[i] = gid;
-            s_ntok[gid] = n;
-        }
-    }
-    __syncthreads();
-    for (int i = tid; i < E; i += blockDim.x) {
-        if (s_rank[i] % GT == 0) {
-            const int gid = s_gid[i];
-            int off = 0;
-            for (int q = 0; q < gid; ++q) off += s_ntok[q];
-            s_goff[gid] = off;
-        }
-    }
-    __syncthreads();
-    // 4. every entry: its group (the leader with the same expert and chunk), slot = group offset + rank % 8
-    for (int i = tid; i < E; i += blockDim.x) {
-        const int e = s_exp[i], rk = s_rank[i];
-        int lead = i;
-        if (rk % GT) {
-            const int want = rk - rk % GT;
-            for (int j = 0; j < i; ++j)
-                if (s_exp[j] == e && s_rank[j] == want) {
-                    lead = j;
-                    break;
-                }
-        }
-        const int gid = s_gid[lead];
-        const int slot = s_goff[gid] + rk % GT;
-        r.s_tok[slot] = i / KT;
-        r.s_w[slot] = s_wt[i];
-        r.e_slot[i] = slot;
-        if (lead == i) {
-            r.g_exp[gid] = e;
-            r.g_ntok[gid] = s_ntok[gid];
-            r.g_off[gid] = s_goff[gid];
-        }
-    }
-    if (tid == 0) {
-        int U = 0;
-        for (int i = 0; i < E; ++i) U += (s_rank[i] % GT) == 0;
-        r.hdr[0] = U;
-        r.hdr[1] = E;
-        r.hdr[2] = T;
-        r.hdr[3] = KT;
-    }
+    route_groups(r, sm, E, KT, T);
 }
 
 // ---------------------------------------------------------------------------------------------------------------

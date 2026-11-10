@@ -142,7 +142,7 @@ fn window_bytes(l: &[u16], rows: usize, down: usize, shared: [usize; 3]) -> (usi
     (u, u * (2 * mat(3) + mat(down)) + shared.iter().map(|&b| mat(b)).sum::<usize>())
 }
 
-/// Layer time at 1..=7 rows against the bytes the unique experts stream, weights from DRAM (a pool of 64 distinct row sets cycles
+/// Layer time (best of three passes of 256 calls) at 1..=7 rows against the bytes the unique experts stream, weights from DRAM (a pool of 64 distinct row sets cycles
 /// through the layer's experts, far beyond the L2). Rows share a base logit vector (pattern 1) like an MTP verify window's.
 #[test]
 #[ignore]
@@ -164,10 +164,14 @@ fn bench_decode_moe() {
             let mut ws = fmoe::workspace(64, TK, H, I, KC).unwrap();
             let mut out = DevBuf::zeroed(rows * H * 2).unwrap();
             let shape = fmoe::Shape { t: rows, ne: NE, top_k: TK, h: H, i: I, kc: KC, max_tokens: 64 };
-            let ms = ms_per_call(&st, 256, |i| {
-                let (x, l, g) = &sets[i % 64];
-                fmoe::forward(x, l, g, &o.tables(), &mut out, shape, None, fmoe::SwigluLimit::default(), &mut ws, &st).unwrap();
-            });
+            let ms = (0..3)
+                .map(|_| {
+                    ms_per_call(&st, 256, |i| {
+                        let (x, l, g) = &sets[i % 64];
+                        fmoe::forward(x, l, g, &o.tables(), &mut out, shape, None, fmoe::SwigluLimit::default(), &mut ws, &st).unwrap();
+                    })
+                })
+                .fold(f64::MAX, f64::min);
             let (u, b) = (us as f64 / 64.0, bytes as f64 / 64.0);
             eprintln!(
                 "rows {rows}: {:6.1} us a layer, unique experts {u:5.1}, {:5.1} MB, {:5.1} GB/s ({:4.0}% of 237)",
