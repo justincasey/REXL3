@@ -308,6 +308,10 @@ impl WindowKey {
 /// Most sequences one MTP draft chain carries (a round with more has the copy drafter for the rest).
 pub const MTP_MAX_SEQS: usize = 4;
 
+/// Drafts of the first graph of a draft chain that runs in pieces (`MtpAsk::exit`): the catch-up pass and one chained step. Whether a
+/// further step is worth its milliseconds is decided on what these two picks say, then one step at a time.
+const CHAIN_FIRST_DRAFTS: usize = 2;
+
 /// An MTP draft chain over up to [`MTP_MAX_SEQS`] sequences: the catch-up rows of each (one sequence reads them from trunk stack row
 /// `src_row`; several are gathered into one contiguous stack first, `src_row` 0), then `drafts - 1` chained one-row steps of every
 /// sequence. Both the catch-up mask AND the one-row mask of every step are needed: a chain can cross the QSA threshold between drafts.
@@ -316,6 +320,8 @@ struct ChainKey {
     seqs: usize,
     catchup_rows: [u8; MTP_MAX_SEQS],
     src_row: usize,
+    /// 0 for a graph that starts with the catch-up pass, else the one chained step `from` that a graph of its own runs.
+    from: usize,
     drafts: usize,
     sparse_catchup: u64,
     sparse_steps: [u16; MTP_MAX_SEQS],
@@ -339,8 +345,30 @@ impl ChainKey {
             seqs: b.n_seq(),
             catchup_rows,
             src_row,
+            from: 0,
             drafts,
             sparse_catchup: sparse_rows(&b.positions, features.qsa_mtp),
+            sparse_steps,
+            features,
+            grid,
+        }
+    }
+
+    /// The key of the graph of the single chained step `j >= 2` of a chain over `seqs` sequences whose last catch-up rows are at `ends`.
+    fn for_step(seqs: usize, j: usize, ends: &[usize], grid: AttnGrid, features: GraphFeatures) -> Self {
+        let mut sparse_steps = [0u16; MTP_MAX_SEQS];
+        if features.qsa_mtp {
+            for (s, &last) in ends.iter().enumerate() {
+                sparse_steps[s] = u16::from(last + j >= QSA_DENSE_CTX) << (j - 1);
+            }
+        }
+        Self {
+            seqs,
+            catchup_rows: [0; MTP_MAX_SEQS],
+            src_row: 0,
+            from: j,
+            drafts: j + 1,
+            sparse_catchup: 0,
             sparse_steps,
             features,
             grid,
@@ -369,11 +397,14 @@ enum StackSrc {
 }
 
 /// A sequence's request for drafts ([`FlashNextModel::mtp_propose_batch`]): its slot, its committed tokens (the last one not yet
-/// run through the trunk) and the most drafts wanted.
+/// run through the trunk), the most drafts wanted and when to stop early.
 pub struct MtpAsk<'a> {
     pub slot: usize,
     pub tokens: &'a [u32],
     pub k: usize,
+    /// Stop chaining once the product of the head's probabilities of the drafts so far is below this (0 or less: run all `k`). A step
+    /// past that point only produces drafts whose chance of being verified and accepted is lower than their cost.
+    pub exit: f32,
 }
 
 /// Where one sequence's rows of the last window (or prefill chunk) lie in `x_streams`: positions `pos0..pos0 + rows` are the stack
@@ -1639,7 +1670,7 @@ impl FlashNextModel {
     /// Up to `k` MTP drafts for `slot`, whose history is `tokens` (the last one not yet run through the trunk): the one-sequence
     /// form of [`FlashNextModel::mtp_propose_batch`].
     pub fn mtp_propose(&mut self, slot: usize, tokens: &[u32], k: usize) -> Result<Vec<u32>, ModelError> {
-        Ok(self.mtp_propose_batch(&[MtpAsk { slot, tokens, k }])?.pop().flatten().map(|d| d.0).unwrap_or_default())
+        Ok(self.mtp_propose_batch(&[MtpAsk { slot, tokens, k, exit: 0.0 }])?.pop().flatten().map(|d| d.0).unwrap_or_default())
     }
 
     /// Drafts for up to [`MTP_MAX_SEQS`] sequences in one chain, each with the head's probability of every draft it keeps (the first is
@@ -1647,8 +1678,10 @@ impl FlashNextModel {
     /// carry (its trunk rows are not on the stack, it has no catch-up rows, it is past the window or the context, or it is the fifth)
     /// gets `None` and the engine's own drafter. The head first catches up on every trunk row still in `x_streams` it has not seen
     /// (each paired with the token that followed it), then chains on its own output with the token and position of every step staged
-    /// on the device, so the whole chain is one replayable graph and one host read; every sequence runs the longest ask's steps and
-    /// keeps its own first `k` drafts. Drafts after the first one below `REXL3_MTP_CONF` are dropped.
+    /// on the device. Without an `exit` in any ask the whole chain is one replayable graph and one host read; every sequence runs the
+    /// longest ask's steps and keeps its own first `k` drafts. With one the chain runs in pieces: the catch-up and its first step as one
+    /// graph, then one step a graph (and one host read, about 0.1 ms) while some sequence still wants drafts and the product of the head's
+    /// probabilities of its drafts so far is at least its `exit`. Drafts after the first one below `REXL3_MTP_CONF` are dropped.
     pub fn mtp_propose_batch(&mut self, asks: &[MtpAsk<'_>]) -> Result<Vec<Option<(Vec<u32>, Vec<f32>)>>, ModelError> {
         let mut out: Vec<Option<(Vec<u32>, Vec<f32>)>> = vec![None; asks.len()];
         if !self.has_mtp() || self.stack.is_empty() {
@@ -1660,6 +1693,7 @@ impl FlashNextModel {
             start: usize,
             end: usize,
             k: usize,
+            exit: f32,
             src_row: usize,
         }
         let mut lanes: Vec<Lane> = Vec::new();
@@ -1680,7 +1714,7 @@ impl FlashNextModel {
                 continue;
             }
             rows += end - start;
-            lanes.push(Lane { ask: i, slot: a.slot, start, end, k, src_row: seg.row0 + (start - seg.pos0) });
+            lanes.push(Lane { ask: i, slot: a.slot, start, end, k, exit: a.exit, src_row: seg.row0 + (start - seg.pos0) });
         }
         // every sequence runs the longest chain: its positions must fit the context too
         let k_max = lanes.iter().map(|l| l.k).max().unwrap_or(0);
@@ -1733,9 +1767,13 @@ impl FlashNextModel {
             }
             (StackSrc::Head(0), 0)
         };
-        let key = ChainKey::for_chain(&b, src_row, k_max, AttnGrid::cover(live, self.opts.max_context), self.graph_features());
         let ends: Vec<usize> = lanes.iter().map(|l| l.end).collect();
-        self.run_graph(Self::chain_graphs, key, live, |m| m.mtp_chain(&b, src, &ends, k_max))?;
+        let slots: Vec<usize> = lanes.iter().map(|l| l.slot).collect();
+        let (grid, features) = (AttnGrid::cover(live, self.opts.max_context), self.graph_features());
+        // drafts the first graph makes: all of them, or (some ask has an exit) the catch-up and its first step, the rest a step at a time
+        let mut done = if lanes.iter().any(|l| l.exit > 0.0) { k_max.min(CHAIN_FIRST_DRAFTS) } else { k_max };
+        let key = ChainKey::for_chain(&b, src_row, done, grid, features);
+        self.run_graph(Self::chain_graphs, key, live, |m| m.mtp_chain(&b, src, &ends, done))?;
         // `mtp_body` does this during capture/eager, but replay does not execute its host bookkeeping.
         self.mixed_rows = 0;
         for l in &lanes {
@@ -1746,9 +1784,28 @@ impl FlashNextModel {
         let mut conf = vec![0f32; n * MAX_DRAFTS];
         self.drafts_dev.download_range(0, &mut ids)?;
         self.conf_dev.download_range(0, &mut conf)?;
+        // another step while a sequence has drafts left to make and its drafts so far are still likely enough to land (a pick below the
+        // confidence floor ends its drafts anyway, see below)
+        let floor = self.mtp_conf;
+        let wants = |s: usize, l: &Lane, done: usize, conf: &[f32]| {
+            if done >= l.k {
+                return false;
+            }
+            let p = &conf[s * MAX_DRAFTS..s * MAX_DRAFTS + done];
+            l.exit <= 0.0 || (p.iter().product::<f32>() >= l.exit && (done == 1 || p[done - 1] >= floor))
+        };
+        while done < k_max && lanes.iter().enumerate().any(|(s, l)| wants(s, l, done, &conf)) {
+            let key = ChainKey::for_step(n, done, &ends, grid, features);
+            self.run_graph(Self::chain_graphs, key, live, |m| m.mtp_step(&slots, &ends, done, StackSrc::Head(0)))?;
+            self.mixed_rows = 0;
+            done += 1;
+            self.sync()?;
+            self.drafts_dev.download_range(0, &mut ids)?;
+            self.conf_dev.download_range(0, &mut conf)?;
+        }
         for (s, l) in lanes.iter().enumerate() {
             let (mut drafts, mut kept) = (Vec::with_capacity(l.k), Vec::with_capacity(l.k));
-            for j in 0..l.k {
+            for j in 0..l.k.min(done) {
                 if j > 0 && conf[s * MAX_DRAFTS + j] < self.mtp_conf {
                     break;
                 }
@@ -2919,26 +2976,34 @@ impl FlashNextModel {
             }
             0
         };
-        let rows: Vec<usize> = (0..n).collect();
+        let slots: Vec<usize> = (0..n).map(|s| b.seq_slot[s] as usize).collect();
         for j in 1..k {
-            let io = mtpk::StepInputs {
-                ids: &mut self.ids,
-                positions: &mut self.positions,
-                row_pos: &mut self.rowidx.pos,
-                row_slot: &mut self.rowidx.slot,
-                seq_start: &mut self.seq_start,
-            };
-            mtpk::stage(io, &self.seq_slot, &self.drafts_dev, &self.chain_pos, n, MAX_DRAFTS, j, &self.stream)?;
-            // the host-side view of the step: only its shape and positions are read on the host
-            let step: Vec<RowRequest> = (0..n)
-                .map(|s| RowRequest { slot: b.seq_slot[s] as usize, first_position: (ends[s] + j) as u64, tokens: vec![0] })
-                .collect();
-            let b1 = RowBatch::from_requests(&step);
             // step 1 reads the rows gathered above, the later ones the previous step's, side by side
             let from = if j == 1 { StackSrc::Head(first) } else { StackSrc::Head(0) };
-            self.mtp_body(&b1, from, Mode::Window, j, &rows)?;
+            self.mtp_step(&slots, ends, j, from)?;
         }
         Ok(())
+    }
+
+    /// Device work of chained step `j` of a draft chain over `slots` (`ends[s]`: the position of sequence `s`'s last catch-up row): the
+    /// token and position of every sequence staged on the device from the previous step's pick, then the head over one row of each,
+    /// reading its input stack from `from`.
+    fn mtp_step(&mut self, slots: &[usize], ends: &[usize], j: usize, from: StackSrc) -> Result<(), ModelError> {
+        let n = slots.len();
+        let io = mtpk::StepInputs {
+            ids: &mut self.ids,
+            positions: &mut self.positions,
+            row_pos: &mut self.rowidx.pos,
+            row_slot: &mut self.rowidx.slot,
+            seq_start: &mut self.seq_start,
+        };
+        mtpk::stage(io, &self.seq_slot, &self.drafts_dev, &self.chain_pos, n, MAX_DRAFTS, j, &self.stream)?;
+        // the host-side view of the step: only its shape and positions are read on the host
+        let step: Vec<RowRequest> =
+            (0..n).map(|s| RowRequest { slot: slots[s], first_position: (ends[s] + j) as u64, tokens: vec![0] }).collect();
+        let b1 = RowBatch::from_requests(&step);
+        let rows: Vec<usize> = (0..n).collect();
+        self.mtp_body(&b1, from, Mode::Window, j, &rows)
     }
 
     /// Snapshot the load-time kernel branches in a graph key. Layer order, weight shapes and indexer placement are
@@ -3293,6 +3358,34 @@ mod tests {
         assert_ne!(before, across);
     }
 
+    #[test]
+    fn single_step_chain_keys_follow_the_step_and_its_qsa_split() {
+        let f = GraphFeatures { qsa_trunk: true, qsa_mtp: true, ple: true, mtp: true, fast: true };
+        let g = AttnGrid::cover(2054, 8192);
+        // step 2 of a chain whose last catch-up row is at 2044 is at 2046, below the QSA threshold
+        let base = ChainKey::for_step(1, 2, &[2044], g, f);
+        assert_eq!(base, ChainKey::for_step(1, 2, &[2044], g, f));
+        assert_eq!(base.sparse_steps, [0; MTP_MAX_SEQS]);
+        let cases = [
+            ("step", ChainKey::for_step(1, 3, &[2044], g, f)),
+            ("step crosses the QSA threshold", ChainKey::for_step(1, 2, &[2046], g, f)),
+            ("sequence count", ChainKey::for_step(2, 2, &[2044, 2044], g, f)),
+            ("attention grid", ChainKey::for_step(1, 2, &[2044], AttnGrid::cover(4100, 8192), f)),
+            ("MTP QSA indexer", ChainKey::for_step(1, 2, &[2046], g, GraphFeatures { qsa_mtp: false, ..f })),
+        ];
+        for (what, key) in cases {
+            assert_ne!(base, key, "{what}");
+        }
+        // the step that crosses the threshold sets its own bit, the dense one none
+        assert_eq!(ChainKey::for_step(1, 4, &[2044], g, f).sparse_steps[0], 1 << 3);
+        // a one-step graph is never the graph of a chain that starts with the catch-up pass
+        let catchup = RowBatch::from_requests(&[RowRequest { slot: 0, first_position: 2041, tokens: vec![1; 4] }]);
+        let chain = ChainKey::for_chain(&catchup, 0, 2, g, f);
+        assert_eq!(chain.from, 0);
+        assert_eq!(base.from, 2);
+        assert_ne!(chain, base);
+    }
+
     /// Real-pack gate: no model load or CUDA context on the CPU test path. Run only on an idle GPU after the pause.
     #[test]
     fn real_pack_graph_replay_equals_eager_across_qsa_threshold() {
@@ -3378,6 +3471,64 @@ mod tests {
             "the run did not retire a graph from each cache: {before:?} -> {after:?}"
         );
         assert!(after.window.eager > before.window.eager, "first sightings ran eagerly");
+    }
+
+    /// Real-pack gate: a draft chain that runs in pieces (an `exit` threshold) makes the drafts and the head probabilities of the chain that
+    /// is one graph, bit for bit: eager, captured and replayed, with steps on both sides of the row-2048 QSA switch.
+    #[test]
+    fn real_pack_stepped_chain_equals_the_single_graph_chain() {
+        use std::path::PathBuf;
+        if std::env::var("REXL3_FN_REAL").ok().as_deref() != Some("1") {
+            eprintln!("not run: REXL3_FN_REAL=1 and REXL3_FLASH_NEXT_DIR are required for chain parity");
+            return;
+        }
+        let dir = PathBuf::from(std::env::var("REXL3_FLASH_NEXT_DIR").expect("set the real-pack directory"));
+        assert!(gb_cuda::device_available(), "real-pack chain parity needs an idle CUDA device");
+        let opts = ModelOptions { slots: 1, kv_pages: 64, max_context: 8192, prefill_rows: 1024, warm: false };
+        let mut m = FlashNextModel::load(&dir, opts).unwrap();
+        assert!(m.has_mtp(), "pack needs the MTP head");
+        // one fresh slot a run: the chain's catch-up rows are made once, so each variant starts from its own prefill
+        let propose = |m: &mut FlashNextModel, n: usize, exit: f32| {
+            m.begin_slot(0).unwrap();
+            let vocab = m.vocab_size() as u64;
+            let prompt: Vec<u32> = (0..n).map(|i| ((i as u64 * 2_654_435_761) % (vocab - 16) + 8) as u32).collect();
+            let path = PrefillPath::for_prompt(n);
+            let mut last = None;
+            for first in (0..n).step_by(m.opts.prefill_rows) {
+                let end = (first + m.opts.prefill_rows).min(n);
+                let chunk = &prompt[first..end];
+                let b = RowBatch::from_requests(&[RowRequest { slot: 0, first_position: first as u64, tokens: chunk.to_vec() }]);
+                last = m.prefill_chunk(&b, path, (end == n).then_some(1)).unwrap();
+                m.mtp_after_prefill(0, first, chunk, prompt.get(end).copied(), path).unwrap();
+            }
+            let mut history = prompt;
+            history.push(last.unwrap().ids[0] as u32);
+            let d = m.mtp_propose_batch(&[MtpAsk { slot: 0, tokens: &history, k: 6, exit }]).unwrap().pop().flatten().unwrap();
+            (d.0, d.1.iter().map(|p| p.to_bits()).collect::<Vec<_>>())
+        };
+        let lengths = [2040, 2044, 2046, 2051];
+        m.use_graphs = false;
+        let eager: Vec<_> = lengths.map(|n| propose(&mut m, n, 0.0)).into();
+        assert!(eager.iter().all(|(d, _)| d.len() == 6), "every chain made its six drafts");
+        for (n, want) in lengths.iter().zip(&eager) {
+            assert_eq!(&propose(&mut m, *n, f32::MIN_POSITIVE), want, "eager stepped chain differs at {n} tokens");
+        }
+        m.use_graphs = true;
+        m.sync().unwrap();
+        m.graphs = GraphCache::new(graph_cache::DEFAULT_WINDOW_GRAPHS, true);
+        m.mtp_graphs = GraphCache::new(graph_cache::DEFAULT_CHAIN_GRAPHS, true);
+        let mut sizes = None;
+        for pass in 0..2 {
+            for (n, want) in lengths.iter().zip(&eager) {
+                assert_eq!(&propose(&mut m, *n, f32::MIN_POSITIVE), want, "captured/replayed stepped chain differs at {n} tokens (pass {pass})");
+                assert_eq!(&propose(&mut m, *n, 0.0), want, "captured/replayed whole chain differs at {n} tokens (pass {pass})");
+            }
+            assert!(m.use_graphs && !m.mtp_graphs.is_empty(), "capture refused; parity would be vacuous");
+            match sizes {
+                None => sizes = Some(m.mtp_graphs.len()),
+                Some(s) => assert_eq!(m.mtp_graphs.len(), s, "the second pass replayed, it captured nothing new"),
+            }
+        }
     }
 
     /// The one switch a prefill chunk is allowed to make, and the row counts that must not change it.

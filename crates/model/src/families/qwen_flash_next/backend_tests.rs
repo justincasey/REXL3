@@ -10,6 +10,8 @@ struct Fake {
     mtp: Vec<(usize, Vec<u32>, Option<u32>, PrefillPath)>,
     fail: Option<ModelError>,
     drafts: Vec<usize>,
+    /// The exit threshold of every ask the chain was given.
+    exits: Vec<f32>,
     committed: Vec<usize>,
     /// `window_candidates` answers with a clone of this table when set (else the all-7 default).
     next_cands: Option<Candidates>,
@@ -82,6 +84,7 @@ impl FlashNextRuntime for Fake {
     }
     fn mtp_propose_batch(&mut self, asks: &[MtpAsk<'_>]) -> Result<Vec<Option<(Vec<u32>, Vec<f32>)>>, ModelError> {
         self.drafts.extend(asks.iter().map(|a| a.k));
+        self.exits.extend(asks.iter().map(|a| a.exit));
         Ok(asks.iter().map(|a| Some((vec![7; a.k], vec![0.5; a.k]))).collect())
     }
 }
@@ -136,6 +139,24 @@ fn mtp_depth_grows_with_acceptance_and_is_bounded_by_request() {
     ];
     assert_eq!(b.propose_batch(&multi), vec![Some(vec![7; 4]), Some(vec![7; 6])]);
     assert_eq!(b.m.drafts[4..], [4, 6]);
+}
+
+#[test]
+fn the_draft_chain_gets_the_whole_depth_and_the_exit_threshold() {
+    let sampling = gb_sampling::Sampling::default();
+    let req = [ProposeRequest { slot: 1, tokens: &[3], sampling: &sampling, max: 6 }];
+    // without the earlier depth rule every ask is for as many drafts as the engine allows (the chain's own exit shortens it), and
+    // acceptance does not move it
+    let mut b = FlashNextBackend::with_runtime(Fake::default(), 64, 7, false);
+    b.propose_batch_scored(&req);
+    b.commit(1, 1);
+    b.propose_batch_scored(&req);
+    assert_eq!(b.m.drafts, vec![6, 6]);
+    assert_eq!(b.m.exits, vec![DEFAULT_MTP_EXIT; 2]);
+    // the threshold is the caller's: 0 runs every step
+    let mut off = FlashNextBackend::with_runtime(Fake::default(), 64, 7, false).with_exit(0.0);
+    off.propose_batch_scored(&req);
+    assert_eq!(off.m.exits, vec![0.0]);
 }
 
 #[test]

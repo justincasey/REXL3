@@ -135,6 +135,8 @@ pub struct FlashNextBackend<M: FlashNextRuntime = FlashNextModel> {
     /// absolute grid of `min(chunk, limit)` rows, which the chunk-invariant forward makes the same bits (`effective_chunk`).
     deadline_rows: Option<usize>,
     adaptive: bool,
+    /// The draft chain stops once the product of the head's probabilities of its drafts is below this (`MtpAsk::exit`); 0 runs every step.
+    exit: f32,
     last_acc: BTreeMap<usize, usize>,
     error: Option<BackendError>,
     fatal: Option<BackendError>,
@@ -157,10 +159,20 @@ fn next_chunk_end(done: usize, total: usize, chunk: usize) -> usize {
     done.saturating_add(chunk - done % chunk).min(total)
 }
 
+/// The default exit threshold of a draft chain (`REXL3_MTP_EXIT`). An extra step costs 1.2 ms of chain and, when its draft rides, 3.3 ms of
+/// verify row, about a twelfth of a round for a token rate of 0.077 a ms, so a draft is worth its step when the chance that it and every draft
+/// before it land is above about a quarter, and the step before it when it is above about a half. MEASURED: replaying a recorded scan of the six
+/// decode prompts and of ten others through the engine's budget policy gives 75.8 and 74.8 tok/s at 0.5 against 71.2 to 72.1 for the earlier depth
+/// rule, flat from 0.4 to 0.6; the decode screen on the node (replies exact): 74.6, 75.4, 75.4 and 74.5 tok/s at 0.4, 0.45, 0.5 and 0.6.
+const DEFAULT_MTP_EXIT: f32 = 0.5;
+
 impl FlashNextBackend<FlashNextModel> {
     pub fn new(m: FlashNextModel, chunk: usize, mtp_k: usize) -> Self {
-        let adaptive = std::env::var("REXL3_MTP_ADAPT").map_or(true, |v| v != "0");
-        Self::with_runtime(m, chunk, mtp_k, adaptive)
+        // the depth rule of the earlier policy (a chain of the last round's accepted drafts plus two) is off unless asked for: with an exit
+        // threshold the chain's length follows the head's own confidence
+        let adaptive = std::env::var("REXL3_MTP_ADAPT").is_ok_and(|v| v == "1");
+        let exit = std::env::var("REXL3_MTP_EXIT").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(DEFAULT_MTP_EXIT).max(0.0);
+        Self::with_runtime(m, chunk, mtp_k, adaptive).with_exit(exit)
     }
 
     pub fn with_prefix_cache(mut self, budget: gb_sched::prefix::CacheBudget, fingerprint: String) -> Result<Self, ModelError> {
@@ -172,7 +184,13 @@ impl FlashNextBackend<FlashNextModel> {
 impl<M: FlashNextRuntime> FlashNextBackend<M> {
     pub fn with_runtime(m: M, chunk: usize, mtp_k: usize, adaptive: bool) -> Self {
         assert!(chunk > 0, "prefill chunk is nonzero");
-        Self { m, chunk, mtp_k, deadline_rows: None, adaptive, last_acc: BTreeMap::new(), error: None, fatal: None, prefix: None }
+        Self { m, chunk, mtp_k, deadline_rows: None, adaptive, exit: DEFAULT_MTP_EXIT, last_acc: BTreeMap::new(), error: None, fatal: None, prefix: None }
+    }
+
+    /// The draft chain's exit threshold (`MtpAsk::exit`); 0 turns early exit off.
+    pub fn with_exit(mut self, exit: f32) -> Self {
+        self.exit = exit;
+        self
     }
 
     /// The rows of the grid the engine-driven slices are cut on: the chunk, or the engine's row limit when it is smaller. Only the
@@ -502,7 +520,8 @@ impl<M: FlashNextRuntime> Backend for FlashNextBackend<M> {
         if self.dead() || self.mtp_k == 0 || reqs.is_empty() {
             return vec![None; reqs.len()];
         }
-        // one chain for every stream asked: each keeps its own first `k` drafts (the depth its last round earned, plus two)
+        // one chain for every stream asked: each keeps its own first `k` drafts (all the engine allows, or with `adaptive` the depth its
+        // last round earned, plus two), and the chain stops when none of them is likely enough to land (`exit`)
         let asks: Vec<MtpAsk<'_>> = reqs
             .iter()
             .map(|r| {
@@ -511,7 +530,7 @@ impl<M: FlashNextRuntime> Backend for FlashNextBackend<M> {
                 } else {
                     self.mtp_k
                 };
-                MtpAsk { slot: r.slot, tokens: r.tokens, k: k.min(r.max) }
+                MtpAsk { slot: r.slot, tokens: r.tokens, k: k.min(r.max), exit: self.exit }
             })
             .collect();
         match self.m.mtp_propose_batch(&asks) {
