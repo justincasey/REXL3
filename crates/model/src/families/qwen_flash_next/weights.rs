@@ -21,6 +21,9 @@ pub enum Transform {
     None,
     Bf16ToF32,
     Bf16AddOneToF32,
+    /// A bf16 tensor where the forward reads fp16 (some packs keep the model's bf16 for the hyper-connection,
+    /// router, GDN a/b and PLE projections that turboderp's pack stores as fp16). Round to nearest even, as `Pack::f16_from_bf16`.
+    Bf16ToF16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,8 +168,10 @@ impl WeightMap {
         let mut region_ids: BTreeMap<String, u32> = BTreeMap::new();
         for name in &claimed {
             let Some((dtype, shape)) = tensors.get(name) else { continue };
-            let (expected, kind, transform) = specification(name);
-            if dtype != expected {
+            let (expected, kind, mut transform) = specification(name);
+            if kind == Kind::Plain && expected == "F16" && dtype == "BF16" {
+                transform = Transform::Bf16ToF16;
+            } else if dtype != expected {
                 errors.push(format!("{name}: dtype {dtype}, expected {expected}"));
             }
             if kind == Kind::Marker && !shape.is_empty() {
@@ -202,7 +207,7 @@ impl WeightMap {
                     Some(bytes) => {
                         let r = &mut regions[id as usize];
                         let offset = r.bytes.div_ceil(256) * 256;
-                        let bytes = if transform == Transform::None { bytes } else { bytes * 2 };
+                        let bytes = if matches!(transform, Transform::None | Transform::Bf16ToF16) { bytes } else { bytes * 2 };
                         r.bytes = offset + bytes;
                         Some(Destination { region: id, offset, bytes })
                     }

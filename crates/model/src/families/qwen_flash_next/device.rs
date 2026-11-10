@@ -239,6 +239,15 @@ fn widen(bytes: &[u8], add_one: bool) -> Vec<u8> {
         .collect()
 }
 
+/// [`Transform::Bf16ToF16`] on raw bf16 bits, exactly as `Pack::f16_from_bf16` does it.
+fn narrow16(bytes: &[u8]) -> Vec<u8> {
+    bytes
+        .chunks_exact(2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .flat_map(|b| gb_exl3::f16::f64_to_f16(f32::from_bits((b as u32) << 16) as f64).to_le_bytes())
+        .collect()
+}
+
 /// Which bound slots this process will use. The MTP head and the n-gram stage can be switched off, and a slot that will
 /// not be claimed must not be staged either: the loader's copies are declared now and run in [`LoadCtx::finish`], after
 /// the claim, so dropping a staged buffer would leave a copy pointing at freed memory.
@@ -331,6 +340,7 @@ fn stage<'p>(ctx: &mut LoadCtx<'p>, pack: &'p Pack, dir: &Path, map: &WeightMap,
                         Transform::None => ctx.raw16(pack, &slot.name, dtype, &slot.shape)?,
                         Transform::Bf16ToF32 => ctx.f32_from_bf16(pack, &slot.name, &slot.shape, false)?,
                         Transform::Bf16AddOneToF32 => ctx.f32_from_bf16(pack, &slot.name, &slot.shape, true)?,
+                        Transform::Bf16ToF16 => ctx.f16_from_bf16(pack, &slot.name, &slot.shape)?,
                     }
                 } else {
                     // a sidecar the shard index does not list: its own extent, converted here
@@ -339,6 +349,7 @@ fn stage<'p>(ctx: &mut LoadCtx<'p>, pack: &'p Pack, dir: &Path, map: &WeightMap,
                         Transform::None => raw,
                         Transform::Bf16ToF32 => widen(&raw, false),
                         Transform::Bf16AddOneToF32 => widen(&raw, true),
+                        Transform::Bf16ToF16 => narrow16(&raw),
                     };
                     let len = bytes.len();
                     ctx.computed(len, move || Ok(bytes.clone()))?
