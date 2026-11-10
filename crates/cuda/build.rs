@@ -122,11 +122,19 @@ fn main() {
         .filter_map(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
         .max();
     let objs: Vec<PathBuf> = srcs.iter().map(|s| out.join(s.file_stem().unwrap()).with_extension("o")).collect();
+    // a .cu that includes another .cu (gdn_hv32.cu, attention_kv2.cu, ...) is stale when the included file is newer than its object
+    let included_newer = |s: &Path, om: std::time::SystemTime| -> bool {
+        let text = fs::read_to_string(s).unwrap_or_default();
+        text.lines()
+            .filter_map(|l| l.trim().strip_prefix("#include \"").and_then(|r| r.strip_suffix('"')))
+            .filter(|n| n.ends_with(".cu"))
+            .any(|n| fs::metadata(Path::new("csrc").join(n)).and_then(|m| m.modified()).map_or(true, |t| t > om))
+    };
     let mut children = Vec::new();
     for (s, obj) in srcs.iter().zip(objs.iter()) {
         let up_to_date =
             match (fs::metadata(obj).and_then(|m| m.modified()).ok(), fs::metadata(s).and_then(|m| m.modified()).ok()) {
-                (Some(om), Some(sm)) => om >= sm && hdr_mtime.is_none_or(|hm| om >= hm),
+                (Some(om), Some(sm)) => om >= sm && hdr_mtime.is_none_or(|hm| om >= hm) && !included_newer(s, om),
                 _ => false,
             };
         if up_to_date {
