@@ -2559,7 +2559,11 @@ impl FlashNextModel {
         // the decoder layer and the collapse run on the head's stack, swapped into x_streams
         std::mem::swap(&mut self.x_streams, &mut self.mtp_streams);
         let mix = mtp.mixer.as_ref().unwrap_or(&w.head_hc).mixer();
-        let r = self.run_layer(&mtp.layer, 0, None, b, mode, None).and_then(|_| self.collapse(&mix, mode, rows));
+        // (run_layer leaves the MLP block's post-inject pending: apply it to the head's stack before the collapse reads it)
+        let r = self
+            .run_layer(&mtp.layer, 0, None, b, mode, None)
+            .and_then(|_| self.flush_post(rows))
+            .and_then(|_| self.collapse(&mix, mode, rows));
         std::mem::swap(&mut self.x_streams, &mut self.mtp_streams);
         r?;
         // The draft reads only the first MTP_HEAD_N columns; the model's exact draft-head copy evaluates exactly those
