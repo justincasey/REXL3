@@ -632,8 +632,23 @@ fn lin(
     st: &Stream,
 ) -> Result<(), ModelError> {
     match mode {
-        Mode::Prefill(PrefillPath::Tiled) => wt.forward_prefill_pinned(x, y, m, Dtype::BF16, pws, st)?,
+        Mode::Prefill(PrefillPath::Tiled) => prefill_gemm(wt, x, y, m, Dtype::BF16, pws, st)?,
         Mode::Window | Mode::Prefill(PrefillPath::Gemv) => wt.forward(x, y, m, Dtype::BF16, Dtype::BF16, ws, st)?,
+    }
+    Ok(())
+}
+
+/// The Tiled prefill GEMM of one EXL3 linear: the fused tensor-core chain GEMM (`gb_cuda::glm_p2`, `Variant::Chain`: the input
+/// rotation as one light kernel, then one GEMM that decodes the trellis tiles into the MMA's B fragments and applies the output
+/// rotation, the scale and the rounding in its epilogue), which is the pinned path's bits (one chain of m16n8k16 MMAs over all of K
+/// from +0.0, see `prefill_p2.rs` and `tests/qwen_prefill_fused.rs`); a layer it does not take (not Mul1, or a K/N that is not a
+/// multiple of 128) keeps the pinned reconstruct + cublasLt path. `pws` holds the rotated input (`rows * k` fp16 is the first
+/// section of the pinned scratch, which `prefill_scratch_need` sizes).
+fn prefill_gemm(wt: &Exl3Weights, x: &DevBuf, y: &mut DevBuf, m: usize, dt: Dtype, pws: &mut DevBuf, st: &Stream) -> Result<(), ModelError> {
+    if gb_cuda::glm_p2::supported(wt) {
+        gb_cuda::glm_p2::linear_variant(wt, x, y, m, dt, dt, pws, gb_cuda::glm_p2::Variant::Chain, 0, st)?;
+    } else {
+        wt.forward_prefill_pinned(x, y, m, dt, pws, st)?;
     }
     Ok(())
 }
@@ -653,7 +668,7 @@ fn lin_f16(
     st: &Stream,
 ) -> Result<(), ModelError> {
     if matches!(mode, Mode::Prefill(PrefillPath::Tiled)) {
-        wt.forward_prefill_pinned(x, y, m, Dtype::F16, pws, st)?;
+        prefill_gemm(wt, x, y, m, Dtype::F16, pws, st)?;
         return Ok(());
     }
     // the decode GEMV is row invariant, so a stack wider than its row limit is the same function run in slices (and a
