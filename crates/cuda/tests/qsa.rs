@@ -600,8 +600,8 @@ fn row_partials(ws: &[f32], rows: usize, parts: usize, r: usize) -> (Vec<u32>, V
 
 /// The chunk-sized kernel's partial sums (part_o, part_m, part_l, before the merge) are bit-identical to the one-row kernel's, row by row,
 /// for every selection length from a handful of tokens (dense rows near the start: totals 1..71, every residue of the 8-token group and of
-/// the 32-token super group) up to a full 512 selected blocks plus the tail block, and for both the single part and the window's 32 parts
-/// (whose ranges start off the group grid).
+/// the 32-token super group) up to a full 512 selected blocks plus the tail block, and for the window's 32 parts (whose ranges start off the group grid); one part is
+/// compared through the bf16 output.
 #[test]
 #[ignore]
 fn qsa_attend_many_rows_partials_equal_one_row_calls_bit_for_bit() {
@@ -619,7 +619,13 @@ fn qsa_attend_many_rows_partials_equal_one_row_calls_bit_for_bit() {
         let (_, sel, sel_n, _) = rig.select(&rows, &q, &st);
         let qm = main_queries(rows.len(), 321);
         let width = N_Q_HEADS * HEAD_DIM;
-        for parts in [1, qsa::WINDOW_PARTS] {
+        // one part: a chunk's attention kernel merges itself and stores no partial sums, so its bf16 output is the comparison
+        let many1 = rig.attend(&rows, &qm, &sel, &sel_n, 1, &st);
+        for r in 0..rows.len() {
+            let one = rig.attend(&rows[r..r + 1], &qm[r * width..(r + 1) * width], &sel[r * TOPK..(r + 1) * TOPK], &sel_n[r..r + 1], 1, &st);
+            assert!(many1[r * width..(r + 1) * width] == one[..], "row {r} {:?} one part: output", rows[r]);
+        }
+        for parts in [qsa::WINDOW_PARTS] {
             let (_, many) = rig.attend_ws(&rows, &qm, &sel, &sel_n, parts, &st);
             for r in 0..rows.len() {
                 let (_, one) =
@@ -634,7 +640,7 @@ fn qsa_attend_many_rows_partials_equal_one_row_calls_bit_for_bit() {
 }
 
 /// A prefill chunk's attention at the real shape: 4,096 rows of positions 4,200.. of one sequence, 512 selected blocks each. Prints the
-/// time of the attend + merge calls and the FNV hashes of the partial sums and of the output.
+/// time of the attend + merge calls and the FNV hash of the output.
 ///     cargo test --release -p gb-cuda --test qsa -- --ignored --nocapture bench_qsa_attend_chunk
 #[test]
 #[ignore]
@@ -666,12 +672,12 @@ fn bench_qsa_attend_chunk() {
             best = best.min(ms);
         }
     }
-    let (w, o): (Vec<f32>, Vec<u16>) = (ws.to_vec().unwrap(), out.to_vec().unwrap());
-    let (hw, ho) = (fnv(bytes_of(&w)), fnv(bytes_of(&o)));
-    eprintln!("BENCH best {best:.3} ms  partials {hw:016x}  out {ho:016x}");
-    // hashes of the partial sums and the output of the four-heads-a-warp kernel before its reduction was regrouped (the one-head-a-warp
-    // kernel's, which it equals bit for bit): any change of the kernel's arithmetic changes them
-    assert_eq!((hw, ho), (0xec1c23cff5f9aedf, 0x05f69ee410812893), "attend partial sums or output changed");
+    let o: Vec<u16> = out.to_vec().unwrap();
+    let ho = fnv(bytes_of(&o));
+    eprintln!("BENCH best {best:.3} ms  out {ho:016x}");
+    // hash of the output of the four-heads-a-warp kernel and merge before the reduction was regrouped (the one-head-a-warp kernel's,
+    // which it equals bit for bit): any change of the attention arithmetic changes it
+    assert_eq!(ho, 0x05f69ee410812893, "attend output changed");
 }
 
 /// The selection kernel keeps exactly the top 512 scores of a row (ties to the lower index), ascending, whatever the scores' distribution:
