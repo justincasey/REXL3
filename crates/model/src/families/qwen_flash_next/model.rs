@@ -520,6 +520,9 @@ pub struct FlashNextModel {
     mixed_rows: usize,
     /// The last window, and per slot the rows of it a `commit` keeps until the next forward replays them.
     last_window: Option<RowBatch>,
+    /// The hyper-connection post-inject of the block just run, not yet applied to `x_streams`: the next pre-mix applies it
+    /// (fused into its norm pass when it can), anything else that reads the streams first calls [`Model::flush_post`].
+    pending_post: Option<PostKind>,
     pending: BTreeMap<usize, usize>,
     /// Replayable windows and draft chains, and the context the grid of the one being run covers.
     graphs: HashMap<WindowKey, Graph>,
@@ -575,6 +578,14 @@ fn grouped_moe_switch() -> bool {
 /// contract; decode and GEMV prefill always keep the fp32 `hcx::pre` reference).
 fn hcg_applies(h: usize, hc: usize, rank: usize) -> bool {
     h % 4 == 0 && hc >= 1 && rank >= 1
+}
+
+/// Which block's post-inject [`Model::pending_post`] holds: the attention block's (`block_out`, `inj_attn`) or the MLP block's
+/// (`moe_out`, `inj_mlp`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PostKind {
+    Attn,
+    Mlp,
 }
 
 /// hcg engages only for tiled prefill: decode (`Mode::Window`) and GEMV prefill keep the fp32 `hcx::pre` path. This is
@@ -1151,6 +1162,7 @@ impl FlashNextModel {
             stack_slot: 0,
             mixed_rows: 0,
             last_window: None,
+            pending_post: None,
             pending: BTreeMap::new(),
             graphs: HashMap::new(),
             mtp_graphs: HashMap::new(),
@@ -1902,12 +1914,55 @@ impl FlashNextModel {
     /// low-rank products run as tensor-core GEMMs on fp16 operands; everything else keeps the fp32 `hcx::pre`.
     fn pre_mix(&mut self, mix: &Mixer<'_>, attn: bool, mode: Mode, rows: usize) -> Result<(), ModelError> {
         let (h, hc, rank) = (self.cfg.hidden, self.cfg.hc_streams, self.cfg.hc_lowrank);
+        // the previous block's post-inject: fused into the pre-mix's norm pass where hcg takes it, a launch of its own otherwise
+        let post = self.pending_post.take();
+        let hcg_on = self.fast && hcg_for_mode(self.hcg && self.hcg_scratch.is_some(), mode);
+        // (the block after an attention block is the MLP's pre-mix and the other way round: the post's `inj` is never the one being written)
+        let fused = post.filter(|p| hcg_on && hcx::post_fusable(h, hc) && (*p == PostKind::Attn) != attn);
+        if let (Some(p), None) = (post, fused) {
+            self.run_post(p, rows)?;
+        }
         if self.fast {
-            let inj = if attn { &mut self.inj_attn } else { &mut self.inj_mlp };
-            if hcg_for_mode(self.hcg && self.hcg_scratch.is_some(), mode) {
+            if hcg_on {
                 let s = self.hcg_scratch.as_mut().expect("hcg on: scratch allocated");
-                hcx::pre_gemm(&self.x_streams, mix, &mut self.x_mixed, Some(inj), s, h, hc, rank, EPS, rows, &self.stream)?;
+                match fused {
+                    Some(PostKind::Attn) => hcx::pre_gemm_post(
+                        &mut self.x_streams,
+                        &self.block_out,
+                        &self.inj_attn,
+                        mix,
+                        &mut self.x_mixed,
+                        Some(&mut self.inj_mlp),
+                        s,
+                        h,
+                        hc,
+                        rank,
+                        EPS,
+                        rows,
+                        &self.stream,
+                    )?,
+                    Some(PostKind::Mlp) => hcx::pre_gemm_post(
+                        &mut self.x_streams,
+                        &self.moe_out,
+                        &self.inj_mlp,
+                        mix,
+                        &mut self.x_mixed,
+                        Some(&mut self.inj_attn),
+                        s,
+                        h,
+                        hc,
+                        rank,
+                        EPS,
+                        rows,
+                        &self.stream,
+                    )?,
+                    None => {
+                        let inj = if attn { &mut self.inj_attn } else { &mut self.inj_mlp };
+                        hcx::pre_gemm(&self.x_streams, mix, &mut self.x_mixed, Some(inj), s, h, hc, rank, EPS, rows, &self.stream)?;
+                    }
+                }
             } else {
+                let inj = if attn { &mut self.inj_attn } else { &mut self.inj_mlp };
                 let s = &mut self.hcx_scratch;
                 hcx::pre(&self.x_streams, mix, &mut self.x_mixed, Some(inj), s, h, hc, rank, EPS, rows, &self.stream)?;
             }
@@ -1915,6 +1970,25 @@ impl FlashNextModel {
             let scratch = PreScratch { normed: &mut self.x_normed, low: &mut self.low_buf };
             let inj = if attn { &mut self.inj_attn } else { &mut self.inj_mlp };
             fn_mhc::hc_pre(&self.x_streams, mix, scratch, &mut self.x_mixed, inj, h, hc, rank, EPS, rows, &self.stream)?;
+        }
+        Ok(())
+    }
+
+    /// The hyper-connection post-inject of a block, applied to `x_streams` in place.
+    fn run_post(&mut self, kind: PostKind, rows: usize) -> Result<(), ModelError> {
+        let (h, hc) = (self.cfg.hidden, self.cfg.hc_streams);
+        let (block, inj) = match kind {
+            PostKind::Attn => (&self.block_out, &self.inj_attn),
+            PostKind::Mlp => (&self.moe_out, &self.inj_mlp),
+        };
+        fn_mhc::hc_post(block, None, inj, &mut self.x_streams, h, hc, rows, &self.stream)?;
+        Ok(())
+    }
+
+    /// Apply a post-inject the next pre-mix has not taken yet (anything that reads or swaps `x_streams` calls this first).
+    fn flush_post(&mut self, rows: usize) -> Result<(), ModelError> {
+        if let Some(p) = self.pending_post.take() {
+            self.run_post(p, rows)?;
         }
         Ok(())
     }
@@ -2192,8 +2266,9 @@ impl FlashNextModel {
             }
         }
 
-        // 3. attention hyper-connection post-inject (the streams are updated in place)
-        fn_mhc::hc_post(&self.block_out, None, &self.inj_attn, &mut self.x_streams, h, hc, rows, &self.stream)?;
+        // 3. attention hyper-connection post-inject (the streams are updated in place): taken by the pre-mix below, which fuses it
+        // into its norm pass when it can
+        self.pending_post = Some(PostKind::Attn);
 
         // 4. MLP hyper-connection pre-mix
         self.pre_mix(&layer.mlp_hc.mixer(), false, mode, rows)?;
@@ -2278,8 +2353,9 @@ impl FlashNextModel {
             )?;
         }
 
-        // 7. MLP hyper-connection post-inject
-        fn_mhc::hc_post(&self.moe_out, None, &self.inj_mlp, &mut self.x_streams, h, hc, rows, &self.stream)?;
+        // 7. MLP hyper-connection post-inject: taken by the next layer's pre-mix (compute_layers flushes it before anything else
+        // reads the streams)
+        self.pending_post = Some(PostKind::Mlp);
         Ok(())
     }
 
@@ -2295,13 +2371,21 @@ impl FlashNextModel {
         let w = Arc::clone(&self.w);
         g_embed(&w.embed, &self.ids, &self.block_out, rows, h, self.cfg.vocab, &self.stream)?;
         fn_mhc::hc_expand(&self.block_out, &mut self.x_streams, h, hc, rows, &self.stream)?;
-        self.run_layers(b, mode, 0, upto)
+        self.pending_post = None;
+        self.run_layers(b, mode, 0, upto)?;
+        // the split's two graphs are captured and replayed independently: the head applies its own last post-inject (the tail
+        // would otherwise find, or miss, it depending on which graph happened to be captured in this call)
+        if upto > 0 {
+            self.flush_post(b.rows)?;
+        }
+        Ok(())
     }
 
     /// The layers from layer `from` (the PLE stage rides in front of its own layer) and the collapse of the streams.
     fn layers_tail(&mut self, b: &RowBatch, mode: Mode, from: usize) -> Result<(), ModelError> {
         let w = Arc::clone(&self.w);
         self.run_layers(b, mode, from, w.layers.len())?;
+        self.flush_post(b.rows)?;
         self.collapse(&w.head_hc.mixer(), mode, b.rows)
     }
 
@@ -2313,6 +2397,7 @@ impl FlashNextModel {
         let mut fi = from - li;
         for (i, layer) in w.layers.iter().enumerate().take(to).skip(from) {
             if let Some(p) = w.ple.as_ref().filter(|p| p.before_layer == i) {
+                self.flush_post(b.rows)?;
                 self.run_ple(p, b, mode)?;
             }
             let moe_layer = self.moe_pf.as_ref().map(|_| i);

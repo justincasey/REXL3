@@ -66,6 +66,75 @@ __global__ void __launch_bounds__(256) norm_kernel(const float* __restrict__ x, 
     }
 }
 
+// norm_kernel after hc_post, in one pass over the streams: x[t][s][d] = x[t][s][d] + bf16(block_out[t][d]) * inj_prev[t][s] (hc_post's
+// expression, a fused multiply-add, written back in place) and then norm_kernel's rms and fp16 hi+lo split of the NEW values, held in
+// registers instead of being read back. Same thread-to-element map, same sums, same rounding as the two kernels it replaces, so the
+// streams, rms, hi and lo are theirs bit for bit. H <= NCH * 1024 (one row a block of 256 threads, four floats a thread a step).
+template <int HC, int NCH>
+__global__ void __launch_bounds__(256) post_norm_kernel(float* __restrict__ x, const __nv_bfloat16* __restrict__ block_out,
+                                                        const float* __restrict__ inj_prev, const half* __restrict__ nw,
+                                                        half* __restrict__ normed_hi, half* __restrict__ normed_lo,
+                                                        float* __restrict__ rms, int H, float eps) {
+    __shared__ float red[8];
+    const int t = blockIdx.x;
+    float wv[HC];
+#pragma unroll
+    for (int s = 0; s < HC; ++s) wv[s] = inj_prev[(size_t)t * HC + s];
+    float4 xn[HC][NCH];
+#pragma unroll
+    for (int c = 0; c < NCH; ++c) {
+        const int d = threadIdx.x * 4 + c * 1024;
+        if (d >= H) continue;
+        const uint2 u = *reinterpret_cast<const uint2*>(block_out + (size_t)t * H + d);
+        const float2 b01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.x));
+        const float2 b23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.y));
+#pragma unroll
+        for (int s = 0; s < HC; ++s) {
+            float4* xp = reinterpret_cast<float4*>(x + ((size_t)t * HC + s) * H + d);
+            const float4 rv = *xp;
+            float4 n;
+            n.x = fmaf(b01.x, wv[s], rv.x);
+            n.y = fmaf(b01.y, wv[s], rv.y);
+            n.z = fmaf(b23.x, wv[s], rv.z);
+            n.w = fmaf(b23.y, wv[s], rv.w);
+            *xp = n;
+            xn[s][c] = n;
+        }
+    }
+#pragma unroll
+    for (int s = 0; s < HC; ++s) {
+        float a = 0.f;
+#pragma unroll
+        for (int c = 0; c < NCH; ++c) {
+            const int d = threadIdx.x * 4 + c * 1024;
+            if (d >= H) continue;
+            const float4 v = xn[s][c];
+            a += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        }
+        const float r = rsqrtf(block_sum(a, red) / (float)H + eps);
+        if (threadIdx.x == 0) rms[t * HC + s] = r;
+        half* hi = normed_hi + ((size_t)t * HC + s) * H;
+        half* lo = normed_lo + ((size_t)t * HC + s) * H;
+        const half* w = nw + (size_t)s * H;
+#pragma unroll
+        for (int c = 0; c < NCH; ++c) {
+            const int d = threadIdx.x * 4 + c * 1024;
+            if (d >= H) continue;
+            const float4 v = xn[s][c];
+            const float2 w01 = __half22float2(*reinterpret_cast<const half2*>(w + d));
+            const float2 w23 = __half22float2(*reinterpret_cast<const half2*>(w + d + 2));
+            const float n0 = v.x * r * (1.f + w01.x), n1 = v.y * r * (1.f + w01.y);
+            const float n2 = v.z * r * (1.f + w23.x), n3 = v.w * r * (1.f + w23.y);
+            const float h0 = __half2float(__float2half_rn(n0)), h1 = __half2float(__float2half_rn(n1));
+            const float h2 = __half2float(__float2half_rn(n2)), h3 = __half2float(__float2half_rn(n3));
+            *reinterpret_cast<half2*>(hi + d) = __floats2half2_rn(h0, h1);
+            *reinterpret_cast<half2*>(hi + d + 2) = __floats2half2_rn(h2, h3);
+            *reinterpret_cast<half2*>(lo + d) = __floats2half2_rn(n0 - h0, n1 - h1);
+            *reinterpret_cast<half2*>(lo + d + 2) = __floats2half2_rn(n2 - h2, n3 - h3);
+        }
+    }
+}
+
 // low (fp16 hi+lo split) = silu(L / hc); inj = 2 sigmoid(Ij / hc). `rank` is both the L/low row stride and the width
 // of the low columns (the inject columns are the separate Ij block, not trailing low columns).
 __global__ void low_kernel(const float* __restrict__ L, const float* __restrict__ Ij, half* __restrict__ low_hi,
@@ -377,9 +446,11 @@ GB_EXPORT size_t gb_hcg_scratch_bytes(int rows, int H, int hc, int rank) {
 // stride `rank` (down [rank][hc*H], up [hc*H][rank], inject [hc][hc*H]); no read extends past a weight buffer.
 static int hcg_pre(const void* streams, const void* norm_w, const void* down_w, const void* up_w,
                    const void* inject_w, void* y_out, float* inj_out, void* scratch, int H, int hc, int rank,
-                   float eps, int T, void* stream, bool fast) {
+                   float eps, int T, void* stream, bool fast, const void* post_block = nullptr, const float* post_inj = nullptr) {
     if (T < 1 || H % 4 || hc < 1 || rank < 1 || !scratch || (inject_w != nullptr) != (inj_out != nullptr))
         return (int)cudaErrorInvalidValue;
+    // the fused hc_post: in-place on `streams`, hc = 4, H up to 3 x 1024
+    if ((post_block != nullptr) != (post_inj != nullptr) || (post_block && (hc != 4 || H > 3 * 1024))) return (int)cudaErrorInvalidValue;
     cublasHandle_t h = handle();
     if (!h) return (int)cudaErrorUnknown;
     cudaStream_t st = gb_stream(stream);
@@ -412,7 +483,11 @@ static int hcg_pre(const void* streams, const void* norm_w, const void* down_w, 
         if (cudaMemsetAsync(normed_lo + (size_t)T * K, 0, (size_t)(padded - T) * K * sizeof(half), st) != cudaSuccess)
             return (int)cudaErrorUnknown;
     }
-    norm_kernel<<<T, 256, 0, st>>>((const float*)streams, (const half*)norm_w, normed_hi, normed_lo, rms, H, hc, eps);
+    if (post_block)
+        post_norm_kernel<4, 3><<<T, 256, 0, st>>>((float*)streams, (const __nv_bfloat16*)post_block, post_inj, (const half*)norm_w, normed_hi,
+                                                  normed_lo, rms, H, eps);
+    else
+        norm_kernel<<<T, 256, 0, st>>>((const float*)streams, (const half*)norm_w, normed_hi, normed_lo, rms, H, hc, eps);
     int rc = GB_CHECK_LAUNCH();
     if (rc) return rc;
     // down: one split-K call per half over every row when the large-call algorithm takes it, else the 64-row slab loop
@@ -489,6 +564,15 @@ GB_EXPORT int gb_hcg_pre(const void* streams, const void* norm_w, const void* do
                          const void* inject_w, void* y_out, float* inj_out, void* scratch, int H, int hc, int rank,
                          float eps, int T, void* stream) {
     return hcg_pre(streams, norm_w, down_w, up_w, inject_w, y_out, inj_out, scratch, H, hc, rank, eps, T, stream, true);
+}
+
+// gb_hcg_pre after the hc_post of the previous block: `streams` first becomes streams + bf16(post_block) * post_inj (per stream, the
+// in-place hc_post), then the pre-mix of the new streams. hc = 4, H <= 3,072.
+GB_EXPORT int gb_hcg_pre_post(void* streams, const void* post_block, const float* post_inj, const void* norm_w, const void* down_w,
+                              const void* up_w, const void* inject_w, void* y_out, float* inj_out, void* scratch, int H, int hc,
+                              int rank, float eps, int T, void* stream) {
+    if (!post_block || !post_inj) return (int)cudaErrorInvalidValue;
+    return hcg_pre(streams, norm_w, down_w, up_w, inject_w, y_out, inj_out, scratch, H, hc, rank, eps, T, stream, true, post_block, post_inj);
 }
 
 // the 64-row slab loop on every shape: the reference gb_hcg_pre is compared against bit for bit

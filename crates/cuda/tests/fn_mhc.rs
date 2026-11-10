@@ -408,6 +408,50 @@ fn hcg_large_calls_equal_the_slab_loop_bit_for_bit_at_qfn_dims() {
     }
 }
 
+/// `pre_gemm_post` (hc_post fused into the pre-mix's norm pass) is `hc_post` then `pre_gemm` bit for bit: the mixed rows, the inject rows
+/// and the updated streams, at the Flash-Next shape and ragged row counts.
+#[test]
+#[ignore]
+fn hcg_fused_post_equals_hc_post_then_pre_gemm_at_qfn_dims() {
+    let Some(st) = gpu() else { return };
+    let r = rig_with(4096, QH, QHC, QR);
+    let mut rng = Rng(0x7a11);
+    for t in [1usize, 63, 64, 100, 1000, 4096] {
+        let (h, hc, rank) = (QH, QHC, QR);
+        let input = DevBuf::from_slice(&r.input[..t * h]).unwrap();
+        let (norm, down, up, inject) = (
+            DevBuf::from_slice(&r.norm).unwrap(),
+            DevBuf::from_slice(&r.down).unwrap(),
+            DevBuf::from_slice(&r.up).unwrap(),
+            DevBuf::from_slice(&r.inject).unwrap(),
+        );
+        let mix = fn_mhc::Mixer { norm: &norm, down: &down, up: &up, inject: Some(&inject) };
+        let block: Vec<u16> = (0..t * h).map(|_| bf(rng.uniform(-2., 2.))).collect();
+        let injp: Vec<f32> = (0..t * hc).map(|_| rng.uniform(-1.5, 1.5)).collect();
+        let (block, injp) = (DevBuf::from_slice(&block).unwrap(), DevBuf::from_slice(&injp).unwrap());
+        let run = |fused: bool| {
+            let mut x = DevBuf::zeroed(t * hc * h * 4).unwrap();
+            fn_mhc::hc_expand(&input, &mut x, h, hc, t, &st).unwrap();
+            let (mut y, mut inj, mut s) = (
+                DevBuf::zeroed(t * h * 2).unwrap(),
+                DevBuf::zeroed(t * hc * 4).unwrap(),
+                DevBuf::zeroed(hcx::gemm_scratch_bytes(t, h, hc, rank)).unwrap(),
+            );
+            if fused {
+                hcx::pre_gemm_post(&mut x, &block, &injp, &mix, &mut y, Some(&mut inj), &mut s, h, hc, rank, 1e-6, t, &st).unwrap();
+            } else {
+                fn_mhc::hc_post(&block, None, &injp, &mut x, h, hc, t, &st).unwrap();
+                hcx::pre_gemm(&x, &mix, &mut y, Some(&mut inj), &mut s, h, hc, rank, 1e-6, t, &st).unwrap();
+            }
+            (dl::<u16>(&y, &st), dl::<f32>(&inj, &st), dl::<f32>(&x, &st))
+        };
+        let (a, b) = (run(false), run(true));
+        assert_eq!(a.0, b.0, "mixed rows, {t} rows");
+        assert_eq!(a.1, b.1, "inject rows, {t} rows");
+        assert_eq!(a.2, b.2, "streams, {t} rows");
+    }
+}
+
 /// Prevents any read that leaks past a tensor from staying silent: every weight is placed in a fresh arena with NaN
 /// poison immediately after it, and the run must reproduce the independently-allocated run bit for bit. Fresh-buffer
 /// reproducibility is covered too: the arena is allocated fresh per run.

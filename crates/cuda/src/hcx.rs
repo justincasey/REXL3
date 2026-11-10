@@ -44,6 +44,11 @@ mod ffi {
             hidden_size: u32, hc_mult: u32, rank: u32, eps: f32, num_tokens: u32, stream: *mut c_void,
         ) -> i32;
         pub fn gb_hcg_scratch_bytes(rows: i32, h: i32, hc: i32, rank: i32) -> usize;
+        pub fn gb_hcg_pre_post(
+            streams: *mut c_void, post_block: *const c_void, post_inj: *const f32, norm_w: *const c_void, down_w: *const c_void,
+            up_w: *const c_void, inject_w: *const c_void, y_out: *mut c_void, inj_out: *mut f32, scratch: *mut c_void,
+            h: i32, hc: i32, rank: i32, eps: f32, t: i32, stream: *mut c_void,
+        ) -> i32;
         pub fn gb_hcg_pre_ref(
             streams: *const c_void, norm_w: *const c_void, down_w: *const c_void, up_w: *const c_void,
             inject_w: *const c_void, y_out: *mut c_void, inj_out: *mut f32, scratch: *mut c_void,
@@ -235,6 +240,71 @@ pub fn pre_gemm(
     st: &Stream,
 ) -> Result<(), CudaError> {
     pre_gemm_with(false, streams, mix, y_out, inj_out, scratch, h, hc, rank, eps, rows, st)
+}
+
+/// Whether [`pre_gemm_post`] takes this shape (four streams, hidden size up to 3,072).
+pub fn post_fusable(h: usize, hc: usize) -> bool {
+    hc == 4 && h % 4 == 0 && h <= 3 * 1024
+}
+
+/// [`pre_gemm`] after the hc_post of the previous block, in one pass over the streams: `streams` first becomes
+/// `streams + bf16(block_out) * inj_prev` per stream (what `fn_mhc::hc_post(block_out, None, inj_prev, streams, ..)` writes, bit for
+/// bit), then the pre-mix reads the new values. Needs [`post_fusable`].
+pub fn pre_gemm_post(
+    streams: &mut DevBuf,
+    block_out: &DevBuf,
+    inj_prev: &DevBuf,
+    mix: &Mixer<'_>,
+    y_out: &mut DevBuf,
+    inj_out: Option<&mut DevBuf>,
+    scratch: &mut DevBuf,
+    h: usize,
+    hc: usize,
+    rank: usize,
+    eps: f32,
+    rows: usize,
+    st: &Stream,
+) -> Result<(), CudaError> {
+    if mix.inject.is_some() != inj_out.is_some() || !post_fusable(h, hc) {
+        eprintln!("rexl3 level=error launch contract: hcg pre_gemm_post needs inject rows matching inj_out and four streams of at most 3,072");
+        return Err(CudaError(1));
+    }
+    mix.check(h, hc, rank, "hcg")?;
+    need(streams, rows * hc * h * 4, "hcg streams")?;
+    need(block_out, rows * h * 2, "hcg post block_out")?;
+    need(inj_prev, rows * hc * 4, "hcg post inj")?;
+    need(y_out, rows * h * 2, "hcg y")?;
+    let yp = y_out.ptr();
+    let ip = match inj_out {
+        Some(b) => {
+            need(b, rows * hc * 4, "hcg inj")?;
+            b.ptr() as *mut f32
+        }
+        None => core::ptr::null_mut(),
+    };
+    need(scratch, gemm_scratch_bytes(rows, h, hc, rank), "hcg scratch")?;
+    let sp = scratch.ptr();
+    let inj_w = mix.inject.map_or(core::ptr::null(), |b| b.ptr());
+    CudaError::check(unsafe {
+        ffi::gb_hcg_pre_post(
+            streams.ptr(),
+            block_out.ptr(),
+            inj_prev.ptr() as *const f32,
+            mix.norm.ptr(),
+            mix.down.ptr(),
+            mix.up.ptr(),
+            inj_w,
+            yp,
+            ip,
+            sp,
+            h as i32,
+            hc as i32,
+            rank as i32,
+            eps,
+            rows as i32,
+            st.raw(),
+        )
+    })
 }
 
 /// [`pre_gemm`] on the 64-row slab loop for every shape (the arithmetic [`pre_gemm`] must reproduce bit for bit; the tests compare).
