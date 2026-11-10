@@ -1,0 +1,3 @@
+## New features and improvements
+
+- The EXL3 decode linear (1-16 rows) reads its trellis through a per-warp shared-memory ring of bulk copies instead of registers, which frees registers (118-128, no spills) and lets two 8-warp blocks stay resident per SM. Every output byte is identical (7,345 hashed shape/dtype combinations and the 2,740 golden decode hashes unchanged). At 7 rows the 6-bit kv projection takes 12.7 us instead of 16.4 us, the 7-bit output projection 65.9 us instead of 74.7 us; a few shapes are 1-2.5% slower (8-bit qkv 115.6 -> 116.9 us, 4-bit 2560x2560 20.4 -> 20.9 us) (one GB10, microbenchmark).

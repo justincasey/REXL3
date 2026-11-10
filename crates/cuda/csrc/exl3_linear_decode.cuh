@@ -89,7 +89,7 @@ __device__ __forceinline__ uint32_t decode2(uint32_t s0, uint32_t s1) {
         const uint32_t x0 = s0 * 0x83DCD12Du, x1 = s1 * 0x83DCD12Du;
         const uint32_t h0 = __dp4a(x0, 0x01010101u, 0x6400u);    // fp16 bits of 1024 + the byte sum
         const uint32_t h1 = __dp4a(x1, 0x01010101u, 0x6400u);
-        const uint32_t hh = (h0 & 0xffffu) | (h1 << 16);
+        const uint32_t hh = __byte_perm(h0, h1, 0x5410);          // (h0 & 0xffff) | (h1 << 16), in one PRMT
         const half2 r = __hfma2(*reinterpret_cast<const half2*>(&hh), __half2half2(__ushort_as_half(0x1eee)),
                                 __half2half2(__ushort_as_half(0xc931)));
         return *reinterpret_cast<const uint32_t*>(&r);
