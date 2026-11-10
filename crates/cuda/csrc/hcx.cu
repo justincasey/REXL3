@@ -9,8 +9,10 @@
 // K1 computes P (one warp a (row, stream), weights read once for all rows of the window) and the sums of squares;
 // K2 turns them into low / inj in every block and applies up. fp32 throughout, weights fp16 as stored.
 //
-// Decode fast path (k1b/k2c): the same arithmetic, bit for bit, with launch shapes tuned for the 1..8-row window:
-// - k1b uses 8-warp blocks (the same per-job math and reduction order);
+// Decode fast path (k1u/k2t, k2c for other shapes): the same arithmetic, bit for bit, tuned for the 1..8-row window:
+// - k1u: a warp owns nine rows of one stream, so the window's x rows are loaded once a chunk for nine weight rows (the
+//   reference k1 re-read them per row: at 7 rows it was bound by the x loads, not by DRAM), and the 32-wide warp
+//   reductions run as one reduce-scatter (scatter_sum32, same xor tree as warp_sum);
 // - k2c gives each block 16 warps (512 threads) covering 16 columns, so the k2 grid halves (320 -> 160 blocks) with
 //   the reference's per-column body untouched;
 // - k2t (hc = 4, rank <= 512, the Flash-Next shape) replaces k2c: one warp owns four columns, the low chunks are read from
@@ -235,52 +237,81 @@ __global__ void __launch_bounds__(256) k2_kernel(const float* __restrict__ x, co
     }
 }
 
-// k1b: the reference k1's jobs and reduction order, launched with 8 warps a block (the decode window's 1..8 rows
-// and the real shapes make the grid small; fewer blocks cut the launch and drain tail). Per-job math is unchanged:
-// the same per-thread add sequence and the same warp-shuffle reduction tree produce bit-identical P and ss.
-__global__ void __launch_bounds__(256) k1b_kernel(const float* __restrict__ x, const half* __restrict__ nw,
-                                                  const half* __restrict__ down, const half* __restrict__ inj,
-                                                  float* __restrict__ P, float* __restrict__ ss, int t0, int nt,
-                                                  int H, int hc, int rank, int ninj) {
-    const int lane = threadIdx.x & 31;
-    const int job = blockIdx.x * 8 + (threadIdx.x >> 5);
+// k1u: the decode fast k1. A warp owns K1U_NJ consecutive rows r of one stream s (r = down rows, then the inject rows) and
+// walks the 256-column chunks once: the x rows of the window are loaded into registers once a chunk and feed all the warp's
+// rows, and the warp's weight chunks are all in flight together. Every (row r, window row t) pair keeps the reference's
+// per-lane add sequence (lane l owns columns 8l + 256i) and its warp-sum tree: the 32-wide reduction runs as
+// scatter_sum32 over the NJ x NT partial sums, so P and ss are bit-identical to k1_kernel's. The ss jobs (sum of squares of
+// x[t][s]) follow the P jobs as one warp each.
+template <int NJ, int NT>
+__global__ void __launch_bounds__(32) k1u_kernel(const float* __restrict__ x, const half* __restrict__ nw,
+                                                 const half* __restrict__ down, const half* __restrict__ inj,
+                                                 float* __restrict__ P, float* __restrict__ ss, int t0, int H, int hc,
+                                                 int rank, int ninj) {
+    const int lane = threadIdx.x;
     const int R = rank + ninj;
+    const int gps = (R + NJ - 1) / NJ;  // row groups a stream
     const size_t HC = (size_t)hc * H;
-    if (job < R * hc) {
-        const int s = job / R, r = job % R;
-        const half* w = (r < rank ? down + (size_t)r * HC : inj + (size_t)(r - rank) * HC) + (size_t)s * H;
+    if ((int)blockIdx.x < gps * hc) {
+        const int s = blockIdx.x / gps, r0 = (blockIdx.x % gps) * NJ;
+        const int nj = min(NJ, R - r0);  // the last group of a stream may be short: its spare rows re-read the last row
+        const half* w[NJ];                // (no per-row predicates: they split the FMA chains into separate blocks)
+#pragma unroll
+        for (int j = 0; j < NJ; ++j) {
+            const int r = min(r0 + j, R - 1);
+            w[j] = (r < rank ? down + (size_t)r * HC : inj + (size_t)(r - rank) * HC) + (size_t)s * H;
+        }
         const half* n = nw + (size_t)s * H;
-        float acc[TMAX];
+        const float* xs = x + (size_t)t0 * HC + (size_t)s * H;
+        float acc[NJ][NT];
 #pragma unroll
-        for (int t = 0; t < TMAX; ++t) acc[t] = 0.f;
+        for (int j = 0; j < NJ; ++j)
+#pragma unroll
+            for (int t = 0; t < NT; ++t) acc[j][t] = 0.f;
+#pragma unroll 1
         for (int d = 8 * lane; d < H; d += 256) {
-            float wv[8], nv[8];
-            h8(w + d, wv);
+            uint4 wq[NJ];
+#pragma unroll
+            for (int j = 0; j < NJ; ++j) wq[j] = __ldg(reinterpret_cast<const uint4*>(w[j] + d));
+            float nv[8];
             h8(n + d, nv);
+            float4 xa[NT], xb[NT];
 #pragma unroll
-            for (int i = 0; i < 8; ++i) wv[i] *= 1.f + nv[i];
+            for (int t = 0; t < NT; ++t) {
+                const float* xr = xs + (size_t)t * HC + d;
+                xa[t] = __ldg(reinterpret_cast<const float4*>(xr));
+                xb[t] = __ldg(reinterpret_cast<const float4*>(xr + 4));
+            }
+            float onep[8];
 #pragma unroll
-            for (int t = 0; t < TMAX; ++t) {
-                if (t < nt) {
-                    const float* xr = x + (size_t)(t0 + t) * HC + (size_t)s * H + d;
-                    const float4 a = __ldg(reinterpret_cast<const float4*>(xr));
-                    const float4 b = __ldg(reinterpret_cast<const float4*>(xr + 4));
-                    acc[t] += wv[0] * a.x + wv[1] * a.y + wv[2] * a.z + wv[3] * a.w + wv[4] * b.x + wv[5] * b.y +
-                              wv[6] * b.z + wv[7] * b.w;
-                }
+            for (int i = 0; i < 8; ++i) onep[i] = 1.f + nv[i];
+#pragma unroll
+            for (int j = 0; j < NJ; ++j) {
+                float wv[8];
+                dec_half8(wq[j], wv);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) wv[i] *= onep[i];
+#pragma unroll
+                for (int t = 0; t < NT; ++t) acc[j][t] = dot8_acc(acc[j][t], wv, xa[t], xb[t]);
             }
         }
+        constexpr int NEL = NJ * NT;
 #pragma unroll
-        for (int t = 0; t < TMAX; ++t) {
-            if (t < nt) {
-                const float v = warp_sum(acc[t]);
-                if (lane == 0) P[((size_t)t * R + r) * hc + s] = v;
+        for (int c = 0; c < (NEL + 31) / 32; ++c) {
+            float v[32];
+#pragma unroll
+            for (int k = 0; k < 32; ++k) {
+                const int e = c * 32 + k;
+                v[k] = e < NEL ? acc[(e / NT) % NJ][e % NT] : 0.f;
             }
+            const float z = scatter_sum32(v, lane);
+            const int e = c * 32 + lane;
+            if (e < NEL && e / NT < nj) P[((size_t)(e % NT) * R + r0 + e / NT) * hc + s] = z;
         }
         return;
     }
-    const int q = job - R * hc;
-    if (q >= nt * hc) return;
+    const int q = (int)blockIdx.x - gps * hc;
+    if (q >= NT * hc) return;
     const int t = q / hc, s = q % hc;
     const float* xr = x + (size_t)(t0 + t) * HC + (size_t)s * H;
     float a = 0.f;
@@ -536,8 +567,27 @@ static void launch_k2t(int nt, const float* x, const half* nw, const half* up, c
     }
 }
 
+// k1u launch for 1..8 rows: NJ rows of a stream a warp. 9 keeps the registers inside what a thread has up to 7 rows (the
+// 324 = 320 + 4 rows of the real mixers split into 36 groups a stream); 8 rows use 6.
+static void launch_k1u(int nt, const float* x, const half* nw, const half* down, const half* inj, float* P, float* ss,
+                       int t0, int H, int hc, int rank, int ninj, cudaStream_t st) {
+    const int R = rank + ninj;
+    switch (nt) {
+#define K1U_CASE(NJ, N)                                                                                                \
+    case N: {                                                                                                          \
+        const int warps = ((R + NJ - 1) / NJ) * hc + N * hc;                                                           \
+        k1u_kernel<NJ, N><<<warps, 32, 0, st>>>(x, nw, down, inj, P, ss, t0, H, hc, rank, ninj);                       \
+        break;                                                                                                         \
+    }
+        K1U_CASE(9, 1) K1U_CASE(9, 2) K1U_CASE(9, 3) K1U_CASE(9, 4) K1U_CASE(9, 5) K1U_CASE(9, 6) K1U_CASE(9, 7)
+        K1U_CASE(6, 8)
+#undef K1U_CASE
+        default: break;
+    }
+}
+
 // y [T][H] bf16 (and inj [T][hc] when inject_w != null) from streams [T][hc][H] fp32. Same contract as gb_hc_pre.
-// `ref=false` (gb_hcx_pre / gb_hcx_pre_z) launches the decode fast kernels (k1b, then k2t for hc = 4 with rank <= 512, k2c
+// `ref=false` (gb_hcx_pre / gb_hcx_pre_z) launches the decode fast kernels (k1u, then k2t for hc = 4 with rank <= 512, k2c
 // otherwise) unconditionally, bit-identical to k1/k2; `ref=true` (gb_hcx_pre_ref / gb_hcx_pre_z_ref) launches the reference
 // k1_kernel/k2_kernel directly for the bit-exact GPU tests.
 static int hcx_pre_impl(const void* streams, const void* hc_norm_w, const void* down_w, const void* up_w,
@@ -554,15 +604,13 @@ static int hcx_pre_impl(const void* streams, const void* hc_norm_w, const void* 
     float* ss = P + (size_t)TMAX * R * hc;
     for (int t0 = 0; t0 < (int)num_tokens; t0 += TMAX) {
         const int nt = min(TMAX, (int)num_tokens - t0);
-        const int jobs = R * hc + nt * hc;
-        const bool use_k1b = !ref;
         const bool use_k2b = !ref;
         const bool use_k2t = !ref && hc == 4 && rk <= 512;
-        if (use_k1b) {
-            k1b_kernel<<<(jobs + 7) / 8, 256, 0, st>>>((const float*)streams, (const half*)hc_norm_w,
-                                                       (const half*)down_w, (const half*)inject_w, P, ss, t0, nt, H,
-                                                       hc, rk, ninj);
+        if (!ref) {
+            launch_k1u(nt, (const float*)streams, (const half*)hc_norm_w, (const half*)down_w, (const half*)inject_w, P,
+                       ss, t0, H, hc, rk, ninj, st);
         } else {
+            const int jobs = R * hc + nt * hc;
             k1_kernel<<<(jobs + 3) / 4, 128, 0, st>>>((const float*)streams, (const half*)hc_norm_w,
                                                        (const half*)down_w, (const half*)inject_w, P, ss, t0, nt, H,
                                                        hc, rk, ninj);
