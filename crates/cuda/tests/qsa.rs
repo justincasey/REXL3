@@ -511,13 +511,9 @@ fn qsa_attend_parts_one_matches_window_parts() {
     }
 }
 
-#[test]
-#[ignore]
-fn golden_qsa_hashes() {
-    use std::io::Write;
-    let Some(st) = gpu() else { return };
-    let path = std::env::var("REXL3_GOLDEN_OUT").expect("REXL3_GOLDEN_OUT");
-    let rig = Rig::new(&LENS, 7, 97, &st);
+/// The golden text (hashes of the pool planes, the selections and the attention outputs) of the QSA kernels on synthetic data.
+fn golden_text(st: &Stream) -> String {
+    let rig = Rig::new(&LENS, 7, 97, st);
     let plane: Vec<u16> = rig.pool.to_vec().unwrap();
     let mut out = String::new();
     for (s, &len) in LENS.iter().enumerate() {
@@ -531,15 +527,45 @@ fn golden_qsa_hashes() {
         out += &format!("slot {s} pool plane ({} blocks) {:016x}\n", len / CR, fnv(bytes_of(&keys)));
     }
     for (name, rows) in row_sets() {
-        let q = rig.queries(&rows, &st);
-        let (_, sel, sel_n, _) = rig.select(&rows, &q, &st);
+        let q = rig.queries(&rows, st);
+        let (_, sel, sel_n, _) = rig.select(&rows, &q, st);
         let qm = main_queries(rows.len(), 99);
-        let o = rig.attend(&rows, &qm, &sel, &sel_n, qsa::WINDOW_PARTS, &st);
-        let o1 = rig.attend(&rows, &qm, &sel, &sel_n, 1, &st);
+        let o = rig.attend(&rows, &qm, &sel, &sel_n, qsa::WINDOW_PARTS, st);
+        let o1 = rig.attend(&rows, &qm, &sel, &sel_n, 1, st);
         out += &format!("{name} queries {:016x}\n", fnv(bytes_of(&q)));
         out += &format!("{name} selection {:016x} sizes {:?}\n", fnv(bytes_of(&sel)), sel_n);
         out += &format!("{name} attention (window parts) {:016x}\n", fnv(bytes_of(&o)));
         out += &format!("{name} attention (one part) {:016x}\n", fnv(bytes_of(&o1)));
     }
-    std::fs::File::create(path).unwrap().write_all(out.as_bytes()).unwrap();
+    out
+}
+
+#[test]
+#[ignore]
+fn golden_qsa_hashes() {
+    use std::io::Write;
+    let Some(st) = gpu() else { return };
+    let path = std::env::var("REXL3_GOLDEN_OUT").expect("REXL3_GOLDEN_OUT");
+    std::fs::File::create(path).unwrap().write_all(golden_text(&st).as_bytes()).unwrap();
+}
+
+/// FNV-1a of `golden_text` as the kernels were before they carried the programmatic-launch attribute.
+const QSA_GOLDEN_HASH: u64 = 0xb964ee15cb1a5d9f;
+
+/// The indexer chain (stage, pool, ring while a sequence is built; scores and top-k; attention and its merge) launched with the
+/// programmatic-dependent-launch attribute (the Flash family bit of the mask) gives the bits of plain launches, and the plain bits are the
+/// recorded ones.
+#[test]
+fn qsa_kernels_are_exact_under_programmatic_launches() {
+    let Some(st) = gpu() else { return };
+    let mut texts = Vec::new();
+    for mask in [0, 8] {
+        gb_cuda::exl3_linear::set_pdl_mask(mask).unwrap();
+        texts.push(golden_text(&st));
+    }
+    gb_cuda::exl3_linear::set_pdl_mask(0).unwrap();
+    let hash = fnv(texts[0].as_bytes());
+    println!("QSA golden hash of the plain launches: 0x{hash:016x}");
+    assert_eq!(texts[0], texts[1], "programmatic launches changed a result");
+    assert_eq!(hash, QSA_GOLDEN_HASH, "the plain launches differ from the recorded results:\n{}", texts[0]);
 }

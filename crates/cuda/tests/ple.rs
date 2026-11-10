@@ -287,14 +287,8 @@ fn ple_rows_are_invariant() {
     }
 }
 
-/// Golden hashes of the PLE kernels on synthetic data.
-///     REXL3_GOLDEN_OUT=golden_ple.txt cargo test --release -p gb-cuda --test ple golden_ple_hashes -- --ignored
-#[test]
-#[ignore]
-fn golden_ple_hashes() {
-    use std::io::Write;
-    let Some(st) = gpu() else { return };
-    let path = std::env::var("REXL3_GOLDEN_OUT").expect("REXL3_GOLDEN_OUT");
+/// The golden text (hashes of the embeddings and the updated streams) of the PLE kernels on synthetic data.
+fn golden_text(st: &Stream) -> String {
     let s = Stage::synthetic(11);
     let (packed, streams) = inputs(N, 12);
     let mut out = String::new();
@@ -304,9 +298,40 @@ fn golden_ple_hashes() {
         ("prefill 300", 300, true),
         ("prefill chunks of 30", 30, true),
     ] {
-        let (o, emb) = run(&s, &packed, &streams, chunk, prefill, &st);
+        let (o, emb) = run(&s, &packed, &streams, chunk, prefill, st);
         out += &format!("{name} embedding {:016x}\n", fnv(bytes_of(&emb)));
         out += &format!("{name} streams {:016x}\n", fnv(bytes_of(&o)));
     }
-    std::fs::File::create(path).unwrap().write_all(out.as_bytes()).unwrap();
+    out
+}
+
+/// Golden hashes of the PLE kernels on synthetic data.
+///     REXL3_GOLDEN_OUT=golden_ple.txt cargo test --release -p gb-cuda --test ple golden_ple_hashes -- --ignored
+#[test]
+#[ignore]
+fn golden_ple_hashes() {
+    use std::io::Write;
+    let Some(st) = gpu() else { return };
+    let path = std::env::var("REXL3_GOLDEN_OUT").expect("REXL3_GOLDEN_OUT");
+    std::fs::File::create(path).unwrap().write_all(golden_text(&st).as_bytes()).unwrap();
+}
+
+/// FNV-1a of `golden_text` as the kernels were before they carried the programmatic-launch attribute.
+const PLE_GOLDEN_HASH: u64 = 0x3f56aca1be85046f;
+
+/// The PLE stage (rows, the two projections, gate, conv, ring) launched with the programmatic-dependent-launch attribute (the Flash family
+/// bit of the mask) gives the bits of plain launches, and the plain bits are the recorded ones.
+#[test]
+fn ple_kernels_are_exact_under_programmatic_launches() {
+    let Some(st) = gpu() else { return };
+    let mut texts = Vec::new();
+    for mask in [0, 8] {
+        gb_cuda::exl3_linear::set_pdl_mask(mask).unwrap();
+        texts.push(golden_text(&st));
+    }
+    gb_cuda::exl3_linear::set_pdl_mask(0).unwrap();
+    let hash = fnv(texts[0].as_bytes());
+    println!("PLE golden hash of the plain launches: 0x{hash:016x}");
+    assert_eq!(texts[0], texts[1], "programmatic launches changed a result");
+    assert_eq!(hash, PLE_GOLDEN_HASH, "the plain launches differ from the recorded results:\n{}", texts[0]);
 }
