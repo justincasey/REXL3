@@ -38,10 +38,10 @@ use gb_cuda::exl3_linear::{Dtype, Exl3Weights, MAX_DECODE_ROWS};
 use gb_cuda::fn_mhc::{self, Mixer, PreScratch};
 use gb_cuda::gdn::{self, Batch, PreInputs, PreWeights, Record};
 use gb_cuda::glue::AttnPrepCfg;
-use gb_cuda::graph::{CaptureError, Graph};
+use gb_cuda::graph::{self as cgraph, CaptureError, Graph};
 use gb_cuda::moe::{MoeDims, MoeExperts, SharedExpert};
 use gb_cuda::moe_prefill::{finish_shared, PrefillScratch, SharedScratchBig};
-use gb_cuda::rt::HostStage;
+use gb_cuda::rt::{Event, HostStage};
 use gb_cuda::{fmoe, fn_glue, fn_moe, glue, hcx, mtpk, ple, qfn_verify, qsa, CudaError, DevBuf, Stream};
 use gb_engine::RowRequest;
 use std::collections::{BTreeMap, HashMap};
@@ -381,6 +381,12 @@ pub struct FlashNextModel {
     pub cfg: FlashNextConfig,
     pub opts: ModelOptions,
     pub stream: Stream,
+    /// The side stream of a window's independent branches (captured as parallel graph branches), and the events that fork it off
+    /// the main stream and join it back. `fork_join` is off with `REXL3_FORK=0`.
+    side: Stream,
+    ev_fork: Event,
+    ev_join: Event,
+    fork_join: bool,
     /// Paged KV of the 12 trunk attention layers, in layer order (`PagedKv::with_kv_heads(pages, KvHeads::Two)`).
     pub kv: Vec<PagedKv>,
     /// The MTP layer's paged KV (same page table); `None` without an MTP head.
@@ -443,6 +449,8 @@ pub struct FlashNextModel {
     /// EXL3 decode workspace, EXL3 pinned-prefill scratch, the GDN prefill workspace, the dense attention partials,
     /// the FrostMoE window workspace and the HCX pre-mix scratch.
     ws: DevBuf,
+    /// A second decode workspace, for the projections a window runs on the side stream while `ws` serves the main one.
+    ws2: DevBuf,
     prefill_ws: DevBuf,
     gdn_prefill_ws: DevBuf,
     attn_ws: DevBuf,
@@ -752,6 +760,27 @@ fn prefill_scratch_need(w: &FlashNextWeights, hc: usize, rows: usize) -> usize {
     need
 }
 
+/// The workspace of the projections a window runs on its side stream (the GDN z; the attention k, v and the indexer's q/k; the MTP
+/// head's two input projections): the widest of them at the decode kernel's row limit.
+fn side_scratch_need(w: &FlashNextWeights) -> usize {
+    let mut need = 1 << 20;
+    for layer in w.layers.iter().chain(w.mtp.as_ref().map(|m| &m.layer)) {
+        match &layer.mixer {
+            MixerWeights::Linear(m) => need = need.max(m.in_proj_z.workspace_bytes(MAX_DECODE_ROWS)),
+            MixerWeights::Full(m) => {
+                need = need.max(m.k_proj.workspace_bytes(MAX_DECODE_ROWS)).max(m.v_proj.workspace_bytes(MAX_DECODE_ROWS));
+                if let Some(ix) = &m.indexer {
+                    need = need.max(ix.qk_proj.workspace_bytes(MAX_DECODE_ROWS));
+                }
+            }
+        }
+    }
+    if let Some(m) = &w.mtp {
+        need = need.max(m.fc_hidden.workspace_bytes(MAX_DECODE_ROWS)).max(m.fc_embedding.workspace_bytes(MAX_DECODE_ROWS));
+    }
+    need
+}
+
 /// The decode workspace: the widest of every linear at the decode kernel's row limit, and of the LM head at a window.
 fn decode_scratch_need(w: &FlashNextWeights, window_rows: usize) -> usize {
     let mut need = 1 << 20;
@@ -988,6 +1017,10 @@ impl FlashNextModel {
 
         let mut m = Self {
             stream: Stream::new_nonblocking()?,
+            side: Stream::new_nonblocking()?,
+            ev_fork: Event::new()?,
+            ev_join: Event::new()?,
+            fork_join: env_on("REXL3_FORK"),
             kv,
             mtp_kv,
             qsa_pool,
@@ -1030,6 +1063,7 @@ impl FlashNextModel {
             fk2: DevBuf::zeroed(rows * kv_dim * 2)?,
             fgate: DevBuf::zeroed(rows * q_dim * 2)?,
             ws: DevBuf::zeroed(ws_bytes)?,
+            ws2: DevBuf::zeroed(side_scratch_need(&w))?,
             prefill_ws: DevBuf::zeroed(pws_bytes)?,
             gdn_prefill_ws: DevBuf::zeroed(gdn::prefill_workspace_bytes(rows))?,
             attn_ws: DevBuf::zeroed(attention::decode_workspace_bytes(WINDOW_ROWS, max_context))?,
@@ -1613,6 +1647,7 @@ impl FlashNextModel {
             &self.qsa_sel,
             &self.qsa_sel_n,
             &self.qsa_ws,
+            &self.ws2,
             &self.mtp_streams,
             &self.mtp_xs,
             &self.mtp_xe,
@@ -1764,8 +1799,18 @@ impl FlashNextModel {
             Mode::Window => ple::proj_window,
             Mode::Prefill(_) => ple::proj_prefill,
         };
+        // the two projections share no buffer: in a window the value one runs on the side stream next to the key one
+        let fork = mode == Mode::Window && self.fork_join;
+        if fork {
+            cgraph::fork(st, &self.side, &self.ev_fork)?;
+            proj(&self.ple_emb, &p.value_proj, &mut self.ple_value, rows, pd, d, &self.side)?;
+        }
         proj(&self.ple_emb, &p.key_proj, &mut self.ple_key, rows, pd, ch, st)?;
-        proj(&self.ple_emb, &p.value_proj, &mut self.ple_value, rows, pd, d, st)?;
+        if fork {
+            cgraph::join(st, &self.side, &self.ev_join)?;
+        } else {
+            proj(&self.ple_emb, &p.value_proj, &mut self.ple_value, rows, pd, d, st)?;
+        }
         let norms = ple::GateNorms { key: &p.norm_key, query: &p.norm_query, conv: &p.norm_conv };
         let scale = 1.0 / (d as f32).sqrt();
         ple::gate(
@@ -1887,9 +1932,18 @@ impl FlashNextModel {
         match &layer.mixer {
             MixerWeights::Linear(m) => {
                 let st = &self.stream;
+                // z is read only by the gated norm after the recurrence: in a window its projection runs on the side stream,
+                // next to qkv (the two share no buffer and no workspace), and is joined back in front of that norm
+                let fork = window && self.fork_join;
+                if fork {
+                    cgraph::fork(st, &self.side, &self.ev_fork)?;
+                    lin(&m.in_proj_z, &self.x_mixed, &mut self.z, rows, mode, &mut self.ws2, &mut self.prefill_ws, &self.side)?;
+                }
                 let qkv_buf = if window { &mut self.win_qkv[li] } else { &mut self.qkv };
                 lin(&m.in_proj_qkv, &self.x_mixed, qkv_buf, rows, mode, &mut self.ws, &mut self.prefill_ws, st)?;
-                lin(&m.in_proj_z, &self.x_mixed, &mut self.z, rows, mode, &mut self.ws, &mut self.prefill_ws, st)?;
+                if !fork {
+                    lin(&m.in_proj_z, &self.x_mixed, &mut self.z, rows, mode, &mut self.ws, &mut self.prefill_ws, st)?;
+                }
                 g_small_linear(&self.x_mixed, &m.in_proj_a, &self.ga, rows, h, gdn::VALUE_HEADS, st)?;
                 g_small_linear(&self.x_mixed, &m.in_proj_b, &self.gb, rows, h, gdn::VALUE_HEADS, st)?;
 
@@ -1919,6 +1973,9 @@ impl FlashNextModel {
                         &mut self.mixer_out,
                     )?;
                 }
+                if fork {
+                    cgraph::join(st, &self.side, &self.ev_join)?;
+                }
                 fn_glue::gated_rmsnorm_sigmoid(
                     None,
                     &self.z,
@@ -1934,9 +1991,69 @@ impl FlashNextModel {
             }
             MixerWeights::Full(m) => {
                 let st = &self.stream;
+                let fork = window && self.fork_join;
+                let n_planes = if self.qsa { self.qsa_pool.len() } else { 0 };
+                let slots = self.pools.slots;
+                let pages = match fi {
+                    Some(i) => self.kv[i].n_blocks,
+                    None => self.mtp_kv.as_ref().ok_or_else(|| ModelError::Request("this pack has no MTP head".into()))?.n_blocks,
+                };
+                // QSA: the indexer planes are kept current on every forward, and selection takes over for a row once
+                // its own position is past the dense range (below it every block would be selected, so it is the same
+                // function). The threshold is the ROW's position, never the batch's size or last position, so no chunk
+                // grid and no window shape can move a row's arithmetic.
+                let plane = m.indexer.as_ref().filter(|_| n_planes > 0).map(|_| fi.unwrap_or(n_planes - 1));
+                // k, v and the indexer's chain (its projection, the stage, the pooled keys and the raw-key ring) read only the mixed
+                // stream and write buffers the rest of the layer does not touch before attn_prep: in a window they run on the side
+                // stream while q_proj runs here, and are joined back in front of attn_prep
+                if fork {
+                    cgraph::fork(st, &self.side, &self.ev_fork)?;
+                }
+                {
+                    let (sd, w2) = if fork { (&self.side, &mut self.ws2) } else { (&self.stream, &mut self.ws) };
+                    lin(&m.k_proj, &self.x_mixed, &mut self.fk, rows, mode, w2, &mut self.prefill_ws, sd)?;
+                    lin(&m.v_proj, &self.x_mixed, &mut self.fv, rows, mode, w2, &mut self.prefill_ws, sd)?;
+                    if let (Some(ix), Some(plane)) = (m.indexer.as_ref(), plane) {
+                        lin(&ix.qk_proj, &self.x_mixed, &mut self.qsa_qk, rows, mode, w2, &mut self.prefill_ws, sd)?;
+                        qsa::stage(
+                            &self.qsa_qk,
+                            &ix.q_norm,
+                            &self.positions,
+                            &mut self.qsa_q,
+                            &mut self.qsa_kraw,
+                            rows,
+                            EPS,
+                            self.cfg.rope_theta as f32,
+                            sd,
+                        )?;
+                        let seqs = qsa::Seqs {
+                            positions: &self.positions,
+                            seq_start: &self.seq_start,
+                            seq_slot: &self.seq_slot,
+                            n_seq: b.n_seq(),
+                            rows,
+                        };
+                        qsa::pool(
+                            &self.qsa_kraw,
+                            &self.qsa_ring[plane],
+                            &ix.k_norm,
+                            &seqs,
+                            &self.table,
+                            &mut self.qsa_pool[plane],
+                            pages,
+                            slots,
+                            QSA_RING,
+                            EPS,
+                            self.cfg.rope_theta as f32,
+                            sd,
+                        )?;
+                        qsa::ring_store(&self.qsa_kraw, &mut self.qsa_ring[plane], &seqs, slots, QSA_RING, sd)?;
+                    }
+                }
                 lin(&m.q_proj, &self.x_mixed, &mut self.qkv, rows, mode, &mut self.ws, &mut self.prefill_ws, st)?;
-                lin(&m.k_proj, &self.x_mixed, &mut self.fk, rows, mode, &mut self.ws, &mut self.prefill_ws, st)?;
-                lin(&m.v_proj, &self.x_mixed, &mut self.fv, rows, mode, &mut self.ws, &mut self.prefill_ws, st)?;
+                if fork {
+                    cgraph::join(st, &self.side, &self.ev_join)?;
+                }
                 let pcfg = AttnPrepCfg {
                     heads: self.cfg.heads,
                     kv_heads: self.cfg.kv_heads,
@@ -1960,57 +2077,13 @@ impl FlashNextModel {
                     st,
                 )?;
 
-                let n_planes = if self.qsa { self.qsa_pool.len() } else { 0 };
-                let slots = self.pools.slots;
                 let kv = match fi {
                     Some(i) => &mut self.kv[i],
                     None => self.mtp_kv.as_mut().ok_or_else(|| ModelError::Request("this pack has no MTP head".into()))?,
                 };
-                let pages = kv.n_blocks;
                 attention::kv_write(&self.fk2, &self.fv, &self.rowidx, &self.table, kv, rows, st)?;
                 let live = self.attn_ctx.unwrap_or_else(|| Self::live_of(b));
 
-                // QSA: the indexer planes are kept current on every forward, and selection takes over for a row once
-                // its own position is past the dense range (below it every block would be selected, so it is the same
-                // function). The threshold is the ROW's position, never the batch's size or last position, so no chunk
-                // grid and no window shape can move a row's arithmetic.
-                let plane = m.indexer.as_ref().filter(|_| n_planes > 0).map(|_| fi.unwrap_or(n_planes - 1));
-                if let (Some(ix), Some(plane)) = (m.indexer.as_ref(), plane) {
-                    lin(&ix.qk_proj, &self.x_mixed, &mut self.qsa_qk, rows, mode, &mut self.ws, &mut self.prefill_ws, st)?;
-                    qsa::stage(
-                        &self.qsa_qk,
-                        &ix.q_norm,
-                        &self.positions,
-                        &mut self.qsa_q,
-                        &mut self.qsa_kraw,
-                        rows,
-                        EPS,
-                        self.cfg.rope_theta as f32,
-                        st,
-                    )?;
-                    let seqs = qsa::Seqs {
-                        positions: &self.positions,
-                        seq_start: &self.seq_start,
-                        seq_slot: &self.seq_slot,
-                        n_seq: b.n_seq(),
-                        rows,
-                    };
-                    qsa::pool(
-                        &self.qsa_kraw,
-                        &self.qsa_ring[plane],
-                        &ix.k_norm,
-                        &seqs,
-                        &self.table,
-                        &mut self.qsa_pool[plane],
-                        pages,
-                        slots,
-                        QSA_RING,
-                        EPS,
-                        self.cfg.rope_theta as f32,
-                        st,
-                    )?;
-                    qsa::ring_store(&self.qsa_kraw, &mut self.qsa_ring[plane], &seqs, slots, QSA_RING, st)?;
-                }
                 let qrow = attention::Q_ROW_ELEMS * 2;
                 let qd = qsa::N_HEADS * qsa::DK * 2;
                 let nb_cap = live.div_ceil(qsa::CR);
@@ -2345,6 +2418,12 @@ impl FlashNextModel {
                 &self.stream,
             )?;
         }
+        // the two input projections share no buffer: in a window the embedding's runs on the side stream next to the hidden one
+        let fork = mode == Mode::Window && self.fork_join;
+        if fork {
+            cgraph::fork(&self.stream, &self.side, &self.ev_fork)?;
+            lin_f16(&mtp.fc_embedding, &self.mtp_xe, &mut self.mtp_e, rows, mode, &mut self.ws2, &mut self.prefill_ws, &self.side)?;
+        }
         lin_f16(
             &mtp.fc_hidden,
             &self.mtp_xs,
@@ -2355,7 +2434,11 @@ impl FlashNextModel {
             &mut self.prefill_ws,
             &self.stream,
         )?;
-        lin_f16(&mtp.fc_embedding, &self.mtp_xe, &mut self.mtp_e, rows, mode, &mut self.ws, &mut self.prefill_ws, &self.stream)?;
+        if fork {
+            cgraph::join(&self.stream, &self.side, &self.ev_join)?;
+        } else {
+            lin_f16(&mtp.fc_embedding, &self.mtp_xe, &mut self.mtp_e, rows, mode, &mut self.ws, &mut self.prefill_ws, &self.stream)?;
+        }
         mtpk::combine(&self.mtp_h, &self.mtp_e, &mut self.mtp_streams, rows, hc, h, &self.stream)?;
         // the decoder layer and the collapse run on the head's stack, swapped into x_streams
         std::mem::swap(&mut self.x_streams, &mut self.mtp_streams);
