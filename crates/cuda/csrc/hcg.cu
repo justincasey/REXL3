@@ -333,6 +333,197 @@ __global__ void __launch_bounds__(kUmThreads, UM_MINB)
     for (int i = 0; i < kDpt; ++i) yr[i] = __float2bfloat16_rn(acc[i] * inv);
 }
 
+// ---------------------------------------------------------------------------------------------------------------------------------
+// post_norm_kernel / norm_kernel and the inject product in one kernel (the Flash-Next shape: H = 2,560, hc = 4, inject [hc][hc H]).
+//
+// The library's inject product (K = hc H = 10,240, N = hc) is cublasLt algo 23 with split-K 20: split j is one chain of m16n8k16 MMAs over
+// the 512 k of [512 j, 512 j + 512) from +0.0, the splits are added in order 0 .. 19, and the lo product is the same again over normed_lo;
+// the output is the lo sum plus the hi sum (MEASURED against the library: tests/hcg_inject.rs). Stream z of a row holds splits 5 z .. 5 z + 4,
+// so one CTA (32 rows, stream z) runs those five chains itself, straight from the normed rows it forms for the down product anyway, and
+// the library's inject launches (a second full read of normed_hi and normed_lo, 168 MB a pre-mix) are gone. The kernel's other work is
+// the unchanged norm_kernel / post_norm_kernel: pass 1 (the previous block's post-inject written back in place, the rms of the new values)
+// has post_norm_kernel's thread-to-element map and sums, pass 2 forms normed = x * rms * (1 + nw) in its expressions and writes the fp16
+// hi / lo split of it for the down GEMMs.
+constexpr int kNiH = 2560, kNiBM = 16, kNiKB = 64, kNiPad = kNiKB + 8, kNiThreads = 256, kNiRing = 3;
+constexpr size_t kNiSmemB = (size_t)kNiRing * 8 * kNiPad * sizeof(half);               // the 4 inject rows (and 4 zero rows) of the n8 tile
+constexpr size_t kNiSmemX = (size_t)kNiRing * kNiBM * kNiKB * sizeof(float);
+constexpr size_t kNiSmemA = (size_t)2 * 2 * kNiBM * kNiPad * sizeof(half);
+constexpr size_t kNiSmem = kNiSmemB + kNiSmemX + kNiSmemA + kNiBM * sizeof(float);
+
+__device__ __forceinline__ void ni_ldsm2(uint32_t& r0, uint32_t& r1, const half* p) {
+    const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(p));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n" : "=r"(r0), "=r"(r1) : "r"(a));
+}
+
+// grid (ceil(T / 16), 4), block 256, dynamic smem kNiLaunchSmem (what two CTAs an SM leave of the 99 KB: a CTA's 16 rows of one stream are
+// 164 KB, so the 96 CTAs in flight keep 15.7 MB of streams between pass 1 and pass 2 in L2). Q [2 (hi, lo)][20][T][4] gets the inject
+// splits' sums.
+constexpr size_t kNiLaunchSmem = 49152;
+static_assert(kNiSmem <= kNiLaunchSmem, "the stages fit the launch's shared memory");
+template <bool POST>
+__global__ void __launch_bounds__(kNiThreads, 2)
+    norm_inj_kernel(float* __restrict__ x, const __nv_bfloat16* __restrict__ block_out, const float* __restrict__ inj_prev,
+                    const half* __restrict__ nw, const half* __restrict__ inj_w, half* __restrict__ normed_hi, half* __restrict__ normed_lo,
+                    float* __restrict__ Q, float* __restrict__ rms_out, int T, float eps) {
+    extern __shared__ __align__(16) unsigned char ni_smem[];
+    half* sB = reinterpret_cast<half*>(ni_smem);
+    float* sX = reinterpret_cast<float*>(ni_smem + kNiSmemB);
+    half* sA = reinterpret_cast<half*>(ni_smem + kNiSmemB + kNiSmemX);
+    float* sR = reinterpret_cast<float*>(ni_smem + kNiSmemB + kNiSmemX + kNiSmemA);
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, t4 = lane & 3;
+    const int r0 = blockIdx.x * kNiBM, s = blockIdx.y;
+
+    // pass 1: post-inject (in place) and the rms of (row, stream). Lane l of the warp holds, for j = 0..7, the partial sum of post_norm_kernel's
+    // thread 32 j + l (its float4 at m = 32 j + l + 256 c for c = 0, 1, 2, m < 640, summed in c order); the warp butterfly of each j is
+    // block_sum's warp sum, and the eight warp sums are added in warp order from 0.f.
+    for (int lr = w; lr < kNiBM; lr += kNiThreads / 32) {
+        const int t = r0 + lr;
+        float rr = 0.f;
+        if (t < T) {
+            float* xr = x + ((size_t)t * 4 + s) * kNiH;
+            float a[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) a[j] = 0.f;
+            float wv = 0.f;
+            if (POST) wv = inj_prev[(size_t)t * 4 + s];
+#pragma unroll
+            for (int c = 0; c < 3; ++c) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int m = 32 * j + lane + 256 * c;
+                    if (m >= kNiH / 4) continue;
+                    float4 v = *reinterpret_cast<const float4*>(xr + 4 * m);
+                    if (POST) {
+                        const uint2 u = *reinterpret_cast<const uint2*>(block_out + (size_t)t * kNiH + 4 * m);
+                        const float2 b01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.x));
+                        const float2 b23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.y));
+                        float4 n;
+                        n.x = fmaf(b01.x, wv, v.x);
+                        n.y = fmaf(b01.y, wv, v.y);
+                        n.z = fmaf(b23.x, wv, v.z);
+                        n.w = fmaf(b23.y, wv, v.w);
+                        *reinterpret_cast<float4*>(xr + 4 * m) = n;
+                        v = n;
+                    }
+                    a[j] += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+                }
+            }
+            float tot = 0.f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                float v = a[j];
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+                tot += v;
+            }
+            rr = rsqrtf(tot / (float)kNiH + eps);
+            if (lane == 0) rms_out[(size_t)t * 4 + s] = rr;
+        }
+        if (lane == 0) sR[lr] = rr;
+    }
+    // the zero rows 4..7 of the inject B tile (never written by the stages)
+    if (tid < kNiRing * 4 * (kNiPad / 8)) {
+        const int slot = tid / (4 * (kNiPad / 8)), rem = tid % (4 * (kNiPad / 8));
+        *reinterpret_cast<uint4*>(sB + ((size_t)slot * 8 + 4 + rem / (kNiPad / 8)) * kNiPad + (rem % (kNiPad / 8)) * 8) = make_uint4(0u, 0u, 0u, 0u);
+    }
+    __threadfence_block();
+    __syncthreads();
+
+    constexpr int kRow = 4 * kNiH;
+    const half* iw = inj_w + (size_t)s * kNiH;
+    // stage st (k in [64 st, 64 st + 64) of the stream) into ring slot st % 3: the four inject rows and the raw x tile
+    auto issue = [&](int st) {
+        const int slot = st % kNiRing, k0 = st * kNiKB;
+        if (tid < 32) um_cp16(sB + ((size_t)slot * 8 + (tid >> 3)) * kNiPad + (tid & 7) * 8, iw + (size_t)(tid >> 3) * kRow + k0 + (tid & 7) * 8);
+        const int r = tid >> 4, q = tid & 15, t = r0 + r;
+        if (t < T) um_cp16(sX + (size_t)slot * kNiBM * kNiKB + r * kNiKB + q * 4, x + ((size_t)t * 4 + s) * kNiH + k0 + q * 4);
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+    // raw stage st -> A tile (st & 1) and the hi / lo columns of the normed rows: post_norm_kernel's expressions
+    auto transform = [&](int st) {
+        const int slot = st % kNiRing, r = tid >> 4, q = tid & 15, t = r0 + r;
+        uint2 hi = make_uint2(0u, 0u), lo = make_uint2(0u, 0u);
+        if (t < T) {
+            const float4 v = *reinterpret_cast<const float4*>(sX + (size_t)slot * kNiBM * kNiKB + r * kNiKB + q * 4);
+            const half* wp = nw + (size_t)s * kNiH + st * kNiKB + q * 4;
+            const float2 w01 = __half22float2(*reinterpret_cast<const half2*>(wp));
+            const float2 w23 = __half22float2(*reinterpret_cast<const half2*>(wp + 2));
+            const float rr = sR[r];
+            const float n0 = v.x * rr * (1.f + w01.x), n1 = v.y * rr * (1.f + w01.y);
+            const float n2 = v.z * rr * (1.f + w23.x), n3 = v.w * rr * (1.f + w23.y);
+            const float h0 = __half2float(__float2half_rn(n0)), h1 = __half2float(__float2half_rn(n1));
+            const float h2 = __half2float(__float2half_rn(n2)), h3 = __half2float(__float2half_rn(n3));
+            const half2 a = __floats2half2_rn(h0, h1), b = __floats2half2_rn(h2, h3);
+            const half2 c = __floats2half2_rn(n0 - h0, n1 - h1), d = __floats2half2_rn(n2 - h2, n3 - h3);
+            hi = make_uint2(*reinterpret_cast<const uint32_t*>(&a), *reinterpret_cast<const uint32_t*>(&b));
+            lo = make_uint2(*reinterpret_cast<const uint32_t*>(&c), *reinterpret_cast<const uint32_t*>(&d));
+            const size_t go = ((size_t)t * 4 + s) * kNiH + st * kNiKB + q * 4;
+            *reinterpret_cast<uint2*>(normed_hi + go) = hi;
+            *reinterpret_cast<uint2*>(normed_lo + go) = lo;
+        }
+        half* ah = sA + (size_t)(st & 1) * 2 * kNiBM * kNiPad + r * kNiPad + q * 4;
+        *reinterpret_cast<uint2*>(ah) = hi;
+        *reinterpret_cast<uint2*>(ah + kNiBM * kNiPad) = lo;
+    };
+
+    float ih[4] = {0.f, 0.f, 0.f, 0.f}, il[4] = {0.f, 0.f, 0.f, 0.f};     // warp 0 (rows 0..15): the inject chains
+    constexpr int kNK = kNiH / kNiKB;
+    issue(0);
+    asm volatile("cp.async.wait_group 0;\n" ::);
+    __syncthreads();
+    transform(0);
+    issue(1);
+#pragma unroll 1
+    for (int i = 0; i < kNK; ++i) {
+        asm volatile("cp.async.wait_group 0;\n" ::);
+        __syncthreads();
+        if (i + 2 < kNK) issue(i + 2);
+        if (i + 1 < kNK) transform(i + 1);
+        if (w == 0) {
+            const half* a_hi = sA + (size_t)(i & 1) * 2 * kNiBM * kNiPad;
+            const half* a_lo = a_hi + kNiBM * kNiPad;
+            const half* bs = sB + (size_t)(i % kNiRing) * 8 * kNiPad;
+#pragma unroll
+            for (int kk = 0; kk < kNiKB / 16; ++kk) {
+                uint32_t fh[4], fl[4], b0, b1;
+                const size_t off = (size_t)(lane & 15) * kNiPad + kk * 16 + (lane >> 4) * 8;
+                um_ldsm4(fh, a_hi + off);
+                um_ldsm4(fl, a_lo + off);
+                ni_ldsm2(b0, b1, bs + (size_t)(lane & 7) * kNiPad + kk * 16 + ((lane >> 3) & 1) * 8);
+                um_mma(ih, fh, b0, b1);
+                um_mma(il, fl, b0, b1);
+            }
+            if ((i & 7) == 7) {                                    // a 512-wide inject split ends: its sums leave, the chains restart
+                const int jj = s * 5 + (i >> 3);
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const int row = r0 + g + (e >> 1) * 8, col = 2 * t4 + (e & 1);
+                    if (row < T && col < 4) {
+                        Q[(((size_t)0 * 20 + jj) * T + row) * 4 + col] = ih[e];
+                        Q[(((size_t)1 * 20 + jj) * T + row) * 4 + col] = il[e];
+                    }
+                    ih[e] = il[e] = 0.f;
+                }
+            }
+        }
+    }
+}
+
+// the inject product's output from the 20 splits' sums: the hi sum and the lo sum in split order, the lo sum plus the hi sum, then
+// low_kernel's expression of inj. One thread a (row, column).
+__global__ void __launch_bounds__(256) inj_reduce_kernel(const float* __restrict__ Q, float* __restrict__ inj, int T, int hc) {
+    const int i = blockIdx.x * 256 + threadIdx.x;
+    if (i >= T * 4) return;
+    const int t = i >> 2, c = i & 3;
+    float hi = Q[((size_t)0 * 20 * T + t) * 4 + c], lo = Q[((size_t)1 * 20 * T + t) * 4 + c];
+    for (int j = 1; j < 20; ++j) {
+        hi += Q[(((size_t)0 * 20 + j) * T + t) * 4 + c];
+        lo += Q[(((size_t)1 * 20 + j) * T + t) * 4 + c];
+    }
+    const float inv = 1.f / (float)hc;
+    inj[i] = 2.f / (1.f + __expf(-(lo + hi) * inv));
+}
+
 // One cuBLAS handle per host thread, created on first use and never destroyed (destroying it at thread exit can run
 // after the CUDA context is gone). The static handle it replaces was a cross-thread cublasSetStream race if the server
 // ever overlaps prefill and decode threads (same fix as exl3_linear.cu's cublas_handle).
@@ -483,12 +674,24 @@ static int hcg_pre(const void* streams, const void* norm_w, const void* down_w, 
         if (cudaMemsetAsync(normed_lo + (size_t)T * K, 0, (size_t)(padded - T) * K * sizeof(half), st) != cudaSuccess)
             return (int)cudaErrorUnknown;
     }
-    if (post_block)
+    // the Flash-Next shape with inject rows: norm_inj_kernel forms the normed rows and the inject product's splits (no library inject launches)
+    const bool ni = lt && inject_w && hc == 4 && H == kNiH;
+    int rc = 0;
+    if (ni) {
+        if (post_block)
+            norm_inj_kernel<true><<<dim3((T + kNiBM - 1) / kNiBM, 4), kNiThreads, kNiLaunchSmem, st>>>(
+                (float*)streams, (const __nv_bfloat16*)post_block, post_inj, (const half*)norm_w, (const half*)inject_w, normed_hi, normed_lo, G,
+                rms, T, eps);
+        else
+            norm_inj_kernel<false><<<dim3((T + kNiBM - 1) / kNiBM, 4), kNiThreads, kNiLaunchSmem, st>>>(
+                (float*)streams, nullptr, nullptr, (const half*)norm_w, (const half*)inject_w, normed_hi, normed_lo, G, rms, T, eps);
+    } else if (post_block) {
         post_norm_kernel<4, 3><<<T, 256, 0, st>>>((float*)streams, (const __nv_bfloat16*)post_block, post_inj, (const half*)norm_w, normed_hi,
                                                   normed_lo, rms, H, eps);
-    else
+    } else {
         norm_kernel<<<T, 256, 0, st>>>((const float*)streams, (const half*)norm_w, normed_hi, normed_lo, rms, H, hc, eps);
-    int rc = GB_CHECK_LAUNCH();
+    }
+    rc = GB_CHECK_LAUNCH();
     if (rc) return rc;
     // down: one split-K call per half over every row when the large-call algorithm takes it, else the 64-row slab loop
     bool down_done = false;
@@ -502,7 +705,7 @@ static int hcg_pre(const void* streams, const void* norm_w, const void* down_w, 
             down_done = true;
         }
     }
-    bool inj_done = !inject_w;
+    bool inj_done = !inject_w || ni;
     if (!inj_done && lt) {
         const int a = lt_gemm_abt(lt, kInjectAlgo, normed_hi, (const half*)inject_w, Ij, padded, hc, K, 0.f, lt_ws, lt_ws_n, st);
         if (a > 0) return a;
@@ -531,12 +734,16 @@ static int hcg_pre(const void* streams, const void* norm_w, const void* down_w, 
             }
         }
     }
-    const size_t n = (size_t)padded * rank + (inject_w ? (size_t)padded * hc : 0);
+    const size_t n = (size_t)padded * rank + (inject_w && !ni ? (size_t)padded * hc : 0);
     low_kernel<<<(unsigned)((n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096), 256, 0, st>>>(
-        L, inject_w ? Ij : nullptr, low_hi, low_lo, inject_w ? inj_pad : nullptr, padded, rank, hc);
+        L, inject_w && !ni ? Ij : nullptr, low_hi, low_lo, inject_w && !ni ? inj_pad : nullptr, padded, rank, hc);
     if ((rc = GB_CHECK_LAUNCH())) return rc;
-    if (inject_w && cudaMemcpyAsync(inj_out, inj_pad, (size_t)T * hc * sizeof(float), cudaMemcpyDeviceToDevice, st) != cudaSuccess)
+    if (ni) {
+        inj_reduce_kernel<<<(T * 4 + 255) / 256, 256, 0, st>>>(G, inj_out, T, hc);
+        if ((rc = GB_CHECK_LAUNCH())) return rc;
+    } else if (inject_w && cudaMemcpyAsync(inj_out, inj_pad, (size_t)T * hc * sizeof(float), cudaMemcpyDeviceToDevice, st) != cudaSuccess) {
         return (int)cudaErrorUnknown;
+    }
     // up has no split (K = rank): a row is one chain of MMAs over K whatever the GEMM's M, so the slab only sets how long the fp32 G slab
     // stays in L2 between the hi pass, the lo pass and the mix that reads it. The large-call path takes 128-row slabs (MEASURED at 4096
     // rows, hi + lo of up: 2.18 ms against 3.36 ms for 64; the mix per slab: 7.36 ms per pre-mix against 7.69 ms with one mix launch).
