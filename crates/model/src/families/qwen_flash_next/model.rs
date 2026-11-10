@@ -582,6 +582,8 @@ pub struct FlashNextModel {
     one_row: RowIndex,
     /// Drafts after the first one whose probability is below this are not verified.
     mtp_conf: f32,
+    /// Queue the n-gram rows of the next window's tokens while the draft chain runs (`REXL3_PLE_PREFETCH=0` turns it off).
+    ple_prefetch: bool,
     /// Where the rows now in `x_streams` (the last window or prefill chunk) lie, one segment per sequence.
     stack: Vec<StackSeg>,
     /// Rows of the last prefill chunk or window whose collapsed trunk rows are still in `x_mixed` (0 once the MTP head
@@ -1265,6 +1267,7 @@ impl FlashNextModel {
             zero_kv: DevBuf::zeroed(one(has_mtp, KvHeads::Two.token_elems() * 2))?,
             one_row: RowIndex { slot: DevBuf::zeroed(4)?, pos: DevBuf::zeroed(4)?, rows: 1 },
             mtp_conf: std::env::var("REXL3_MTP_CONF").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0),
+            ple_prefetch: env_on("REXL3_PLE_PREFETCH"),
             stack: Vec::new(),
             mixed_rows: 0,
             last_window: None,
@@ -1774,6 +1777,10 @@ impl FlashNextModel {
         let mut done = if lanes.iter().any(|l| l.exit > 0.0) { k_max.min(CHAIN_FIRST_DRAFTS) } else { k_max };
         let key = ChainKey::for_chain(&b, src_row, done, grid, features);
         self.run_graph(Self::chain_graphs, key, live, |m| m.mtp_chain(&b, src, &ends, done))?;
+        // the GPU is running the chain: the window's first row (the last committed token) is known, so its n-gram rows are asked for now
+        for l in &lanes {
+            self.prefetch_window_rows(asks[l.ask].tokens, &[], 0);
+        }
         // `mtp_body` does this during capture/eager, but replay does not execute its host bookkeeping.
         self.mixed_rows = 0;
         for l in &lanes {
@@ -1794,9 +1801,16 @@ impl FlashNextModel {
             let p = &conf[s * MAX_DRAFTS..s * MAX_DRAFTS + done];
             l.exit <= 0.0 || (p.iter().product::<f32>() >= l.exit && (done == 1 || p[done - 1] >= floor))
         };
+        let mut prefetched = 0;
         while done < k_max && lanes.iter().enumerate().any(|(s, l)| wants(s, l, done, &conf)) {
             let key = ChainKey::for_step(n, done, &ends, grid, features);
             self.run_graph(Self::chain_graphs, key, live, |m| m.mtp_step(&slots, &ends, done, StackSrc::Head(0)))?;
+            // ... and, with the next step running, the rows of the drafts the last piece made
+            for (s, l) in lanes.iter().enumerate() {
+                let drafts: Vec<u32> = (0..done).map(|j| ids[s * MAX_DRAFTS + j] as u32).collect();
+                self.prefetch_window_rows(asks[l.ask].tokens, &drafts, prefetched + 1);
+            }
+            prefetched = done;
             self.mixed_rows = 0;
             done += 1;
             self.sync()?;
@@ -1815,6 +1829,34 @@ impl FlashNextModel {
             out[l.ask] = Some((drafts, kept));
         }
         Ok(out)
+    }
+
+    /// Ask the kernel to read the n-gram rows the next window will gather for its rows `from_row..`: row 0 is the last committed token of
+    /// `tokens`, row `j` the draft `drafts[j - 1]`. The reads are queued, not waited for, so the gather at the window finds the pages
+    /// resident; the gathered bytes are the same whether or not this ran. `REXL3_PLE_PREFETCH=0` turns it off.
+    fn prefetch_window_rows(&self, tokens: &[u32], drafts: &[u32], from_row: usize) {
+        let Some(p) = &self.w.ple else { return };
+        if !self.ple_prefetch || tokens.is_empty() || from_row > drafts.len() {
+            return;
+        }
+        let n = tokens.len();
+        // the token of window row `r`; rows -1 and -2 are the committed tokens before the first row
+        let row = |r: isize| -> u32 {
+            if r >= 1 {
+                drafts[r as usize - 1]
+            } else {
+                let i = n as isize - 1 + r;
+                if i < 0 {
+                    p.table.eos
+                } else {
+                    tokens[i as usize]
+                }
+            }
+        };
+        let r0 = from_row as isize;
+        let mut hist = vec![row(r0 - 2), row(r0 - 1)];
+        hist.extend((r0..=drafts.len() as isize).map(row));
+        let _ = p.table.prefetch(&hist, 2);
     }
 
     /// Upload the host page table (`kv_tab`) to the device table after a change made outside a forward.
