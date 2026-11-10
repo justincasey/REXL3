@@ -470,6 +470,33 @@ __global__ void __launch_bounds__(256) conv_commit_kernel(
     for (int i = 0; i < KEEP; ++i) pool[(size_t)i * CONV] = nw[i];
 }
 
+// conv_commit_kernel over every layer in one launch: the layer is blockIdx.z, its window qkv rows and conv pool come from a device
+// table of ConvLayer the caller builds once. Each (channel block, sequence, layer) block runs conv_commit_kernel's code on its own
+// layer's data, so the pools end with the bits of one launch a layer (the launches wrote disjoint pools and read disjoint rows).
+struct ConvLayer {
+    const __nv_bfloat16* qkv;   // the layer's window rows, bf16 [rows][CONV]
+    __nv_bfloat16* conv;        // the layer's conv pool, all slots
+};
+
+__global__ void __launch_bounds__(256) conv_commit_all_kernel(
+        const ConvLayer* __restrict__ layers, const int* __restrict__ seq_start, const int* __restrict__ slot,
+        const int* __restrict__ keep) {
+    const ConvLayer L = layers[blockIdx.z];
+    const int seq = blockIdx.y, ch = blockIdx.x * 256 + threadIdx.x;
+    const int begin = seq_start[seq], len = seq_start[seq + 1] - begin;
+    const int n = min(max(keep[seq], 0), len);
+    if (n <= 0 || ch >= CONV) return;
+    __nv_bfloat16* pool = L.conv + (size_t)slot[seq] * KEEP * CONV + ch;
+    __nv_bfloat16 nw[KEEP];
+#pragma unroll
+    for (int i = 0; i < KEEP; ++i) {
+        const int e = n + i;
+        nw[i] = e < KEEP ? pool[(size_t)e * CONV] : L.qkv[(size_t)(begin + e - KEEP) * CONV + ch];
+    }
+#pragma unroll
+    for (int i = 0; i < KEEP; ++i) pool[(size_t)i * CONV] = nw[i];
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // prefill chain (TensorFold gdn_prefill.cu): the sequential recurrence with the state in registers, TPR threads per
 // value row each holding 128/TPR keys; steps staged through shared memory STEPS at a time. Summation order differs
@@ -650,6 +677,15 @@ GB_EXPORT int GB_GDN_EXPORT(gb_gdn_commit_conv)(const void* qkv, void* conv_pool
     if (n_seq <= 0) return 0;
     conv_commit_kernel<<<dim3(CONV / 256, n_seq), 256, 0, gb_stream(stream)>>>(
         (const __nv_bfloat16*)qkv, (__nv_bfloat16*)conv_pool, seq_start, slot, keep, nullptr, 0);
+    return GB_CHECK_LAUNCH();
+}
+
+// `layers` is a device array of n_layers ConvLayer (two pointers each: the layer's window qkv rows, its conv pool).
+GB_EXPORT int GB_GDN_EXPORT(gb_gdn_commit_conv_all)(const void* layers, int n_layers, const int* seq_start, const int* slot,
+                                     const int* keep, int n_seq, void* stream) {
+    if (n_seq <= 0 || n_layers <= 0) return 0;
+    conv_commit_all_kernel<<<dim3(CONV / 256, n_seq, n_layers), 256, 0, gb_stream(stream)>>>(
+        (const ConvLayer*)layers, seq_start, slot, keep);
     return GB_CHECK_LAUNCH();
 }
 

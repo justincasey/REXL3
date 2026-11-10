@@ -300,6 +300,15 @@ mod ffi {
             n_seq: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn gb_gdn_commit_conv_all(
+            layers: *const c_void,
+            n_layers: i32,
+            seq_start: *const i32,
+            slot: *const i32,
+            keep: *const i32,
+            n_seq: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn gb_gdn_commit(
             k: *const c_void,
             v: *const c_void,
@@ -475,6 +484,15 @@ mod ffi {
             n_seq: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn gb_gdn_commit_conv_all_hv32(
+            layers: *const c_void,
+            n_layers: i32,
+            seq_start: *const i32,
+            slot: *const i32,
+            keep: *const i32,
+            n_seq: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn gb_gdn_commit_hv32(
             k: *const c_void,
             v: *const c_void,
@@ -643,6 +661,15 @@ mod ffi {
         pub fn gb_gdn_commit_conv_hv64(
             qkv: *const c_void,
             conv_pool: *mut c_void,
+            seq_start: *const i32,
+            slot: *const i32,
+            keep: *const i32,
+            n_seq: i32,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn gb_gdn_commit_conv_all_hv64(
+            layers: *const c_void,
+            n_layers: i32,
             seq_start: *const i32,
             slot: *const i32,
             keep: *const i32,
@@ -1000,6 +1027,40 @@ pub fn commit_conv_shaped(
         launcher!(shape, gb_gdn_commit_conv, gb_gdn_commit_conv_hv32, gb_gdn_commit_conv_hv64)(
             qkv.ptr(),
             conv_pool.ptr(),
+            batch.seq_start.ptr() as *const i32,
+            batch.slot.ptr() as *const i32,
+            keep.ptr() as *const i32,
+            batch.n_seq as i32,
+            stream.raw(),
+        )
+    };
+    CudaError::check(rc)
+}
+
+/// The table [`commit_conv_all`] reads: for each layer, the address of its window qkv rows and of its conv pool (two u64 each),
+/// in a device buffer the caller keeps (the buffers' addresses never change).
+pub fn conv_layer_table(qkv: &[&DevBuf], conv_pool: &[&DevBuf]) -> Result<DevBuf, CudaError> {
+    assert_eq!(qkv.len(), conv_pool.len(), "one window buffer and one conv pool a layer");
+    let words: Vec<u64> = qkv.iter().zip(conv_pool).flat_map(|(q, c)| [q.ptr() as u64, c.ptr() as u64]).collect();
+    DevBuf::from_slice(&words)
+}
+
+/// [`commit_conv`] of every layer of `table` (see [`conv_layer_table`]) in one launch: each layer's pool ends with the bits a launch of
+/// its own gives it. `shape` is the shape of every layer.
+pub fn commit_conv_all(
+    shape: GdnShape,
+    stream: &Stream,
+    table: &DevBuf,
+    layers: usize,
+    batch: &Batch<'_>,
+    keep: &DevBuf,
+) -> Result<(), CudaError> {
+    need(table, layers * 16, "conv layer table");
+    need(keep, batch.n_seq * 4, "keep");
+    let rc = unsafe {
+        launcher!(shape, gb_gdn_commit_conv_all, gb_gdn_commit_conv_all_hv32, gb_gdn_commit_conv_all_hv64)(
+            table.ptr(),
+            layers as i32,
             batch.seq_start.ptr() as *const i32,
             batch.slot.ptr() as *const i32,
             keep.ptr() as *const i32,

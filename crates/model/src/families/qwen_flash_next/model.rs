@@ -261,7 +261,8 @@ fn sparse_rows(positions: &[i32], qsa: bool) -> u64 {
 /// receive per-sequence grids, and QSA runs are partitioned by the absolute row order. `par` is the record set the window
 /// fills (`recs[par]`; the other holds what the previous window owes) and `owed` whether its GDN window kernels fold that owed
 /// replay in: both are baked into the launches. `part` is which graph of the window: the whole of it (0), or, when it is split in
-/// front of the PLE stage, the layers before it (1) and the rest (2).
+/// front of the PLE stage, the layers before it (1), the PLE stage and a few layers (2) and the rest (3; 2 is absent when the
+/// window has no middle graph).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct WindowKey {
     rows: usize,
@@ -410,6 +411,10 @@ struct OwedWindow {
     keep: Vec<i32>,
 }
 
+/// Layers of a window's middle graph (see `FlashNextModel::run_window`): the PLE stage and this many layers after it are one graph,
+/// and the rest of the window another, which the host launches while the middle one runs.
+const WINDOW_MID_LAYERS: usize = 3;
+
 pub struct FlashNextModel {
     pub cfg: FlashNextConfig,
     pub opts: ModelOptions,
@@ -493,6 +498,8 @@ pub struct FlashNextModel {
     /// records are two sets that alternate between windows (`rec_par` is the one the last window wrote): the next window's
     /// kernel replays the rows the last one owes from the set it left, while it fills the other.
     win_qkv: Vec<DevBuf>,
+    /// The addresses of every GDN layer's `win_qkv` and conv pool, for the one launch that commits all the conv histories.
+    conv_table: DevBuf,
     recs: [Vec<Record>; 2],
     rec_par: usize,
     /// Whether the window being run folds an owed replay in (a graph's key), and the replay the last window still owes.
@@ -1124,6 +1131,8 @@ impl FlashNextModel {
         // launches; only timing changes, never a bit. `REXL3_GLM_PDL` (0..31) overrides.
         let pdl = std::env::var("REXL3_GLM_PDL").ok().and_then(|v| v.trim().parse::<i32>().ok()).unwrap_or(9) & 31;
         gb_cuda::exl3_linear::set_pdl_mask(pdl).map_err(|e| ModelError::Config(format!("pdl mask: {e}")))?;
+        let win_qkv = (0..lin_layers).map(|_| DevBuf::zeroed(WINDOW_ROWS * gdn::CONV_DIM * 2)).collect::<Result<Vec<_>, _>>()?;
+        let conv_table = gdn::conv_layer_table(&win_qkv.iter().collect::<Vec<_>>(), &pools.conv.iter().collect::<Vec<_>>())?;
         let mut m = Self {
             stream: Stream::new_nonblocking()?,
             side: Stream::new_nonblocking()?,
@@ -1178,7 +1187,8 @@ impl FlashNextModel {
             attn_ws: DevBuf::zeroed(attention::decode_workspace_bytes(WINDOW_ROWS, max_context))?,
             fmoe_ws: fmoe::workspace(WINDOW_ROWS, top_k, h, interm, fmoe::DEFAULT_KC)?,
             hcx_scratch: DevBuf::zeroed(hcx::scratch_bytes(hc, rank))?,
-            win_qkv: (0..lin_layers).map(|_| DevBuf::zeroed(WINDOW_ROWS * gdn::CONV_DIM * 2)).collect::<Result<Vec<_>, _>>()?,
+            win_qkv,
+            conv_table,
             recs: [
                 (0..lin_layers).map(|_| Record::alloc(WINDOW_ROWS)).collect::<Result<Vec<_>, _>>()?,
                 (0..lin_layers).map(|_| Record::alloc(WINDOW_ROWS)).collect::<Result<Vec<_>, _>>()?,
@@ -1517,9 +1527,7 @@ impl FlashNextModel {
             rows: win.rows,
             n_slots: self.pools.slots,
         };
-        for li in 0..self.win_qkv.len() {
-            gdn::commit_conv(&self.stream, &self.win_qkv[li], &mut self.pools.conv[li], &batch, &self.keep)?;
-        }
+        gdn::commit_conv_all(gdn::GdnShape::Hv48, &self.stream, &self.conv_table, self.win_qkv.len(), &batch, &self.keep)?;
         self.owed = Some(OwedWindow { par: self.rec_par, win, keep });
         Ok(true)
     }
@@ -2581,10 +2589,12 @@ impl FlashNextModel {
         self.w.ple.as_ref().map(|p| p.before_layer)
     }
 
-    /// Launch a window whose batch and index arrays are staged: one graph, or, with a PLE stage, two with the host gather of the PLE rows
-    /// between them. The first graph (the embedding and the layers before the PLE stage) needs no PLE row, so the GPU runs it while
-    /// the host reads the n-gram table (hundreds of microseconds of page faults for a drafted window), and the second graph is
-    /// launched behind the rows' upload. The kernels, their order and their arguments are those of the one-graph window.
+    /// Launch a window whose batch and index arrays are staged: one graph, or, with a PLE stage, three with the host gather of the PLE
+    /// rows between the first two. The first graph (the embedding and the layers before the PLE stage) needs no PLE row, so the GPU
+    /// runs it while the host reads the n-gram table (hundreds of microseconds of page faults for a drafted window). The second (the
+    /// PLE stage and a few layers) is launched behind the rows' upload, and the third (the rest and the LM head), which takes the host
+    /// about 0.6 us a kernel to launch, goes in while the second runs, so that launch is not in front of the GPU. The kernels, their
+    /// order and their arguments are those of the one-graph window.
     fn run_window(&mut self, b: &RowBatch, count: usize, par: usize, owed: bool) -> Result<(), ModelError> {
         let live = Self::live_of(b);
         let key = WindowKey::for_batch(b, count, AttnGrid::cover(live, self.opts.max_context), self.graph_features())
@@ -2593,7 +2603,11 @@ impl FlashNextModel {
             Some(split) => {
                 self.run_graph(Self::window_graphs, key.part(1), live, |m| m.window_head(b, split))?;
                 self.prepare_ple(b)?;
-                self.run_graph(Self::window_graphs, key.part(2), live, |m| m.window_tail(b, count, split))
+                let mid = (split + WINDOW_MID_LAYERS).min(self.w.layers.len());
+                if mid > split {
+                    self.run_graph(Self::window_graphs, key.part(2), live, |m| m.window_mid(b, split, mid))?;
+                }
+                self.run_graph(Self::window_graphs, key.part(3), live, |m| m.window_tail(b, count, mid))
             }
             None => {
                 let all = self.w.layers.len();
@@ -2608,6 +2622,13 @@ impl FlashNextModel {
     /// The device work of a window up to its PLE stage: the embedding, the stream expansion and the layers before it.
     fn window_head(&mut self, b: &RowBatch, split: usize) -> Result<(), ModelError> {
         self.layers_head(b, Mode::Window, split)
+    }
+
+    /// The layers `from..to` of a window split in three graphs (the middle one, which takes the PLE stage in front of layer `from`).
+    /// It ends with its own last post-inject, so the graph after it starts from the streams as they are.
+    fn window_mid(&mut self, b: &RowBatch, from: usize, to: usize) -> Result<(), ModelError> {
+        self.run_layers(b, Mode::Window, from, to)?;
+        self.flush_post(b.rows)
     }
 
     /// The rest of a window from its PLE stage on (`split == 0` and no PLE: the whole window): the remaining layers, the full
