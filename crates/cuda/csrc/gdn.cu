@@ -106,8 +106,8 @@ __global__ void __launch_bounds__(128) pre_kernel(
         const __nv_bfloat16* __restrict__ conv_pool, const int* __restrict__ seq_start, const int* __restrict__ slot,
         int n_seq, __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v,
         float* __restrict__ g, float* __restrict__ beta, const int* __restrict__ parent) {
-    pdl_wait();
     pdl_trigger();  // the window kernel may launch and load the recurrent state; it waits for this grid before it reads q, k, v
+    pdl_wait();
     const int row = blockIdx.x;
     const int unit = blockIdx.y * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     const int seq = find_seq(seq_start, n_seq, row);
@@ -311,8 +311,8 @@ __global__ void __launch_bounds__(32 * W_STEP) window_kernel(
         }
     }
     // the state and the owed record are no earlier kernel's output of this window; q, k, v, g and beta are the pre kernel's
+    pdl_trigger();  // the successor may launch now; it waits for this grid before it reads anything
     pdl_wait();
-    pdl_trigger();
     RowIn<R> next;
     next.load(q, k, v, g, beta, begin, head, value0, lane);
     for (int row = begin; row < end; ++row) {

@@ -153,6 +153,7 @@ __device__ __forceinline__ void step_lane_words(const uint32_t (&raw)[step_regs<
 // xh [M, K] fp16 = (x * suh) H / sqrt(128), fp32 inside, fp16 out. One warp a 128-wide block of one row.
 __global__ void __launch_bounds__(128) rot_in_kernel(const void* __restrict__ x, int x_dtype,
                                                      const half* __restrict__ suh, half* __restrict__ xh, int K) {
+    pdl_trigger();                               // the successor may launch at once: it waits for this grid before it reads xh
     pdl_wait();                                  // first, in every block, early exits included (see pdl.cuh)
     const int blk = blockIdx.y * 4 + (threadIdx.x >> 5), row = blockIdx.x, lane = threadIdx.x & 31;
     if (blk * 128 >= K) return;
@@ -160,7 +161,6 @@ __global__ void __launch_bounds__(128) rot_in_kernel(const void* __restrict__ x,
     float v[4], s[4];
     load4(suh, F16, k, s);
     load4(x, x_dtype, (size_t)row * K + k, v);
-    pdl_trigger();
 #pragma unroll
     for (int j = 0; j < 4; ++j) v[j] *= s[j];
     fwht128(v, lane);
@@ -204,6 +204,7 @@ __global__ void __launch_bounds__(128) rot_in_frag_kernel(const void* __restrict
 __global__ void __launch_bounds__(128) rot_out_kernel(const float* __restrict__ c, const half* __restrict__ svh,
                                                       const half* __restrict__ bias, void* __restrict__ y,
                                                       int y_dtype, int M, int N, int SK) {
+    pdl_trigger();                               // the successor may launch at once: it waits for this grid before it reads y
     pdl_wait();                                  // c is the predecessor's output; first, early exits included
     const int blk = blockIdx.y * 4 + (threadIdx.x >> 5), row = blockIdx.x, lane = threadIdx.x & 31;
     if (blk * 128 >= N) return;
@@ -219,7 +220,6 @@ __global__ void __launch_bounds__(128) rot_out_kernel(const float* __restrict__ 
         for (int d = 0; d < 8; ++d)
             if (q0 + d < SK) { s.x += u[d].x; s.y += u[d].y; s.z += u[d].z; s.w += u[d].w; }
     }
-    pdl_trigger();
     float v[4] = {s.x, s.y, s.z, s.w};
     finish(v, lane, svh, bias, col);
     store4(y, y_dtype, at, v);

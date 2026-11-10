@@ -243,8 +243,8 @@ __global__ void __launch_bounds__(KV_TOKEN_U4) kv_write_kernel(const uint4* __re
                                                        const int* __restrict__ row_slot, const int* __restrict__ row_pos,
                                                        const int* __restrict__ table, int max_blocks,
                                                        uint4* __restrict__ kc, uint4* __restrict__ vc) {
-    pdl_wait();
     pdl_trigger();
+    pdl_wait();
     const int r = blockIdx.x;
     const int pos = row_pos[r];
     if (pos < 0) return;
@@ -266,8 +266,8 @@ decode_partial_kernel(const bf16* __restrict__ q, const bf16* __restrict__ kc, c
                       const int* __restrict__ table, int max_blocks, const int* __restrict__ row_slot,
                       const int* __restrict__ row_pos, int rows, int nch_max, float* __restrict__ part_o,
                       float* __restrict__ part_m, float* __restrict__ part_l) {
-    pdl_wait();
     pdl_trigger();
+    pdl_wait();
     // 128-byte aligned on purpose: the static arrays below put the dynamic region at 16/32/48 mod 64 otherwise, and cp.async
     // fills into a base that is not 64-byte aligned run ~25 % slower (decode at 261k: 3.1 ms -> 2.4 ms a layer).
     extern __shared__ __align__(128) uint4 smem[];
@@ -413,8 +413,8 @@ decode_partial_kernel(const bf16* __restrict__ q, const bf16* __restrict__ kc, c
 __global__ void __launch_bounds__(D) decode_merge_kernel(const float* __restrict__ part_o, const float* __restrict__ part_m,
                                                          const float* __restrict__ part_l, const int* __restrict__ row_pos,
                                                          bf16* __restrict__ out, int nch_max) {
-    pdl_wait();
     pdl_trigger();
+    pdl_wait();
     const int row = blockIdx.x, head = blockIdx.y, d = threadIdx.x;
     const int pos = row_pos[row];
     const int nch = pos < 0 ? 0 : min(pos / CHUNK + 1, nch_max);  // a negative position (padding row) writes zeros

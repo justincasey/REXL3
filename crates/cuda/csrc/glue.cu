@@ -146,6 +146,7 @@ struct OpGate { __device__ static float f(float o, float g) { return o * sigmoid
 
 template <class Op>
 __global__ void ew_vec_k(const u16* a, const u16* b, u16* out, size_t n8) {
+    pdl_trigger();
     pdl_wait();
     for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n8; i += (size_t)gridDim.x * blockDim.x) {
         float x[8], y[8], o[8];
@@ -193,6 +194,7 @@ template <int J, int JH>
 __global__ void attn_prep_k(const u16* q_in, const u16* k_in, const int* pos, const int* pos3, const float* qw, const float* kw,
                             u16* q_out, u16* gate_out, u16* k_out, int H, int HKV, int rotary, int has_gate, float eps,
                             RopeTab tab) {
+    pdl_trigger();
     pdl_wait();
     constexpr int HD = J * 32;
     __shared__ float cs[128], sn[128];
@@ -310,6 +312,7 @@ __device__ __forceinline__ void small_linear_block(const u16* x, const __half* w
                                                    float (&sm)[SL_RT][SL_NT / 32]) {
     // the weight row is no kernel's output: bring it toward L2 while the predecessor still runs
     if (threadIdx.x < (unsigned)((k + 63) / 64)) prefetch_l2(w + (size_t)j * k + (size_t)threadIdx.x * 64);
+    pdl_trigger();
     pdl_wait();
     const int r0 = blockIdx.y * SL_RT;
     const int nvec = k / 8;
@@ -1028,6 +1031,7 @@ GB_EXPORT int gb_gather_rows(const void* src, const int* row_idx, void* dst, int
 // Flash-Next gated norm and shared-expert addition. Original REXL3 code, Victor Cruz.
 template <int EPL>
 __global__ void gated_rmsnorm_sigmoid_k(const u16* o, const u16* z, const float* w, u16* out, int heads, float eps) {
+    pdl_trigger();
     pdl_wait();
     constexpr int DIM = EPL * 32;
     const int row = blockIdx.x;

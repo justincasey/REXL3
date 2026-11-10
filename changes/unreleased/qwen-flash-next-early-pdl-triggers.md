@@ -1,0 +1,3 @@
+## New features and improvements
+
+- The decode launches of Qwen3.8-Flash-Next's rotation, glue, gated-delta-net and attention kernels release their successor at their start instead of after their own wait (programmatic dependent launch), so the next kernel's blocks are resident, and can load weights, before the previous one finishes. Every kernel still waits for its predecessor before it reads anything, so only timing changes and every output bit is the same. Measured on one GB10 together with the window launch overlap (decode screen of six prompts, replies exact, `tokens_per_round` 2.9194): 68.67 to 69.66 tok/s drafted and 36.26 to 37.03 tok/s serial.
