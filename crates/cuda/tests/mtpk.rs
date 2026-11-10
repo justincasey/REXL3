@@ -295,3 +295,213 @@ fn golden_mtpk_hashes() {
     let path = std::env::var("REXL3_GOLDEN_OUT").expect("REXL3_GOLDEN_OUT");
     std::fs::write(path, format!("{}\n", lines.join("\n"))).unwrap();
 }
+
+// ---- pick: bit-exact against recorded results of the reference kernel ----------------------------------------------------------
+
+/// One logits row of `n` bf16 values (as bits) of the named kind. The generator is part of the test's identity: the recorded results
+/// below are those of the reference kernel on exactly these rows.
+fn pick_row(kind: &str, seed: u64, n: usize) -> Vec<u16> {
+    let mut r = Rng(0x9e37_79b9_0000_0000 ^ seed);
+    let uni = |r: &mut Rng, lo: f32, hi: f32| bf(r.uniform(lo, hi));
+    match kind {
+        // bf16 rounding of a uniform draw makes the top few grid values repeat many times: ties across threads and warps
+        "uniform" => (0..n).map(|_| uni(&mut r, -6., 6.)).collect(),
+        // a wide range: a few exps dominate the sum, the rest are tiny
+        "wide" => (0..n).map(|_| uni(&mut r, -30., 30.)).collect(),
+        // eight distinct values, the maximum shared by about an eighth of the row
+        "levels" => (0..n).map(|_| bf((r.next_u64() % 8) as f32 * 0.5 - 1.)).collect(),
+        // every element equal: the whole row ties
+        "plateau" => vec![bf(0.5); n],
+        // strictly increasing, then strictly decreasing: the maximum moves with n
+        "ramp_up" => (0..n).map(|i| bf(i as f32 / 4096.)).collect(),
+        "ramp_down" => (0..n).map(|i| bf((n - i) as f32 / 4096.)).collect(),
+        // a spike (and a second equal one after it) on noise: the first must win
+        k if k.starts_with("spike") => {
+            let at: usize = k[5..].parse().unwrap();
+            let mut v: Vec<u16> = (0..n).map(|_| uni(&mut r, -2., 2.)).collect();
+            v[at] = bf(9.);
+            if at + 1500 < n {
+                v[at + 1500] = bf(9.);
+            }
+            v
+        }
+        // two equal maxima on adjacent elements: the lower index must win, whichever threads, words and warps own the two
+        k if k.starts_with("pair") => {
+            let at: usize = k[4..].parse().unwrap();
+            let mut v: Vec<u16> = (0..n).map(|_| uni(&mut r, -2., 2.)).collect();
+            v[at] = bf(9.);
+            v[at + 1] = bf(9.);
+            v
+        }
+        _ => panic!("pick row kind {kind}"),
+    }
+}
+
+/// `(label, kind, seed, n, at)`: a row of `n` logits starting `at` elements into the buffer.
+const PICK_CASES: &[(&str, &str, u64, usize, usize)] = &[
+    ("uniform65536/1", "uniform", 1, 65536, 0),
+    ("uniform65536/2", "uniform", 2, 65536, 0),
+    ("uniform65536/3", "uniform", 3, 65536, 0),
+    ("uniform65536/4", "uniform", 4, 65536, 0),
+    ("uniform65536/5@7", "uniform", 5, 65536, 7),
+    ("wide65536/1", "wide", 1, 65536, 0),
+    ("wide65536/2", "wide", 2, 65536, 0),
+    ("levels65536/1", "levels", 1, 65536, 0),
+    ("levels65536/2", "levels", 2, 65536, 0),
+    ("levels65536/3@3", "levels", 3, 65536, 3),
+    ("plateau65536", "plateau", 0, 65536, 0),
+    ("ramp_up65536", "ramp_up", 0, 65536, 0),
+    ("ramp_down65536", "ramp_down", 0, 65536, 0),
+    ("spike0/65536", "spike0", 1, 65536, 0),
+    ("spike1023/65536", "spike1023", 2, 65536, 0),
+    ("spike1024/65536", "spike1024", 3, 65536, 0),
+    ("spike40000/65536", "spike40000", 4, 65536, 0),
+    ("spike64035/65536", "spike64035", 5, 65536, 0),
+    ("uniform65535/1", "uniform", 11, 65535, 0),
+    ("uniform65535/2@5", "uniform", 12, 65535, 5),
+    ("uniform64513", "uniform", 13, 64513, 0),
+    ("uniform64512", "uniform", 14, 64512, 0),
+    ("levels64000", "levels", 15, 64000, 0),
+    ("wide50001", "wide", 16, 50001, 0),
+    ("uniform33000", "uniform", 17, 33000, 0),
+    ("uniform4097", "uniform", 18, 4097, 0),
+    ("uniform1024", "uniform", 19, 1024, 0),
+    ("uniform1000", "uniform", 20, 1000, 0),
+    ("levels129", "levels", 21, 129, 0),
+    ("uniform33", "uniform", 22, 33, 0),
+    ("plateau2", "plateau", 0, 2, 0),
+    ("uniform1", "uniform", 23, 1, 0),
+];
+
+/// The reference kernel's `(out_id, bits of out_p)` for each case of [`PICK_CASES`], recorded from the kernel before it was
+/// restructured (one block of 1024 threads, two sequential passes over the row).
+const PICK_GOLDEN: &[(&str, i32, u32)] = &[
+    ("uniform65536/1", 76, 0x3940cf6c),
+    ("uniform65536/2", 505, 0x393cf004),
+    ("uniform65536/3", 1232, 0x393e3fb3),
+    ("uniform65536/4", 1528, 0x39400ba9),
+    ("uniform65536/5@7", 308, 0x3941c9d6),
+    ("wide65536/1", 76, 0x3a70be04),
+    ("wide65536/2", 827, 0x3a6cd3a3),
+    ("levels65536/1", 24, 0x384d2ddd),
+    ("levels65536/2", 2, 0x384b476b),
+    ("levels65536/3@3", 11, 0x384c73ea),
+    ("plateau65536", 0, 0x37800000),
+    ("ramp_up65536", 65408, 0x397ff26f),
+    ("ramp_down65536", 0, 0x397fe26f),
+    ("spike0/65536", 0, 0x3d764d14),
+    ("spike1023/65536", 1023, 0x3d73bd84),
+    ("spike1024/65536", 1024, 0x3d74adda),
+    ("spike40000/65536", 40000, 0x3d75b953),
+    ("spike64035/65536", 64035, 0x3d777abd),
+    ("uniform65535/1", 775, 0x3941a0fd),
+    ("uniform65535/2@5", 845, 0x393f2a3e),
+    ("uniform64513", 677, 0x3941d503),
+    ("uniform64512", 625, 0x3942ad5e),
+    ("levels64000", 19, 0x3852fd35),
+    ("wide50001", 1103, 0x3a9bb177),
+    ("uniform33000", 184, 0x39be219d),
+    ("uniform4097", 1200, 0x3b3e06ed),
+    ("uniform1024", 160, 0x3c2d5dbc),
+    ("uniform1000", 412, 0x3c43a2c5),
+    ("levels129", 2, 0x3cc95890),
+    ("uniform33", 31, 0x3e84a54e),
+    ("plateau2", 0, 0x3f000000),
+    ("uniform1", 0, 0x3f800000),
+];
+
+fn run_pick(st: &Stream, kind: &str, seed: u64, n: usize, at: usize) -> (i32, u32, Vec<u16>) {
+    let mut buf = pick_row("uniform", 0xfeed ^ seed, at + n + 9); // the elements around the row are random, never read
+    let row = pick_row(kind, seed, n);
+    buf[at..at + n].copy_from_slice(&row);
+    let logits = DevBuf::from_slice(&buf).unwrap();
+    let mut id = DevBuf::from_slice(&[-7i32, -7, -7]).unwrap();
+    let mut p = DevBuf::from_slice(&[f32::NAN; 3]).unwrap();
+    mtpk::pick(&logits, at, n, &mut id, &mut p, 1, st).unwrap();
+    let (id, p) = (dl::<i32>(&id, st), dl::<f32>(&p, st));
+    assert_eq!((id[0], id[2]), (-7, -7), "pick wrote outside out_id[j]");
+    assert!(p[0].is_nan() && p[2].is_nan(), "pick wrote outside out_p[j]");
+    (id[1], p[1].to_bits(), row)
+}
+
+#[test]
+fn pick_matches_reference_kernel_bits() {
+    let Some(st) = gpu() else { return };
+    let mut wrong = Vec::new();
+    for &(label, kind, seed, n, at) in PICK_CASES {
+        let (id, bits, row) = run_pick(&st, kind, seed, n, at);
+        // the line to record in PICK_GOLDEN, from a run of the reference kernel
+        println!("    (\"{label}\", {id}, 0x{bits:08x}),");
+        // semantics, independent of the recorded bits: the lowest index of the maximum; a probability near the f64 softmax
+        let vals: Vec<f32> = row.iter().map(|&x| bff(x)).collect();
+        let mx = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let want_id = vals.iter().position(|&v| v == mx).unwrap() as i32;
+        assert_eq!(id, want_id, "{label}: argmax (lowest index on ties)");
+        let sum: f64 = vals.iter().map(|&v| ((v - mx) as f64).exp()).sum();
+        let p = f32::from_bits(bits);
+        assert!(((p as f64) * sum - 1.).abs() < 2e-4, "{label}: p={p} vs softmax {}", 1. / sum);
+        let g = PICK_GOLDEN.iter().find(|g| g.0 == label);
+        if g.map(|g| (g.1, g.2)) != Some((id, bits)) {
+            wrong.push(format!("{label}: id {id} p {p} (bits 0x{bits:08x}) differ from the reference kernel's {g:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "out_id/out_p differ from the reference kernel:\n{}", wrong.join("\n"));
+    assert_eq!(PICK_GOLDEN.len(), PICK_CASES.len(), "a recorded result without a case");
+}
+
+/// A production-sized row that starts on a 4-byte boundary is picked by the 512-thread kernel; the same row one element further into
+/// a buffer is not aligned and is picked by the 1024-thread reference kernel. Both must give the same index and the same probability
+/// bits, on rows of every kind, with the maximum (and a tie for it) at every kind of position.
+#[test]
+fn pick_wide_kernel_equals_reference_kernel() {
+    let Some(st) = gpu() else { return };
+    let kinds = [
+        "uniform", "wide", "levels", "plateau", "ramp_up", "ramp_down", "spike0", "spike1", "spike511", "spike1023", "spike1024",
+        "spike30001", "spike64035", "pair0", "pair510", "pair1022", "pair1023", "pair2048", "pair40001", "pair64000",
+    ];
+    let mut rows = 0;
+    for (s, kind) in kinds.iter().enumerate() {
+        for seed in 0..6u64 {
+            let seed = 1000 + 17 * s as u64 + seed;
+            let (id_a, bits_a, row) = run_pick(&st, kind, seed, 65536, 0);
+            let (id_b, bits_b, _) = run_pick(&st, kind, seed, 65536, 1);
+            assert_eq!((id_a, bits_a), (id_b, bits_b), "{kind} seed {seed}: aligned (wide) vs misaligned (reference) row");
+            let mx = row.iter().map(|&x| bff(x)).fold(f32::NEG_INFINITY, f32::max);
+            assert_eq!(id_a as usize, row.iter().position(|&x| bff(x) == mx).unwrap(), "{kind} seed {seed}: argmax");
+            rows += 1;
+        }
+    }
+    println!("{rows} rows: the wide kernel and the reference kernel agree on every index and every probability bit");
+}
+
+/// Repeated launches on one row: the same bits every time (no race between the passes), and a mean kernel time per launch.
+#[test]
+fn pick_is_repeatable_and_timed() {
+    let Some(st) = gpu() else { return };
+    let row = pick_row("uniform", 77, 65536);
+    let logits = DevBuf::from_slice(&row).unwrap();
+    let mut id = DevBuf::zeroed(16 * 4).unwrap();
+    let mut p = DevBuf::zeroed(16 * 4).unwrap();
+    mtpk::pick(&logits, 0, 65536, &mut id, &mut p, 0, &st).unwrap();
+    let first = (dl::<i32>(&id, &st)[0], dl::<f32>(&p, &st)[0].to_bits());
+    let iters = 400;
+    unsafe {
+        use gb_cuda::rt::timed_events as te;
+        let (mut e0, mut e1) = (std::ptr::null_mut(), std::ptr::null_mut());
+        assert_eq!(te::create(&mut e0), 0);
+        assert_eq!(te::create(&mut e1), 0);
+        assert_eq!(te::record(e0, st.raw()), 0);
+        for k in 0..iters {
+            mtpk::pick(&logits, 0, 65536, &mut id, &mut p, k % 16, &st).unwrap();
+        }
+        assert_eq!(te::record(e1, st.raw()), 0);
+        assert_eq!(te::synchronize(e1), 0);
+        let mut ms = 0f32;
+        assert_eq!(te::elapsed_ms(&mut ms, e0, e1), 0);
+        println!("pick 65536 bf16: {:.2} us per launch ({iters} back-to-back launches, warm L2)", ms * 1e3 / iters as f32);
+    }
+    let (ids, ps) = (dl::<i32>(&id, &st), dl::<f32>(&p, &st));
+    for j in 0..16 {
+        assert_eq!((ids[j], ps[j].to_bits()), first, "launch result {j} differs from the first");
+    }
+}
