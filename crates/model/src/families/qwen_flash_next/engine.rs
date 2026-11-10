@@ -134,7 +134,10 @@ fn pack_header_fingerprint(dir: &Path) -> Result<String, ModelError> {
     let mut h = Sha256::new();
     h.update(b"rexl3-flash-next-pack-headers-v1\0");
     h.update(crate::fingerprint::fingerprint(&ck).as_bytes());
-    for file in [super::inventory::NGRAM_FILE, super::inventory::MTP_MIXER_FILE] {
+    for file in [super::inventory::NGRAM_FILE, super::inventory::MTP_MIXER_FILE]
+        .into_iter()
+        .filter(|f| *f != super::inventory::MTP_MIXER_FILE || dir.join(f).exists())
+    {
         let path = dir.join(file);
         let (_, _, entries) = read_header_checked(&path).map_err(|e| ModelError::Config(format!("pack fingerprint: {e}")))?;
         let size = path.metadata().map_err(|e| ModelError::Config(format!("{}: {e}", path.display())))?.len();

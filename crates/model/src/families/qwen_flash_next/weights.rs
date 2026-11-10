@@ -307,9 +307,11 @@ impl WeightMap {
         }
         // The scanner declines n-gram shard trellises as EXL3 linears (no scales).
         // Read their checked header independently; this does not map or read the 32 GB payload.
+        // The MTP mixer patch file is turboderp's packaging; a pack that carries the same three tensors inside its
+        // shards. A missing patch file is then fine, and `bind` still names any mixer tensor that is missing from both.
         for file in [inventory::NGRAM_FILE, inventory::MTP_MIXER_FILE].into_iter().filter(|file| {
             (*file != inventory::NGRAM_FILE || !cfg.ple_layer_ids.is_empty())
-                && (*file != inventory::MTP_MIXER_FILE || cfg.mtp_layers > 0)
+                && (*file != inventory::MTP_MIXER_FILE || (cfg.mtp_layers > 0 && dir.join(file).exists()))
         }) {
             let path = dir.join(file);
             let (header, data_len, entries) = read_header_checked(&path).map_err(|e| vec![e.to_string()])?;
