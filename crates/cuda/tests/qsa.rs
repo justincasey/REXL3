@@ -673,3 +673,80 @@ fn bench_qsa_attend_chunk() {
     // kernel's, which it equals bit for bit): any change of the kernel's arithmetic changes them
     assert_eq!((hw, ho), (0xec1c23cff5f9aedf, 0x05f69ee410812893), "attend partial sums or output changed");
 }
+
+/// The selection kernel keeps exactly the top 512 scores of a row (ties to the lower index), ascending, whatever the scores' distribution:
+/// continuous, a few distinct values (heavy ties at the threshold), all equal, mostly zero, and a cluster narrower than the radix digits.
+/// Entries past a row's last block hold huge values the kernel must not read.
+#[test]
+#[ignore]
+fn qsa_topk_matches_cpu_selection_with_ties() {
+    let Some(st) = gpu() else { return };
+    let mut rng = Rng(77);
+    let nbs: Vec<usize> = (0..60).map(|i| [513, 514, 600, 1023, 1024, 1025, 2049, 2050, 4095, 5000, 8191, 9000][i % 12] + i / 12).collect();
+    let nb_cap = *nbs.iter().max().unwrap() + 3;
+    let n = nbs.len();
+    let mut scores = vec![0f32; n * nb_cap];
+    let mut pos = vec![0i32; n];
+    for (r, &nbq) in nbs.iter().enumerate() {
+        pos[r] = (nbq * CR - 1 + r % CR) as i32;
+        for j in 0..nb_cap {
+            scores[r * nb_cap + j] = if j >= nbq {
+                1e9
+            } else {
+                match r % 6 {
+                    0 => rng.uniform(0.0, 4.0),
+                    1 => (rng.uniform(0.0, 64.0) as u32) as f32 / 16.0,
+                    2 => (rng.uniform(0.0, 3.0) as u32) as f32,
+                    3 => 1.5,
+                    4 => if rng.uniform(0.0, 1.0) < 0.8 { 0.0 } else { rng.uniform(0.0, 2.0) },
+                    _ => 2.0 + rng.uniform(0.0, 1.0) * 1e-6,
+                }
+            };
+        }
+    }
+    let (sd, pd) = (DevBuf::from_slice(&scores).unwrap(), DevBuf::from_slice(&pos).unwrap());
+    let slot = DevBuf::from_slice(&vec![0i32; n]).unwrap();
+    let rr = qsa::Rows { slot: &slot, pos: &pd, rows: n };
+    let (mut sel, mut sel_n) = (DevBuf::zeroed(n * TOPK * 4).unwrap(), DevBuf::zeroed(n * 4).unwrap());
+    qsa::topk(&sd, &rr, nb_cap, &mut sel, &mut sel_n, &st).unwrap();
+    st.sync().unwrap();
+    let (sel, sel_n): (Vec<i32>, Vec<i32>) = (sel.to_vec().unwrap(), sel_n.to_vec().unwrap());
+    for (r, &nbq) in nbs.iter().enumerate() {
+        let want = ref_topk(&scores[r * nb_cap..r * nb_cap + nbq]);
+        assert_eq!(sel_n[r] as usize, want.len(), "row {r} (nbq {nbq}, kind {}): count", r % 6);
+        assert_eq!(sel[r * TOPK..r * TOPK + want.len()], want[..], "row {r} (nbq {nbq}, kind {}): selection", r % 6);
+    }
+}
+
+/// Time of the selection kernel on the chunk's real scores (4,096 rows at positions 28,000.., about 7,000 to 8,000 blocks of keys each: the last chunk of a 32K prompt).
+///     cargo test --release -p gb-cuda --test qsa -- --ignored --nocapture bench_qsa_topk_chunk
+#[test]
+#[ignore]
+fn bench_qsa_topk_chunk() {
+    let Some(st) = gpu() else { return };
+    let rig = Rig::new(&[32800], 11, 1000, &st);
+    let rows: Vec<(usize, usize)> = (0..4096).map(|i| (0, 28000 + i)).collect();
+    let q = rig.queries(&rows, &st);
+    let (sc, sel0, sel_n0, nb_cap) = rig.select(&rows, &q, &st);
+    let n = rows.len();
+    let (sd, pd) = (DevBuf::from_slice(&sc).unwrap(), DevBuf::from_slice(&rows.iter().map(|&(_, p)| p as i32).collect::<Vec<_>>()).unwrap());
+    let slot = DevBuf::from_slice(&vec![0i32; n]).unwrap();
+    let rr = qsa::Rows { slot: &slot, pos: &pd, rows: n };
+    let (mut sel, mut sel_n) = (DevBuf::zeroed(n * TOPK * 4).unwrap(), DevBuf::zeroed(n * 4).unwrap());
+    let mut best = f64::MAX;
+    for it in 0..8 {
+        st.sync().unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..4 {
+            qsa::topk(&sd, &rr, nb_cap, &mut sel, &mut sel_n, &st).unwrap();
+        }
+        st.sync().unwrap();
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / 4.0;
+        if it > 0 {
+            best = best.min(ms);
+        }
+    }
+    let (s1, n1): (Vec<i32>, Vec<i32>) = (sel.to_vec().unwrap(), sel_n.to_vec().unwrap());
+    assert!(s1 == sel0 && n1 == sel_n0, "selection differs from the pipeline's");
+    eprintln!("BENCH topk best {best:.3} ms  selection {:016x}", fnv(bytes_of(&s1)));
+}
