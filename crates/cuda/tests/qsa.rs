@@ -438,6 +438,34 @@ fn qsa_rows_are_invariant() {
 
 /// Golden hashes of the QSA kernels on synthetic data (pool planes, selections, attention).
 ///     REXL3_GOLDEN_OUT=golden_qsa.txt cargo test --release -p gb-cuda --test qsa golden_qsa_hashes -- --ignored
+/// A prefill chunk's rows (64 and more) take the four-heads-a-warp kernel, a window's few rows the twelve-warp one: every row's bf16 output
+/// is the same either way, bit for bit, at one part and at the window's split.
+#[test]
+#[ignore]
+fn qsa_attend_many_rows_equal_one_row_calls_bit_for_bit() {
+    let Some(st) = gpu() else { return };
+    let rig = Rig::new(&LENS, 7, 97, &st);
+    for rows in [
+        (0..80).map(|i| (2, 8900 + i)).collect::<Vec<_>>(),
+        (0..70).map(|i| (1, 2040 + 29 * i)).collect::<Vec<_>>(),
+        (0..65).map(|i| (1 + i % 2, 2100 + 20 * i)).collect::<Vec<_>>(),
+    ] {
+        let rows: Vec<(usize, usize)> = rows.into_iter().filter(|&(s, p)| p < LENS[s]).collect();
+        assert!(rows.len() >= 64, "the chunk-sized kernel needs 64 rows or more");
+        let q = rig.queries(&rows, &st);
+        let (_, sel, sel_n, _) = rig.select(&rows, &q, &st);
+        let qm = main_queries(rows.len(), 123);
+        for parts in [1, qsa::WINDOW_PARTS] {
+            let many = rig.attend(&rows, &qm, &sel, &sel_n, parts, &st);
+            let width = N_Q_HEADS * HEAD_DIM;
+            for r in 0..rows.len() {
+                let one = rig.attend(&rows[r..r + 1], &qm[r * width..(r + 1) * width], &sel[r * TOPK..(r + 1) * TOPK], &sel_n[r..r + 1], parts, &st);
+                assert_eq!(many[r * width..(r + 1) * width], one[..], "row {r} {:?} parts {parts}", rows[r]);
+            }
+        }
+    }
+}
+
 #[test]
 #[ignore]
 fn qsa_attend_parts_one_matches_window_parts() {
