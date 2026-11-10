@@ -450,20 +450,32 @@ __global__ void __launch_bounds__(SL_NT, SLR_MINB) small_linear_rows_k(const u16
 // and the reduction tree are the other kernels' (a 32-output reduce-scatter per four rows).
 constexpr int SLC_J = 8;
 constexpr int SLC_RG = 4;
-template <bool F32OUT>
+constexpr int SLC_EXTRA = 128;  // threads that own a second 8-vector (k <= 3,072): their weights sit in shared memory
+// NV = 8-vectors a thread owns (thread t: vectors t, t + 256 of k): its fmaf chain runs over them in that order, as the other kernels'.
+// The first vector's weights stay in registers, the second's (only threads < k / 8 - 256 have one) in shared memory.
+template <bool F32OUT, int NV>
 __global__ void __launch_bounds__(SL_NT, 2) small_linear_cols_k(const u16* x, const __half* w, void* y, int rows, int k, int n,
                                                                 int rows_per_block) {
     __shared__ float sm[2][SL_NT / 32][32];
+    __shared__ uint4 w2[NV > 1 ? SLC_J : 1][NV > 1 ? SLC_EXTRA : 1];
     const int j0 = blockIdx.x * SLC_J;
     const int rb = blockIdx.y * rows_per_block;
     const int re = min(rows, rb + rows_per_block);
-    const int v = threadIdx.x;
-    const bool live = v < k / 8;
+    const int nvec = k / 8;
     uint4 wv[SLC_J];
 #pragma unroll
     for (int j = 0; j < SLC_J; ++j)
-        wv[j] = (live && j0 + j < n) ? __ldg((const uint4*)(w + (size_t)(j0 + j) * k) + v) : make_uint4(0u, 0u, 0u, 0u);
+        wv[j] = (threadIdx.x < nvec && j0 + j < n) ? __ldg((const uint4*)(w + (size_t)(j0 + j) * k) + threadIdx.x) : make_uint4(0u, 0u, 0u, 0u);
+    if (NV > 1) {
+        const int v2 = threadIdx.x + SL_NT;
+        if (threadIdx.x < SLC_EXTRA) {
+#pragma unroll
+            for (int j = 0; j < SLC_J; ++j)
+                w2[j][threadIdx.x] = (v2 < nvec && j0 + j < n) ? __ldg((const uint4*)(w + (size_t)(j0 + j) * k) + v2) : make_uint4(0u, 0u, 0u, 0u);
+        }
+    }
     const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    __syncthreads();
     int buf = 0;
     for (int r0 = rb; r0 < re; r0 += SLC_RG, buf ^= 1) {
         float acc[SLC_RG][SLC_J];
@@ -472,14 +484,22 @@ __global__ void __launch_bounds__(SL_NT, 2) small_linear_cols_k(const u16* x, co
 #pragma unroll
             for (int j = 0; j < SLC_J; ++j) acc[r][j] = 0.f;
 #pragma unroll
-        for (int r = 0; r < SLC_RG; ++r) {
-            const uint4 xu = (live && r0 + r < re) ? __ldg((const uint4*)(x + (size_t)(r0 + r) * k) + v) : make_uint4(0u, 0u, 0u, 0u);
-            float xf[8];
-            unpack8(xu, xf);
+        for (int q = 0; q < NV; ++q) {
+            const int v = threadIdx.x + q * SL_NT;
+            const bool live = v < nvec;
+            float xf[SLC_RG][8];
+#pragma unroll
+            for (int r = 0; r < SLC_RG; ++r) {
+                const uint4 xu = (live && r0 + r < re) ? __ldg((const uint4*)(x + (size_t)(r0 + r) * k) + v) : make_uint4(0u, 0u, 0u, 0u);
+                unpack8(xu, xf[r]);
+            }
 #pragma unroll
             for (int j = 0; j < SLC_J; ++j) {
+                uint4 wu;
+                if (q == 0) wu = wv[j];
+                else wu = threadIdx.x < SLC_EXTRA ? w2[NV > 1 ? j : 0][NV > 1 ? threadIdx.x : 0] : make_uint4(0u, 0u, 0u, 0u);
                 float wf[8];
-                const __half2* h2 = (const __half2*)&wv[j];
+                const __half2* h2 = (const __half2*)&wu;
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
                     const float2 f = __half22float2(h2[i]);
@@ -487,7 +507,9 @@ __global__ void __launch_bounds__(SL_NT, 2) small_linear_cols_k(const u16* x, co
                     wf[2 * i + 1] = f.y;
                 }
 #pragma unroll
-                for (int i = 0; i < 8; ++i) acc[r][j] = fmaf(xf[i], wf[i], acc[r][j]);
+                for (int r = 0; r < SLC_RG; ++r)
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) acc[r][j] = fmaf(xf[r][i], wf[i], acc[r][j]);
             }
         }
         float s[32];  // output r * SLC_J + j
@@ -891,18 +913,22 @@ static int small_linear_rows(const void* x, const void* w, void* y, int rows, in
     if (rows == 0 || n == 0) return 0;
     if (n < 8) return small_linear(x, w, y, rows, k, n, f32out, stream);
     cudaStream_t st = gb_stream(stream);
-    if (k / 8 <= SL_NT) {
-        // about 4 blocks an SM (48 SMs): a slice of rows each, a multiple of the 4-row step
+    if (k / 8 <= SL_NT + SLC_EXTRA) {
+        // weight-stationary: up to two 8-vectors a thread (k <= 3,072), ~4 blocks an SM (48 SMs): a slice of rows each, a multiple of
+        // the 4-row step
         const int col_groups = (n + SLC_J - 1) / SLC_J;
         int slices = (192 + col_groups - 1) / col_groups;
         const int steps = (rows + SLC_RG - 1) / SLC_RG;
         if (slices > steps) slices = steps;
         const int rows_per_block = ((steps + slices - 1) / slices) * SLC_RG;
         const dim3 grid(col_groups, (rows + rows_per_block - 1) / rows_per_block);
-        if (f32out)
-            small_linear_cols_k<true><<<grid, SL_NT, 0, st>>>((const u16*)x, (const __half*)w, y, rows, k, n, rows_per_block);
-        else
-            small_linear_cols_k<false><<<grid, SL_NT, 0, st>>>((const u16*)x, (const __half*)w, y, rows, k, n, rows_per_block);
+#define GB_SLC(NV_)                                                                                                           \
+    if (f32out)                                                                                                               \
+        small_linear_cols_k<true, NV_><<<grid, SL_NT, 0, st>>>((const u16*)x, (const __half*)w, y, rows, k, n, rows_per_block); \
+    else                                                                                                                      \
+        small_linear_cols_k<false, NV_><<<grid, SL_NT, 0, st>>>((const u16*)x, (const __half*)w, y, rows, k, n, rows_per_block);
+        if (k / 8 <= SL_NT) { GB_SLC(1) } else { GB_SLC(2) }
+#undef GB_SLC
         return GB_CHECK_LAUNCH();
     }
     const dim3 grid((n + SLR_J - 1) / SLR_J, (rows + SLR_R - 1) / SLR_R);
