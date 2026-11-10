@@ -14,9 +14,18 @@
 //   * normalisation is x * (1.0f / sqrtf(ss / dim + eps)) * w with correctly rounded sqrtf and division, so a plain
 //     f32 host loop with the same summation order reproduces the bits.
 #include "common.cuh"
+#include "pdl.cuh"
 #include <math.h>
 
 namespace {
+
+// Flash-Next decode launches (gbp_pdl::kFlash): a kernel launched with the programmatic-dependent-launch attribute may start before
+// its predecessor finishes, so it calls pdl_wait() before it reads anything an earlier kernel of the stream wrote or writes anything an
+// earlier kernel may still read (a no-op in a launch without the attribute). Only timing changes, never a bit.
+using gbp_pdl::pdl_wait;
+using gbp_pdl::pdl_trigger;
+using gbp_pdl::prefetch_l2;
+inline bool flash_pdl() { return gbp_pdl::on(gbp_pdl::kFlash); }
 
 typedef uint16_t u16;
 typedef uint32_t u32;
@@ -137,6 +146,7 @@ struct OpGate { __device__ static float f(float o, float g) { return o * sigmoid
 
 template <class Op>
 __global__ void ew_vec_k(const u16* a, const u16* b, u16* out, size_t n8) {
+    pdl_wait();
     for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n8; i += (size_t)gridDim.x * blockDim.x) {
         float x[8], y[8], o[8];
         unpack8(((const uint4*)a)[i], x);
@@ -161,7 +171,8 @@ int launch_ew(const void* a, const void* b, void* out, long long n, void* stream
     size_t blocks = (units + 255) / 256;
     if (blocks > 1u << 20) blocks = 1u << 20;
     if (vec)
-        ew_vec_k<Op><<<(unsigned)blocks, 256, 0, gb_stream(stream)>>>((const u16*)a, (const u16*)b, (u16*)out, units);
+        gbp_pdl::launch_pdl(flash_pdl(), ew_vec_k<Op>, dim3((unsigned)blocks), dim3(256), 0, gb_stream(stream), (const u16*)a,
+                            (const u16*)b, (u16*)out, units);
     else
         ew_scalar_k<Op><<<(unsigned)blocks, 256, 0, gb_stream(stream)>>>((const u16*)a, (const u16*)b, (u16*)out, units);
     return GB_CHECK_LAUNCH();
@@ -182,6 +193,7 @@ template <int J, int JH>
 __global__ void attn_prep_k(const u16* q_in, const u16* k_in, const int* pos, const int* pos3, const float* qw, const float* kw,
                             u16* q_out, u16* gate_out, u16* k_out, int H, int HKV, int rotary, int has_gate, float eps,
                             RopeTab tab) {
+    pdl_wait();
     constexpr int HD = J * 32;
     __shared__ float cs[128], sn[128];
     const int row = blockIdx.x;
@@ -297,6 +309,9 @@ template <bool F32OUT>
 __global__ void __launch_bounds__(SL_NT) small_linear_k(const u16* x, const __half* w, void* y, int rows, int k, int n) {
     __shared__ float sm[SL_RT][SL_NT / 32];
     const int j = blockIdx.x;
+    // the weight row is no kernel's output: bring it toward L2 while the predecessor still runs
+    if (threadIdx.x < (unsigned)((k + 63) / 64)) prefetch_l2(w + (size_t)j * k + (size_t)threadIdx.x * 64);
+    pdl_wait();
     const int r0 = blockIdx.y * SL_RT;
     const int nvec = k / 8;
     float acc[SL_RT];
@@ -663,6 +678,7 @@ struct Stage2Src {
 // candidate). valid == stride is the whole row, and every bit of it is what the kernel gave before `valid` existed.
 template <int P>
 __global__ void __launch_bounds__(TK_NT) topk_stage1_k(const u16* logits, u64* ws, int stride, int valid, int nchunks, int count) {
+    pdl_wait();
     __shared__ TkShared<P> s;
     const int chunk = blockIdx.x, row = blockIdx.y;
     Stage1Src src;
@@ -676,6 +692,7 @@ __global__ void __launch_bounds__(TK_NT) topk_stage1_k(const u16* logits, u64* w
 
 template <int P>
 __global__ void __launch_bounds__(TK_NT) topk_stage2_k(const u64* ws, int* ids, float* vals, int nchunks, int count) {
+    pdl_wait();
     __shared__ TkShared<P> s;
     const int row = blockIdx.x;
     Stage2Src src;
@@ -703,8 +720,9 @@ static size_t topk_nchunks(int vocab) { return ((size_t)vocab + TK_CHUNK - 1) / 
 template <int P>
 int launch_topk(const void* logits, int rows, int stride, int valid, int count, int* ids, float* vals, u64* ws, void* stream) {
     const int nch = (int)topk_nchunks(valid);
-    topk_stage1_k<P><<<dim3(nch, rows), TK_NT, 0, gb_stream(stream)>>>((const u16*)logits, ws, stride, valid, nch, count);
-    topk_stage2_k<P><<<rows, TK_NT, 0, gb_stream(stream)>>>(ws, ids, vals, nch, count);
+    gbp_pdl::launch_pdl(flash_pdl(), topk_stage1_k<P>, dim3(nch, rows), dim3(TK_NT), 0, gb_stream(stream), (const u16*)logits, ws, stride,
+                        valid, nch, count);
+    gbp_pdl::launch_pdl(flash_pdl(), topk_stage2_k<P>, dim3(rows), dim3(TK_NT), 0, gb_stream(stream), ws, ids, vals, nch, count);
     return GB_CHECK_LAUNCH();
 }
 
@@ -799,9 +817,8 @@ static int attn_prep_launch(const void* q_in, const void* k_in, const int* posit
     const dim3 grid(rows), block(32 * nw);
     cudaStream_t st = gb_stream(stream);
 #define GB_AP(J, JH)                                                                                                   \
-    attn_prep_k<J, JH><<<grid, block, 0, st>>>((const u16*)q_in, (const u16*)k_in, positions, pos3, q_w, k_w,       \
-                                               (u16*)q_out, (u16*)gate_out, (u16*)k_out, heads, kv_heads, rotary_dim,       \
-                                               has_gate, eps, tab)
+    gbp_pdl::launch_pdl(flash_pdl(), attn_prep_k<J, JH>, grid, block, 0, st, (const u16*)q_in, (const u16*)k_in, positions, pos3, \
+                        q_w, k_w, (u16*)q_out, (u16*)gate_out, (u16*)k_out, heads, kv_heads, rotary_dim, has_gate, eps, tab)
     const int jh = rotary_dim / 64;
     if (head_dim == 64) {
         if (jh == 0) GB_AP(2, 0); else GB_AP(2, 1);
@@ -852,9 +869,11 @@ static int small_linear(const void* x, const void* w, void* y, int rows, int k, 
     if (rows == 0 || n == 0) return 0;
     const dim3 grid(n, (rows + SL_RT - 1) / SL_RT);
     if (f32out)
-        small_linear_k<true><<<grid, SL_NT, 0, gb_stream(stream)>>>((const u16*)x, (const __half*)w, y, rows, k, n);
+        gbp_pdl::launch_pdl(flash_pdl(), small_linear_k<true>, grid, dim3(SL_NT), 0, gb_stream(stream), (const u16*)x, (const __half*)w,
+                            y, rows, k, n);
     else
-        small_linear_k<false><<<grid, SL_NT, 0, gb_stream(stream)>>>((const u16*)x, (const __half*)w, y, rows, k, n);
+        gbp_pdl::launch_pdl(flash_pdl(), small_linear_k<false>, grid, dim3(SL_NT), 0, gb_stream(stream), (const u16*)x, (const __half*)w,
+                            y, rows, k, n);
     return GB_CHECK_LAUNCH();
 }
 GB_EXPORT int gb_small_linear_f16w(const void* x, const void* w, void* y, int rows, int k, int n, void* stream) {
@@ -955,6 +974,7 @@ GB_EXPORT int gb_gather_rows(const void* src, const int* row_idx, void* dst, int
 // Flash-Next gated norm and shared-expert addition. Original REXL3 code, Victor Cruz.
 template <int EPL>
 __global__ void gated_rmsnorm_sigmoid_k(const u16* o, const u16* z, const float* w, u16* out, int heads, float eps) {
+    pdl_wait();
     constexpr int DIM = EPL * 32;
     const int row = blockIdx.x;
     const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nw = blockDim.x >> 5;
@@ -1004,9 +1024,11 @@ GB_EXPORT int gb_gated_rmsnorm_sigmoid(const void* o, const void* z, const float
     if (rows == 0) return 0;
     const int nw = heads < 32 ? heads : 32;
     if (dim == 128)
-        gated_rmsnorm_sigmoid_k<4><<<rows, 32 * nw, 0, gb_stream(stream)>>>((const u16*)o, (const u16*)z, w, (u16*)out, heads, eps);
+        gbp_pdl::launch_pdl(flash_pdl(), gated_rmsnorm_sigmoid_k<4>, dim3(rows), dim3(32 * nw), 0, gb_stream(stream), (const u16*)o,
+                            (const u16*)z, w, (u16*)out, heads, eps);
     else
-        gated_rmsnorm_sigmoid_k<8><<<rows, 32 * nw, 0, gb_stream(stream)>>>((const u16*)o, (const u16*)z, w, (u16*)out, heads, eps);
+        gbp_pdl::launch_pdl(flash_pdl(), gated_rmsnorm_sigmoid_k<8>, dim3(rows), dim3(32 * nw), 0, gb_stream(stream), (const u16*)o,
+                            (const u16*)z, w, (u16*)out, heads, eps);
     return GB_CHECK_LAUNCH();
 }
 

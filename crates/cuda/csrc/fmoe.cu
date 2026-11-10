@@ -17,8 +17,16 @@
 //     rotation. The last group of a down column block combines all experts per token in top-k order.
 #include "common.cuh"
 #include "exl3_linear_decode.cuh"
+#include "pdl.cuh"
 
 namespace fmoe {
+
+// Flash-Next decode launches (gbp_pdl::kFlash, the fmoe forward only): a kernel launched with the programmatic-dependent-launch
+// attribute may start before its predecessor finishes, so it calls pdl_wait() before it reads anything an earlier kernel wrote
+// (a no-op in a launch without the attribute). Only timing changes, never a bit.
+using gbp_pdl::pdl_wait;
+using gbp_pdl::pdl_trigger;
+inline bool flash_pdl() { return gbp_pdl::on(gbp_pdl::kFlash); }
 
 constexpr int GT = 8;             // tokens a group (mma n8)
 constexpr int WARPS = 4;          // warps a block
@@ -261,6 +269,8 @@ constexpr int ROUTE_EMAX = 64 * 11 + 64;   // smem capacity (64 tokens, top-k <=
 __global__ void __launch_bounds__(ROUTE_THREADS) route_kernel(const __nv_bfloat16* __restrict__ logits,
                                                               const __nv_bfloat16* __restrict__ shared_gate,
                                                               void* route_base, int emax, int T, int NE, int K) {
+    pdl_wait();     // the logits and the shared gate are the router linears' outputs
+    pdl_trigger();  // gate_up may launch: it reads the route only after its own pdl_wait
     __shared__ int s_exp[ROUTE_EMAX];
     __shared__ float s_wt[ROUTE_EMAX];
     __shared__ int s_rank[ROUTE_EMAX];
@@ -425,6 +435,8 @@ __global__ void __launch_bounds__(ROUTE_THREADS) route_group_kernel(const __nv_b
                                                                     const float* __restrict__ expert_bias, float scale,
                                                                     void* route_base, int emax, int T, int NE, int K,
                                                                     int n_group, int topk_group) {
+    pdl_wait();
+    pdl_trigger();
     __shared__ int s_exp[ROUTE_EMAX];
     __shared__ float s_wt[ROUTE_EMAX];
     __shared__ int s_rank[ROUTE_EMAX];
@@ -615,6 +627,8 @@ struct GateUpArgs {
 };
 
 __global__ void __launch_bounds__(WARPS * 32, 4) gate_up_kernel(GateUpArgs a) {
+    pdl_wait();     // the route (expert groups) and the activations are the predecessors' outputs
+    pdl_trigger();  // every block has started once the successor launches; it waits for this grid before it reads
     extern __shared__ __align__(16) half smem_x[];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const Route r = route_view(const_cast<void*>(a.route), a.emax);
@@ -748,6 +762,8 @@ struct DownArgs {
 };
 
 __global__ void __launch_bounds__(WARPS * 32, 4) down_kernel(DownArgs a) {
+    pdl_wait();
+    pdl_trigger();
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const Route r = route_view(const_cast<void*>(a.route), a.emax);
     const int NBD = a.H >> 7, KCD = a.I >> 7;
@@ -1572,12 +1588,12 @@ GB_EXPORT int gb_fmoe_forward(const void* x, const void* logits, const void* sha
     const int E = T * (top_k + (shared_gate ? 1 : 0));
 
     if (group)
-        route_group_kernel<<<1, ROUTE_THREADS, 0, st>>>((const __nv_bfloat16*)logits, (const __nv_bfloat16*)shared_gate,
-                                                        expert_bias, routed_scaling, w.route, emax, T, NE, top_k, n_group,
-                                                        topk_group);
+        gbp_pdl::launch_pdl(flash_pdl(), route_group_kernel, dim3(1), dim3(ROUTE_THREADS), 0, st, (const __nv_bfloat16*)logits,
+                            (const __nv_bfloat16*)shared_gate, expert_bias, routed_scaling, w.route, emax, T, NE, top_k, n_group,
+                            topk_group);
     else
-        route_kernel<<<1, ROUTE_THREADS, 0, st>>>((const __nv_bfloat16*)logits, (const __nv_bfloat16*)shared_gate,
-                                                 w.route, emax, T, NE, top_k);
+        gbp_pdl::launch_pdl(flash_pdl(), route_kernel, dim3(1), dim3(ROUTE_THREADS), 0, st, (const __nv_bfloat16*)logits,
+                            (const __nv_bfloat16*)shared_gate, w.route, emax, T, NE, top_k);
     int rc = GB_CHECK_LAUNCH();
     if (rc) return rc;
 
@@ -1588,14 +1604,14 @@ GB_EXPORT int gb_fmoe_forward(const void* x, const void* logits, const void* sha
     // the staged tokens live in the default 48 KiB of dynamic shared memory (the kernel never raises its limit): at most 5 blocks of 128
     // a chunk, so H = 2048 (16 blocks) takes KC 4, 8 and 16 and Flash-Next's H = 2560 (20 blocks) KC 4, 5, 10 and 20
     if (smem_a > 48 * 1024) return (int)cudaErrorInvalidValue;
-    gate_up_kernel<<<(jobs_a + WARPS - 1) / WARPS, WARPS * 32, smem_a, st>>>(ga);
+    gbp_pdl::launch_pdl(flash_pdl(), gate_up_kernel, dim3((jobs_a + WARPS - 1) / WARPS), dim3(WARPS * 32), smem_a, st, ga);
     rc = GB_CHECK_LAUNCH();
     if (rc) return rc;
 
     DownArgs da{(const half*)w.xd, w.route, emax, dT, dSv, ktab, (float*)w.partd, (float*)w.y, (int*)w.cntd,
                 (int*)w.cntc, (__nv_bfloat16*)out, H, I};
     const int jobs_b = E * (H / 128) * (I / 128);
-    down_kernel<<<(jobs_b + WARPS - 1) / WARPS, WARPS * 32, 0, st>>>(da);
+    gbp_pdl::launch_pdl(flash_pdl(), down_kernel, dim3((jobs_b + WARPS - 1) / WARPS), dim3(WARPS * 32), 0, st, da);
     return GB_CHECK_LAUNCH();
 }
 

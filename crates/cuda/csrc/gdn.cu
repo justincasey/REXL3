@@ -24,6 +24,7 @@
 // Sequences: seq_start i32[n_seq+1] (row offsets), slot i32[n_seq]. Slots within one launch that writes the pools
 // (commit, prefill) must be distinct.
 #include "common.cuh"
+#include "pdl.cuh"
 
 #ifndef GB_GDN_HV
 #define GB_GDN_HV 48
@@ -31,6 +32,13 @@
 #endif
 
 namespace {
+
+// Flash-Next decode launches (gbp_pdl::kFlash): a kernel launched with the programmatic-dependent-launch attribute may start before its
+// predecessor finishes, so it calls pdl_wait() before it reads anything an earlier kernel wrote (a no-op in a launch without the
+// attribute). Only timing changes, never a bit.
+using gbp_pdl::pdl_wait;
+using gbp_pdl::pdl_trigger;
+inline bool flash_pdl() { return gbp_pdl::on(gbp_pdl::kFlash); }
 
 constexpr int HK = 16;                       // key heads
 constexpr int HV = GB_GDN_HV;                // value heads
@@ -98,6 +106,8 @@ __global__ void __launch_bounds__(128) pre_kernel(
         const __nv_bfloat16* __restrict__ conv_pool, const int* __restrict__ seq_start, const int* __restrict__ slot,
         int n_seq, __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v,
         float* __restrict__ g, float* __restrict__ beta, const int* __restrict__ parent) {
+    pdl_wait();
+    pdl_trigger();  // the window kernel may launch and load the recurrent state; it waits for this grid before it reads q, k, v
     const int row = blockIdx.x;
     const int unit = blockIdx.y * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     const int seq = find_seq(seq_start, n_seq, row);
@@ -300,6 +310,9 @@ __global__ void __launch_bounds__(32 * W_STEP) window_kernel(
             store_state<R>(base, s, value0, lane);
         }
     }
+    // the state and the owed record are no earlier kernel's output of this window; q, k, v, g and beta are the pre kernel's
+    pdl_wait();
+    pdl_trigger();
     RowIn<R> next;
     next.load(q, k, v, g, beta, begin, head, value0, lane);
     for (int row = begin; row < end; ++row) {
@@ -569,8 +582,8 @@ int launch_pre(const __nv_bfloat16* qkv, const __nv_bfloat16* a, const __nv_bflo
                const int* slot, int n_seq, int rows, __nv_bfloat16* q, __nv_bfloat16* k, __nv_bfloat16* v, float* g,
                float* beta, cudaStream_t st, const int* parent = nullptr) {
     if (rows <= 0 || n_seq <= 0) return 0;
-    pre_kernel<<<dim3(rows, NUNITS / 4), 128, 0, st>>>(qkv, a, b, conv_w, a_log, dt_bias, conv_pool, seq_start, slot,
-                                                       n_seq, q, k, v, g, beta, parent);
+    gbp_pdl::launch_pdl(flash_pdl(), pre_kernel, dim3(rows, NUNITS / 4), dim3(128), 0, st, qkv, a, b, conv_w, a_log, dt_bias, conv_pool,
+                        seq_start, slot, n_seq, q, k, v, g, beta, parent);
     return GB_CHECK_LAUNCH();
 }
 
@@ -588,9 +601,9 @@ GB_EXPORT int GB_GDN_EXPORT(gb_gdn_window)(const void* q, const void* k, const v
                             const float* S, const int* seq_start, const int* slot, int n_seq, void* o, void* stream) {
     if (n_seq <= 0) return 0;
     const Owed none{nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0};
-    window_kernel<<<dim3(DK / (R_STEP * W_STEP), HV, n_seq), 32 * W_STEP, 0, gb_stream(stream)>>>(
-        (const __nv_bfloat16*)q, (const __nv_bfloat16*)k, (const __nv_bfloat16*)v, g, beta, const_cast<float*>(S),
-        seq_start, slot, (__nv_bfloat16*)o, none);
+    gbp_pdl::launch_pdl(flash_pdl(), window_kernel, dim3(DK / (R_STEP * W_STEP), HV, n_seq), dim3(32 * W_STEP), 0, gb_stream(stream),
+                        (const __nv_bfloat16*)q, (const __nv_bfloat16*)k, (const __nv_bfloat16*)v, g, beta, const_cast<float*>(S),
+                        seq_start, slot, (__nv_bfloat16*)o, none);
     return GB_CHECK_LAUNCH();
 }
 
@@ -602,9 +615,9 @@ GB_EXPORT int GB_GDN_EXPORT(gb_gdn_window_owed)(const void* q, const void* k, co
                                  const int* owed_keep, void* stream) {
     if (n_seq <= 0) return 0;
     const Owed ow{(const __nv_bfloat16*)owed_k, (const __nv_bfloat16*)owed_v, owed_g, owed_beta, owed_row0, owed_keep, nullptr, 0};
-    window_kernel<<<dim3(DK / (R_STEP * W_STEP), HV, n_seq), 32 * W_STEP, 0, gb_stream(stream)>>>(
-        (const __nv_bfloat16*)q, (const __nv_bfloat16*)k, (const __nv_bfloat16*)v, g, beta, S, seq_start, slot,
-        (__nv_bfloat16*)o, ow);
+    gbp_pdl::launch_pdl(flash_pdl(), window_kernel, dim3(DK / (R_STEP * W_STEP), HV, n_seq), dim3(32 * W_STEP), 0, gb_stream(stream),
+                        (const __nv_bfloat16*)q, (const __nv_bfloat16*)k, (const __nv_bfloat16*)v, g, beta, S, seq_start, slot,
+                        (__nv_bfloat16*)o, ow);
     return GB_CHECK_LAUNCH();
 }
 

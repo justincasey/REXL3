@@ -28,6 +28,7 @@
 // src/tensorfold/cuda/kernels/attention.py, and the mma / ldmatrix / cp.async helpers of qmm_frag.cuh.
 // See THIRD_PARTY_NOTICES.md.
 #include "common.cuh"
+#include "pdl.cuh"
 
 #ifndef GB_ATTN_NKV
 #define GB_ATTN_NKV 4
@@ -38,6 +39,13 @@
 #endif
 
 namespace {
+
+// Flash-Next decode launches (gbp_pdl::kFlash): a kernel launched with the programmatic-dependent-launch attribute may start before its
+// predecessor finishes, so it calls pdl_wait() before it reads anything an earlier kernel wrote (a no-op in a launch without the
+// attribute). Only timing changes, never a bit.
+using gbp_pdl::pdl_wait;
+using gbp_pdl::pdl_trigger;
+inline bool flash_pdl() { return gbp_pdl::on(gbp_pdl::kFlash); }
 
 constexpr int D = 256, NQ = GB_ATTN_NQ, NKV = GB_ATTN_NKV, GRP = NQ / NKV, PAGE = 256, CHUNK = 512, BN = 64, HALF = 32;
 static_assert(NKV == 4 || NKV == 2, "the kernels are built and tested for 4 and 2 kv heads");
@@ -235,6 +243,8 @@ __global__ void __launch_bounds__(KV_TOKEN_U4) kv_write_kernel(const uint4* __re
                                                        const int* __restrict__ row_slot, const int* __restrict__ row_pos,
                                                        const int* __restrict__ table, int max_blocks,
                                                        uint4* __restrict__ kc, uint4* __restrict__ vc) {
+    pdl_wait();
+    pdl_trigger();
     const int r = blockIdx.x;
     const int pos = row_pos[r];
     if (pos < 0) return;
@@ -256,6 +266,8 @@ decode_partial_kernel(const bf16* __restrict__ q, const bf16* __restrict__ kc, c
                       const int* __restrict__ table, int max_blocks, const int* __restrict__ row_slot,
                       const int* __restrict__ row_pos, int rows, int nch_max, float* __restrict__ part_o,
                       float* __restrict__ part_m, float* __restrict__ part_l) {
+    pdl_wait();
+    pdl_trigger();
     // 128-byte aligned on purpose: the static arrays below put the dynamic region at 16/32/48 mod 64 otherwise, and cp.async
     // fills into a base that is not 64-byte aligned run ~25 % slower (decode at 261k: 3.1 ms -> 2.4 ms a layer).
     extern __shared__ __align__(128) uint4 smem[];
@@ -401,6 +413,8 @@ decode_partial_kernel(const bf16* __restrict__ q, const bf16* __restrict__ kc, c
 __global__ void __launch_bounds__(D) decode_merge_kernel(const float* __restrict__ part_o, const float* __restrict__ part_m,
                                                          const float* __restrict__ part_l, const int* __restrict__ row_pos,
                                                          bf16* __restrict__ out, int nch_max) {
+    pdl_wait();
+    pdl_trigger();
     const int row = blockIdx.x, head = blockIdx.y, d = threadIdx.x;
     const int pos = row_pos[row];
     const int nch = pos < 0 ? 0 : min(pos / CHUNK + 1, nch_max);  // a negative position (padding row) writes zeros
@@ -791,8 +805,8 @@ GB_EXPORT int GB_ATTN_EXPORT(gb_kv_write)(const void* k, const void* v, const in
                           int max_blocks, void* k_cache, void* v_cache, int rows, void* stream) {
     if (rows < 0 || max_blocks <= 0) return (int)cudaErrorInvalidValue;
     if (rows == 0) return 0;
-    kv_write_kernel<<<rows, KV_TOKEN_U4, 0, gb_stream(stream)>>>((const uint4*)k, (const uint4*)v, row_slot, row_pos,
-                                                          block_table, max_blocks, (uint4*)k_cache, (uint4*)v_cache);
+    gbp_pdl::launch_pdl(flash_pdl(), kv_write_kernel, dim3(rows), dim3(KV_TOKEN_U4), 0, gb_stream(stream), (const uint4*)k, (const uint4*)v,
+                        row_slot, row_pos, block_table, max_blocks, (uint4*)k_cache, (uint4*)v_cache);
     return GB_CHECK_LAUNCH();
 }
 
@@ -821,12 +835,12 @@ GB_EXPORT int GB_ATTN_EXPORT(gb_attn_decode)(const void* q, const void* k_cache,
     float* pm = (float*)((char*)workspace + align256(pairs * D * 4));
     float* pl = (float*)((char*)workspace + align256(pairs * D * 4) + align256(pairs * 4));
     cudaStream_t s = gb_stream(stream);
-    decode_partial_kernel<DEC_NS><<<dim3((rows + RBLK - 1) / RBLK, NKV, nch), 128, DEC_SMEM, s>>>(
-        (const bf16*)q, (const bf16*)k_cache, (const bf16*)v_cache, block_table, max_blocks, row_slot, row_pos, rows,
-        nch, po, pm, pl);
+    gbp_pdl::launch_pdl(flash_pdl(), decode_partial_kernel<DEC_NS>, dim3((rows + RBLK - 1) / RBLK, NKV, nch), dim3(128), DEC_SMEM, s,
+                        (const bf16*)q, (const bf16*)k_cache, (const bf16*)v_cache, block_table, max_blocks, row_slot, row_pos, rows, nch,
+                        po, pm, pl);
     int rc = GB_CHECK_LAUNCH();
     if (rc) return rc;
-    decode_merge_kernel<<<dim3(rows, NQ), D, 0, s>>>(po, pm, pl, row_pos, (bf16*)out, nch);
+    gbp_pdl::launch_pdl(flash_pdl(), decode_merge_kernel, dim3(rows, NQ), dim3(D), 0, s, po, pm, pl, row_pos, (bf16*)out, nch);
     return GB_CHECK_LAUNCH();
 }
 

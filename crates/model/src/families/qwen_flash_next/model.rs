@@ -1015,6 +1015,11 @@ impl FlashNextModel {
             (false, None)
         };
 
+        // Programmatic dependent launch (csrc/pdl.cuh): a launch may start while its predecessor still runs and reads the
+        // predecessor's writes only after `pdl_wait`. Family bits: 1 the EXL3 chain, 8 the Flash-Next glue, GDN, MoE and attention
+        // launches; only timing changes, never a bit. `REXL3_GLM_PDL` (0..31) overrides.
+        let pdl = std::env::var("REXL3_GLM_PDL").ok().and_then(|v| v.trim().parse::<i32>().ok()).unwrap_or(9) & 31;
+        gb_cuda::exl3_linear::set_pdl_mask(pdl).map_err(|e| ModelError::Config(format!("pdl mask: {e}")))?;
         let mut m = Self {
             stream: Stream::new_nonblocking()?,
             side: Stream::new_nonblocking()?,
