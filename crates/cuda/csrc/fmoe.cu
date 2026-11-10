@@ -31,8 +31,6 @@ inline bool flash_pdl() { return gbp_pdl::on(gbp_pdl::kFlash); }
 constexpr int GT = 8;             // tokens a group (mma n8)
 constexpr int WARPS = 4;          // warps a block
 constexpr float RS128 = 0.088388347648318440f;   // 1 / sqrt(128)
-constexpr float MUL1_SCALE = 1774.0f / 262144.0f; // fp16 0x1EEE
-constexpr float MUL1_BIAS = -10.3828125f;         // fp16 0xC931
 constexpr uint32_t MUL1_MUL = 0x83DCD12Du;
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -161,10 +159,6 @@ __device__ __forceinline__ void tile_load(const uint32_t* __restrict__ tile, int
     }
 }
 
-__device__ __forceinline__ float mul1(uint32_t s) {
-    return fmaf((float)__dp4a(s * MUL1_MUL, 0x01010101u, 1024u), MUL1_SCALE, MUL1_BIAS);
-}
-
 // The 16-bit state of value j (0..7) of a lane, from its words and first-window bit offset (gbx::window16 over the
 // 96-bit stream shifted so the lane's first window starts at bit 0). `w` points at the lane's words (at least
 // GeoK<K2>::NL of them; the caller's arrays hold 3).
@@ -178,15 +172,18 @@ __device__ __forceinline__ uint32_t lane_window(const uint32_t* w, int off0, int
     return gbx::window16(hi, mid, lo, gbx::stream_end<K2>(j) - gbx::stream_end<K2>(0));
 }
 
+// The mma A fragment of the tile from the lane's windows: gbx::decode2 (half2 arithmetic: the fp16 bits 0x6400 + bytesum are
+// exactly 1024 + bytesum, and fp16(fma((1024 + bytesum) * 0x1EEE + 0xC931)) rounds the one exact sum, so the pair is the very
+// bits the fp32 formula fp16((1024 + bytesum) * 1774 / 262144 - 10.3828125) gave).
 template <int K2>
 __device__ __forceinline__ void tile_decode(const uint32_t* w, int off0, uint32_t (&a)[4]) {
-    float v[8];
+    uint32_t s[8];
 #pragma unroll
-    for (int j = 0; j < 8; ++j) v[j] = mul1(lane_window<K2>(w, off0, j));
-    a[0] = h2u(v[0], v[1]);
-    a[1] = h2u(v[4], v[5]);
-    a[2] = h2u(v[2], v[3]);
-    a[3] = h2u(v[6], v[7]);
+    for (int j = 0; j < 8; ++j) s[j] = lane_window<K2>(w, off0, j);
+    a[0] = gbx::decode2<gbx::CB_MUL1>(s[0], s[1]);
+    a[1] = gbx::decode2<gbx::CB_MUL1>(s[4], s[5]);
+    a[2] = gbx::decode2<gbx::CB_MUL1>(s[2], s[3]);
+    a[3] = gbx::decode2<gbx::CB_MUL1>(s[6], s[7]);
 }
 
 // acc[j] += W^T tile (kt, nb * 8 + j) * B(kt) for kt in [0, nkt), tiles of row kt at base + kt * stride_k + j * NW.
@@ -716,11 +713,22 @@ __global__ void __launch_bounds__(WARPS * 32, 4) gate_up_kernel(GateUpArgs a) {
         const float* pg = a.part + ((size_t)slot * 2 + 0) * pstride_mat + col;
         const float* pu = a.part + ((size_t)slot * 2 + 1) * pstride_mat + col;
         float vg[4] = {0.f, 0.f, 0.f, 0.f}, vu[4] = {0.f, 0.f, 0.f, 0.f};
-        for (int k = 0; k < a.KC; ++k) {
-            const float4 x0 = ldcg4(pg + (size_t)k * a.I);
-            const float4 x1 = ldcg4(pu + (size_t)k * a.I);
-            vg[0] += x0.x; vg[1] += x0.y; vg[2] += x0.z; vg[3] += x0.w;
-            vu[0] += x1.x; vu[1] += x1.y; vu[2] += x1.z; vu[3] += x1.w;
+        // the chunk partials are fetched a batch at a time (independent loads, one latency a batch) and added in chunk order
+        constexpr int KB = 10;
+        for (int k0 = 0; k0 < a.KC; k0 += KB) {
+            float4 x0[KB], x1[KB];
+#pragma unroll
+            for (int j = 0; j < KB; ++j)
+                if (k0 + j < a.KC) {
+                    x0[j] = ldcg4(pg + (size_t)(k0 + j) * a.I);
+                    x1[j] = ldcg4(pu + (size_t)(k0 + j) * a.I);
+                }
+#pragma unroll
+            for (int j = 0; j < KB; ++j)
+                if (k0 + j < a.KC) {
+                    vg[0] += x0[j].x; vg[1] += x0[j].y; vg[2] += x0[j].z; vg[3] += x0[j].w;
+                    vu[0] += x1[j].x; vu[1] += x1[j].y; vu[2] += x1[j].z; vu[3] += x1[j].w;
+                }
         }
         had128(vg, lane);
         had128(vu, lane);
@@ -827,9 +835,15 @@ __global__ void __launch_bounds__(WARPS * 32, 4) down_kernel(DownArgs a) {
     for (int c = 0; c < ntok; ++c) {
         const int slot = off + c;
         float v[4] = {0.f, 0.f, 0.f, 0.f};
-        for (int k = 0; k < KCD; ++k) {
-            const float4 x = ldcg4(a.partd + ((size_t)slot * KCD + k) * a.H + col);
-            v[0] += x.x; v[1] += x.y; v[2] += x.z; v[3] += x.w;
+        constexpr int KB = 8;
+        for (int k0 = 0; k0 < KCD; k0 += KB) {
+            float4 x[KB];
+#pragma unroll
+            for (int j = 0; j < KB; ++j)
+                if (k0 + j < KCD) x[j] = ldcg4(a.partd + ((size_t)slot * KCD + k0 + j) * a.H + col);
+#pragma unroll
+            for (int j = 0; j < KB; ++j)
+                if (k0 + j < KCD) { v[0] += x[j].x; v[1] += x[j].y; v[2] += x[j].z; v[3] += x[j].w; }
         }
         had128(v, lane);
 #pragma unroll
@@ -846,14 +860,33 @@ __global__ void __launch_bounds__(WARPS * 32, 4) down_kernel(DownArgs a) {
 
     // every group finished column block nb: combine per token in top-k order
     const int Tn = r.hdr[2], KT = r.hdr[3];
+    // a lane fetches the slot and weight of entry k of the token (KT <= 17 entries), the y rows are then loaded all at once and
+    // added in top-k order; the next token's slots are fetched before this token's rows are added
+    constexpr int KMAX = 17;
+    int slot_n = 0;
+    float w_n = 0.f;
+    if (lane < KT) {
+        slot_n = r.e_slot[lane];
+        w_n = r.s_w[slot_n];
+    }
     for (int tok = 0; tok < Tn; ++tok) {
-        float v[4] = {0.f, 0.f, 0.f, 0.f};
-        for (int k = 0; k < KT; ++k) {
-            const int slot = r.e_slot[tok * KT + k];
-            const float w = r.s_w[slot];
-            const float4 x = ldcg4(a.y + (size_t)slot * a.H + col);
-            v[0] += w * x.x; v[1] += w * x.y; v[2] += w * x.z; v[3] += w * x.w;
+        const int slot_l = slot_n;
+        const float w_l = w_n;
+        if (tok + 1 < Tn && lane < KT) {
+            slot_n = r.e_slot[(tok + 1) * KT + lane];
+            w_n = r.s_w[slot_n];
         }
+        float4 x[KMAX];
+#pragma unroll
+        for (int k = 0; k < KMAX; ++k)
+            if (k < KT) x[k] = ldcg4(a.y + (size_t)__shfl_sync(0xffffffffu, slot_l, k) * a.H + col);
+        float v[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int k = 0; k < KMAX; ++k)
+            if (k < KT) {
+                const float w = __shfl_sync(0xffffffffu, w_l, k);
+                v[0] += w * x[k].x; v[1] += w * x[k].y; v[2] += w * x[k].z; v[3] += w * x[k].w;
+            }
         st_bf16x4(a.out + (size_t)tok * a.H + col, v);
     }
     if (lane == 0) a.cntc[nb] = 0;
