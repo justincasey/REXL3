@@ -80,6 +80,7 @@ mod ffi {
             cap: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn gb_moe_pf_unify(items: *mut c_void, nitems: *mut c_void, cap: i32, stream: *mut c_void) -> i32;
         pub fn gb_moe_pf_rot_in(
             x: *const c_void,
             x_dtype: i32,
@@ -96,7 +97,7 @@ mod ffi {
             e: i32,
             stream: *mut c_void,
         ) -> i32;
-        pub fn gb_moe_pf_gateup(
+        pub fn gb_moe_pf_gateup_u(
             xs0: *const c_void,
             xs1: *const c_void,
             tp0: *const c_void,
@@ -117,7 +118,7 @@ mod ffi {
             limit: f32,
             stream: *mut c_void,
         ) -> i32;
-        pub fn gb_moe_pf_down(
+        pub fn gb_moe_pf_down_u(
             xd: *const c_void,
             tp: *const c_void,
             items: *const c_void,
@@ -260,8 +261,8 @@ impl PrefillScratch {
             ("wts_f32", p * 4),
             ("pick_local", p * 4),
             ("spair", s * 4),
-            ("items", 3 * cap * 16),
-            ("nitems", 16),
+            ("items", 4 * cap * 16),
+            ("nitems", 32),
             ("plan_hist", b * e * 4),
             ("plan_toff", e * 4),
             ("plan_cnt", e * 4),
@@ -328,6 +329,14 @@ impl PrefillScratch {
     /// `use_parallel_plan(true)` was called. Both write the identical spair / items / nitems, so `mark("plan")` and
     /// every downstream kernel are unchanged.
     pub(crate) fn run_plan(&self, pick: *const c_void, rows: usize, e: i32, st: &Stream) -> Result<(), CudaError> {
+        unsafe {
+            self.run_plan_classes(pick, rows, e, st)?;
+            check(ffi::gb_moe_pf_unify(self.items.ptr(), self.nitems.ptr(), self.cap as i32, st.raw()))
+        }
+    }
+
+    /// The plan proper (spair, the three classes' item lists, their counts), by the selected builder.
+    fn run_plan_classes(&self, pick: *const c_void, rows: usize, e: i32, st: &Stream) -> Result<(), CudaError> {
         unsafe {
             if self.plan_parallel {
                 check(ffi::gb_moe_pf_plan_parallel(
@@ -606,7 +615,7 @@ impl MoeExperts {
                         st.raw(),
                     ))?;
                     mark("rot_in")?;
-                    check(ffi::gb_moe_pf_gateup(
+                    check(ffi::gb_moe_pf_gateup_u(
                         s.xs_g.ptr(),
                         s.xs_u.ptr(),
                         b.gate_ptrs.ptr(),
@@ -639,7 +648,7 @@ impl MoeExperts {
                         st.raw(),
                     ))?;
                     s.run_plan(pl, rows, n, st)?;
-                    check(ffi::gb_moe_pf_down(
+                    check(ffi::gb_moe_pf_down_u(
                         s.xd.ptr(),
                         b.down_ptrs.ptr(),
                         s.items.ptr(),
@@ -713,7 +722,7 @@ impl MoeExperts {
                     st.raw(),
                 ))?;
                 mark("rot_in")?;
-                check(ffi::gb_moe_pf_gateup(
+                check(ffi::gb_moe_pf_gateup_u(
                     s.xs_g.ptr(),
                     s.xs_u.ptr(),
                     self.gate_ptrs.ptr(),
@@ -735,7 +744,7 @@ impl MoeExperts {
                     st.raw(),
                 ))?;
                 mark("gate_up")?;
-                check(ffi::gb_moe_pf_down(
+                check(ffi::gb_moe_pf_down_u(
                     s.xd.ptr(),
                     self.down_ptrs.ptr(),
                     s.items.ptr(),

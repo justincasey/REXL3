@@ -169,24 +169,41 @@ template <int K2, int CB, int MT>
 constexpr bool v2_dn_fits() {
     return CB == 2 && smem_down2<K2, MT>() <= kSmemDn2;
 }
+// The unified launches (gateup2u_kernel / down2u_kernel) run the three tile counts in one kernel and need every one of them to fit; the shared memory a
+// block maps is the largest of the three.
+template <int K2>
+constexpr size_t smem_gateup2u() {
+    return smem_gateup2<K2, 4>() > smem_gateup2<K2, 2>() ? smem_gateup2<K2, 4>() : smem_gateup2<K2, 2>();
+}
+template <int K2>
+constexpr size_t smem_down2u() {
+    return smem_down2<K2, 4>() > smem_down2<K2, 2>() ? smem_down2<K2, 4>() : smem_down2<K2, 2>();
+}
+template <int K2, int CB>
+constexpr bool v2_gu_fits_u() {
+    return CB == 2 && smem_gateup2<K2, 1>() <= smem_gateup2u<K2>() && smem_gateup2u<K2>() <= kSmemMax2;
+}
+template <int K2, int CB>
+constexpr bool v2_dn_fits_u() {
+    return CB == 2 && smem_down2<K2, 1>() <= smem_down2u<K2>() && smem_down2u<K2>() <= kSmemDn2;
+}
 // The shape side of the preconditions: one K split, WK warps' chains whole stages.
 inline bool v2_gu_shape(int K, int sk) { return sk == 1 && K % 128 == 0 && ((K / 16) / kWK) % kGuKps == 0; }
 inline bool v2_dn_shape(int K, int sk) { return sk == 1 && K % 128 == 0 && ((K / 16) / kWK) % kDnKps == 0; }
 
+// One work item of the second form (block = 128 columns `blockIdx.x` of `item`): the MT-tile instance of the kernel body. Not inlined: the unified
+// launches pick the instance at run time, and the three instances inlined into one kernel shared one register allocation and spilled to local memory
+// fourteen times as much as the class kernels did (MEASURED: 21 M spill requests a layer against 1.5 M); a call gives each instance its own.
 template <int K2, int CB, int MT, int KPS, int ST>
-__global__ void __launch_bounds__(512, 1) gateup2_kernel(const uint32_t* __restrict__ XS0, const uint32_t* __restrict__ XS1,
-                                                         const uint64_t* __restrict__ TP0, const uint64_t* __restrict__ TP1,
-                                                         const int4* __restrict__ items, const int* __restrict__ nitems,
-                                                         const half* __restrict__ svh_g, const half* __restrict__ svh_u,
-                                                         const half* __restrict__ suh_d, uint32_t* __restrict__ xd, int K, int N, float limit) {
+__device__ __noinline__ void gateup2_item(const int4 item, const uint32_t* __restrict__ XS0, const uint32_t* __restrict__ XS1,
+                                             const uint64_t* __restrict__ TP0, const uint64_t* __restrict__ TP1,
+                                             const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d,
+                                             uint32_t* __restrict__ xd, int K, int N, float limit) {
     constexpr int TW = tile_words<K2>();
     constexpr int STAGE_W = MT * KPS * 128 + KPS * 8 * TW;
     constexpr int STG_W = MT * 16 * kLds2;
-    const int it = blockIdx.y;
-    if (it >= nitems[0]) return;
     extern __shared__ __align__(16) uint32_t smem2[];          // [team 0 ring][team 1 ring], then the staging [gate rows][up rows] in the same bytes
     const int tid = threadIdx.x, team = tid >> 8, tt = tid & 255, warp = tt >> 5, lane = tid & 31;
-    const int4 item = items[it];
     const int e = item.x, tile0 = item.y, nt = item.z, vrows = item.w;
     const int nb = blockIdx.x;
     const uint32_t* T = reinterpret_cast<const uint32_t*>(team ? TP1[e] : TP0[e]);
@@ -230,15 +247,43 @@ __global__ void __launch_bounds__(512, 1) gateup2_kernel(const uint32_t* __restr
     }
 }
 
+// One launch a class of items (1 tile, 2 tiles, 3 or 4 tiles): the MT of the class.
 template <int K2, int CB, int MT, int KPS, int ST>
-__global__ void __launch_bounds__(256, 2) down2_kernel(const uint32_t* __restrict__ XS, const uint64_t* __restrict__ TP, const int4* __restrict__ items,
-                                                       const int* __restrict__ nitems, const half* __restrict__ svh_d, const int* __restrict__ spair,
-                                                       float* __restrict__ y, int K, int N) {
+__global__ void __launch_bounds__(512, 1) gateup2_kernel(const uint32_t* __restrict__ XS0, const uint32_t* __restrict__ XS1,
+                                                         const uint64_t* __restrict__ TP0, const uint64_t* __restrict__ TP1,
+                                                         const int4* __restrict__ items, const int* __restrict__ nitems,
+                                                         const half* __restrict__ svh_g, const half* __restrict__ svh_u,
+                                                         const half* __restrict__ suh_d, uint32_t* __restrict__ xd, int K, int N, float limit) {
     const int it = blockIdx.y;
     if (it >= nitems[0]) return;
+    gateup2_item<K2, CB, MT, KPS, ST>(items[it], XS0, XS1, TP0, TP1, svh_g, svh_u, suh_d, xd, K, N, limit);
+}
+
+// One launch for every item, in the order of the unified list (an expert's items one after the other, so the 5 column blocks of the items of an expert
+// that run together stream its trellis from DRAM once): the MT of an item is picked from its tile count (1, 2, 3 or 4 tiles -> MT 1, 2, 4, 4), each with
+// its own ring depth.
+template <int K2, int CB, int KPS>
+__global__ void __launch_bounds__(512, 1) gateup2u_kernel(const uint32_t* __restrict__ XS0, const uint32_t* __restrict__ XS1,
+                                                          const uint64_t* __restrict__ TP0, const uint64_t* __restrict__ TP1,
+                                                          const int4* __restrict__ items, const int* __restrict__ nitems,
+                                                          const half* __restrict__ svh_g, const half* __restrict__ svh_u,
+                                                          const half* __restrict__ suh_d, uint32_t* __restrict__ xd, int K, int N, float limit) {
+    const int it = blockIdx.y;
+    if (it >= nitems[0]) return;
+    const int4 item = items[it];
+    if (item.z == 1)
+        gateup2_item<K2, CB, 1, KPS, gu_st(1)>(item, XS0, XS1, TP0, TP1, svh_g, svh_u, suh_d, xd, K, N, limit);
+    else if (item.z == 2)
+        gateup2_item<K2, CB, 2, KPS, gu_st(2)>(item, XS0, XS1, TP0, TP1, svh_g, svh_u, suh_d, xd, K, N, limit);
+    else
+        gateup2_item<K2, CB, 4, KPS, gu_st(4)>(item, XS0, XS1, TP0, TP1, svh_g, svh_u, suh_d, xd, K, N, limit);
+}
+
+template <int K2, int CB, int MT, int KPS, int ST>
+__device__ __noinline__ void down2_item(const int4 item, const uint32_t* __restrict__ XS, const uint64_t* __restrict__ TP,
+                                           const half* __restrict__ svh_d, const int* __restrict__ spair, float* __restrict__ y, int K, int N) {
     extern __shared__ __align__(16) uint32_t smem2[];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    const int4 item = items[it];
     const int e = item.x, tile0 = item.y, nt = item.z, vrows = item.w;
     const int nb = blockIdx.x;
     const uint32_t* T = reinterpret_cast<const uint32_t*>(TP[e]);
@@ -261,4 +306,29 @@ __global__ void __launch_bounds__(256, 2) down2_kernel(const uint32_t* __restric
         for (int j = 0; j < 4; ++j) v[j] = v[j] * HAD_SCALE * sv[j];
         *reinterpret_cast<float4*>(y + (size_t)spair[tile0 * 16 + r] * N + n) = make_float4(v[0], v[1], v[2], v[3]);
     }
+}
+
+template <int K2, int CB, int MT, int KPS, int ST>
+__global__ void __launch_bounds__(256, 2) down2_kernel(const uint32_t* __restrict__ XS, const uint64_t* __restrict__ TP, const int4* __restrict__ items,
+                                                       const int* __restrict__ nitems, const half* __restrict__ svh_d, const int* __restrict__ spair,
+                                                       float* __restrict__ y, int K, int N) {
+    const int it = blockIdx.y;
+    if (it >= nitems[0]) return;
+    down2_item<K2, CB, MT, KPS, ST>(items[it], XS, TP, svh_d, spair, y, K, N);
+}
+
+// The unified list's launch (see gateup2u_kernel).
+template <int K2, int CB, int KPS>
+__global__ void __launch_bounds__(256, 2) down2u_kernel(const uint32_t* __restrict__ XS, const uint64_t* __restrict__ TP, const int4* __restrict__ items,
+                                                        const int* __restrict__ nitems, const half* __restrict__ svh_d, const int* __restrict__ spair,
+                                                        float* __restrict__ y, int K, int N) {
+    const int it = blockIdx.y;
+    if (it >= nitems[0]) return;
+    const int4 item = items[it];
+    if (item.z == 1)
+        down2_item<K2, CB, 1, KPS, dn_st(1)>(item, XS, TP, svh_d, spair, y, K, N);
+    else if (item.z == 2)
+        down2_item<K2, CB, 2, KPS, dn_st(2)>(item, XS, TP, svh_d, spair, y, K, N);
+    else
+        down2_item<K2, CB, 4, KPS, dn_st(4)>(item, XS, TP, svh_d, spair, y, K, N);
 }

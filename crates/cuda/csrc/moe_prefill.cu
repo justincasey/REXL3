@@ -7,6 +7,7 @@
 //              three lists of work items (class A: 1 tile, B: 2 tiles, C: 3 or 4 tiles of one expert)
 //   rot_in     per pair p: xs_mat[pos(p)] = fp16(H(x[row of p] * suh_mat[e])) for the gate and the up matrix, stored in the mma's
 //              A-FRAGMENT order (one 16-byte read a lane and k step, see rot_in_frag_kernel in exl3_linear.cu)
+//   unify      the three classes' item lists merged into one list ordered by first tile (an expert's items follow each other)
 //   gate/up    per (128 columns, work item): two teams of four warps, one a matrix, run the item's tiles of rows times the expert's W_q
 //              (ALL K splits inside the block, sums over warps and splits in the decode path's order), then the block itself does
 //              the epilogue on the two sums in shared memory: H, * svh, clamped SwiGLU, * suh_down, H, fp16 -> the down GEMM's A fragments
@@ -299,6 +300,41 @@ __global__ void __launch_bounds__(kPlanThreads) plan_items_kernel(const int* __r
     if (rem == 1) items[oA] = make_int4(tid, t0 + 4 * full, 1, vr);
     if (rem == 2) items[cap + oB] = make_int4(tid, t0 + 4 * full, 2, vr);
     if (rem == 3) items[2 * cap + oC + full] = make_int4(tid, t0 + 4 * full, 3, vr);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// the unified item list: the three classes' lists (each in ascending first tile, tiles being unique) merged into one list ordered by first tile, so
+// the items of an expert (and the experts) follow each other. Item i of class c goes to the place (its index in its class) + (the number of items of
+// the other two classes with a lower first tile). The slots past the total are zeroed (the same full-buffer identity as the plan's own item tail).
+// items [4 * cap] int4: the three classes' lists as the plan wrote them, then the unified list; nitems [8]: the three classes' counts, the sorted
+// rows, then the unified count.
+
+__device__ __forceinline__ int items_before(const int4* l, int n, int tile0) {
+    int lo = 0, hi = n;
+    while (lo < hi) {
+        const int mid = (lo + hi) >> 1;
+        if (l[mid].y < tile0) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+}
+
+__global__ void __launch_bounds__(256) unify_items_kernel(int4* __restrict__ items, int* __restrict__ nitems, int cap) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int n[3] = {nitems[0], nitems[1], nitems[2]};
+    const int total = n[0] + n[1] + n[2];
+    if (i == 0) nitems[4] = total;
+    if (i < cap && i >= total) items[3 * (size_t)cap + i] = make_int4(0, 0, 0, 0);
+    if (i < 3 * cap) {
+        const int c = i / cap, idx = i - c * cap;
+        if (idx < n[c]) {
+            const int4 it = items[i];
+            int rank = idx;
+#pragma unroll
+            for (int o = 0; o < 3; ++o)
+                if (o != c) rank += items_before(items + (size_t)o * cap, n[o], it.y);
+            items[3 * (size_t)cap + rank] = it;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -637,6 +673,27 @@ int launch_down2(const DnArgs& a, cudaStream_t st) {
     return GB_CHECK_LAUNCH();
 }
 
+// The unified list's launches: one launch for all the items (see gateup2u_kernel / down2u_kernel).
+template <int K2, int CB>
+int launch_gateup2u(const GuArgs& a, cudaStream_t st) {
+    constexpr size_t smem = smem_gateup2u<K2>();
+    auto kernel = gateup2u_kernel<K2, CB, kGuKps>;
+    set_smem(kernel, smem);
+    const dim3 grid((unsigned)(a.N / 128), (unsigned)a.cap);
+    kernel<<<grid, 512, smem, st>>>(a.xs0, a.xs1, a.tp0, a.tp1, a.items, a.nitems, a.svh_g, a.svh_u, a.suh_d, a.xd, a.K, a.N, a.limit);
+    return GB_CHECK_LAUNCH();
+}
+
+template <int K2, int CB>
+int launch_down2u(const DnArgs& a, cudaStream_t st) {
+    constexpr size_t smem = smem_down2u<K2>();
+    auto kernel = down2u_kernel<K2, CB, kDnKps>;
+    set_smem(kernel, smem);
+    const dim3 grid((unsigned)(a.N / 128), (unsigned)a.cap);
+    kernel<<<grid, 256, smem, st>>>(a.xs, a.tp, a.items, a.nitems, a.svh_d, a.spair, a.y, a.K, a.N);
+    return GB_CHECK_LAUNCH();
+}
+
 // Which form runs a class: the second where its preconditions hold (it computes the same bits), else the first. `REXL3_MOE_PF_V1=1` forces the first form
 // (A/B runs and tests).
 inline bool force_v1() {
@@ -658,6 +715,54 @@ int launch_down_any(const DnArgs& a, cudaStream_t st) {
         if (v2_dn_shape(a.K, a.SK) && !force_v1()) return launch_down2<K2, CB, NT>(a, st);
     }
     return launch_down<K2, CB, NT>(a, st);
+}
+
+// Every launch of the gate/up (down) GEMM of one layer: the unified list's single launch when the caller built it (`unified`) and the second form
+// takes the shape, else the three classes' launches, the heaviest class first: its blocks fill the machine and the single-tile ones fill in behind them.
+template <int K2, int CB>
+int launch_gateup_set(const GuArgs& a, bool unified, cudaStream_t st) {
+    if constexpr (v2_gu_fits_u<K2, CB>()) {
+        if (unified && v2_gu_shape(a.K, a.SK) && !force_v1()) {
+            GuArgs c = a;
+            c.items = a.items + 3 * a.cap;
+            c.nitems = a.nitems + 4;
+            return launch_gateup2u<K2, CB>(c, st);
+        }
+    }
+    GuArgs c = a;
+    c.items = a.items + 2 * a.cap;
+    c.nitems = a.nitems + 2;
+    int rc = launch_gateup_any<K2, CB, 4>(c, st);
+    c.items = a.items + a.cap;
+    c.nitems = a.nitems + 1;
+    if (!rc) rc = launch_gateup_any<K2, CB, 2>(c, st);
+    c.items = a.items;
+    c.nitems = a.nitems;
+    if (!rc) rc = launch_gateup_any<K2, CB, 1>(c, st);
+    return rc;
+}
+
+template <int K2, int CB>
+int launch_down_set(const DnArgs& a, bool unified, cudaStream_t st) {
+    if constexpr (v2_dn_fits_u<K2, CB>()) {
+        if (unified && v2_dn_shape(a.K, a.SK) && !force_v1()) {
+            DnArgs c = a;
+            c.items = a.items + 3 * a.cap;
+            c.nitems = a.nitems + 4;
+            return launch_down2u<K2, CB>(c, st);
+        }
+    }
+    DnArgs c = a;
+    c.items = a.items + 2 * a.cap;
+    c.nitems = a.nitems + 2;
+    int rc = launch_down_any<K2, CB, 4>(c, st);
+    c.items = a.items + a.cap;
+    c.nitems = a.nitems + 1;
+    if (!rc) rc = launch_down_any<K2, CB, 2>(c, st);
+    c.items = a.items;
+    c.nitems = a.nitems;
+    if (!rc) rc = launch_down_any<K2, CB, 1>(c, st);
+    return rc;
 }
 
 #define GB_PF_FOR_CB(X, K2) X(K2, 0) X(K2, 1) X(K2, 2)
@@ -734,6 +839,13 @@ GB_EXPORT int gb_moe_pf_plan_parallel(const void* pick, void* spair, void* items
     return GB_CHECK_LAUNCH();
 }
 
+// The unified item list of a plan (see unify_items_kernel): items [4 * cap] int4 (the plan wrote the first three regions), nitems [8] i32.
+GB_EXPORT int gb_moe_pf_unify(void* items, void* nitems, int cap, void* stream) {
+    if (cap < 1 || !items || !nitems) return (int)cudaErrorInvalidValue;
+    unify_items_kernel<<<(unsigned)((3LL * cap + 255) / 256), 256, 0, gb_stream(stream)>>>(static_cast<int4*>(items), static_cast<int*>(nitems), cap);
+    return GB_CHECK_LAUNCH();
+}
+
 // xs0 / xs1: A fragments of the gate / up inputs, [S / 16][K / 16][32][4] u32, S = the padded row capacity.
 GB_EXPORT int gb_moe_pf_rot_in(const void* x, int x_dtype, const void* pick, const void* spair, const void* nitems, const void* suh0,
                                const void* suh1, void* xs0, void* xs1, int rows, int topk, int K, int E, void* stream) {
@@ -755,12 +867,9 @@ static int gemm_args_ok(int K, int N, int bits, int codebook, int sk, int wk, in
            wk == kWK && (K / 16) % (sk * wk) == 0 && cap >= 1;
 }
 
-// The gate and up GEMMs with the epilogue (K = the model width, N = the expert width I): xd = the down GEMM's A fragments [S / 16][I / 16][32][4]
-// u32. tp0/tp1: per-expert trellis device addresses (uint64 [E]). The K split `sk` and wk = 4 are gb_moe_default_plan's (mats = 2).
-// limit <= 0: no clamp.
-GB_EXPORT int gb_moe_pf_gateup(const void* xs0, const void* xs1, const void* tp0, const void* tp1, const void* items, const void* nitems,
-                               const void* svh_g, const void* svh_u, const void* suh_d, void* xd, int K, int N, int bits, int codebook,
-                               int sk, int wk, int cap, float limit, void* stream) {
+static int gateup_entry(const void* xs0, const void* xs1, const void* tp0, const void* tp1, const void* items, const void* nitems,
+                        const void* svh_g, const void* svh_u, const void* suh_d, void* xd, int K, int N, int bits, int codebook, int sk, int wk,
+                        int cap, float limit, void* stream, bool unified) {
     if (!gemm_args_ok(K, N, bits, codebook, sk, wk, cap) || !xs0 || !xs1 || !tp0 || !tp1 || !items || !nitems || !svh_g || !svh_u || !suh_d || !xd)
         return (int)cudaErrorInvalidValue;
     const GuArgs a{static_cast<const uint32_t*>(xs0), static_cast<const uint32_t*>(xs1), static_cast<const uint64_t*>(tp0),
@@ -768,22 +877,40 @@ GB_EXPORT int gb_moe_pf_gateup(const void* xs0, const void* xs1, const void* tp0
                    static_cast<const half*>(svh_g), static_cast<const half*>(svh_u), static_cast<const half*>(suh_d),
                    static_cast<uint32_t*>(xd), K, N, sk, cap, limit};
     cudaStream_t st = gb_stream(stream);
-    int rc = 0;
-    // the heaviest class first: its blocks fill the machine and the single-tile ones fill in behind them
 #define GB_G(K2_, CB_)                                                                                                  \
-    if (2 * bits == K2_ && codebook == CB_) {                                                                           \
-        GuArgs c = a;                                                                                                   \
-        c.items = a.items + 2 * cap;                                                                                    \
-        c.nitems = a.nitems + 2;                                                                                        \
-        rc = launch_gateup_any<K2_, CB_, 4>(c, st);                                                                       \
-        c.items = a.items + cap;                                                                                        \
-        c.nitems = a.nitems + 1;                                                                                        \
-        if (!rc) rc = launch_gateup_any<K2_, CB_, 2>(c, st);                                                              \
-        c.items = a.items;                                                                                              \
-        c.nitems = a.nitems;                                                                                            \
-        if (!rc) rc = launch_gateup_any<K2_, CB_, 1>(c, st);                                                              \
-        return rc;                                                                                                      \
-    }
+    if (2 * bits == K2_ && codebook == CB_) return launch_gateup_set<K2_, CB_>(a, unified, st);
+    GB_PF_FOR_ALL(GB_G)
+#undef GB_G
+    return (int)cudaErrorInvalidValue;
+}
+
+// The gate and up GEMMs with the epilogue (K = the model width, N = the expert width I): xd = the down GEMM's A fragments [S / 16][I / 16][32][4]
+// u32. tp0/tp1: per-expert trellis device addresses (uint64 [E]). The K split `sk` and wk = 4 are gb_moe_default_plan's (mats = 2).
+// limit <= 0: no clamp. Runs the three classes' item lists (`items` [3 * cap] int4 from the plan).
+GB_EXPORT int gb_moe_pf_gateup(const void* xs0, const void* xs1, const void* tp0, const void* tp1, const void* items, const void* nitems,
+                               const void* svh_g, const void* svh_u, const void* suh_d, void* xd, int K, int N, int bits, int codebook,
+                               int sk, int wk, int cap, float limit, void* stream) {
+    return gateup_entry(xs0, xs1, tp0, tp1, items, nitems, svh_g, svh_u, suh_d, xd, K, N, bits, codebook, sk, wk, cap, limit, stream, false);
+}
+
+// The same GEMMs over `items` [4 * cap] int4 and `nitems` [8] i32 with the unified list gb_moe_pf_unify built (all the work items, an expert's items
+// together): one launch where the second form takes the shape, else the class launches (the class lists are in the same buffers).
+GB_EXPORT int gb_moe_pf_gateup_u(const void* xs0, const void* xs1, const void* tp0, const void* tp1, const void* items, const void* nitems,
+                                 const void* svh_g, const void* svh_u, const void* suh_d, void* xd, int K, int N, int bits, int codebook,
+                                 int sk, int wk, int cap, float limit, void* stream) {
+    return gateup_entry(xs0, xs1, tp0, tp1, items, nitems, svh_g, svh_u, suh_d, xd, K, N, bits, codebook, sk, wk, cap, limit, stream, true);
+}
+
+static int down_entry(const void* xd, const void* tp, const void* items, const void* nitems, const void* svh_d, const void* spair, void* y, int K,
+                      int N, int bits, int codebook, int sk, int wk, int cap, void* stream, bool unified) {
+    if (!gemm_args_ok(K, N, bits, codebook, sk, wk, cap) || !xd || !tp || !items || !nitems || !svh_d || !spair || !y)
+        return (int)cudaErrorInvalidValue;
+    const DnArgs a{static_cast<const uint32_t*>(xd), static_cast<const uint64_t*>(tp), static_cast<const int4*>(items),
+                   static_cast<const int*>(nitems), static_cast<const half*>(svh_d), static_cast<const int*>(spair),
+                   static_cast<float*>(y), K, N, sk, cap};
+    cudaStream_t st = gb_stream(stream);
+#define GB_G(K2_, CB_)                                                                                                  \
+    if (2 * bits == K2_ && codebook == CB_) return launch_down_set<K2_, CB_>(a, unified, st);
     GB_PF_FOR_ALL(GB_G)
 #undef GB_G
     return (int)cudaErrorInvalidValue;
@@ -793,30 +920,13 @@ GB_EXPORT int gb_moe_pf_gateup(const void* xs0, const void* xs1, const void* tp0
 // sorted row belongs to (`spair`). The split `sk` is gb_moe_default_plan's for mats = 1.
 GB_EXPORT int gb_moe_pf_down(const void* xd, const void* tp, const void* items, const void* nitems, const void* svh_d, const void* spair,
                              void* y, int K, int N, int bits, int codebook, int sk, int wk, int cap, void* stream) {
-    if (!gemm_args_ok(K, N, bits, codebook, sk, wk, cap) || !xd || !tp || !items || !nitems || !svh_d || !spair || !y)
-        return (int)cudaErrorInvalidValue;
-    const DnArgs a{static_cast<const uint32_t*>(xd), static_cast<const uint64_t*>(tp), static_cast<const int4*>(items),
-                   static_cast<const int*>(nitems), static_cast<const half*>(svh_d), static_cast<const int*>(spair),
-                   static_cast<float*>(y), K, N, sk, cap};
-    cudaStream_t st = gb_stream(stream);
-    int rc = 0;
-#define GB_G(K2_, CB_)                                                                                                  \
-    if (2 * bits == K2_ && codebook == CB_) {                                                                           \
-        DnArgs c = a;                                                                                                   \
-        c.items = a.items + 2 * cap;                                                                                    \
-        c.nitems = a.nitems + 2;                                                                                        \
-        rc = launch_down_any<K2_, CB_, 4>(c, st);                                                                         \
-        c.items = a.items + cap;                                                                                        \
-        c.nitems = a.nitems + 1;                                                                                        \
-        if (!rc) rc = launch_down_any<K2_, CB_, 2>(c, st);                                                                \
-        c.items = a.items;                                                                                              \
-        c.nitems = a.nitems;                                                                                            \
-        if (!rc) rc = launch_down_any<K2_, CB_, 1>(c, st);                                                                \
-        return rc;                                                                                                      \
-    }
-    GB_PF_FOR_ALL(GB_G)
-#undef GB_G
-    return (int)cudaErrorInvalidValue;
+    return down_entry(xd, tp, items, nitems, svh_d, spair, y, K, N, bits, codebook, sk, wk, cap, stream, false);
+}
+
+// The down GEMM over the unified list (see gb_moe_pf_gateup_u).
+GB_EXPORT int gb_moe_pf_down_u(const void* xd, const void* tp, const void* items, const void* nitems, const void* svh_d, const void* spair,
+                               void* y, int K, int N, int bits, int codebook, int sk, int wk, int cap, void* stream) {
+    return down_entry(xd, tp, items, nitems, svh_d, spair, y, K, N, bits, codebook, sk, wk, cap, stream, true);
 }
 
 // out [rows, D] fp32 = sum over slots in order of w * y, then + shared [rows, D] fp32 (null: nothing added). y [P, D] from gb_moe_pf_down.
