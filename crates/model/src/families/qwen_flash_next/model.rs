@@ -28,7 +28,7 @@
 
 use super::config::FlashNextConfig;
 use super::device::{FlashNextLayer, FlashNextWeights, MixerWeights, PleWeights};
-use super::graph_cache::{self, GraphKind, GraphStats};
+use super::graph_cache::{self, Admit, GraphCache, GraphKind, GraphStats};
 use super::ngram::{Ahead, TokContext};
 use crate::error::ModelError;
 use crate::forward::{Candidates, Mode, PrefillPath};
@@ -45,7 +45,7 @@ use gb_cuda::moe_prefill::{finish_shared, PrefillScratch, SharedScratchBig};
 use gb_cuda::rt::{Event, HostStage};
 use gb_cuda::{fmoe, fn_glue, fn_moe, glue, hcx, mtpk, ple, qfn_verify, qsa, CudaError, DevBuf, Stream};
 use gb_engine::RowRequest;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -555,11 +555,12 @@ pub struct FlashNextModel {
     /// (fused into its norm pass when it can), anything else that reads the streams first calls [`Model::flush_post`].
     pending_post: Option<PostKind>,
     pending: BTreeMap<usize, usize>,
-    /// Replayable windows and draft chains, and the context the grid of the one being run covers.
-    graphs: HashMap<WindowKey, Graph>,
-    mtp_graphs: HashMap<ChainKey, Graph>,
-    /// What the two maps above have done (`/metrics`, the `flash_next_graphs` event).
+    /// Replayable windows and draft chains (bounded; a graph after a shape's second sighting: see `graph_cache`) and what they
+    /// have done (`/metrics`, the `flash_next_graphs` event).
+    graphs: GraphCache<WindowKey, Graph>,
+    mtp_graphs: GraphCache<ChainKey, Graph>,
     graph_stats: GraphStats,
+    /// The context the grid of the window or chain being run covers.
     attn_ctx: Option<usize>,
     use_graphs: bool,
     /// The fused hyper-connection pre-mix (`REXL3_FAST=0` takes the reference kernels instead).
@@ -1228,8 +1229,14 @@ impl FlashNextModel {
             last_window: None,
             pending_post: None,
             pending: BTreeMap::new(),
-            graphs: HashMap::new(),
-            mtp_graphs: HashMap::new(),
+            graphs: GraphCache::new(
+                graph_cache::limit_from_env(graph_cache::ENV_WINDOW_GRAPHS, graph_cache::DEFAULT_WINDOW_GRAPHS),
+                graph_cache::capture_first_from_env(),
+            ),
+            mtp_graphs: GraphCache::new(
+                graph_cache::limit_from_env(graph_cache::ENV_CHAIN_GRAPHS, graph_cache::DEFAULT_CHAIN_GRAPHS),
+                graph_cache::capture_first_from_env(),
+            ),
             graph_stats: GraphStats::default(),
             attn_ctx: None,
             use_graphs: graphs_enabled(),
@@ -2929,20 +2936,21 @@ impl FlashNextModel {
         }
     }
 
-    fn window_graphs(&mut self) -> &mut HashMap<WindowKey, Graph> {
-        &mut self.graphs
+    fn window_graphs(&mut self) -> (&mut GraphCache<WindowKey, Graph>, &Stream) {
+        (&mut self.graphs, &self.stream)
     }
 
-    fn chain_graphs(&mut self) -> &mut HashMap<ChainKey, Graph> {
-        &mut self.mtp_graphs
+    fn chain_graphs(&mut self) -> (&mut GraphCache<ChainKey, Graph>, &Stream) {
+        (&mut self.mtp_graphs, &self.stream)
     }
 
-    /// Run `body` for a window of live context `live` under the graph recorded for `key`: captured on first use, then
-    /// replayed. The key's attention grid must cover the window (a graph sized for less context would read a stale grid),
+    /// Run `body` for a window of live context `live` under the graph recorded for `key`: replayed when the cache has it,
+    /// run eagerly the first time the shape is seen, captured (and replayed) the second time (`graph_cache` has the policy and
+    /// the bound). The key's attention grid must cover the window (a graph sized for less context would read a stale grid),
     /// and the grid is what attention launches with while `body` runs, graphs on or off.
     fn run_graph<K: GraphKey>(
         &mut self,
-        graphs: fn(&mut Self) -> &mut HashMap<K, Graph>,
+        graphs: fn(&mut Self) -> (&mut GraphCache<K, Graph>, &Stream),
         key: K,
         live: usize,
         body: impl Fn(&mut Self) -> Result<(), ModelError>,
@@ -2956,10 +2964,7 @@ impl FlashNextModel {
         }
         self.attn_ctx = Some(grid.ctx());
         let r = if self.use_graphs {
-            let mut map = std::mem::take(graphs(self));
-            let r = self.capture_and_launch(&mut map, key, body);
-            *graphs(self) = map;
-            r
+            self.capture_and_launch(graphs, key, body)
         } else {
             self.graph_stats.of(K::KIND).eager += 1;
             body(self)
@@ -2968,60 +2973,76 @@ impl FlashNextModel {
         r
     }
 
-    // not `entry()`: a capture the runtime refuses must leave the map untouched and run the work eagerly instead
-    #[allow(clippy::map_entry)]
     fn capture_and_launch<K: GraphKey>(
         &mut self,
-        map: &mut HashMap<K, Graph>,
+        graphs: fn(&mut Self) -> (&mut GraphCache<K, Graph>, &Stream),
         key: K,
         body: impl Fn(&mut Self) -> Result<(), ModelError>,
     ) -> Result<(), ModelError> {
-        if !map.contains_key(&key) {
-            let (free_before, began) = (gb_cuda::rt::mem_info().ok().map(|m| m.0), std::time::Instant::now());
-            let cap = match Graph::begin(&self.stream) {
-                Ok(c) => c,
-                Err(e) if e.is_fatal() => return Err(ModelError::Cuda(e)),
-                Err(e) => {
-                    eprintln!("rexl3 level=warn graph capture refused ({e}): running Flash-Next windows eagerly");
-                    self.use_graphs = false;
-                    self.graph_stats.of(K::KIND).eager += 1;
-                    return body(self);
-                }
-            };
-            let ran = body(self);
-            match cap.finish(ran) {
-                Ok(g) => {
-                    map.insert(key, g);
-                    let st = &mut self.graph_stats;
-                    st.of(K::KIND).captures += 1;
-                    st.capture_ms += began.elapsed().as_secs_f64() * 1e3;
-                    if let (Some(before), Ok((after, _))) = (free_before, gb_cuda::rt::mem_info()) {
-                        st.free_drop_bytes += before as i64 - after as i64;
-                    }
-                    if st.captures() % graph_cache::EVENT_EVERY == 0 {
-                        let live = match K::KIND {
-                            GraphKind::Window => (map.len(), self.mtp_graphs.len()),
-                            GraphKind::Chain => (self.graphs.len(), map.len()),
-                        };
-                        eprintln!("{}", st.event_line(live, graph_cache::HostSample::take()));
-                    }
-                }
-                Err(CaptureError::Closure(e)) => return Err(e),
-                Err(e) => {
-                    if let Some(f) = e.fatal() {
-                        return Err(ModelError::Cuda(gb_cuda::CudaError(f.0)));
-                    }
-                    eprintln!("rexl3 level=warn {e}: running Flash-Next windows eagerly");
-                    self.use_graphs = false;
-                    self.graph_stats.of(K::KIND).eager += 1;
-                    return body(self);
-                }
-            }
-        } else {
+        let (cache, stream) = graphs(self);
+        if let Some(g) = cache.get(&key) {
+            g.launch(stream)?;
             self.graph_stats.of(K::KIND).replays += 1;
+            return Ok(());
         }
-        map[&key].launch(&self.stream)?;
-        Ok(())
+        if cache.admit(key) == Admit::Eager {
+            self.graph_stats.of(K::KIND).eager += 1;
+            return body(self);
+        }
+        if cache.is_full() {
+            // The graph that goes may still be running: the first part of a split window is launched and not waited for when its
+            // second part captures. Every other launch is waited for by the sync that ends its round, but a retirement does not
+            // depend on where it falls.
+            self.sync()?;
+            let (cache, _) = graphs(self);
+            let limit = cache.limit();
+            drop(cache.retire_oldest());
+            let evictions = &mut self.graph_stats.of(K::KIND).evictions;
+            *evictions += 1;
+            if *evictions == 1 {
+                eprintln!(
+                    "rexl3 event=flash_next_graph_cache_full kind={:?} limit={limit} note=\"shapes past the limit retire the least recently launched graph\"",
+                    K::KIND
+                );
+            }
+        }
+        let (free_before, began) = (gb_cuda::rt::mem_info().ok().map(|m| m.0), std::time::Instant::now());
+        let cap = match Graph::begin(&self.stream) {
+            Ok(c) => c,
+            Err(e) if e.is_fatal() => return Err(ModelError::Cuda(e)),
+            Err(e) => {
+                eprintln!("rexl3 level=warn graph capture refused ({e}): running Flash-Next windows eagerly");
+                self.use_graphs = false;
+                self.graph_stats.of(K::KIND).eager += 1;
+                return body(self);
+            }
+        };
+        let ran = body(self);
+        let g = match cap.finish(ran) {
+            Ok(g) => g,
+            Err(CaptureError::Closure(e)) => return Err(e),
+            Err(e) => {
+                if let Some(f) = e.fatal() {
+                    return Err(ModelError::Cuda(gb_cuda::CudaError(f.0)));
+                }
+                eprintln!("rexl3 level=warn {e}: running Flash-Next windows eagerly");
+                self.use_graphs = false;
+                self.graph_stats.of(K::KIND).eager += 1;
+                return body(self);
+            }
+        };
+        let launched = g.launch(&self.stream);
+        graphs(self).0.insert(key, g);
+        let st = &mut self.graph_stats;
+        st.of(K::KIND).captures += 1;
+        st.capture_ms += began.elapsed().as_secs_f64() * 1e3;
+        if let (Some(before), Ok((after, _))) = (free_before, gb_cuda::rt::mem_info()) {
+            st.free_drop_bytes += before as i64 - after as i64;
+        }
+        if st.captures() % graph_cache::EVENT_EVERY == 0 {
+            eprintln!("{}", st.event_line((self.graphs.len(), self.mtp_graphs.len()), graph_cache::HostSample::take()));
+        }
+        Ok(launched?)
     }
 }
 
