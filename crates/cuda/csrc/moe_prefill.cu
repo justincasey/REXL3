@@ -551,6 +551,47 @@ __global__ void __launch_bounds__(32) combine_f32_kernel(const float* __restrict
     *reinterpret_cast<float4*>(out + (size_t)r * D + n) = make_float4(acc[0], acc[1], acc[2], acc[3]);
 }
 
+// The f32-weight combine and the shared expert's finish in one launch: out [rows, D] bf16 = bf16(routed + sigmoid(gate[r]) * shared[r, d]), `routed` the
+// slot chain of combine_f32_kernel (acc = fmaf(w_k, y_k, acc) over the slots in order from 0), held in registers where finish_shared_kernel reads it back
+// from a fp32 buffer: the same fp32 sum into the same expression (`a + b * g`, both multiply and add rounded, this file is built --fmad=false), the one
+// bf16 round at the end.
+__global__ void __launch_bounds__(32) combine_finish_kernel(const float* __restrict__ y, const int* __restrict__ pick, const float* __restrict__ wts,
+                                                            const float* __restrict__ shared, const __nv_bfloat16* __restrict__ gate,
+                                                            __nv_bfloat16* __restrict__ out, int D, int E, int topk) {
+    const int r = blockIdx.x, lane = threadIdx.x;
+    const int n = blockIdx.y * 128 + 4 * lane;
+    float4 u[kMaxTopK];
+    bool ok[kMaxTopK];
+#pragma unroll
+    for (int k = 0; k < kMaxTopK; ++k) {
+        ok[k] = false;
+        if (k < topk) {
+            const int e = pick[(size_t)r * topk + k];
+            ok[k] = e >= 0 && e < E;
+            if (ok[k]) u[k] = *reinterpret_cast<const float4*>(y + ((size_t)r * topk + k) * D + n);
+        }
+    }
+    const float4 b = *reinterpret_cast<const float4*>(shared + (size_t)r * D + n);
+    const float g = 1.0f / (1.0f + expf(-__bfloat162float(gate[r])));
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+    for (int q = 0; q < kMaxTopK; ++q) {
+        if (q < topk && ok[q]) {
+            const float w = wts[(size_t)r * topk + q];
+            acc[0] = fmaf(w, u[q].x, acc[0]);
+            acc[1] = fmaf(w, u[q].y, acc[1]);
+            acc[2] = fmaf(w, u[q].z, acc[2]);
+            acc[3] = fmaf(w, u[q].w, acc[3]);
+        }
+    }
+    const __nv_bfloat162 o0 = __floats2bfloat162_rn(acc[0] + b.x * g, acc[1] + b.y * g);
+    const __nv_bfloat162 o1 = __floats2bfloat162_rn(acc[2] + b.z * g, acc[3] + b.w * g);
+    uint2 o;
+    o.x = *reinterpret_cast<const uint32_t*>(&o0);
+    o.y = *reinterpret_cast<const uint32_t*>(&o1);
+    *reinterpret_cast<uint2*>(out + (size_t)r * D + n) = o;
+}
+
 // The router's fp32 weights (`moe_topk_softmax` writes f32) into the scratch's fp16 weights: out [n] = fp16(in [n]),
 // round to nearest even (the format the combine reads; the Qwen path calls this right after routing).
 __global__ void wts_f32_f16_kernel(const float* __restrict__ in, half* __restrict__ out, size_t n) {
@@ -947,6 +988,19 @@ GB_EXPORT int gb_moe_pf_combine_f32(const void* y, const void* pick, const void*
     const dim3 grid((unsigned)rows, (unsigned)(D / 128));
     combine_f32_kernel<<<grid, 32, 0, gb_stream(stream)>>>(static_cast<const float*>(y), static_cast<const int*>(pick), static_cast<const float*>(wts),
                                                             static_cast<const float*>(shared), static_cast<float*>(out), D, E, topk);
+    return GB_CHECK_LAUNCH();
+}
+
+// The f32-weight combine with the shared expert's finish fused: out [rows, D] bf16 = bf16(sum over slots in order of w * y + sigmoid(gate) * shared),
+// gate bf16 [rows], shared fp32 [rows, D], wts f32 [rows * topk]; the bits of gb_moe_pf_combine_f32 (shared = null) followed by gb_moe_pf_finish_shared.
+GB_EXPORT int gb_moe_pf_combine_finish(const void* y, const void* pick, const void* wts, const void* shared, const void* gate, void* out, int rows,
+                                       int topk, int D, int E, void* stream) {
+    if (rows < 1 || topk < 1 || topk > kMaxTopK || D <= 0 || D % 128 || E < 1 || !y || !pick || !wts || !shared || !gate || !out)
+        return (int)cudaErrorInvalidValue;
+    const dim3 grid((unsigned)rows, (unsigned)(D / 128));
+    combine_finish_kernel<<<grid, 32, 0, gb_stream(stream)>>>(static_cast<const float*>(y), static_cast<const int*>(pick), static_cast<const float*>(wts),
+                                                              static_cast<const float*>(shared), static_cast<const __nv_bfloat16*>(gate),
+                                                              static_cast<__nv_bfloat16*>(out), D, E, topk);
     return GB_CHECK_LAUNCH();
 }
 

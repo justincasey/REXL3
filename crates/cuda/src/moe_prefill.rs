@@ -159,6 +159,19 @@ mod ffi {
             e: i32,
             stream: *mut c_void,
         ) -> i32;
+        pub fn gb_moe_pf_combine_finish(
+            y: *const c_void,
+            pick: *const c_void,
+            wts: *const c_void,
+            shared: *const c_void,
+            gate: *const c_void,
+            out: *mut c_void,
+            rows: i32,
+            topk: i32,
+            d: i32,
+            e: i32,
+            stream: *mut c_void,
+        ) -> i32;
         pub fn gb_moe_pf_wts_f32_f16(
             src: *const c_void,
             dst: *mut c_void,
@@ -494,7 +507,7 @@ impl MoeExperts {
         s: &mut PrefillScratch,
         st: &Stream,
     ) -> Result<(), CudaError> {
-        self.run_prefill_impl(x, x_dtype, rows, shared, out, s, st, false, &mut |_| Ok(()))
+        self.run_prefill_impl(x, x_dtype, rows, shared, out, s, st, false, None, &mut |_| Ok(()))
     }
 
     /// [`MoeExperts::run_prefill`] calling `mark(stage)` after each launch (profiling: record an event there).
@@ -510,7 +523,7 @@ impl MoeExperts {
         st: &Stream,
         mark: &mut dyn FnMut(&'static str) -> Result<(), CudaError>,
     ) -> Result<(), CudaError> {
-        self.run_prefill_impl(x, x_dtype, rows, shared, out, s, st, false, mark)
+        self.run_prefill_impl(x, x_dtype, rows, shared, out, s, st, false, None, mark)
     }
 
     /// The f32-weight variant of [`MoeExperts::run_prefill`] (the Qwen grouped path): the router's f32 weights in `s.wts_f32`
@@ -527,7 +540,7 @@ impl MoeExperts {
         s: &mut PrefillScratch,
         st: &Stream,
     ) -> Result<(), CudaError> {
-        self.run_prefill_impl(x, x_dtype, rows, shared, out, s, st, true, &mut |_| Ok(()))
+        self.run_prefill_impl(x, x_dtype, rows, shared, out, s, st, true, None, &mut |_| Ok(()))
     }
 
     /// [`MoeExperts::run_prefill_f32_wts`] calling `mark(stage)` after each launch.
@@ -543,7 +556,102 @@ impl MoeExperts {
         st: &Stream,
         mark: &mut dyn FnMut(&'static str) -> Result<(), CudaError>,
     ) -> Result<(), CudaError> {
-        self.run_prefill_impl(x, x_dtype, rows, shared, out, s, st, true, mark)
+        self.run_prefill_impl(x, x_dtype, rows, shared, out, s, st, true, None, mark)
+    }
+
+    /// [`MoeExperts::run_prefill_f32_wts`] with the shared expert's finish fused into the combine (the Qwen grouped path): `out` (bf16 `[rows, D]`) =
+    /// bf16(routed + sigmoid(`gate`) * `shared`), `shared` fp32 `[rows, D]`, `gate` bf16 `[rows]`. The same bits as the f32-weight run with no shared slot
+    /// into an fp32 `[rows, D]` buffer followed by [`finish_shared`] on it, without that buffer's write and read.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_prefill_f32_wts_finish(
+        &self,
+        x: &DevBuf,
+        x_dtype: Dtype,
+        rows: usize,
+        shared: &DevBuf,
+        gate: &DevBuf,
+        out: &mut DevBuf,
+        s: &mut PrefillScratch,
+        st: &Stream,
+    ) -> Result<(), CudaError> {
+        self.run_prefill_impl(x, x_dtype, rows, Some(shared), out, s, st, true, Some(gate), &mut |_| Ok(()))
+    }
+
+    /// [`MoeExperts::run_prefill_f32_wts_finish`] calling `mark(stage)` after each launch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_prefill_f32_wts_finish_marked(
+        &self,
+        x: &DevBuf,
+        x_dtype: Dtype,
+        rows: usize,
+        shared: &DevBuf,
+        gate: &DevBuf,
+        out: &mut DevBuf,
+        s: &mut PrefillScratch,
+        st: &Stream,
+        mark: &mut dyn FnMut(&'static str) -> Result<(), CudaError>,
+    ) -> Result<(), CudaError> {
+        self.run_prefill_impl(x, x_dtype, rows, Some(shared), out, s, st, true, Some(gate), mark)
+    }
+
+    /// The combine launch: `out` = the slot chain of each row's `y` (plus `shared` last), fp32; with `gate`, the fused combine and shared-expert finish
+    /// into bf16.
+    #[allow(clippy::too_many_arguments)]
+    fn combine_stage(
+        &self,
+        s: &PrefillScratch,
+        shared: Option<&DevBuf>,
+        gate: Option<&DevBuf>,
+        out: &mut DevBuf,
+        rows: usize,
+        wts_f32: bool,
+        st: &Stream,
+    ) -> Result<(), CudaError> {
+        let d = self.dims;
+        let shared_ptr = shared.map_or(core::ptr::null(), |b| b.ptr() as *const c_void);
+        unsafe {
+            if let Some(g) = gate {
+                check(ffi::gb_moe_pf_combine_finish(
+                    s.y_pairs.ptr(),
+                    s.pick.ptr(),
+                    s.wts_f32.ptr(),
+                    shared_ptr,
+                    g.ptr(),
+                    out.ptr(),
+                    rows as i32,
+                    d.topk as i32,
+                    d.hidden as i32,
+                    d.experts as i32,
+                    st.raw(),
+                ))
+            } else if wts_f32 {
+                check(ffi::gb_moe_pf_combine_f32(
+                    s.y_pairs.ptr(),
+                    s.pick.ptr(),
+                    s.wts_f32.ptr(),
+                    shared_ptr,
+                    out.ptr(),
+                    rows as i32,
+                    d.topk as i32,
+                    d.hidden as i32,
+                    d.experts as i32,
+                    st.raw(),
+                ))
+            } else {
+                check(ffi::gb_moe_pf_combine(
+                    s.y_pairs.ptr(),
+                    s.pick.ptr(),
+                    s.wts.ptr(),
+                    shared_ptr,
+                    out.ptr(),
+                    rows as i32,
+                    d.topk as i32,
+                    d.hidden as i32,
+                    d.experts as i32,
+                    st.raw(),
+                ))
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -557,6 +665,7 @@ impl MoeExperts {
         s: &mut PrefillScratch,
         st: &Stream,
         wts_f32: bool,
+        gate: Option<&DevBuf>,
         mark: &mut dyn FnMut(&'static str) -> Result<(), CudaError>,
     ) -> Result<(), CudaError> {
         let d = self.dims;
@@ -566,8 +675,9 @@ impl MoeExperts {
             || rows > s.max_rows
             || !s.fits(&d)
             || x.bytes() < rows * d.hidden * x_dtype.size()
-            || out.bytes() < rows * d.hidden * 4
+            || out.bytes() < rows * d.hidden * if gate.is_some() { 2 } else { 4 }
             || shared.is_some_and(|b| b.bytes() < rows * d.hidden * 4)
+            || gate.is_some_and(|g| !wts_f32 || shared.is_none() || g.bytes() < rows * 2)
             || if wts_f32 { s.wts_f32.bytes() < rows * d.topk * 4 } else { s.wts.bytes() < rows * d.topk * 2 }
         {
             return Err(INVALID);
@@ -667,35 +777,7 @@ impl MoeExperts {
                     ))?;
                     mark("down")?;
                 }
-                let wts_ptr = if wts_f32 { s.wts_f32.ptr() as *const _ } else { s.wts.ptr() as *const _ };
-                let rc = if wts_f32 {
-                    check(ffi::gb_moe_pf_combine_f32(
-                        s.y_pairs.ptr(),
-                        s.pick.ptr(),
-                        wts_ptr,
-                        shared.map_or(core::ptr::null(), |b| b.ptr() as *const _),
-                        out.ptr(),
-                        rows as i32,
-                        d.topk as i32,
-                        d.hidden as i32,
-                        d.experts as i32,
-                        st.raw(),
-                    ))
-                } else {
-                    check(ffi::gb_moe_pf_combine(
-                        s.y_pairs.ptr(),
-                        s.pick.ptr(),
-                        wts_ptr,
-                        shared.map_or(core::ptr::null(), |b| b.ptr() as *const _),
-                        out.ptr(),
-                        rows as i32,
-                        d.topk as i32,
-                        d.hidden as i32,
-                        d.experts as i32,
-                        st.raw(),
-                    ))
-                };
-                rc?;
+                self.combine_stage(s, shared, gate, out, rows, wts_f32, st)?;
                 mark("combine")
             }
         } else {
@@ -762,35 +844,7 @@ impl MoeExperts {
                     st.raw(),
                 ))?;
                 mark("down")?;
-                let wts_ptr = if wts_f32 { s.wts_f32.ptr() as *const _ } else { s.wts.ptr() as *const _ };
-                let rc = if wts_f32 {
-                    check(ffi::gb_moe_pf_combine_f32(
-                        s.y_pairs.ptr(),
-                        s.pick.ptr(),
-                        wts_ptr,
-                        shared.map_or(core::ptr::null(), |b| b.ptr() as *const _),
-                        out.ptr(),
-                        rows as i32,
-                        d.topk as i32,
-                        d.hidden as i32,
-                        d.experts as i32,
-                        st.raw(),
-                    ))
-                } else {
-                    check(ffi::gb_moe_pf_combine(
-                        s.y_pairs.ptr(),
-                        s.pick.ptr(),
-                        wts_ptr,
-                        shared.map_or(core::ptr::null(), |b| b.ptr() as *const _),
-                        out.ptr(),
-                        rows as i32,
-                        d.topk as i32,
-                        d.hidden as i32,
-                        d.experts as i32,
-                        st.raw(),
-                    ))
-                };
-                rc?;
+                self.combine_stage(s, shared, gate, out, rows, wts_f32, st)?;
                 mark("combine")
             }
         }

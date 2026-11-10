@@ -41,7 +41,7 @@ use gb_cuda::gdn::{self, Batch, PreInputs, PreWeights, Record};
 use gb_cuda::glue::AttnPrepCfg;
 use gb_cuda::graph::{self as cgraph, CaptureError, Graph};
 use gb_cuda::moe::{MoeDims, MoeExperts, SharedExpert};
-use gb_cuda::moe_prefill::{finish_shared, PrefillScratch, SharedScratchBig};
+use gb_cuda::moe_prefill::{PrefillScratch, SharedScratchBig};
 use gb_cuda::rt::{Event, HostStage};
 use gb_cuda::{fmoe, fn_glue, fn_moe, glue, hcx, mtpk, ple, qfn_verify, qsa, CudaError, DevBuf, Stream};
 use gb_engine::RowRequest;
@@ -623,10 +623,9 @@ pub struct FlashNextModel {
     /// weights and the stacked fp16 scales the grouped kernels read. Empty when the path is off; a `None` layer has an
     /// unsupported width layout and falls back to CoopMK for that layer.
     moe_experts: Vec<Option<MoeExperts>>,
-    /// The shared expert's big-row scratch of the grouped prefill, and the two fp32 outputs the path works in (the
-    /// routed sum, and the scaled shared-expert output), before the single fp32 -> bf16 cast.
+    /// The shared expert's big-row scratch of the grouped prefill, and the fp32 output it works in (the shared-expert
+    /// output), which the routed experts' combine adds, scaled by its sigmoid gate, before the single fp32 -> bf16 cast.
     moe_shared_scratch: Option<SharedScratchBig>,
-    moe_out_f32: DevBuf,
     shared_out_f32: DevBuf,
     /// The hcg hyper-connection pre-mix (the declared prefill contract): the same `hcx::pre` math as tensor-core
     /// GEMMs on fp16 hi+lo Dekker-split operands. Sized for `rows` rows of the exact Flash-Next dims; `None` keeps
@@ -1117,7 +1116,7 @@ impl FlashNextModel {
         // The grouped prefill's per-layer routed experts and its shared-expert scratch, built when the switch is on and
         // the shape is supported. `MoeExperts::from_exl3` uploads only the stacked fp16 scales the grouped kernels read
         // (construction; the pointer tables reference the weights' own device buffers), so it runs once here, not per chunk.
-        let (moe_experts, moe_shared_scratch, moe_out_f32, shared_out_f32) = if moe_pf.is_some() {
+        let (moe_experts, moe_shared_scratch, shared_out_f32) = if moe_pf.is_some() {
             let dims = flash_next_moe_dims(cfg.hidden, cfg.moe_intermediate, cfg.experts, cfg.experts_per_tok)
                 .expect("the grouped scratch was allocated, so the shape is supported");
             let shared_inter = w.layers[0].moe.shared_expert.gate.n;
@@ -1145,9 +1144,9 @@ impl FlashNextModel {
                 }
             }
             let ss = SharedScratchBig::new_dims(h, shared_inter, rows).map_err(ModelError::Cuda)?;
-            (exs, Some(ss), DevBuf::zeroed(rows * h * 4)?, DevBuf::zeroed(rows * h * 4)?)
+            (exs, Some(ss), DevBuf::zeroed(rows * h * 4)?)
         } else {
-            (Vec::new(), None, DevBuf::zeroed(1)?, DevBuf::zeroed(1)?)
+            (Vec::new(), None, DevBuf::zeroed(1)?)
         };
 
         // The hcg pre-mix scratch: a ~260 MB per-chunk buffer for the max row count on every qualifying shape
@@ -1289,7 +1288,6 @@ impl FlashNextModel {
             moe_pf,
             moe_experts,
             moe_shared_scratch,
-            moe_out_f32,
             shared_out_f32,
             hcg,
             hcg_scratch,
@@ -1972,7 +1970,7 @@ impl FlashNextModel {
         if let Some(p) = &self.moe_pf {
             n += p.bytes() as u64;
         }
-        n += self.moe_out_f32.bytes() as u64 + self.shared_out_f32.bytes() as u64;
+        n += self.shared_out_f32.bytes() as u64;
         if let Some(ss) = &self.moe_shared_scratch {
             n += ss.bytes() as u64;
         }
@@ -2590,10 +2588,18 @@ impl FlashNextModel {
                 ss,
                 st,
             )?;
-            // the routed experts on the picks in `pf` (fp32 out, f32 weights; no shared slot here)
-            ex.run_prefill_f32_wts(&self.x_mixed, Dtype::BF16, rows, None, &mut self.moe_out_f32, pf, st)?;
-            // finish: bf16 out = bf16(routed + sigmoid(gate) * shared), the one cast
-            finish_shared(&self.moe_out_f32, &self.shared_out_f32, &self.sh_gate_scalar, &mut self.moe_out, rows, h, st)?;
+            // the routed experts on the picks in `pf` (f32 weights), the combine and the finish in one launch:
+            // bf16 out = bf16(routed + sigmoid(gate) * shared), the one cast
+            ex.run_prefill_f32_wts_finish(
+                &self.x_mixed,
+                Dtype::BF16,
+                rows,
+                &self.shared_out_f32,
+                &self.sh_gate_scalar,
+                &mut self.moe_out,
+                pf,
+                st,
+            )?;
         } else {
             fn_moe::moe_topk_softmax(
                 &self.router_logits,
