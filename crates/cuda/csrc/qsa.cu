@@ -574,12 +574,14 @@ __device__ __forceinline__ void group_pv(float sc, const uint4 (&vu)[TB], float&
 
 constexpr int SOFF_ROW = 36;  // words a row of the offset tables: a multiple of 4 (uint4 reads) that spreads the 8 copies over the banks
 
-// grid (rows, NKV, parts), block 32 * (GRP / HPW): warp w serves q heads kvh * GRP + w * HPW .. + HPW - 1
+// grid (rows, NKV, parts), block 32 * (GRP / HPW): warp w serves q heads kvh * GRP + w * HPW .. + HPW - 1. With MERGED (one part) the
+// kernel ends with merge_k's arithmetic for that one part and writes the bf16 output `out` [rows][24][256] instead of the partial sums.
+template <bool MERGED>
 __global__ void __launch_bounds__(32 * (GRP / HPW))
     attend_h(const __nv_bfloat16* __restrict__ qm, const __nv_bfloat16* __restrict__ kc, const __nv_bfloat16* __restrict__ vc,
              const int* __restrict__ table, int max_blocks, const int* __restrict__ row_slot, const int* __restrict__ positions,
              const int* __restrict__ sel, const int* __restrict__ sel_n, float* __restrict__ part_o, float* __restrict__ part_m,
-             float* __restrict__ part_l, int parts) {
+             float* __restrict__ part_l, __nv_bfloat16* __restrict__ out, int parts) {
     static_assert(GRP % HPW == 0, "heads a warp must divide the group");
     // Per warp, 8 copies of the row offsets (in uint4 units) of 32 consecutive tokens: in copy c, token 8j + k's offset is at position
     // 8j + (k ^ c), so lane g's K rows come from copy g in token order k ^ g and every lane's V rows from copy 0.
@@ -655,13 +657,27 @@ __global__ void __launch_bounds__(32 * (GRP / HPW))
     }
 #pragma unroll
     for (int h = 0; h < HPW; ++h) {
-        const size_t pi = ((size_t)r * NQ + head0 + h) * parts + part;
-        float4* po = reinterpret_cast<float4*>(part_o + pi * D + lane * 8);
-        po[0] = make_float4(o[h][0], o[h][1], o[h][2], o[h][3]);
-        po[1] = make_float4(o[h][4], o[h][5], o[h][6], o[h][7]);
-        if (lane == h) {
-            part_m[pi] = m;
-            part_l[pi] = l;
+        if (MERGED) {
+            // merge_k over one part: mx = m, c = exp2f(m - mx), l = 0 + l * c, o = 0 + o * c, out = bf16(o / l)
+            const float mh = __shfl_sync(0xffffffffu, m, h), lh = __shfl_sync(0xffffffffu, l, h);
+            const float c = exp2f(mh - mh);
+            const float lq = 0.f + lh * c;
+            __nv_bfloat162 pk[4];
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const float o0 = 0.f + o[h][2 * e] * c, o1 = 0.f + o[h][2 * e + 1] * c;
+                pk[e] = __halves2bfloat162(__float2bfloat16_rn(o0 / lq), __float2bfloat16_rn(o1 / lq));
+            }
+            *reinterpret_cast<uint4*>(out + ((size_t)r * NQ + head0 + h) * D + lane * 8) = *reinterpret_cast<const uint4*>(pk);
+        } else {
+            const size_t pi = ((size_t)r * NQ + head0 + h) * parts + part;
+            float4* po = reinterpret_cast<float4*>(part_o + pi * D + lane * 8);
+            po[0] = make_float4(o[h][0], o[h][1], o[h][2], o[h][3]);
+            po[1] = make_float4(o[h][4], o[h][5], o[h][6], o[h][7]);
+            if (lane == h) {
+                part_m[pi] = m;
+                part_l[pi] = l;
+            }
         }
     }
 }
@@ -745,14 +761,28 @@ GB_EXPORT int gb_qsa_attend(const void* q, const void* k_cache, const void* v_ca
     // many rows (a prefill chunk): four heads a warp, the same bits as one head a warp (see attend_h); the decode windows' few rows
     // keep the twelve-warp block, whose grid fills the SMs through `parts`
     if (rows >= qsa::ATTEND_H_MIN_ROWS) {
-        gbp_pdl::launch_pdl(flash_pdl(), qsa::attend_h, grid, dim3(32 * (qsa::GRP / qsa::ATTEND_HPW)), 0, gb_stream(stream),
+        gbp_pdl::launch_pdl(flash_pdl(), qsa::attend_h<false>, grid, dim3(32 * (qsa::GRP / qsa::ATTEND_HPW)), 0, gb_stream(stream),
                             (const __nv_bfloat16*)q, (const __nv_bfloat16*)k_cache, (const __nv_bfloat16*)v_cache, table, max_blocks,
-                            row_slot, positions, sel, sel_n, (float*)part_o, (float*)part_m, (float*)part_l, parts);
+                            row_slot, positions, sel, sel_n, (float*)part_o, (float*)part_m, (float*)part_l,
+                            (__nv_bfloat16*)nullptr, parts);
         return GB_CHECK_LAUNCH();
     }
     gbp_pdl::launch_pdl(flash_pdl(), qsa::attend_k, grid, dim3(32 * qsa::GRP), 0, gb_stream(stream), (const __nv_bfloat16*)q,
                         (const __nv_bfloat16*)k_cache, (const __nv_bfloat16*)v_cache, table, max_blocks, row_slot, positions, sel,
                         sel_n, (float*)part_o, (float*)part_m, (float*)part_l, parts);
+    return GB_CHECK_LAUNCH();
+}
+
+// gb_qsa_attend and gb_qsa_merge for a prefill chunk's one part: the attention kernel ends with merge_k's arithmetic and writes the
+// bf16 output [rows][24][256] itself (the output is merge_k's bit for bit; no partial sums are stored). rows >= ATTEND_H_MIN_ROWS.
+GB_EXPORT int gb_qsa_attend_merged(const void* q, const void* k_cache, const void* v_cache, const int* table, int max_blocks,
+                                   const int* row_slot, const int* positions, const int* sel, const int* sel_n, void* out, int rows,
+                                   void* stream) {
+    if (rows < qsa::ATTEND_H_MIN_ROWS) return (int)cudaErrorInvalidValue;
+    const dim3 grid(rows, qsa::NKV, 1);
+    qsa::attend_h<true><<<grid, 32 * (qsa::GRP / qsa::ATTEND_HPW), 0, gb_stream(stream)>>>(
+        (const __nv_bfloat16*)q, (const __nv_bfloat16*)k_cache, (const __nv_bfloat16*)v_cache, table, max_blocks, row_slot, positions,
+        sel, sel_n, nullptr, nullptr, nullptr, (__nv_bfloat16*)out, 1);
     return GB_CHECK_LAUNCH();
 }
 

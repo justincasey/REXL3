@@ -22,6 +22,8 @@ pub const SPARSE_FROM: usize = CR * TOPK + 3;
 /// Partial sums a decode-window row's attention is split into. Fixed, so a row's result never depends on how many rows
 /// share its window (drafted == serial, bit for bit): each part is a fixed share of that row's own token list.
 pub const WINDOW_PARTS: usize = 32;
+/// Rows from which one part's attention and merge are one kernel (`qsa.cu`'s ATTEND_H_MIN_ROWS).
+const ATTEND_MERGED_MIN_ROWS: usize = 64;
 
 /// Refuses a buffer smaller than what a launch touches, before anything is queued (`CudaError(1)`, as an invalid value).
 fn need(b: &DevBuf, bytes: usize, what: &str) -> Result<(), CudaError> {
@@ -52,6 +54,9 @@ mod ffi {
                              max_blocks: i32, row_slot: *const c_void, positions: *const c_void, sel: *const c_void,
                              sel_n: *const c_void, part_o: *mut c_void, part_m: *mut c_void, part_l: *mut c_void,
                              rows: i32, parts: i32, stream: *mut c_void) -> i32;
+        pub fn gb_qsa_attend_merged(q: *const c_void, k_cache: *const c_void, v_cache: *const c_void, table: *const c_void,
+                                    max_blocks: i32, row_slot: *const c_void, positions: *const c_void, sel: *const c_void,
+                                    sel_n: *const c_void, out: *mut c_void, rows: i32, stream: *mut c_void) -> i32;
         pub fn gb_qsa_merge(part_o: *const c_void, part_m: *const c_void, part_l: *const c_void, out: *mut c_void,
                             rows: i32, parts: i32, stream: *mut c_void) -> i32;
     }
@@ -258,13 +263,32 @@ pub fn attend(
     assert!(parts >= 1);
     let ws_bytes = attend_workspace_bytes(rows, parts);
     need(ws, ws_bytes, "qsa attend workspace")?;
+    need(out, qn, "qsa attend out")?;
+    if parts == 1 && rows >= ATTEND_MERGED_MIN_ROWS {
+        // a prefill chunk: the attention kernel writes the merged output itself, no partial sums
+        return CudaError::check(unsafe {
+            ffi::gb_qsa_attend_merged(
+                q.ptr(),
+                kv.k.ptr(),
+                kv.v.ptr(),
+                table.buf.ptr(),
+                table.max_blocks as i32,
+                rr.slot.ptr(),
+                rr.pos.ptr(),
+                sel.ptr(),
+                sel_n.ptr(),
+                out.ptr(),
+                rows as i32,
+                st.raw(),
+            )
+        });
+    }
     let base = ws.ptr() as *mut u8;
     let pairs = rows * N_Q_HEADS * parts;
     let a = |x: usize| x.div_ceil(256) * 256;
     let (o_b, m_b) = (a(pairs * HEAD_DIM * 4), a(pairs * 4));
     // SAFETY: the three parts lie inside the `ws_bytes` checked above
     let (po, pm, pl) = unsafe { (base, base.add(o_b), base.add(o_b + m_b)) };
-    need(out, qn, "qsa attend out")?;
     let op = out.ptr();
     CudaError::check(unsafe {
         ffi::gb_qsa_attend(
