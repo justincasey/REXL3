@@ -415,7 +415,7 @@ impl<M: FlashNextRuntime> Backend for FlashNextBackend<M> {
             return nans();
         }
         let run = (|| -> Result<_, ModelError> {
-            self.m.flush()?;
+            // no flush: the window folds the commit the last one made into its own kernels
             let b = RowBatch::from_requests(reqs);
             let c = self.m.window_candidates(&b, candidates)?;
             Ok((0..reqs.len()).map(|i| b.seq_rows(i).map(|r| row_of(&c, r, candidates)).collect()).collect())
@@ -446,7 +446,7 @@ impl<M: FlashNextRuntime> Backend for FlashNextBackend<M> {
             return self.step(reqs, candidates);
         }
         let run = (|| -> Result<_, ModelError> {
-            self.m.flush()?;
+            // no flush: the window folds the commit the last one made into its own kernels
             let b = RowBatch::from_requests(reqs);
             if let Some(c) = self.m.window_candidates_dv(&b, candidates)? {
                 debug_assert_eq!(c.count, 1, "the gather returns one candidate per row");
@@ -499,7 +499,7 @@ impl<M: FlashNextRuntime> Backend for FlashNextBackend<M> {
         if k == 0 {
             return vec![None];
         }
-        let result = self.m.flush().and_then(|()| self.m.mtp_propose(r.slot, r.tokens, k));
+        let result = self.m.mtp_propose(r.slot, r.tokens, k);
         match result {
             Ok(mut tokens) if !tokens.is_empty() => {
                 tokens.truncate(k);

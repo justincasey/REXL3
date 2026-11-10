@@ -128,13 +128,14 @@ impl MemoryModel for FlashNextMemory<'_> {
         let qsa = self.attention_layers() * QSA_RING * c.indexer_head_dim as u64 * 2;
         c.linear_layers() as u64 * gdn + ple + qsa
     }
-    /// Per GDN layer and row: one record (q, k at the key heads, v at the value heads, bf16; decay and beta fp32) and the raw
-    /// qkv row the conv history is rebuilt from (bf16).
+    /// Per GDN layer and row: two records (q, k at the key heads, v at the value heads, bf16; decay and beta fp32) and the raw
+    /// qkv row the conv history is rebuilt from (bf16). The records exist twice: the window that follows a commit replays the
+    /// previous window's set (its accepted rows, in the window kernel) while it fills the other.
     fn window_record_bytes_per_row(&self) -> u64 {
         let c = self.cfg;
         let record =
             2 * c.lin_key_heads * c.lin_key_dim * 2 + c.lin_value_heads * c.lin_value_dim * 2 + 2 * c.lin_value_heads * 4;
-        (c.linear_layers() * (record + c.conv_channels() * 2)) as u64
+        (c.linear_layers() * (2 * record + c.conv_channels() * 2)) as u64
     }
     fn scratch_bytes(&self, rows: u64) -> u64 {
         rows.saturating_mul(self.scratch_bytes_per_row()).saturating_add(self.fixed_bytes())
@@ -194,8 +195,8 @@ mod tests {
         // 36 GDN layers x (48 x 128 x 128 x 4 + 3 x 10,240 x 2) + PLE ring 128 x 10,240 x 2 + 13 QSA rings of 128 x 128 x 2
         assert_eq!(p.state_bytes_per_seq(), 36 * (3_145_728 + 61_440) + 2_621_440 + 13 * 32_768);
         assert_eq!(p.recurrent_layers(), 36);
-        // per GDN layer and row: q, k 2 x 4,096 + v 12,288 + decay, beta 2 x 192 + raw qkv 20,480 = 41,344
-        assert_eq!(p.window_record_bytes_per_row(), 36 * 41_344);
+        // per GDN layer and row: q, k 2 x 4,096 + v 12,288 + decay, beta 2 x 192 = 20,864 twice + raw qkv 20,480 = 62,208
+        assert_eq!(p.window_record_bytes_per_row(), 36 * 62_208);
         let m = FlashNextMemory { cfg: &c, opts: opts() };
         // per row: streams 40,960 + 40,960 + 32 + 1,280; mixers 15,360 + 12,288 + 24,576 + 12,288 + 192 + 3,072 + 24,576;
         // MoE 1,024 + 88 + 14,080 + 3,840 + 5,120 + 2; PLE 1,632 + 5,120 + 20,480 + 5,120 + 16 + 20,480;

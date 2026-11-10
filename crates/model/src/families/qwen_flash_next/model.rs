@@ -255,7 +255,9 @@ fn sparse_rows(positions: &[i32], qsa: bool) -> u64 {
 }
 
 /// A verify / decode window. Sequence boundaries matter even with the same number of rows and sequences: GDN and PLE
-/// receive per-sequence grids, and QSA runs are partitioned by the absolute row order.
+/// receive per-sequence grids, and QSA runs are partitioned by the absolute row order. `par` is the record set the window
+/// fills (`recs[par]`; the other holds what the previous window owes) and `owed` whether its GDN window kernels fold that owed
+/// replay in: both are baked into the launches.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct WindowKey {
     rows: usize,
@@ -263,6 +265,8 @@ struct WindowKey {
     seq_ends: u64,
     candidates: usize,
     sparse: u64,
+    par: usize,
+    owed: bool,
     features: GraphFeatures,
     grid: AttnGrid,
 }
@@ -276,9 +280,16 @@ impl WindowKey {
             seq_ends,
             candidates,
             sparse: sparse_rows(&b.positions, features.qsa_trunk),
+            par: 0,
+            owed: false,
             features,
             grid,
         }
+    }
+
+    /// The same window in record set `par`, with or without an owed replay folded in.
+    fn in_round(self, par: usize, owed: bool) -> Self {
+        Self { par, owed, ..self }
     }
 }
 
@@ -347,6 +358,15 @@ struct PleAhead {
     first: usize,
     rows: usize,
     ahead: Ahead,
+}
+
+/// The state replay a committed window still owes: the first `keep[j]` rows of its sequence j (rows from `win.seq_start[j]`
+/// of record set `par`) are not yet in the recurrent state. The conv history is rebuilt at once (the next window's `pre`
+/// reads it); the rows of S are replayed by the next window kernel that runs the sequence, or standalone when none does.
+struct OwedWindow {
+    par: usize,
+    win: RowBatch,
+    keep: Vec<i32>,
 }
 
 pub struct FlashNextModel {
@@ -420,9 +440,19 @@ pub struct FlashNextModel {
     attn_ws: DevBuf,
     fmoe_ws: DevBuf,
     hcx_scratch: DevBuf,
-    /// Per GDN layer, the window's record and the raw qkv rows its commit replays.
+    /// Per GDN layer, the raw qkv rows the window's commit rebuilds the conv history from, and the window's records. The
+    /// records are two sets that alternate between windows (`rec_par` is the one the last window wrote): the next window's
+    /// kernel replays the rows the last one owes from the set it left, while it fills the other.
     win_qkv: Vec<DevBuf>,
-    recs: Vec<Record>,
+    recs: [Vec<Record>; 2],
+    rec_par: usize,
+    /// Whether the window being run folds an owed replay in (a graph's key), and the replay the last window still owes.
+    owed_in: bool,
+    owed: Option<OwedWindow>,
+    /// i32 `[n_seq]` of the window being run: the first row in the previous record, and the rows to replay, of each of its
+    /// sequences (`gdn::Owed`).
+    owed_row0: DevBuf,
+    owed_keep: DevBuf,
     logits: DevBuf,
     topk_ws: DevBuf,
     topk_ids: DevBuf,
@@ -998,7 +1028,15 @@ impl FlashNextModel {
             fmoe_ws: fmoe::workspace(WINDOW_ROWS, top_k, h, interm, fmoe::DEFAULT_KC)?,
             hcx_scratch: DevBuf::zeroed(hcx::scratch_bytes(hc, rank))?,
             win_qkv: (0..lin_layers).map(|_| DevBuf::zeroed(WINDOW_ROWS * gdn::CONV_DIM * 2)).collect::<Result<Vec<_>, _>>()?,
-            recs: (0..lin_layers).map(|_| Record::alloc(WINDOW_ROWS)).collect::<Result<Vec<_>, _>>()?,
+            recs: [
+                (0..lin_layers).map(|_| Record::alloc(WINDOW_ROWS)).collect::<Result<Vec<_>, _>>()?,
+                (0..lin_layers).map(|_| Record::alloc(WINDOW_ROWS)).collect::<Result<Vec<_>, _>>()?,
+            ],
+            rec_par: 0,
+            owed_in: false,
+            owed: None,
+            owed_row0: DevBuf::zeroed((slots + 1) * 4)?,
+            owed_keep: DevBuf::zeroed((slots + 1) * 4)?,
             logits: DevBuf::zeroed(WINDOW_ROWS * cfg.vocab * 2)?,
             topk_ws: DevBuf::zeroed(glue::topk_workspace_bytes(WINDOW_ROWS, cfg.vocab, MAX_CANDIDATES))?,
             topk_ids: DevBuf::zeroed(WINDOW_ROWS * MAX_CANDIDATES * 4)?,
@@ -1111,6 +1149,17 @@ impl FlashNextModel {
     pub fn end_slot(&mut self, slot: usize) {
         self.pending.remove(&slot);
         self.mtp_done.remove(&slot);
+        // what the slot's last window still owes its state is dropped with the sequence
+        if let Some(ow) = &mut self.owed {
+            for (j, &sl) in ow.win.seq_slot.iter().enumerate() {
+                if sl as usize == slot {
+                    ow.keep[j] = 0;
+                }
+            }
+            if ow.keep.iter().all(|&k| k == 0) {
+                self.owed = None;
+            }
+        }
         if slot < self.opts.slots {
             self.kv_tab.release(slot);
             self.table_dirty = true;
@@ -1153,7 +1202,7 @@ impl FlashNextModel {
     }
 
     /// A decode / verify window over one or more sequences: candidates for every row. The window's recurrent state is
-    /// committed by [`FlashNextModel::commit`] + the next forward (or [`FlashNextModel::flush`]).
+    /// committed by [`FlashNextModel::commit`] + the next window (which folds the replay in) or [`FlashNextModel::flush`].
     pub fn window_candidates(&mut self, b: &RowBatch, count: usize) -> Result<Candidates, ModelError> {
         if count == 0 || count > MAX_CANDIDATES {
             return Err(ModelError::Request(format!("candidate count must be 1..={MAX_CANDIDATES}, got {count}")));
@@ -1165,13 +1214,14 @@ impl FlashNextModel {
             return Err(ModelError::Request("a Flash-Next window of trees is not built".into()));
         }
         let rows = b.rows;
-        self.flush()?;
+        let (par, owed) = self.begin_window(b)?;
         self.last_window = Some(b.clone());
         self.prepare_batch(b)?;
         self.prepare_ple(b)?;
         self.note_stack(b);
         let live = Self::live_of(b);
-        let key = WindowKey::for_batch(b, count, AttnGrid::cover(live, self.opts.max_context), self.graph_features());
+        let key = WindowKey::for_batch(b, count, AttnGrid::cover(live, self.opts.max_context), self.graph_features())
+            .in_round(par, owed);
         self.run_graph(Self::window_graphs, key, live, |m| m.window_body(b, count))?;
         self.mixed_rows = rows;
         self.sync()?;
@@ -1203,13 +1253,14 @@ impl FlashNextModel {
             return Err(ModelError::Request("a Flash-Next window of trees is not built".into()));
         }
         let rows = b.rows;
-        self.flush()?;
+        let (par, owed) = self.begin_window(b)?;
         self.last_window = Some(b.clone());
         self.prepare_batch(b)?;
         self.prepare_ple(b)?;
         self.note_stack(b);
         let live = Self::live_of(b);
-        let key = WindowKey::for_batch(b, count, AttnGrid::cover(live, self.opts.max_context), self.graph_features());
+        let key = WindowKey::for_batch(b, count, AttnGrid::cover(live, self.opts.max_context), self.graph_features())
+            .in_round(par, owed);
         self.run_graph(Self::window_graphs, key, live, |m| m.window_body(b, count))?;
         self.mixed_rows = rows;
         self.sync()?;
@@ -1269,18 +1320,43 @@ impl FlashNextModel {
         self.pending.insert(slot, keep);
     }
 
-    /// Apply pending commits now (before anything reads a slot's state).
+    /// Apply pending commits now (before anything reads a slot's state): the conv history, and the rows of S replayed here
+    /// instead of being folded into the next window kernel.
     pub fn flush(&mut self) -> Result<(), ModelError> {
+        let mut launched = self.flush_conv()?;
+        if let Some(ow) = self.owed.take() {
+            self.replay_owed(ow.par, &ow.win, &ow.keep)?;
+            launched = true;
+        }
+        if launched {
+            self.sync()?;
+        }
+        Ok(())
+    }
+
+    /// The conv history of the pending commits, at once (the next window's `pre` reads it). The replay of their rows of S is
+    /// recorded as owed (see [`OwedWindow`]), not run: the next window kernel that runs the sequence folds it in. Whether
+    /// anything was launched. No synchronisation: the stream orders it before everything queued after.
+    fn flush_conv(&mut self) -> Result<bool, ModelError> {
         if self.pending.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let Some(win) = self.last_window.take() else {
             self.pending.clear();
-            return Ok(());
+            return Ok(false);
         };
-        let keep: Vec<i32> =
-            win.seq_slot.iter().map(|&sl| self.pending.get(&(sl as usize)).copied().unwrap_or(0) as i32).collect();
+        let keep: Vec<i32> = (0..win.n_seq())
+            .map(|j| self.pending.get(&(win.seq_slot[j] as usize)).copied().unwrap_or(0).min(win.seq_rows(j).len()) as i32)
+            .collect();
         self.pending.clear();
+        if keep.iter().all(|&k| k == 0) {
+            return Ok(false);
+        }
+        // every window folds in or replays what its predecessor owed, so nothing is owed here. If something were, the window that
+        // just ran read a state that lacks those rows, and its record set is the one about to be written over
+        if self.owed.is_some() {
+            return Err(ModelError::StateLost("a window ran without taking the previous window's owed replay".into()));
+        }
         put(&mut self.stage, &mut self.keep, &keep, &self.stream)?;
         // the window's own index arrays (a draft chain may have rewritten them since): the commit replays exactly its rows
         put(&mut self.stage, &mut self.seq_start, &win.seq_start, &self.stream)?;
@@ -1292,19 +1368,77 @@ impl FlashNextModel {
             rows: win.rows,
             n_slots: self.pools.slots,
         };
-        for li in 0..self.recs.len() {
-            gdn::commit(
-                &self.stream,
-                &self.recs[li],
-                &self.win_qkv[li],
-                &mut self.pools.s[li],
-                &mut self.pools.conv[li],
-                &batch,
-                &self.keep,
-            )?;
+        for li in 0..self.win_qkv.len() {
+            gdn::commit_conv(&self.stream, &self.win_qkv[li], &mut self.pools.conv[li], &batch, &self.keep)?;
         }
-        self.sync()?;
+        self.owed = Some(OwedWindow { par: self.rec_par, win, keep });
+        Ok(true)
+    }
+
+    /// Replay `keep[j]` rows of sequence j of window `win` (its rows in record set `par`) into the recurrent state with the
+    /// standalone commit kernel: the rows no window kernel is going to fold in (a sequence that does not run in the next window,
+    /// or a caller that wants the state itself).
+    fn replay_owed(&mut self, par: usize, win: &RowBatch, keep: &[i32]) -> Result<(), ModelError> {
+        if keep.iter().all(|&k| k == 0) {
+            return Ok(());
+        }
+        put(&mut self.stage, &mut self.keep, keep, &self.stream)?;
+        put(&mut self.stage, &mut self.seq_start, &win.seq_start, &self.stream)?;
+        put(&mut self.stage, &mut self.seq_slot, &win.seq_slot, &self.stream)?;
+        let batch = Batch {
+            seq_start: &self.seq_start,
+            slot: &self.seq_slot,
+            n_seq: win.n_seq(),
+            rows: win.rows,
+            n_slots: self.pools.slots,
+        };
+        for li in 0..self.recs[par].len() {
+            gdn::commit_state(&self.stream, &self.recs[par][li], &mut self.pools.s[li], &batch, &self.keep)?;
+        }
         Ok(())
+    }
+
+    /// The window over `b` is about to run: the previous window's owed rows of S, as its kernels will see them. For the
+    /// sequences of `b` that owe rows, uploads their (first row in the previous record, rows to replay); the rows owed by
+    /// sequences that do not run in `b` are replayed here, before their record set can be overwritten. Whether any is left
+    /// for the window kernels to fold in (from the record set `rec_par` holds now).
+    fn fold_owed(&mut self, b: &RowBatch) -> Result<bool, ModelError> {
+        let Some(ow) = self.owed.take() else { return Ok(false) };
+        if ow.par != self.rec_par {
+            return Err(ModelError::StateLost("the owed replay's records are not the last window's".into()));
+        }
+        let n = b.n_seq();
+        let (mut row0, mut keep) = (vec![0i32; n], vec![0i32; n]);
+        let mut left = ow.keep.clone();
+        for (i, &sl) in b.seq_slot.iter().enumerate() {
+            if let Some(j) = ow.win.seq_slot.iter().position(|&x| x == sl) {
+                row0[i] = ow.win.seq_start[j];
+                keep[i] = ow.keep[j];
+                left[j] = 0;
+            }
+        }
+        // `owed` is already forgotten: a failure here leaves state that no longer matches the tokens committed, whatever the
+        // CUDA code says
+        self.replay_owed(ow.par, &ow.win, &left).map_err(|e| ModelError::StateLost(e.to_string()))?;
+        if keep.iter().all(|&k| k == 0) {
+            return Ok(false);
+        }
+        put(&mut self.stage, &mut self.owed_row0, &row0, &self.stream)?;
+        put(&mut self.stage, &mut self.owed_keep, &keep, &self.stream)?;
+        Ok(true)
+    }
+
+    /// Everything a window over `b` starts from: the pending commits made and the previous window's owed rows of S settled
+    /// (see [`FlashNextModel::fold_owed`]). Returns the record set the window fills (the sets alternate while a replay is owed,
+    /// so the one it folds in stays intact) and whether it folds a replay in.
+    fn begin_window(&mut self, b: &RowBatch) -> Result<(usize, bool), ModelError> {
+        self.flush_conv()?;
+        let owed = self.fold_owed(b)?;
+        if owed {
+            self.rec_par ^= 1;
+        }
+        self.owed_in = owed;
+        Ok((self.rec_par, owed))
     }
 
     /// After a prefill chunk of `slot` at `first..first + chunk.len()`: the MTP head over every row whose next token is
@@ -1353,7 +1487,9 @@ impl FlashNextModel {
         if !self.has_mtp() || k == 0 || tokens.len() < 2 || self.stack_rows == 0 || self.stack_slot != slot {
             return Ok(Vec::new());
         }
-        self.flush()?;
+        // the draft chain reads no recurrent state: the conv history of a pending commit is made now, its rows of S ride the
+        // next window
+        self.flush_conv()?;
         let end = tokens.len() - 1; // trunk positions [start, end) still need their MTP rows
         let start = self.mtp_done.get(&slot).copied().unwrap_or(0).max(self.stack_pos0);
         if end <= start || end > self.stack_pos0 + self.stack_rows || end - start > WINDOW_ROWS || end + k > self.opts.max_context
@@ -1485,6 +1621,8 @@ impl FlashNextModel {
             &self.chain_pos,
             &self.drafts_dev,
             &self.conf_dev,
+            &self.owed_row0,
+            &self.owed_keep,
             &self.zero_kv,
             &self.one_row.slot,
             &self.one_row.pos,
@@ -1495,7 +1633,7 @@ impl FlashNextModel {
         for b in &self.win_qkv {
             n += b.bytes() as u64;
         }
-        for r in &self.recs {
+        for r in self.recs.iter().flatten() {
             n += (r.q.bytes() + r.k.bytes() + r.v.bytes() + r.g_decay.bytes() + r.beta.bytes()) as u64;
         }
         if let Some(p) = &self.moe_pf {
@@ -1671,6 +1809,7 @@ impl FlashNextModel {
 
     fn forward(&mut self, b: &RowBatch, mode: Mode) -> Result<(), ModelError> {
         self.flush()?;
+        self.owed_in = false;
         if mode == Mode::Window {
             self.last_window = Some(b.clone());
         }
@@ -1759,8 +1898,14 @@ impl FlashNextModel {
                 let wts = PreWeights { conv_w: &m.conv_w, a_log: &m.a_log, dt_bias: &m.dt_bias };
                 if window {
                     let inp = PreInputs { qkv: &self.win_qkv[li], a: &self.ga, b: &self.gb };
-                    gdn::pre(st, &inp, &wts, &self.pools.conv[li], &batch, &mut self.recs[li])?;
-                    gdn::window(st, &self.recs[li], &self.pools.s[li], &batch, &mut self.mixer_out)?;
+                    let par = self.rec_par;
+                    gdn::pre(st, &inp, &wts, &self.pools.conv[li], &batch, &mut self.recs[par][li])?;
+                    if self.owed_in {
+                        let owed = gdn::Owed { rec: &self.recs[par ^ 1][li], row0: &self.owed_row0, keep: &self.owed_keep };
+                        gdn::window_owed(st, &self.recs[par][li], &owed, &mut self.pools.s[li], &batch, &mut self.mixer_out)?;
+                    } else {
+                        gdn::window(st, &self.recs[par][li], &self.pools.s[li], &batch, &mut self.mixer_out)?;
+                    }
                 } else {
                     let inp = PreInputs { qkv: &self.qkv, a: &self.ga, b: &self.gb };
                     gdn::prefill(
