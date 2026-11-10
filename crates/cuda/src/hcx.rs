@@ -21,6 +21,12 @@ mod ffi {
     use core::ffi::c_void;
     crate::launchers! {
         pub fn gb_hcx_scratch_bytes(hc: i32, rank: i32, ninj: i32) -> usize;
+        pub fn gb_hcx_pre_post(
+            streams: *mut c_void, block_out: *const c_void, inj_prev: *const f32, hc_norm_w: *const c_void,
+            down_w: *const c_void, up_w: *const c_void, inject_w: *const c_void, y_out: *mut c_void,
+            inj_out: *mut f32, scratch: *mut c_void, hidden_size: u32, hc_mult: u32, rank: u32, eps: f32,
+            num_tokens: u32, stream: *mut c_void,
+        ) -> i32;
         pub fn gb_hcx_pre_ref(
             streams: *const c_void, hc_norm_w: *const c_void, down_w: *const c_void, up_w: *const c_void,
             inject_w: *const c_void, y_out: *mut c_void, inj_out: *mut f32, scratch: *mut c_void,
@@ -103,6 +109,66 @@ pub fn pre(
     CudaError::check(unsafe {
         ffi::gb_hcx_pre(
             streams.ptr(),
+            mix.norm.ptr(),
+            mix.down.ptr(),
+            mix.up.ptr(),
+            inj_w,
+            yp,
+            ip,
+            sp,
+            h as u32,
+            hc as u32,
+            rank as u32,
+            eps,
+            rows as u32,
+            st.raw(),
+        )
+    })
+}
+
+/// Whether [`pre_post`] takes this shape (four streams, a low rank of at most 512, hidden size a multiple of 256: the decode kernels' shape).
+pub fn pre_post_foldable(h: usize, hc: usize, rank: usize) -> bool {
+    hc == 4 && rank <= 512 && rank % 8 == 0 && h % 256 == 0
+}
+
+/// [`pre`] after the hc_post of the previous block, in the same two launches: `streams` first becomes `streams + bf16(block_out) *
+/// inj_prev` per stream (what `fn_mhc::hc_post(block_out, None, inj_prev, streams, ..)` writes, bit for bit), then the pre-mix reads the
+/// new values. The mixer must have inject weights (`inj_out` given) and the shape must pass [`pre_post_foldable`].
+pub fn pre_post(
+    streams: &mut DevBuf,
+    block_out: &DevBuf,
+    inj_prev: &DevBuf,
+    mix: &Mixer<'_>,
+    y_out: &mut DevBuf,
+    inj_out: &mut DevBuf,
+    scratch: &mut DevBuf,
+    h: usize,
+    hc: usize,
+    rank: usize,
+    eps: f32,
+    rows: usize,
+    st: &Stream,
+) -> Result<(), CudaError> {
+    if mix.inject.is_none() || !pre_post_foldable(h, hc, rank) {
+        eprintln!("rexl3 level=error launch contract: hcx pre_post needs inject weights, four streams, rank <= 512 and a hidden size multiple of 256");
+        return Err(CudaError(1));
+    }
+    mix.check(h, hc, rank, "hcx")?;
+    need(streams, rows * hc * h * 4, "hcx streams")?;
+    need(block_out, rows * h * 2, "hcx post block_out")?;
+    need(inj_prev, rows * hc * 4, "hcx post inj")?;
+    need(y_out, rows * h * 2, "hcx y")?;
+    let yp = y_out.ptr();
+    need(inj_out, rows * hc * 4, "hcx inj")?;
+    let ip = inj_out.ptr() as *mut f32;
+    need(scratch, scratch_bytes(hc, rank), "hcx scratch")?;
+    let sp = scratch.ptr();
+    let inj_w = mix.inject.map_or(core::ptr::null(), |b| b.ptr());
+    CudaError::check(unsafe {
+        ffi::gb_hcx_pre_post(
+            streams.ptr(),
+            block_out.ptr(),
+            inj_prev.ptr() as *const f32,
             mix.norm.ptr(),
             mix.down.ptr(),
             mix.up.ptr(),

@@ -19,6 +19,9 @@
 //   shared memory once for the four streams, and the 4 x rows per-lane partial sums are reduce-scattered (same xor tree as
 //   warp_sum) so the exp/divide tail runs once a warp instead of once a (stream, row) per lane; see the block comment above it;
 // - hc_post is regridded over the whole [t, s, d] volume (elementwise, so any grid gives the same bits).
+// - pre_post (decode, hc = 4, rank <= 512): the previous block's hc_post rides in k1u and k2t instead of a launch of its own. Both kernels
+//   read x' = fma(bf16(block_out), inj_prev, x), the value hc_post_kernel writes, wherever they read the streams; k1u never writes (its
+//   blocks of one stream all read the same x), k2t writes x' back from the one lane that owns each element once k1u has completed.
 // - with the gbp_pdl::kHcx bit of the PDL mask (pdl.cuh) k1u, k2t (and hc_post, fn_mhc.cu) launch with the
 //   programmatic-dependent-launch attribute: each triggers its successor at its start and waits for its predecessor before it
 //   reads anything an earlier kernel wrote, after issuing what depends on nothing (k1u its first weight chunk, k2t its first
@@ -248,11 +251,14 @@ __global__ void __launch_bounds__(256) k2_kernel(const float* __restrict__ x, co
 // per-lane add sequence (lane l owns columns 8l + 256i) and its warp-sum tree: the 32-wide reduction runs as
 // scatter_sum32 over the NJ x NT partial sums, so P and ss are bit-identical to k1_kernel's. The ss jobs (sum of squares of
 // x[t][s]) follow the P jobs as one warp each.
-template <int NJ, int NT>
+// POST: the previous block's hc_post is folded in: the kernel reads x' = x + bf16(block_out) * inj_prev (one fused multiply-add an
+// element, the arithmetic of hc_post_kernel) wherever it reads the streams, and never writes them (k2t writes x' back).
+template <int NJ, int NT, bool POST>
 __global__ void __launch_bounds__(32) k1u_kernel(const float* __restrict__ x, const half* __restrict__ nw,
                                                  const half* __restrict__ down, const half* __restrict__ inj,
                                                  float* __restrict__ P, float* __restrict__ ss, int t0, int H, int hc,
-                                                 int rank, int ninj) {
+                                                 int rank, int ninj, const __nv_bfloat16* __restrict__ bo,
+                                                 const float* __restrict__ ijp) {
     const int lane = threadIdx.x;
     const int R = rank + ninj;
     const int gps = (R + NJ - 1) / NJ;  // row groups a stream
@@ -282,6 +288,11 @@ __global__ void __launch_bounds__(32) k1u_kernel(const float* __restrict__ x, co
         h8(n + 8 * lane, nv);
         gbp_pdl::pdl_trigger();
         gbp_pdl::pdl_wait();  // x (and P/ss, last read by the previous call's k2) belong to earlier kernels of the stream
+        float ij[POST ? NT : 1];
+        if constexpr (POST) {
+#pragma unroll
+            for (int t = 0; t < NT; ++t) ij[t] = ijp[(size_t)(t0 + t) * hc + s];
+        }
 #pragma unroll 1
         for (int d = 8 * lane; d < H; d += 256) {
             float4 xa[NT], xb[NT];
@@ -290,6 +301,17 @@ __global__ void __launch_bounds__(32) k1u_kernel(const float* __restrict__ x, co
                 const float* xr = xs + (size_t)t * HC + d;
                 xa[t] = __ldg(reinterpret_cast<const float4*>(xr));
                 xb[t] = __ldg(reinterpret_cast<const float4*>(xr + 4));
+                if constexpr (POST) {
+                    const uint4 u = __ldg(reinterpret_cast<const uint4*>(bo + (size_t)(t0 + t) * H + d));
+                    xa[t].x = fmaf(__uint_as_float(u.x << 16), ij[t], xa[t].x);
+                    xa[t].y = fmaf(__uint_as_float(u.x & 0xffff0000u), ij[t], xa[t].y);
+                    xa[t].z = fmaf(__uint_as_float(u.y << 16), ij[t], xa[t].z);
+                    xa[t].w = fmaf(__uint_as_float(u.y & 0xffff0000u), ij[t], xa[t].w);
+                    xb[t].x = fmaf(__uint_as_float(u.z << 16), ij[t], xb[t].x);
+                    xb[t].y = fmaf(__uint_as_float(u.z & 0xffff0000u), ij[t], xb[t].y);
+                    xb[t].z = fmaf(__uint_as_float(u.w << 16), ij[t], xb[t].z);
+                    xb[t].w = fmaf(__uint_as_float(u.w & 0xffff0000u), ij[t], xb[t].w);
+                }
             }
             float onep[8];
 #pragma unroll
@@ -330,9 +352,18 @@ __global__ void __launch_bounds__(32) k1u_kernel(const float* __restrict__ x, co
     if (q >= NT * hc) return;
     const int t = q / hc, s = q % hc;
     const float* xr = x + (size_t)(t0 + t) * HC + (size_t)s * H;
+    float ijv = 0.f;
+    if constexpr (POST) ijv = ijp[(size_t)(t0 + t) * hc + s];
     float a = 0.f;
     for (int d = 4 * lane; d < H; d += 128) {
-        const float4 v = __ldg(reinterpret_cast<const float4*>(xr + d));
+        float4 v = __ldg(reinterpret_cast<const float4*>(xr + d));
+        if constexpr (POST) {
+            const uint2 u = __ldg(reinterpret_cast<const uint2*>(bo + (size_t)(t0 + t) * H + d));
+            v.x = fmaf(__uint_as_float(u.x << 16), ijv, v.x);
+            v.y = fmaf(__uint_as_float(u.x & 0xffff0000u), ijv, v.y);
+            v.z = fmaf(__uint_as_float(u.y << 16), ijv, v.z);
+            v.w = fmaf(__uint_as_float(u.y & 0xffff0000u), ijv, v.w);
+        }
         a += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
     }
     a = warp_sum(a);
@@ -442,12 +473,16 @@ __device__ __forceinline__ void k2t_prefetch_l2(const void* p, unsigned bytes) {
     asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(p), "r"(bytes) : "memory");
 }
 
-template <int NT>
-__global__ void __launch_bounds__(K2T_WPB * 32, 2) k2t_kernel(const float* __restrict__ x, const half* __restrict__ nw,
+// POST: as in k1u, x' = x + bf16(block_out) * inj_prev is what the kernel takes for x, and each (row, stream, column) is written back
+// (to `x`, in place) by the one lane that reads it: k1u has completed by then, so no other reader of the old values is left.
+template <int NT, bool POST>
+__global__ void __launch_bounds__(K2T_WPB * 32, 2) k2t_kernel(float* x, const half* __restrict__ nw,
                                                               const half* __restrict__ up, const float* __restrict__ P,
                                                               const float* __restrict__ ss, __nv_bfloat16* __restrict__ y,
                                                               float* __restrict__ inj_out, int t0, int H, int rank,
-                                                              int ninj, float eps, float* __restrict__ dbg_z, int pf) {
+                                                              int ninj, float eps, float* __restrict__ dbg_z, int pf,
+                                                              const __nv_bfloat16* __restrict__ bo,
+                                                              const float* __restrict__ ijp) {
     constexpr int HCN = 4;
     extern __shared__ float s_low[];  // swizzled low [NT][rank]
     __shared__ float s_rms[NT * HCN];
@@ -554,7 +589,11 @@ __global__ void __launch_bounds__(K2T_WPB * 32, 2) k2t_kernel(const float* __res
         if (te < NT) {
             if (dbg_z) dbg_z[((size_t)se * NT + te) * H + col] = z;
             const float nv = 1.f + __half2float(nw[(size_t)se * H + col]);
-            const float xv = x[(size_t)(t0 + te) * HC + (size_t)se * H + col];
+            float xv = x[(size_t)(t0 + te) * HC + (size_t)se * H + col];
+            if constexpr (POST) {
+                xv = fmaf(__bfloat162float(bo[(size_t)(t0 + te) * H + col]), ijp[(size_t)(t0 + te) * HCN + se], xv);
+                x[(size_t)(t0 + te) * HC + (size_t)se * H + col] = xv;
+            }
             term = xv * s_rms[te * HCN + se] * nv / (1.f + __expf(-z));
         }
         const float t1 = __shfl_sync(0xffffffffu, term, (lane + 8) & 31);
@@ -580,9 +619,9 @@ GB_EXPORT size_t gb_hcx_scratch_bytes(int hc, int rank, int ninj) {
 
 // k2t launch for 1..8 rows (rows are a template parameter: the per-lane partial sums live in registers). With the kHcx PDL bit
 // the launch carries the programmatic-dependent-launch attribute (k2t waits before it reads k1's output).
-static int launch_k2t(int nt, const float* x, const half* nw, const half* up, const float* P, const float* ss,
+static int launch_k2t(int nt, float* x, const half* nw, const half* up, const float* P, const float* ss,
                       __nv_bfloat16* y, float* inj_out, int t0, int H, int rank, int ninj, float eps, float* dbg_z,
-                      cudaStream_t st) {
+                      cudaStream_t st, const __nv_bfloat16* bo, const float* ijp) {
     const int blocks = (H + K2T_WPB * K2T_CPW - 1) / (K2T_WPB * K2T_CPW);
     const int stride1 = rank > 320 ? 128 : 32;
     const size_t smem = (size_t)nt * (256 + (rank > 256 ? 2 * stride1 : 0)) * sizeof(float);
@@ -590,8 +629,10 @@ static int launch_k2t(int nt, const float* x, const half* nw, const half* up, co
     switch (nt) {
 #define K2T_CASE(N)                                                                                                    \
     case N:                                                                                                            \
-        return gbp_pdl::launch_pdl(pdl, k2t_kernel<N>, dim3(blocks), dim3(K2T_WPB * 32), smem, st, x, nw, up, P, ss,   \
-                                   y, inj_out, t0, H, rank, ninj, eps, dbg_z, pdl ? 1 : 0);
+        return bo ? gbp_pdl::launch_pdl(pdl, k2t_kernel<N, true>, dim3(blocks), dim3(K2T_WPB * 32), smem, st, x, nw,   \
+                                        up, P, ss, y, inj_out, t0, H, rank, ninj, eps, dbg_z, pdl ? 1 : 0, bo, ijp)    \
+                  : gbp_pdl::launch_pdl(pdl, k2t_kernel<N, false>, dim3(blocks), dim3(K2T_WPB * 32), smem, st, x, nw,  \
+                                        up, P, ss, y, inj_out, t0, H, rank, ninj, eps, dbg_z, pdl ? 1 : 0, bo, ijp);
         K2T_CASE(1) K2T_CASE(2) K2T_CASE(3) K2T_CASE(4) K2T_CASE(5) K2T_CASE(6) K2T_CASE(7) K2T_CASE(8)
 #undef K2T_CASE
         default: return (int)cudaErrorInvalidValue;
@@ -601,15 +642,18 @@ static int launch_k2t(int nt, const float* x, const half* nw, const half* up, co
 // k1u launch for 1..8 rows: NJ rows of a stream a warp. 9 keeps the registers inside what a thread has up to 7 rows (the
 // 324 = 320 + 4 rows of the real mixers split into 36 groups a stream); 8 rows use 6. Same PDL attribute rule as k2t.
 static int launch_k1u(int nt, const float* x, const half* nw, const half* down, const half* inj, float* P, float* ss,
-                      int t0, int H, int hc, int rank, int ninj, cudaStream_t st) {
+                      int t0, int H, int hc, int rank, int ninj, cudaStream_t st, const __nv_bfloat16* bo,
+                      const float* ijp) {
     const int R = rank + ninj;
     const bool pdl = gbp_pdl::on(gbp_pdl::kHcx);
     switch (nt) {
 #define K1U_CASE(NJ, N)                                                                                                \
     case N: {                                                                                                          \
         const int warps = ((R + NJ - 1) / NJ) * hc + N * hc;                                                           \
-        return gbp_pdl::launch_pdl(pdl, k1u_kernel<NJ, N>, dim3(warps), dim3(32), 0, st, x, nw, down, inj, P, ss, t0,  \
-                                   H, hc, rank, ninj);                                                                 \
+        return bo ? gbp_pdl::launch_pdl(pdl, k1u_kernel<NJ, N, true>, dim3(warps), dim3(32), 0, st, x, nw, down, inj,  \
+                                        P, ss, t0, H, hc, rank, ninj, bo, ijp)                                         \
+                  : gbp_pdl::launch_pdl(pdl, k1u_kernel<NJ, N, false>, dim3(warps), dim3(32), 0, st, x, nw, down, inj, \
+                                        P, ss, t0, H, hc, rank, ninj, bo, ijp);                                        \
     }
         K1U_CASE(9, 1) K1U_CASE(9, 2) K1U_CASE(9, 3) K1U_CASE(9, 4) K1U_CASE(9, 5) K1U_CASE(9, 6) K1U_CASE(9, 7)
         K1U_CASE(6, 8)
@@ -625,12 +669,14 @@ static int launch_k1u(int nt, const float* x, const half* nw, const half* down, 
 static int hcx_pre_impl(const void* streams, const void* hc_norm_w, const void* down_w, const void* up_w,
                         const void* inject_w, void* y_out, float* inj_out, void* scratch, unsigned int hidden_size,
                         unsigned int hc_mult, unsigned int rank, float eps, unsigned int num_tokens, void* stream,
-                        bool ref, float* dbg_z) {
+                        bool ref, float* dbg_z, const void* block_out = nullptr, const float* inj_prev = nullptr) {
     if (num_tokens == 0) return 0;
     const int H = (int)hidden_size, hc = (int)hc_mult, rk = (int)rank;
     if (H % 256 || rk % 8 || hc > 8) return (int)cudaErrorInvalidValue;
     const int ninj = inject_w ? hc : 0;
     const int R = rk + ninj;
+    // the folded hc_post (block_out + inj_prev given) exists in the decode kernels of the Flash-Next shape only
+    if (block_out && (ref || !inj_prev || hc != 4 || rk > 512)) return (int)cudaErrorInvalidValue;
     cudaStream_t st = gb_stream(stream);
     float* P = static_cast<float*>(scratch);
     float* ss = P + (size_t)TMAX * R * hc;
@@ -641,7 +687,7 @@ static int hcx_pre_impl(const void* streams, const void* hc_norm_w, const void* 
         int rc;
         if (!ref) {
             rc = launch_k1u(nt, (const float*)streams, (const half*)hc_norm_w, (const half*)down_w, (const half*)inject_w,
-                            P, ss, t0, H, hc, rk, ninj, st);
+                            P, ss, t0, H, hc, rk, ninj, st, (const __nv_bfloat16*)block_out, inj_prev);
         } else {
             const int jobs = R * hc + nt * hc;
             k1_kernel<<<(jobs + 3) / 4, 128, 0, st>>>((const float*)streams, (const half*)hc_norm_w,
@@ -651,8 +697,9 @@ static int hcx_pre_impl(const void* streams, const void* hc_norm_w, const void* 
         }
         if (rc) return rc;
         if (use_k2t) {
-            rc = launch_k2t(nt, (const float*)streams, (const half*)hc_norm_w, (const half*)up_w, P, ss,
-                            (__nv_bfloat16*)y_out, inject_w ? inj_out : nullptr, t0, H, rk, ninj, eps, dbg_z, st);
+            rc = launch_k2t(nt, (float*)streams, (const half*)hc_norm_w, (const half*)up_w, P, ss,
+                            (__nv_bfloat16*)y_out, inject_w ? inj_out : nullptr, t0, H, rk, ninj, eps, dbg_z, st,
+                            (const __nv_bfloat16*)block_out, inj_prev);
         } else {
             if (use_k2b) {
                 k2c_kernel<<<(H + 15) / 16, 512, (size_t)nt * rk * sizeof(float), st>>>(
@@ -675,6 +722,16 @@ GB_EXPORT int gb_hcx_pre(const void* streams, const void* hc_norm_w, const void*
                          unsigned int hc_mult, unsigned int rank, float eps, unsigned int num_tokens, void* stream) {
     return hcx_pre_impl(streams, hc_norm_w, down_w, up_w, inject_w, y_out, inj_out, scratch, hidden_size, hc_mult,
                         rank, eps, num_tokens, stream, false, nullptr);
+}
+
+// gb_hcx_pre after the previous block's hc_post, in the same two launches: `streams` first becomes streams + bf16(block_out) * inj_prev per
+// stream (what gb_fn_hc_post writes, bit for bit), then the pre-mix reads the new values. hc = 4, rank <= 512 only.
+GB_EXPORT int gb_hcx_pre_post(void* streams, const void* block_out, const float* inj_prev, const void* hc_norm_w,
+                              const void* down_w, const void* up_w, const void* inject_w, void* y_out, float* inj_out,
+                              void* scratch, unsigned int hidden_size, unsigned int hc_mult, unsigned int rank,
+                              float eps, unsigned int num_tokens, void* stream) {
+    return hcx_pre_impl(streams, hc_norm_w, down_w, up_w, inject_w, y_out, inj_out, scratch, hidden_size, hc_mult,
+                        rank, eps, num_tokens, stream, false, nullptr, block_out, inj_prev);
 }
 
 GB_EXPORT int gb_hcx_pre_ref(const void* streams, const void* hc_norm_w, const void* down_w, const void* up_w,

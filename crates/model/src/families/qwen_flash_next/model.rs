@@ -2172,7 +2172,11 @@ impl FlashNextModel {
         let hcg_on = self.fast && hcg_for_mode(self.hcg && self.hcg_scratch.is_some(), mode);
         // (the block after an attention block is the MLP's pre-mix and the other way round: the post's `inj` is never the one being written)
         let fused = post.filter(|p| hcg_on && hcx::post_fusable(h, hc) && (*p == PostKind::Attn) != attn);
-        if let (Some(p), None) = (post, fused) {
+        // the decode kernels (not hcg) take the post themselves: the pre-mix of the other block kind reads block_out / inj of the pending post
+        let folded = post.filter(|p| {
+            self.fast && !hcg_on && hcx::pre_post_foldable(h, hc, rank) && (*p == PostKind::Attn) != attn
+        });
+        if let (Some(p), None, None) = (post, fused, folded) {
             self.run_post(p, rows)?;
         }
         if self.fast {
@@ -2215,9 +2219,43 @@ impl FlashNextModel {
                     }
                 }
             } else {
-                let inj = if attn { &mut self.inj_attn } else { &mut self.inj_mlp };
                 let s = &mut self.hcx_scratch;
-                hcx::pre(&self.x_streams, mix, &mut self.x_mixed, Some(inj), s, h, hc, rank, EPS, rows, &self.stream)?;
+                match folded {
+                    Some(PostKind::Attn) => hcx::pre_post(
+                        &mut self.x_streams,
+                        &self.block_out,
+                        &self.inj_attn,
+                        mix,
+                        &mut self.x_mixed,
+                        &mut self.inj_mlp,
+                        s,
+                        h,
+                        hc,
+                        rank,
+                        EPS,
+                        rows,
+                        &self.stream,
+                    )?,
+                    Some(PostKind::Mlp) => hcx::pre_post(
+                        &mut self.x_streams,
+                        &self.moe_out,
+                        &self.inj_mlp,
+                        mix,
+                        &mut self.x_mixed,
+                        &mut self.inj_attn,
+                        s,
+                        h,
+                        hc,
+                        rank,
+                        EPS,
+                        rows,
+                        &self.stream,
+                    )?,
+                    None => {
+                        let inj = if attn { &mut self.inj_attn } else { &mut self.inj_mlp };
+                        hcx::pre(&self.x_streams, mix, &mut self.x_mixed, Some(inj), s, h, hc, rank, EPS, rows, &self.stream)?;
+                    }
+                }
             }
         } else {
             let scratch = PreScratch { normed: &mut self.x_normed, low: &mut self.low_buf };
