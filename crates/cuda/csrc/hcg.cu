@@ -115,7 +115,16 @@ __global__ void __launch_bounds__(256) mix_kernel(const float* __restrict__ x, c
 // and shared memory instead of 168 MB of fp32 round trips through DRAM), never what it is. A CTA is 64 rows by 32 d of ALL four streams:
 // warp w owns stream w's 32 columns (the up rows w * H + d0 .. + 31), both chains, so the epilogue sums the four streams of a (row, d)
 // from shared memory in stream order.
-constexpr int kUmRows = 64, kUmD = 32, kUmKB = 32, kUmPad = kUmKB + 8, kUmThreads = 128;
+#ifndef UM_ROWS
+#define UM_ROWS 32
+#endif
+#ifndef UM_MINB
+#define UM_MINB 2
+#endif
+#ifndef UM_KB
+#define UM_KB 32
+#endif
+constexpr int kUmRows = UM_ROWS, kUmD = 32, kUmKB = UM_KB, kUmPad = kUmKB + 8, kUmThreads = 128, kUmMT = kUmRows / 16;
 constexpr size_t kUmStageHalves = (size_t)(2 * kUmRows + 4 * kUmD) * kUmPad;
 constexpr size_t kUmSmem = 2 * kUmStageHalves * sizeof(half);
 
@@ -134,7 +143,7 @@ __device__ __forceinline__ void um_mma(float (&c)[4], const uint32_t (&a)[4], ui
 }
 
 // grid (H / 32, padded / 64), block 128, dynamic smem kUmSmem
-__global__ void __launch_bounds__(kUmThreads, 2)
+__global__ void __launch_bounds__(kUmThreads, UM_MINB)
     up_mix_kernel(const half* __restrict__ low_hi, const half* __restrict__ low_lo, const half* __restrict__ up_w,
                   const float* __restrict__ x, const float* __restrict__ rms, const half* __restrict__ nw,
                   __nv_bfloat16* __restrict__ y, int T, int H, int rank) {
@@ -160,9 +169,23 @@ __global__ void __launch_bounds__(kUmThreads, 2)
             um_cp16(base + (size_t)row * kUmPad + ch * 8, src);
         }
     };
-    float acc_hi[4][4][4], acc_lo[4][4][4];
+    // the epilogue's x and rms (thread = row tid / kTpr, kDpt d from dh) are fetched before the K loop: their latency hides behind it
+    constexpr int kTpr = kUmThreads / kUmRows, kDpt = kUmD / kTpr;  // threads a row, d a thread
+    const int row = tid / kTpr, dh = (tid % kTpr) * kDpt;
+    const int t = r0 + row;
+    float4 xp[4][kDpt / 4];
+    float rp[4];
+    if (t < T) {
 #pragma unroll
-    for (int a = 0; a < 4; ++a)
+        for (int s = 0; s < 4; ++s) {
+            rp[s] = rms[(size_t)t * 4 + s];
+#pragma unroll
+            for (int i = 0; i < kDpt; i += 4) xp[s][i / 4] = *reinterpret_cast<const float4*>(x + ((size_t)t * 4 + s) * H + d0 + dh + i);
+        }
+    }
+    float acc_hi[kUmMT][4][4], acc_lo[kUmMT][4][4];
+#pragma unroll
+    for (int a = 0; a < kUmMT; ++a)
 #pragma unroll
         for (int b = 0; b < 4; ++b)
 #pragma unroll
@@ -188,7 +211,7 @@ __global__ void __launch_bounds__(kUmThreads, 2)
                 bf[2 * p][0] = r[0]; bf[2 * p][1] = r[1]; bf[2 * p + 1][0] = r[2]; bf[2 * p + 1][1] = r[3];
             }
 #pragma unroll
-            for (int mt = 0; mt < 4; ++mt) {
+            for (int mt = 0; mt < kUmMT; ++mt) {
                 uint32_t ah[4], al[4];
                 const size_t off = (size_t)(mt * 16 + (lane & 15)) * kUmPad + kk * 16 + (lane >> 4) * 8;
                 um_ldsm4(ah, ahi + off);
@@ -206,7 +229,7 @@ __global__ void __launch_bounds__(kUmThreads, 2)
     // G = hi chain + lo chain, per stream into shared memory [stream][row][d], row stride 33 floats
     float* gs = reinterpret_cast<float*>(um_smem);
 #pragma unroll
-    for (int mt = 0; mt < 4; ++mt)
+    for (int mt = 0; mt < kUmMT; ++mt)
 #pragma unroll
         for (int nt = 0; nt < 4; ++nt)
 #pragma unroll
@@ -216,21 +239,18 @@ __global__ void __launch_bounds__(kUmThreads, 2)
             }
     __syncthreads();
     // epilogue: thread = (row tid / 2, 16 d from (tid & 1) * 16); the sum over the four streams in stream order (mix_kernel's expression)
-    const int row = tid >> 1, dh = (tid & 1) * 16;
-    const int t = r0 + row;
     if (t >= T) return;
     const float inv = 1.f / 4.f;
-    float acc[16];
+    float acc[kDpt];
 #pragma unroll
-    for (int i = 0; i < 16; ++i) acc[i] = 0.f;
+    for (int i = 0; i < kDpt; ++i) acc[i] = 0.f;
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
-        const float rs = rms[(size_t)t * 4 + s];
-        const float* xr = x + ((size_t)t * 4 + s) * H + d0 + dh;
+        const float rs = rp[s];
         const half* nwr = nw + (size_t)s * H + d0 + dh;
 #pragma unroll
-        for (int i = 0; i < 16; i += 4) {
-            const float4 xv = *reinterpret_cast<const float4*>(xr + i);
+        for (int i = 0; i < kDpt; i += 4) {
+            const float4 xv = xp[s][i / 4];
             const float xs[4] = {xv.x, xv.y, xv.z, xv.w};
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
@@ -241,7 +261,7 @@ __global__ void __launch_bounds__(kUmThreads, 2)
     }
     __nv_bfloat16* yr = y + (size_t)t * H + d0 + dh;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) yr[i] = __float2bfloat16_rn(acc[i] * inv);
+    for (int i = 0; i < kDpt; ++i) yr[i] = __float2bfloat16_rn(acc[i] * inv);
 }
 
 // One cuBLAS handle per host thread, created on first use and never destroyed (destroying it at thread exit can run
