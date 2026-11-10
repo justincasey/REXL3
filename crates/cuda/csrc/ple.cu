@@ -20,6 +20,16 @@
 // the batch. The ring is indexed by position (mod ring), so a rejected draft row is simply rewritten by the next window
 // before any later row reads it: there is no commit step.
 #include "common.cuh"
+#include "pdl.cuh"
+
+// Decode launches (gbp_pdl::kFlash): a kernel launched with the programmatic-dependent-launch attribute may start before its predecessor
+// finishes, so it calls pdl_wait() -- first in every thread, early exits included -- before it reads anything an earlier kernel wrote or
+// writes anything an earlier kernel may still read; weights are read (or pulled towards L2) before it. A launch without the attribute
+// makes both calls no-ops (pdl.cuh), so only timing changes, never a bit.
+using gbp_pdl::pdl_trigger;
+using gbp_pdl::pdl_wait;
+using gbp_pdl::prefetch_l2;
+inline bool flash_pdl() { return gbp_pdl::on(gbp_pdl::kFlash); }
 
 namespace {
 
@@ -51,9 +61,12 @@ __device__ __forceinline__ int seq_of(const int* seq_start, int n_seq, int r) {
 __global__ void __launch_bounds__(ROW) rows_k(const uint16_t* __restrict__ packed, const __half* __restrict__ bias,
                                               __half* __restrict__ emb, int heads, int k, int words) {
     extern __shared__ uint16_t wsm[];
+    pdl_trigger();     // proj_k may launch: it waits for this grid before it reads emb
     const int e = blockIdx.x;  // entry = token row * heads + head
     const int head = e % heads;
     const int i = threadIdx.x;
+    const float head_bias = h2f(bias[head * ROW + i]);  // a weight: read before the wait
+    pdl_wait();        // packed is staged by an earlier operation of the stream; emb may still be read by earlier kernels
     for (int t = i; t < words; t += ROW) wsm[t] = packed[(size_t)e * words + t];
     __syncthreads();
     uint32_t state = 0;
@@ -69,15 +82,19 @@ __global__ void __launch_bounds__(ROW) rows_k(const uint16_t* __restrict__ packe
     const float kbias = __half2float(__ushort_as_half((unsigned short)0xc931));
     const float cb = __half2float(__float2half_rn(__fadd_rn(__fmul_rn(hs, kinv), kbias)));
     const float scale = __half2float(__ushort_as_half(wsm[0]));
-    const float b = h2f(bias[head * ROW + i]);
-    emb[(size_t)e * ROW + i] = __float2half_rn(__fadd_rn(__fmul_rn(cb, scale), b));
+    emb[(size_t)e * ROW + i] = __float2half_rn(__fadd_rn(__fmul_rn(cb, scale), head_bias));
 }
 
 // One warp per output column; the batch rows are walked in tiles of 8 so each warp streams its weight row once per tile.
 __global__ void __launch_bounds__(256) proj_k(const __half* __restrict__ x, const __half* __restrict__ w, __half* __restrict__ y,
                                               int rows, int k, int n) {
+    pdl_trigger();  // the successor may launch: it waits for this grid before it reads y
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int col = blockIdx.x * 8 + warp;
+    // before the wait: pull the start of this warp's weight row towards L2 (the kernel streams weights, a predecessor's tail leaves the
+    // memory idle, and nothing here depends on what the predecessor writes)
+    if (col < n && lane * 64 < k) prefetch_l2(w + (size_t)col * k + lane * 64);
+    pdl_wait();     // x is the predecessor's output; y may still be read by earlier kernels; the early exit is after it
     if (col >= n) return;
     const __half* wr = w + (size_t)col * k;
     for (int r0 = 0; r0 < rows; r0 += 8) {
@@ -122,6 +139,7 @@ __global__ void __launch_bounds__(256) gate_k(const float* __restrict__ streams,
                                               float* __restrict__ sg, __half* __restrict__ nb, int d, int hc, float eps,
                                               float scale) {
     __shared__ float red[32];
+    pdl_trigger();  // conv_k may launch: it waits for this grid before it reads sg and nb
     const int r = blockIdx.x / hc, s = blockIdx.x % hc;
     const size_t base = ((size_t)r * hc + s) * d;  // this stream's slice of a [hc * d] row
     const float* xs = streams + base;
@@ -130,6 +148,13 @@ __global__ void __launch_bounds__(256) gate_k(const float* __restrict__ streams,
     const float* wks = wk + (size_t)s * d;
     const float* wqs = wq + (size_t)s * d;
     const float* wcs = wc + (size_t)s * d;
+    // before the wait: this stream's three weight slices towards L2 (a line is 32 floats)
+    for (int i = threadIdx.x * 32; i < d; i += blockDim.x * 32) {
+        prefetch_l2(wks + i);
+        prefetch_l2(wqs + i);
+        prefetch_l2(wcs + i);
+    }
+    pdl_wait();  // streams, key and value are earlier kernels' outputs; sg and nb may still be read by earlier kernels
     float kk = 0.f, qq = 0.f;
     for (int i = threadIdx.x; i < d; i += blockDim.x) {
         const float a = h2f(kr[i]), b = xs[i];
@@ -162,9 +187,17 @@ __global__ void __launch_bounds__(256) conv_k(float* __restrict__ streams, const
                                               const __half* __restrict__ ring, const __half* __restrict__ conv_w,
                                               const int* __restrict__ positions, const int* __restrict__ seq_start,
                                               const int* __restrict__ seq_slot, int n_seq, int d, int hc, int ring_len) {
+    pdl_trigger();  // ring_k may launch: it waits for this grid before it reads nb
     const int r = blockIdx.y;
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     const int ch = hc * d;
+    // before the wait: this channel's conv taps, a weight
+    float cw[TAPS] = {0.f, 0.f, 0.f, 0.f};
+    if (c < ch) {
+#pragma unroll
+        for (int j = 0; j < TAPS; ++j) cw[j] = h2f(conv_w[(size_t)c * TAPS + j]);
+    }
+    pdl_wait();  // sg, value, nb, the ring and the positions are earlier kernels' outputs; streams may still be read by earlier kernels
     if (c >= ch) return;
     const int sq = seq_of(seq_start, n_seq, r);
     const int r0 = seq_start[sq];
@@ -180,7 +213,7 @@ __global__ void __launch_bounds__(256) conv_k(float* __restrict__ streams, const
         } else if (q >= 0) {
             v = h2f(ring[((size_t)slot * ring_len + (q % ring_len)) * ch + c]);
         }
-        acc += h2f(conv_w[(size_t)c * TAPS + j]) * v;
+        acc += cw[j] * v;
     }
     const float y = h2f(__float2half_rn(acc));                       // the conv's f16 output
     const float z = h2f(__float2half_rn(y / (1.f + expf(-y))));      // silu, f16 out
@@ -193,6 +226,8 @@ __global__ void __launch_bounds__(256) conv_k(float* __restrict__ streams, const
 __global__ void __launch_bounds__(256) ring_k(const __half* __restrict__ nb, __half* __restrict__ ring,
                                               const int* __restrict__ positions, const int* __restrict__ seq_start,
                                               const int* __restrict__ seq_slot, int n_seq, int ch, int ring_len) {
+    pdl_trigger();  // the successor may launch: it waits for this grid before it reads or writes anything
+    pdl_wait();     // nb is conv_k's input and gate_k's output; the ring may still be read by conv_k
     const int r = blockIdx.y;
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= ch) return;
@@ -256,15 +291,16 @@ GB_EXPORT int gb_ple_rows(const void* packed, const void* bias, void* emb, int e
                           void* stream) {
     if (entries < 0 || heads <= 0 || k < 1 || k > 8 || words != 1 + ROW * k / 16) return (int)cudaErrorInvalidValue;
     if (entries == 0) return 0;
-    rows_k<<<entries, ROW, words * sizeof(uint16_t), gb_stream(stream)>>>((const uint16_t*)packed, (const __half*)bias,
-                                                                          (__half*)emb, heads, k, words);
+    gbp_pdl::launch_pdl(flash_pdl(), rows_k, dim3((unsigned)entries), dim3(ROW), (size_t)words * sizeof(uint16_t), gb_stream(stream),
+                        (const uint16_t*)packed, (const __half*)bias, (__half*)emb, heads, k, words);
     return GB_CHECK_LAUNCH();
 }
 
 GB_EXPORT int gb_ple_proj(const void* x, const void* w, void* y, int rows, int k, int n, void* stream) {
     if (rows < 0 || k <= 0 || n <= 0 || k % 8 != 0) return (int)cudaErrorInvalidValue;
     if (rows == 0) return 0;
-    proj_k<<<(n + 7) / 8, 256, 0, gb_stream(stream)>>>((const __half*)x, (const __half*)w, (__half*)y, rows, k, n);
+    gbp_pdl::launch_pdl(flash_pdl(), proj_k, dim3((unsigned)((n + 7) / 8)), dim3(256), 0, gb_stream(stream), (const __half*)x,
+                        (const __half*)w, (__half*)y, rows, k, n);
     return GB_CHECK_LAUNCH();
 }
 
@@ -280,9 +316,9 @@ GB_EXPORT int gb_ple_gate(const void* streams, const void* key, const void* valu
                           const void* wc, void* sg, void* nb, int rows, int d, int hc, float eps, float scale, void* stream) {
     if (rows < 0 || d <= 0 || hc <= 0) return (int)cudaErrorInvalidValue;
     if (rows == 0) return 0;
-    gate_k<<<rows * hc, 256, 0, gb_stream(stream)>>>((const float*)streams, (const __half*)key, (const __half*)value,
-                                                     (const float*)wk, (const float*)wq, (const float*)wc, (float*)sg,
-                                                     (__half*)nb, d, hc, eps, scale);
+    gbp_pdl::launch_pdl(flash_pdl(), gate_k, dim3((unsigned)(rows * hc)), dim3(256), 0, gb_stream(stream), (const float*)streams,
+                        (const __half*)key, (const __half*)value, (const float*)wk, (const float*)wq, (const float*)wc, (float*)sg,
+                        (__half*)nb, d, hc, eps, scale);
     return GB_CHECK_LAUNCH();
 }
 
@@ -292,9 +328,9 @@ GB_EXPORT int gb_ple_conv(void* streams, const void* sg, const void* value, cons
     if (rows < 0 || n_seq <= 0 || d <= 0 || hc <= 0 || ring_len < DIL * (TAPS - 1)) return (int)cudaErrorInvalidValue;
     if (rows == 0) return 0;
     const dim3 grid((hc * d + 255) / 256, rows);
-    conv_k<<<grid, 256, 0, gb_stream(stream)>>>((float*)streams, (const float*)sg, (const __half*)value, (const __half*)nb,
-                                                (const __half*)ring, (const __half*)conv_w, positions, seq_start, seq_slot,
-                                                n_seq, d, hc, ring_len);
+    gbp_pdl::launch_pdl(flash_pdl(), conv_k, grid, dim3(256), 0, gb_stream(stream), (float*)streams, (const float*)sg,
+                        (const __half*)value, (const __half*)nb, (const __half*)ring, (const __half*)conv_w, positions, seq_start,
+                        seq_slot, n_seq, d, hc, ring_len);
     return GB_CHECK_LAUNCH();
 }
 
@@ -303,7 +339,7 @@ GB_EXPORT int gb_ple_ring(const void* nb, void* ring, const int* positions, cons
     if (rows < 0 || n_seq <= 0 || ch <= 0 || ring_len <= 0) return (int)cudaErrorInvalidValue;
     if (rows == 0) return 0;
     const dim3 grid((ch + 255) / 256, rows);
-    ring_k<<<grid, 256, 0, gb_stream(stream)>>>((const __half*)nb, (__half*)ring, positions, seq_start, seq_slot, n_seq, ch,
-                                                ring_len);
+    gbp_pdl::launch_pdl(flash_pdl(), ring_k, grid, dim3(256), 0, gb_stream(stream), (const __half*)nb, (__half*)ring, positions,
+                        seq_start, seq_slot, n_seq, ch, ring_len);
     return GB_CHECK_LAUNCH();
 }

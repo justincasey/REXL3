@@ -20,7 +20,16 @@
 // The pool plane is paged like the KV cache: page `table[slot][4 j / 256]` holds blocks with j / 64 equal, at j % 64.
 // Rows of one sequence are contiguous with contiguous positions (seq_start [n_seq + 1], seq_slot [n_seq]).
 #include "common.cuh"
+#include "pdl.cuh"
 #include <cuda_bf16.h>
+
+// Decode launches (gbp_pdl::kFlash): a kernel launched with the programmatic-dependent-launch attribute may start before its predecessor
+// finishes, so it calls pdl_wait() -- first in every thread, early exits included -- before it reads anything an earlier kernel wrote or
+// writes anything an earlier kernel may still read; what depends on no earlier kernel (weights, the rope frequencies) is read or computed
+// before it. A launch without the attribute makes both calls no-ops (pdl.cuh), so only timing changes, never a bit.
+using gbp_pdl::pdl_trigger;
+using gbp_pdl::pdl_wait;
+inline bool flash_pdl() { return gbp_pdl::on(gbp_pdl::kFlash); }
 
 namespace qsa {
 
@@ -55,14 +64,14 @@ __device__ __forceinline__ float inv_freq(float theta, int i) {
     return (float)pow((double)theta, -(double)(2 * i) / (double)RD);
 }
 
-// rope one 128-dim vector held one element per thread (d = threadIdx.x) through `sh`; result rounded to f16
-__device__ __forceinline__ float rope_elem(float x, int d, int pos, float theta, float* sh) {
+// rope one 128-dim vector held one element per thread (d = threadIdx.x) through `sh`; result rounded to f16. `invf` is inv_freq(theta, d % 32)
+// for d < RD (the caller computes it: it depends on nothing a predecessor wrote), unused otherwise.
+__device__ __forceinline__ float rope_elem(float x, int d, int pos, float invf, float* sh) {
     sh[d] = x;
     __syncthreads();
     float o = x;
     if (d < RD) {
-        const int i = d % (RD / 2);
-        const float ang = (float)pos * inv_freq(theta, i);
+        const float ang = (float)pos * invf;
         const float c = cosf(ang), s = sinf(ang);
         o = d < RD / 2 ? x * c - sh[d + RD / 2] * s : x * c + sh[d - RD / 2] * s;
     }
@@ -83,7 +92,16 @@ __device__ __forceinline__ float block_sum128(float v, float* red) {
 __global__ void __launch_bounds__(160) stage_k(const uint16_t* __restrict__ qk, const float* __restrict__ qw,
                                                const int* __restrict__ positions, __half* __restrict__ q,
                                                __half* __restrict__ kraw, float eps, float theta) {
+    pdl_trigger();  // pool_k may launch: it waits for this grid before it reads kraw
     const int r = blockIdx.x, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    // before the wait: this lane's rope frequency (a double-precision pow, the slowest part of the kernel) and the norm weights
+    float invf = 0.f, wq[4] = {0.f, 0.f, 0.f, 0.f};
+    if (w < NH) {
+        invf = inv_freq(theta, lane);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) wq[j] = qw[lane + 32 * j];
+    }
+    pdl_wait();  // qk and positions are earlier kernels' outputs; q and kraw may still be read by earlier kernels
     const uint16_t* src = qk + (size_t)r * QK + w * DK;
     if (w == NH) {
         for (int d = lane; d < DK; d += 32) kraw[(size_t)r * DK + d] = __float2half_rn(bf(src[d]));
@@ -99,9 +117,9 @@ __global__ void __launch_bounds__(160) stage_k(const uint16_t* __restrict__ qk, 
     ss = warp_sum(ss);
     const float inv = 1.0f / sqrtf(ss / (float)DK + eps);
 #pragma unroll
-    for (int j = 0; j < 4; ++j) x[j] = rh((x[j] * inv) * qw[lane + 32 * j]);
+    for (int j = 0; j < 4; ++j) x[j] = rh((x[j] * inv) * wq[j]);
     // rope pair (lane, lane + 32) sits in this lane as x[0], x[1]
-    const float ang = (float)positions[r] * inv_freq(theta, lane);
+    const float ang = (float)positions[r] * invf;
     const float c = cosf(ang), s = sinf(ang);
     const float a = x[0], b = x[1];
     x[0] = rh(a * c - b * s);
@@ -118,7 +136,12 @@ __global__ void __launch_bounds__(DK) pool_k(const __half* __restrict__ kraw, co
                                              int n_seq, const int* __restrict__ table, int max_blocks,
                                              __half* __restrict__ pool, int ring_len, float eps, float theta) {
     __shared__ float red[4], sh[DK];
+    pdl_trigger();  // ring_k may launch: it waits for this grid before it reads kraw or writes the ring this kernel reads
     const int r = blockIdx.x, d = threadIdx.x;
+    // before the wait: this thread's norm weight and rope frequency, which no predecessor writes
+    const float kwd = kw[d];
+    const float invf = d < RD ? inv_freq(theta, d % (RD / 2)) : 0.f;
+    pdl_wait();  // every early exit below is after it
     const int p = positions[r];
     if (p % CR != CR - 1) return;
     const int sq = seq_of(seq_start, n_seq, r);
@@ -134,9 +157,9 @@ __global__ void __launch_bounds__(DK) pool_k(const __half* __restrict__ kraw, co
     const float m = rh(sum * 0.25f);
     const float ss = block_sum128(m * m, red);
     const float inv = 1.0f / sqrtf(ss / (float)DK + eps);
-    const float y = rh((m * inv) * kw[d]);
+    const float y = rh((m * inv) * kwd);
     const int j = p / CR;
-    const float o = rope_elem(y, d, j * CR, theta, sh);
+    const float o = rope_elem(y, d, j * CR, invf, sh);
     const int page = table[(size_t)slot * max_blocks + j / PB];
     pool[((size_t)page * PB + j % PB) * DK + d] = __float2half_rn(o);
 }
@@ -144,6 +167,8 @@ __global__ void __launch_bounds__(DK) pool_k(const __half* __restrict__ kraw, co
 __global__ void __launch_bounds__(DK) ring_k(const __half* __restrict__ kraw, __half* __restrict__ ring,
                                              const int* __restrict__ positions, const int* __restrict__ seq_start,
                                              const int* __restrict__ seq_slot, int n_seq, int ring_len) {
+    pdl_trigger();  // the successor may launch: it waits for this grid before it reads or writes anything
+    pdl_wait();     // kraw is stage_k's output, and the ring is read by pool_k
     const int r = blockIdx.x, d = threadIdx.x;
     const int sq = seq_of(seq_start, n_seq, r);
     const int p_last = positions[seq_start[sq + 1] - 1], p = positions[r];
@@ -162,6 +187,8 @@ __global__ void __launch_bounds__(256) scores_k(const __half* __restrict__ q, co
     __shared__ float qs[RG][NH * DK];
     __shared__ int nbq_s[RG], slot_s[RG];
     __shared__ int nbq_max;
+    pdl_trigger();  // the successor may launch: it waits for this grid before it reads or writes anything
+    pdl_wait();     // q, the pool plane, the table and the positions are earlier kernels' outputs; every early exit is after it
     const int r0 = blockIdx.y * RG, rn = min(RG, rows - r0);
     if (threadIdx.x < RG) {
         const int r = r0 + min((int)threadIdx.x, rn - 1);
@@ -220,6 +247,8 @@ __global__ void __launch_bounds__(1024) topk_k(const float* __restrict__ scores,
     __shared__ unsigned sh_prefix, sh_need;
     __shared__ int wsum[32], weq[32];
     __shared__ int sh_base_gt, sh_base_eq;
+    pdl_trigger();
+    pdl_wait();  // scores and positions are earlier kernels' outputs; the early exit below is after it
     const int r = blockIdx.x, t = threadIdx.x;
     const int nbq = (positions[r] + 1) / CR;
     int* out = sel + (size_t)r * TOPK;
@@ -314,6 +343,8 @@ __global__ void __launch_bounds__(32 * GRP) attend_k(const __nv_bfloat16* __rest
                                                      const int* __restrict__ positions, const int* __restrict__ sel,
                                                      const int* __restrict__ sel_n, float* __restrict__ part_o,
                                                      float* __restrict__ part_m, float* __restrict__ part_l, int parts) {
+    pdl_trigger();
+    pdl_wait();  // q, the selection and the positions are earlier kernels' outputs
     const int r = blockIdx.x, kvh = blockIdx.y, part = blockIdx.z;
     const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int head = kvh * GRP + w;
@@ -407,6 +438,8 @@ __global__ void __launch_bounds__(32 * (GRP / HPW))
              const int* __restrict__ sel, const int* __restrict__ sel_n, float* __restrict__ part_o, float* __restrict__ part_m,
              float* __restrict__ part_l, int parts) {
     static_assert(GRP % HPW == 0, "heads a warp must divide the group");
+    pdl_trigger();
+    pdl_wait();  // q, the selection and the positions are earlier kernels' outputs
     const int r = blockIdx.x, kvh = blockIdx.y, part = blockIdx.z;
     const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int head0 = kvh * GRP + w * HPW;
@@ -516,6 +549,8 @@ __global__ void __launch_bounds__(32 * (GRP / HPW))
 // grid (rows, NQ), block D
 __global__ void __launch_bounds__(D) merge_k(const float* __restrict__ part_o, const float* __restrict__ part_m,
                                              const float* __restrict__ part_l, __nv_bfloat16* __restrict__ out, int parts) {
+    pdl_trigger();
+    pdl_wait();  // the partial sums are attend's output, and out may still be read by earlier kernels
     const int r = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
     const size_t base = ((size_t)r * NQ + h) * parts;
     float mx = -INFINITY;
@@ -537,8 +572,8 @@ GB_EXPORT int gb_qsa_stage(const void* qk, const void* qw, const int* positions,
                            float theta, void* stream) {
     if (rows < 0) return (int)cudaErrorInvalidValue;
     if (rows == 0) return 0;
-    qsa::stage_k<<<rows, 160, 0, gb_stream(stream)>>>((const uint16_t*)qk, (const float*)qw, positions, (__half*)q,
-                                                      (__half*)kraw, eps, theta);
+    gbp_pdl::launch_pdl(flash_pdl(), qsa::stage_k, dim3((unsigned)rows), dim3(160), 0, gb_stream(stream), (const uint16_t*)qk,
+                        (const float*)qw, positions, (__half*)q, (__half*)kraw, eps, theta);
     return GB_CHECK_LAUNCH();
 }
 
@@ -547,9 +582,9 @@ GB_EXPORT int gb_qsa_pool(const void* kraw, const void* ring, const void* kw, co
                           int ring_len, float eps, float theta, void* stream) {
     if (rows < 0 || n_seq <= 0 || ring_len < qsa::CR) return (int)cudaErrorInvalidValue;
     if (rows == 0) return 0;
-    qsa::pool_k<<<rows, qsa::DK, 0, gb_stream(stream)>>>((const __half*)kraw, (const __half*)ring, (const float*)kw,
-                                                         positions, seq_start, seq_slot, n_seq, table, max_blocks,
-                                                         (__half*)pool, ring_len, eps, theta);
+    gbp_pdl::launch_pdl(flash_pdl(), qsa::pool_k, dim3((unsigned)rows), dim3(qsa::DK), 0, gb_stream(stream), (const __half*)kraw,
+                        (const __half*)ring, (const float*)kw, positions, seq_start, seq_slot, n_seq, table, max_blocks,
+                        (__half*)pool, ring_len, eps, theta);
     return GB_CHECK_LAUNCH();
 }
 
@@ -557,8 +592,8 @@ GB_EXPORT int gb_qsa_ring(const void* kraw, void* ring, const int* positions, co
                           int n_seq, int rows, int ring_len, void* stream) {
     if (rows < 0 || n_seq <= 0 || ring_len <= 0) return (int)cudaErrorInvalidValue;
     if (rows == 0) return 0;
-    qsa::ring_k<<<rows, qsa::DK, 0, gb_stream(stream)>>>((const __half*)kraw, (__half*)ring, positions, seq_start, seq_slot,
-                                                         n_seq, ring_len);
+    gbp_pdl::launch_pdl(flash_pdl(), qsa::ring_k, dim3((unsigned)rows), dim3(qsa::DK), 0, gb_stream(stream), (const __half*)kraw,
+                        (__half*)ring, positions, seq_start, seq_slot, n_seq, ring_len);
     return GB_CHECK_LAUNCH();
 }
 
@@ -567,8 +602,8 @@ GB_EXPORT int gb_qsa_scores(const void* q, const void* pool, const int* table, i
     if (rows < 0 || nb_cap <= 0) return (int)cudaErrorInvalidValue;
     if (rows == 0) return 0;
     const dim3 grid((nb_cap + 255) / 256, (rows + qsa::RG - 1) / qsa::RG);
-    qsa::scores_k<<<grid, 256, 0, gb_stream(stream)>>>((const __half*)q, (const __half*)pool, table, max_blocks, row_slot,
-                                                       positions, (float*)scores, rows, nb_cap, 1.0f / sqrtf((float)qsa::DK));
+    gbp_pdl::launch_pdl(flash_pdl(), qsa::scores_k, grid, dim3(256), 0, gb_stream(stream), (const __half*)q, (const __half*)pool,
+                        table, max_blocks, row_slot, positions, (float*)scores, rows, nb_cap, 1.0f / sqrtf((float)qsa::DK));
     return GB_CHECK_LAUNCH();
 }
 
@@ -576,7 +611,8 @@ GB_EXPORT int gb_qsa_topk(const void* scores, const int* positions, int rows, in
                           void* stream) {
     if (rows < 0 || nb_cap <= 0) return (int)cudaErrorInvalidValue;
     if (rows == 0) return 0;
-    qsa::topk_k<<<rows, 1024, 0, gb_stream(stream)>>>((const float*)scores, positions, nb_cap, sel, sel_n);
+    gbp_pdl::launch_pdl(flash_pdl(), qsa::topk_k, dim3((unsigned)rows), dim3(1024), 0, gb_stream(stream), (const float*)scores,
+                        positions, nb_cap, sel, sel_n);
     return GB_CHECK_LAUNCH();
 }
 
@@ -589,14 +625,15 @@ GB_EXPORT int gb_qsa_attend(const void* q, const void* k_cache, const void* v_ca
     // many rows (a prefill chunk): four heads a warp, the same bits as one head a warp (see attend_h); the decode windows' few rows
     // keep the twelve-warp block, whose grid fills the SMs through `parts`
     if (rows >= qsa::ATTEND_H_MIN_ROWS) {
-        qsa::attend_h<qsa::ATTEND_HPW, qsa::TB><<<grid, 32 * (qsa::GRP / qsa::ATTEND_HPW), 0, gb_stream(stream)>>>(
-            (const __nv_bfloat16*)q, (const __nv_bfloat16*)k_cache, (const __nv_bfloat16*)v_cache, table, max_blocks, row_slot,
-            positions, sel, sel_n, (float*)part_o, (float*)part_m, (float*)part_l, parts);
+        gbp_pdl::launch_pdl(flash_pdl(), qsa::attend_h<qsa::ATTEND_HPW, qsa::TB>, grid, dim3(32 * (qsa::GRP / qsa::ATTEND_HPW)), 0,
+                            gb_stream(stream), (const __nv_bfloat16*)q, (const __nv_bfloat16*)k_cache, (const __nv_bfloat16*)v_cache,
+                            table, max_blocks, row_slot, positions, sel, sel_n, (float*)part_o, (float*)part_m, (float*)part_l,
+                            parts);
         return GB_CHECK_LAUNCH();
     }
-    qsa::attend_k<<<grid, 32 * qsa::GRP, 0, gb_stream(stream)>>>(
-        (const __nv_bfloat16*)q, (const __nv_bfloat16*)k_cache, (const __nv_bfloat16*)v_cache, table, max_blocks, row_slot,
-        positions, sel, sel_n, (float*)part_o, (float*)part_m, (float*)part_l, parts);
+    gbp_pdl::launch_pdl(flash_pdl(), qsa::attend_k, grid, dim3(32 * qsa::GRP), 0, gb_stream(stream), (const __nv_bfloat16*)q,
+                        (const __nv_bfloat16*)k_cache, (const __nv_bfloat16*)v_cache, table, max_blocks, row_slot, positions, sel,
+                        sel_n, (float*)part_o, (float*)part_m, (float*)part_l, parts);
     return GB_CHECK_LAUNCH();
 }
 
@@ -605,7 +642,7 @@ GB_EXPORT int gb_qsa_merge(const void* part_o, const void* part_m, const void* p
     if (rows < 0 || parts <= 0) return (int)cudaErrorInvalidValue;
     if (rows == 0) return 0;
     const dim3 grid(rows, qsa::NQ);
-    qsa::merge_k<<<grid, qsa::D, 0, gb_stream(stream)>>>((const float*)part_o, (const float*)part_m, (const float*)part_l,
-                                                         (__nv_bfloat16*)out, parts);
+    gbp_pdl::launch_pdl(flash_pdl(), qsa::merge_k, grid, dim3(qsa::D), 0, gb_stream(stream), (const float*)part_o,
+                        (const float*)part_m, (const float*)part_l, (__nv_bfloat16*)out, parts);
     return GB_CHECK_LAUNCH();
 }

@@ -1,0 +1,3 @@
+## New features and improvements
+
+- The sparse-attention indexer's kernels and the n-gram embedding stage's kernels of Qwen3.8-Flash-Next launch as programmatic dependent launches, and do what depends on no earlier kernel (the rope frequencies, the weights, a prefetch of the projection weights towards L2) before the wait. Every output bit is unchanged (golden runs with the launch attribute off and on equal to the recorded bits). Measured on one GB10 (nsys of the decode screen, six prompts, same boot): per window the n-gram projections take 184.9 us before and 147.3 us after, the gate 22.2 to 17.9 us, and the indexer's stage, pool and ring kernels 16.4 to 9.5 us on the 14 full-attention layers' launches taken one by one (6.3 to 4.4, 8.3 to 4.1, 1.9 to 1.0 us).
