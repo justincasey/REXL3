@@ -837,6 +837,8 @@ fn g_embed(
 }
 
 /// Two `g_small_linear`s of one input in one launch: `(w, y, n)` of each (the very bits of two calls, the second never waits for the first).
+/// A prefill chunk (`SMALL_LINEAR_ROWS_MIN` rows or more) runs the two calls through `g_small_linear`, which takes the many-row kernel there:
+/// the pair kernel is the per-row one and would give back what that kernel saves.
 fn g_small_linear_pair(
     x: &DevBuf,
     a: (&DevBuf, &DevBuf, usize),
@@ -845,6 +847,10 @@ fn g_small_linear_pair(
     k: usize,
     st: &Stream,
 ) -> Result<(), ModelError> {
+    if rows >= SMALL_LINEAR_ROWS_MIN {
+        g_small_linear(x, a.0, a.1, rows, k, a.2, st)?;
+        return g_small_linear(x, b.0, b.1, rows, k, b.2, st);
+    }
     // SAFETY: bf16 x `[rows, k]`, f16 weights `[n, k]`, bf16 outputs `[rows, n]`.
     unsafe {
         glue::small_linear_f16w_pair(
