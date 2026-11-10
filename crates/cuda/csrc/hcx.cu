@@ -423,6 +423,8 @@ __global__ void __launch_bounds__(512) k2c_kernel(const float* __restrict__ x, c
 // - a warp owns K2T_CPW consecutive columns; for each column the four streams' weight chunks are loaded once, and each
 //   low chunk is read from shared memory once for the four streams;
 // - low lives in shared memory swizzled so a lane's two float4 are conflict free;
+// - the first column's weights are loaded before waiting for k1; under a PDL launch the other columns are bulk-prefetched
+//   into L2 right after the wait (before the low computation), so the low computation overlaps their DRAM latency;
 // - the 4 x NT per-lane partial sums are reduced by scatter_sum32 (a reduce-scatter with the same xor 16/8/4/2/1 pairings
 //   as warp_sum, so each element is bit-identical to warp_sum of it), after which lane s*8+t owns z[s][t] and evaluates the
 //   sigmoid mix once; the four streams' terms are added in the reference order s = 0..3 through three shuffles.
@@ -436,12 +438,16 @@ __device__ __forceinline__ int k2t_low_pos(int t, int r, int base1, int stride1)
     return it == 0 ? (t * 2 + h) * 128 + l * 4 + i : base1 + (t * 2 + h) * stride1 + l * 4 + i;
 }
 
+__device__ __forceinline__ void k2t_prefetch_l2(const void* p, unsigned bytes) {
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(p), "r"(bytes) : "memory");
+}
+
 template <int NT>
 __global__ void __launch_bounds__(K2T_WPB * 32, 2) k2t_kernel(const float* __restrict__ x, const half* __restrict__ nw,
                                                               const half* __restrict__ up, const float* __restrict__ P,
                                                               const float* __restrict__ ss, __nv_bfloat16* __restrict__ y,
                                                               float* __restrict__ inj_out, int t0, int H, int rank,
-                                                              int ninj, float eps, float* __restrict__ dbg_z) {
+                                                              int ninj, float eps, float* __restrict__ dbg_z, int pf) {
     constexpr int HCN = 4;
     extern __shared__ float s_low[];  // swizzled low [NT][rank]
     __shared__ float s_rms[NT * HCN];
@@ -466,6 +472,11 @@ __global__ void __launch_bounds__(K2T_WPB * 32, 2) k2t_kernel(const float* __res
         }
     }
     gbp_pdl::pdl_wait();  // P and ss are k1's output (and y / inj_out were last read by earlier kernels)
+    // PDL launches only (the weights then stream while k1 drains; a plain launch measured slower with it): the warp's other
+    // columns, one bulk L2 prefetch a stream (their rows are contiguous), issued after the wait so they queue behind k1's
+    // stream but ahead of the low computation below, whose latency they now cover.
+    if (pf && col0 + 1 < H && lane < HCN)
+        k2t_prefetch_l2(up + ((size_t)lane * H + col0 + 1) * rank, (unsigned)(2 * rank * (min(K2T_CPW, H - col0) - 1)));
     if (tid < NT * HCN) s_rms[tid] = rsqrtf(ss[tid] / (float)H + eps);
     __syncthreads();
     for (int i = tid; i < NT * rank; i += K2T_WPB * 32) {
@@ -580,7 +591,7 @@ static int launch_k2t(int nt, const float* x, const half* nw, const half* up, co
 #define K2T_CASE(N)                                                                                                    \
     case N:                                                                                                            \
         return gbp_pdl::launch_pdl(pdl, k2t_kernel<N>, dim3(blocks), dim3(K2T_WPB * 32), smem, st, x, nw, up, P, ss,   \
-                                   y, inj_out, t0, H, rank, ninj, eps, dbg_z);
+                                   y, inj_out, t0, H, rank, ninj, eps, dbg_z, pdl ? 1 : 0);
         K2T_CASE(1) K2T_CASE(2) K2T_CASE(3) K2T_CASE(4) K2T_CASE(5) K2T_CASE(6) K2T_CASE(7) K2T_CASE(8)
 #undef K2T_CASE
         default: return (int)cudaErrorInvalidValue;
