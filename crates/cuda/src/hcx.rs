@@ -44,6 +44,11 @@ mod ffi {
             hidden_size: u32, hc_mult: u32, rank: u32, eps: f32, num_tokens: u32, stream: *mut c_void,
         ) -> i32;
         pub fn gb_hcg_scratch_bytes(rows: i32, h: i32, hc: i32, rank: i32) -> usize;
+        pub fn gb_hcg_pre_ref(
+            streams: *const c_void, norm_w: *const c_void, down_w: *const c_void, up_w: *const c_void,
+            inject_w: *const c_void, y_out: *mut c_void, inj_out: *mut f32, scratch: *mut c_void,
+            h: i32, hc: i32, rank: i32, eps: f32, t: i32, stream: *mut c_void,
+        ) -> i32;
         pub fn gb_hcg_pre(
             streams: *const c_void, norm_w: *const c_void, down_w: *const c_void, up_w: *const c_void,
             inject_w: *const c_void, y_out: *mut c_void, inj_out: *mut f32, scratch: *mut c_void,
@@ -229,6 +234,41 @@ pub fn pre_gemm(
     rows: usize,
     st: &Stream,
 ) -> Result<(), CudaError> {
+    pre_gemm_with(false, streams, mix, y_out, inj_out, scratch, h, hc, rank, eps, rows, st)
+}
+
+/// [`pre_gemm`] on the 64-row slab loop for every shape (the arithmetic [`pre_gemm`] must reproduce bit for bit; the tests compare).
+pub fn pre_gemm_ref(
+    streams: &DevBuf,
+    mix: &Mixer<'_>,
+    y_out: &mut DevBuf,
+    inj_out: Option<&mut DevBuf>,
+    scratch: &mut DevBuf,
+    h: usize,
+    hc: usize,
+    rank: usize,
+    eps: f32,
+    rows: usize,
+    st: &Stream,
+) -> Result<(), CudaError> {
+    pre_gemm_with(true, streams, mix, y_out, inj_out, scratch, h, hc, rank, eps, rows, st)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pre_gemm_with(
+    reference: bool,
+    streams: &DevBuf,
+    mix: &Mixer<'_>,
+    y_out: &mut DevBuf,
+    inj_out: Option<&mut DevBuf>,
+    scratch: &mut DevBuf,
+    h: usize,
+    hc: usize,
+    rank: usize,
+    eps: f32,
+    rows: usize,
+    st: &Stream,
+) -> Result<(), CudaError> {
     if mix.inject.is_some() != inj_out.is_some() {
         eprintln!("rexl3 level=error launch contract: hcg inj_out must be given exactly when the mixer has inject weights");
         return Err(CudaError(1));
@@ -247,8 +287,9 @@ pub fn pre_gemm(
     need(scratch, gemm_scratch_bytes(rows, h, hc, rank), "hcg scratch")?;
     let sp = scratch.ptr();
     let inj_w = mix.inject.map_or(core::ptr::null(), |b| b.ptr());
+    let f = if reference { ffi::gb_hcg_pre_ref } else { ffi::gb_hcg_pre };
     CudaError::check(unsafe {
-        ffi::gb_hcg_pre(
+        f(
             streams.ptr(),
             mix.norm.ptr(),
             mix.down.ptr(),

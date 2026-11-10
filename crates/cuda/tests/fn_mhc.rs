@@ -370,6 +370,44 @@ fn run_hcg_at(r: &Rig, t: usize, h: usize, hc: usize, rank: usize, st: &Stream) 
     (dl(&gy, st), dl(&gi, st))
 }
 
+/// [`run_hcg_at`] on the 64-row slab loop (`pre_gemm_ref`), the arithmetic `pre_gemm` has to reproduce.
+fn run_hcg_ref_at(r: &Rig, t: usize, h: usize, hc: usize, rank: usize, st: &Stream) -> (Vec<u16>, Vec<f32>) {
+    let input = DevBuf::from_slice(&r.input).unwrap();
+    let mut x = DevBuf::zeroed(t * hc * h * 4).unwrap();
+    fn_mhc::hc_expand(&input, &mut x, h, hc, t, st).unwrap();
+    let (norm, down, up, inject) = (
+        DevBuf::from_slice(&r.norm).unwrap(),
+        DevBuf::from_slice(&r.down).unwrap(),
+        DevBuf::from_slice(&r.up).unwrap(),
+        DevBuf::from_slice(&r.inject).unwrap(),
+    );
+    let mix = fn_mhc::Mixer { norm: &norm, down: &down, up: &up, inject: Some(&inject) };
+    let (mut gy, mut gi, mut gs) = (
+        DevBuf::zeroed(t * h * 2).unwrap(),
+        DevBuf::zeroed(t * hc * 4).unwrap(),
+        DevBuf::zeroed(hcx::gemm_scratch_bytes(t, h, hc, rank)).unwrap(),
+    );
+    hcx::pre_gemm_ref(&x, &mix, &mut gy, Some(&mut gi), &mut gs, h, hc, rank, 1e-6, t, st).unwrap();
+    (dl(&gy, st), dl(&gi, st))
+}
+
+/// The Flash-Next shape (H 2560, hc 4, rank 320) runs the down, inject and up products as a few large calls with fixed cublasLt
+/// algorithms (split-K 4 and 20 like the library's own M = 64 pick); the outputs, `y` and `inject`, are the slab loop's bit for bit at
+/// every row count (the 64-row pass boundaries, a ragged tail, a whole 4,096-row chunk).
+#[test]
+#[ignore]
+fn hcg_large_calls_equal_the_slab_loop_bit_for_bit_at_qfn_dims() {
+    let Some(st) = gpu() else { return };
+    let r = rig_with(4096, QH, QHC, QR);
+    for t in [1usize, 7, 63, 64, 65, 129, 192, 1000, 2048, 4000, 4096] {
+        let rr = rig_rows(&r, 0, t, QH);
+        let big = run_hcg_at(&rr, t, QH, QHC, QR, &st);
+        let slab = run_hcg_ref_at(&rr, t, QH, QHC, QR, &st);
+        assert_eq!(big.0, slab.0, "hcg y, {t} rows");
+        assert_eq!(big.1, slab.1, "hcg inject, {t} rows");
+    }
+}
+
 /// Prevents any read that leaks past a tensor from staying silent: every weight is placed in a fresh arena with NaN
 /// poison immediately after it, and the run must reproduce the independently-allocated run bit for bit. Fresh-buffer
 /// reproducibility is covered too: the arena is allocated fresh per run.
