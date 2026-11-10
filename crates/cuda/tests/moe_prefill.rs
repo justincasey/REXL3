@@ -1428,3 +1428,275 @@ fn assert_consumed_eq(mask: &[bool], a: &[u16], b: &[u16], k: usize, msg: &str) 
     }
     assert_eq!(shown, 0, "{msg}: {shown} consumed elements differ");
 }
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// Flash-Next dims (hidden 2560, expert width 640, 512 experts, top-10, bf16 input, f32 router weights, gate/up 3 bits, down 4 bits: the
+// production layer), with a routing whose expert popularity is log-normal (a few hot experts, a long tail), drawn per row as the Gumbel top-k.
+
+/// `rows * topk` picks in slot order (best score first) and their softmax f32 weights.
+fn qwen_route(r: &mut Rng, rows: usize, e: usize, topk: usize, sigma: f64) -> (Vec<i32>, Vec<f32>) {
+    let pop: Vec<f64> = (0..e).map(|_| sigma * normal(r)).collect();
+    let (mut pick, mut wts) = (Vec::with_capacity(rows * topk), Vec::with_capacity(rows * topk));
+    for _ in 0..rows {
+        let mut sc: Vec<(f64, usize)> = (0..e)
+            .map(|x| {
+                let u = ((r.next_u64() >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
+                (pop[x] - (-u.ln()).ln(), x)
+            })
+            .collect();
+        sc.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        let top = &sc[..topk];
+        let z: f64 = top.iter().map(|t| (t.0 - top[0].0).exp()).sum();
+        for t in top {
+            pick.push(t.1 as i32);
+            wts.push(((t.0 - top[0].0).exp() / z) as f32);
+        }
+    }
+    (pick, wts)
+}
+
+fn qwen_x_bf16(r: &mut Rng, n: usize) -> Vec<u16> {
+    (0..n).map(|_| gb_cuda::dsv4_attn::bf16_bits(normal(r) as f32)).collect()
+}
+
+/// The Flash-Next layer (hidden 2560, expert width 640, 512 experts, top-10: the production K splits and item grouping) equals the decode path bit for
+/// bit, for the widths the pack has (gate/up 3 bits, down 4 bits) and for down 5 bits (a width whose shared memory does not fit the one-launch form for
+/// every tile count: the class launches run, on the same plan), at row counts that give experts 1 .. 4 tiles, whole 64-row groups and every
+/// remainder.
+#[test]
+fn qwen_shaped_prefill_equals_the_decode_path() {
+    gpu!();
+    let st = Stream::new().unwrap();
+    let d = qwen_dims();
+    let mut checked = 0usize;
+    for (bg, bd) in [(3usize, 4usize), (3, 5)] {
+        let ex = synth_layer(d, bg, bd, Codebook::Mul1, 700 + bd as u64);
+        let mut s = PrefillScratch::new(&d, 800).unwrap();
+        s.use_parallel_plan(true);
+        s.poison(0xAB, &st).unwrap();
+        let mut r = Rng(710 + bd as u64);
+        for &rows in &[1usize, 17, 129, 333, 800] {
+            let inp = inputs(&mut r, rows, d.hidden, 2.0);
+            for style in [Style::Uniform, Style::Skewed, Style::Hot, Style::Holes] {
+                let (pick, wts) = make_picks(&mut r, style, rows, d.experts, d.topk);
+                let want = decode_reference(&ex, &st, &inp.xh, &pick, &wts, &inp.shared, rows, 128);
+                let got = prefill_path(&ex, &st, &mut s, &inp.xh, &pick, &wts, &inp.shared, rows, rows);
+                assert_same(&format!("Flash-Next dims {bg}/{bd} bit, {rows} rows, {style:?}"), &got, &want, &d, &pick);
+                checked += rows;
+            }
+        }
+    }
+    eprintln!("{checked} Flash-Next row results bit-identical to the decode path");
+}
+
+/// The shared expert's finish fused into the combine gives the bits of the combine into fp32 followed by `finish_shared`, on gates of every size
+/// (including the ones whose sigmoid saturates to 0 and 1) and on picks with unrouted slots.
+#[test]
+fn qwen_fused_combine_finish_equals_combine_then_finish() {
+    gpu!();
+    let st = Stream::new_nonblocking().unwrap();
+    let d = qwen_dims();
+    let ex = synth_layer(d, 3, 4, Codebook::Mul1, 720);
+    let mut s = PrefillScratch::new(&d, 600).unwrap();
+    s.use_parallel_plan(true);
+    let mut r = Rng(721);
+    for (rows, style) in [(1usize, Style::Uniform), (129, Style::Skewed), (300, Style::Holes), (600, Style::Hot)] {
+        let inp = inputs(&mut r, rows, d.hidden, 1.5);
+        let (pick, _) = make_picks(&mut r, style, rows, d.experts, d.topk);
+        let wts = rand_wts_f32(&mut r, rows * d.topk);
+        let gate: Vec<u16> = (0..rows)
+            .map(|i| {
+                let g = match i % 7 {
+                    0 => 80.0,
+                    1 => -80.0,
+                    2 => 0.0,
+                    _ => 4.0 * normal(&mut r) as f32,
+                };
+                gb_cuda::dsv4_attn::bf16_bits(g)
+            })
+            .collect();
+        s.set_picks_f32(&pick, &wts).unwrap();
+        let (x, shared, gate_b) = (up(&inp.xh), up(&inp.shared), up(&gate));
+        gb_cuda::rt::device_sync().unwrap();
+        let mut routed = DevBuf::zeroed(rows * d.hidden * 4).unwrap();
+        ex.run_prefill_f32_wts(&x, Dtype::F16, rows, None, &mut routed, &mut s, &st).unwrap();
+        let mut want = DevBuf::zeroed(rows * d.hidden * 2).unwrap();
+        finish_shared(&routed, &shared, &gate_b, &mut want, rows, d.hidden, &st).unwrap();
+        let mut got = DevBuf::zeroed(rows * d.hidden * 2).unwrap();
+        ex.run_prefill_f32_wts_finish(&x, Dtype::F16, rows, &shared, &gate_b, &mut got, &mut s, &st).unwrap();
+        let (w, g): (Vec<u16>, Vec<u16>) = (sync_dl(&want, &st), sync_dl(&got, &st));
+        if let Some(i) = w.iter().zip(&g).position(|(a, b)| a != b) {
+            panic!("{rows} rows {style:?}: fused combine + finish differs at row {} column {}: {:#06x} vs {:#06x}", i / d.hidden, i % d.hidden, g[i], w[i]);
+        }
+    }
+}
+
+/// The unified item list is the three classes' lists merged by first tile: every item once, strictly ascending first tiles (an expert's items
+/// follow each other), its count in `nitems[4]`, the slots after it zero, from both plan builders.
+#[test]
+fn the_unified_item_list_is_the_merge_of_the_classes() {
+    gpu!();
+    let st = Stream::new().unwrap();
+    let d = qwen_dims();
+    let mut s = PrefillScratch::new(&d, 4096).unwrap();
+    s.poison(0xAB, &st).unwrap();
+    let mut r = Rng(730);
+    let cap = item_cap(4096 * d.topk, d.experts);       // the scratch's slots a class (it was built for 4,096 rows)
+    for &rows in &[1usize, 16, 17, 129, 1000, 4096] {
+        for style in [Style::Uniform, Style::Skewed, Style::Hot, Style::Sparse, Style::Holes] {
+            let pick = make_picks(&mut r, style, rows, d.experts, d.topk).0;
+            for parallel in [false, true] {
+                s.use_parallel_plan(parallel);
+                let (_, items, nitems) = s.plan(&pick, rows, d.experts as i32, &st).unwrap();
+                let n = [nitems[0] as usize, nitems[1] as usize, nitems[2] as usize];
+                let total = n[0] + n[1] + n[2];
+                assert_eq!(nitems[4] as usize, total, "unified count, {rows} rows {style:?} parallel {parallel}");
+                let item = |c: usize, i: usize| -> [i32; 4] {
+                    let at = (c * cap + i) * 4;
+                    [items[at], items[at + 1], items[at + 2], items[at + 3]]
+                };
+                let mut want: Vec<[i32; 4]> = (0..3).flat_map(|c| (0..n[c]).map(move |i| (c, i))).map(|(c, i)| item(c, i)).collect();
+                want.sort_by_key(|it| it[1]);
+                for i in 0..cap {
+                    let got = item(3, i);
+                    if i < total {
+                        assert_eq!(got, want[i], "unified item {i}, {rows} rows {style:?} parallel {parallel}");
+                        assert!(i == 0 || want[i - 1][1] < got[1], "first tiles ascend");
+                    } else {
+                        assert_eq!(got, [0; 4], "unified slot {i} past the count is zero");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Per-stage milliseconds of one Flash-Next layer of 4,096 rows (L2 flushed before each call) and the hashes of its outputs (`REXL3_BENCH_ROWS`,
+/// `REXL3_BENCH_SIGMA`, `REXL3_BENCH_DOWN_BITS`, `REXL3_BENCH_ITERS` change the shape of the run).
+#[test]
+#[ignore]
+fn bench_prefill_experts_qwen() {
+    gpu!();
+    let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let rows = env("REXL3_BENCH_ROWS", 4096);
+    let down_bits = env("REXL3_BENCH_DOWN_BITS", 4);
+    let iters = env("REXL3_BENCH_ITERS", 5);
+    let sigma: f64 = std::env::var("REXL3_BENCH_SIGMA").ok().and_then(|v| v.parse().ok()).unwrap_or(0.8);
+    let st = Stream::new().unwrap();
+    let d = qwen_dims();
+    let ex = synth_layer(d, 3, down_bits, Codebook::Mul1, 11);
+    let flush = DevBuf::zeroed(256 << 20).unwrap();
+    let mut flush_out = DevBuf::zeroed(16).unwrap();
+    let mut r = Rng(5);
+    let mut s = PrefillScratch::new(&d, rows).unwrap();
+    s.use_parallel_plan(true);
+    let x = up(&qwen_x_bf16(&mut r, rows * d.hidden));
+    let (pick, wts) = qwen_route(&mut r, rows, d.experts, d.topk, sigma);
+    s.set_picks_f32(&pick, &wts).unwrap();
+    let t = EventTimer::new(8).unwrap();
+    let names = ["plan", "rot_in", "gate_up", "down", "combine"];
+    let mut stage = [0f64; 5];
+    let mut total = 0f64;
+    // the production form: the shared expert's finish fused into the combine, bf16 out
+    let gate = up(&qwen_x_bf16(&mut r, rows));
+    let shared: Vec<f32> = (0..rows * d.hidden).map(|_| normal(&mut r) as f32).collect();
+    let shared = up(&shared);
+    let mut out = DevBuf::zeroed(rows * d.hidden * 2).unwrap();
+    for it in 0..iters + 1 {
+        gb_cuda::moe::read_probe(&flush, 256 << 20, &mut flush_out, &st).unwrap();
+        t.record(0, &st).unwrap();
+        let mut n = 0;
+        ex.run_prefill_f32_wts_finish_marked(&x, Dtype::BF16, rows, &shared, &gate, &mut out, &mut s, &st, &mut |_| {
+            n += 1;
+            t.record(n, &st)
+        })
+        .unwrap();
+        if it > 0 {
+            for i in 0..5 {
+                stage[i] += t.ms(i, i + 1).unwrap() as f64 / iters as f64;
+            }
+            total += t.ms(0, 5).unwrap() as f64 / iters as f64;
+        }
+    }
+    st.sync().unwrap();
+    // the two-step it replaces (combine into fp32, then the finish): the bits must be the same, and the time of the tail
+    let mut out_f32 = DevBuf::zeroed(rows * d.hidden * 4).unwrap();
+    let mut out_two = DevBuf::zeroed(rows * d.hidden * 2).unwrap();
+    let mut two_ms = 0f64;
+    for it in 0..iters + 1 {
+        ex.run_prefill_f32_wts(&x, Dtype::BF16, rows, None, &mut out_f32, &mut s, &st).unwrap();
+        gb_cuda::moe::read_probe(&flush, 256 << 20, &mut flush_out, &st).unwrap();
+        t.record(6, &st).unwrap();
+        gb_cuda::moe_prefill::finish_shared(&out_f32, &shared, &gate, &mut out_two, rows, d.hidden, &st).unwrap();
+        t.record(7, &st).unwrap();
+        if it > 0 {
+            two_ms += t.ms(6, 7).unwrap() as f64 / iters as f64;
+        }
+    }
+    let (a, b): (Vec<u16>, Vec<u16>) = (sync_dl(&out, &st), sync_dl(&out_two, &st));
+    assert!(a == b, "the fused combine + finish differs from the two steps");
+    println!("finish_shared alone {two_ms:.3} ms (the fused combine takes its place; fused output == two-step output)");
+    let ic = s.item_counts().unwrap();
+    let mut cnt = vec![0usize; d.experts];
+    for &p in &pick {
+        cnt[p as usize] += 1;
+    }
+    let (mx, used) = (cnt.iter().max().unwrap(), cnt.iter().filter(|&&c| c > 0).count());
+    println!(
+        "Flash-Next layer R={rows} sigma {sigma} down {down_bits} bit: {used} experts, max {mx} pairs, items 1/2/3-4 tiles {}/{}/{}: {total:.3} ms | {}",
+        ic[0],
+        ic[1],
+        ic[2],
+        names.iter().zip(stage).map(|(n, m)| format!("{n} {m:.3}")).collect::<Vec<_>>().join(", ")
+    );
+    // the DRAM floors of the layer's streams: the 420 MB the rotation writes (a memset of two input-fragment buffers) and the 420 MB the combine reads
+    let mut big = DevBuf::zeroed(420 << 20).unwrap();
+    let (mut w_ms, mut r_ms) = (0f64, 0f64);
+    for it in 0..iters + 1 {
+        gb_cuda::moe::read_probe(&flush, 256 << 20, &mut flush_out, &st).unwrap();
+        t.record(0, &st).unwrap();
+        big.memset_async(1, &st).unwrap();
+        t.record(1, &st).unwrap();
+        gb_cuda::moe::read_probe(&big, 420 << 20, &mut flush_out, &st).unwrap();
+        t.record(2, &st).unwrap();
+        if it > 0 {
+            w_ms += t.ms(0, 1).unwrap() as f64 / iters as f64;
+            r_ms += t.ms(1, 2).unwrap() as f64 / iters as f64;
+        }
+    }
+    println!("420 MB: memset {w_ms:.3} ms ({:.0} GB/s), read {r_ms:.3} ms ({:.0} GB/s)", 0.4404 / w_ms * 1e3, 0.4404 / r_ms * 1e3);
+    let o: Vec<u16> = sync_dl(&out, &st);
+    let y: Vec<f32> = sync_dl(&s.y_pairs, &st);
+    println!(
+        "hash out {:016x} y {:016x}",
+        gb_exl3::fnv1a(o.iter().flat_map(|x| x.to_le_bytes())),
+        hash_f32(&y[..rows * d.topk * d.hidden])
+    );
+}
+
+/// How much of a repeated stream the L2 keeps: memset then read of S MB, the bandwidth of each as S grows (a stream that fits stays out of DRAM).
+#[test]
+#[ignore]
+fn bench_l2_capacity() {
+    gpu!();
+    let st = Stream::new().unwrap();
+    let mut flush_out = DevBuf::zeroed(16).unwrap();
+    let t = EventTimer::new(4).unwrap();
+    for mb in [2usize, 4, 8, 12, 16, 20, 24, 32, 48, 96, 400] {
+        let mut buf = DevBuf::zeroed(mb << 20).unwrap();
+        let reps = (2048 / mb).max(4);
+        // write then read the same S MB, `reps` times over
+        buf.memset_async(1, &st).unwrap();
+        t.record(0, &st).unwrap();
+        for _ in 0..reps {
+            buf.memset_async(2, &st).unwrap();
+        }
+        t.record(1, &st).unwrap();
+        for _ in 0..reps {
+            gb_cuda::moe::read_probe(&buf, mb << 20, &mut flush_out, &st).unwrap();
+        }
+        t.record(2, &st).unwrap();
+        let (w, r) = (t.ms(0, 1).unwrap() as f64 / reps as f64, t.ms(1, 2).unwrap() as f64 / reps as f64);
+        println!("{mb:4} MB: memset {:6.0} GB/s, read {:6.0} GB/s", mb as f64 / 1024.0 * 1.0737 / w * 1e3, mb as f64 / 1024.0 * 1.0737 / r * 1e3);
+    }
+}
