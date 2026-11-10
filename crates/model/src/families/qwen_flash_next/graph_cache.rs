@@ -14,8 +14,10 @@
 //! trace of 7,050 windows through both rules: 502 captures against 1,136 for a plain second-sighting rule, and 23.1% of the windows
 //! replayed against 23.6%.) At most [`DEFAULT_WINDOW_GRAPHS`] window graphs and [`DEFAULT_CHAIN_GRAPHS`] chain graphs are alive at
 //! once; a capture that finds its cache full retires the least recently launched graph first (that shape starts over at its next
-//! sighting). The defaults leave room for the hot shapes of one stream (the six prompts of the decode screen, one after the other,
-//! made 74 window and 22 chain graphs in their first 96 captures) and cost at most (128 + 64) x 7.4 MiB = 1.4 GiB.
+//! sighting). A window is cached as up to three graphs (parts), so the window cap counts three entries per window. The defaults leave
+//! room for the hot shapes of one stream (the six prompts of the decode screen, one after the other, made 136 window graphs, about 45
+//! windows, and 24 chain graphs in their first 160 captures, and replayed 10,188 and 891 times) and cost at most
+//! 384 x 2.5 MiB + 64 x 7.4 MiB = 1.4 GiB (a part took 2.5 MiB of unified memory; the chain figure is the whole-window one, an upper bound).
 //!
 //! None of this changes a bit of output: eager launches, a capture's launches and a replay run the same kernels with the same
 //! arguments in the same order; only when a graph exists, and for how long, changes.
@@ -23,8 +25,8 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
-/// Window graphs (a window, or each of its two parts when the PLE stage splits it) alive at once.
-pub const DEFAULT_WINDOW_GRAPHS: usize = 128;
+/// Window graphs (a window is up to three of them, one per part) alive at once.
+pub const DEFAULT_WINDOW_GRAPHS: usize = 384;
 /// MTP draft-chain graphs alive at once.
 pub const DEFAULT_CHAIN_GRAPHS: usize = 64;
 
