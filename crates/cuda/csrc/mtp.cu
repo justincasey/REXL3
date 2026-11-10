@@ -4,6 +4,15 @@
 //   xe [R][H]      f16 = emb[r] * rsqrt(mean_d emb[r][d]^2 + eps) * ne[d]                           (ne = 1 + w)
 //   dst [R][hc][H] f32 = h[r * hc + s] + e[r]       (the embedding branch is broadcast into every stream)
 #include "common.cuh"
+#include "pdl.cuh"
+
+// Decode launches (gbp_pdl::kFlash): a kernel launched with the programmatic-dependent-launch attribute may start before its predecessor
+// finishes, so it calls pdl_wait() -- first in every thread -- before it reads anything an earlier kernel wrote or writes anything an
+// earlier kernel may still read; weights are read before it. A launch without the attribute makes both calls no-ops (pdl.cuh), so only
+// timing changes, never a bit.
+using gbp_pdl::pdl_trigger;
+using gbp_pdl::pdl_wait;
+inline bool flash_pdl() { return gbp_pdl::on(gbp_pdl::kFlash); }
 
 namespace mtpk {
 
@@ -19,36 +28,79 @@ __device__ __forceinline__ float block_sum(float v, float* red) {
     return t;
 }
 
+// Elements of a block's row kept in registers: 12 a thread of the block's 256 (hidden sizes up to 3,072; the rest of a longer row is read
+// from memory as before). The weight row across the wait, the input row after it, so each is read once.
+constexpr int IN_NT = 256, IN_MAXC = 12;
+
 // grid: R * (hc + 1) blocks of 256; block (r, s): s < hc a stream of the stack, s == hc the embedding row
-__global__ void __launch_bounds__(256) in_kernel(const float* __restrict__ stack, const half* __restrict__ nh,
-                                                 const __nv_bfloat16* __restrict__ emb, const float* __restrict__ ne,
-                                                 half* __restrict__ xs, half* __restrict__ xe, int H, int hc,
-                                                 float eps) {
+__global__ void __launch_bounds__(IN_NT) in_kernel(const float* __restrict__ stack, const half* __restrict__ nh,
+                                                   const __nv_bfloat16* __restrict__ emb, const float* __restrict__ ne,
+                                                   half* __restrict__ xs, half* __restrict__ xe, int H, int hc, float eps) {
     __shared__ float red[32];
+    pdl_trigger();  // the next kernel may launch: it waits for this grid before it reads xs or xe
     const int r = blockIdx.x / (hc + 1), s = blockIdx.x % (hc + 1);
+    // before the wait: this block's weight row (nh[s] as f32, or ne), the elements d = threadIdx.x + 256 c, c < 12
+    float cst[IN_MAXC];
+#pragma unroll
+    for (int c = 0; c < IN_MAXC; ++c) {
+        const int d = threadIdx.x + c * IN_NT;
+        cst[c] = d >= H ? 0.f : s < hc ? __half2float(nh[(size_t)s * H + d]) : ne[d];
+    }
+    pdl_wait();  // stack and emb are earlier kernels' outputs; xs and xe may still be read by earlier kernels
+    float xr[IN_MAXC];
+    float a = 0.f;
     if (s < hc) {
         const float* x = stack + ((size_t)r * hc + s) * H;
-        float a = 0.f;
-        for (int d = threadIdx.x; d < H; d += blockDim.x) a += x[d] * x[d];
+#pragma unroll
+        for (int c = 0; c < IN_MAXC; ++c) {
+            const int d = threadIdx.x + c * IN_NT;
+            xr[c] = d < H ? x[d] : 0.f;
+        }
+        // the sum of squares in increasing d, as a loop over d = threadIdx.x, + 256, ... would add it
+#pragma unroll
+        for (int c = 0; c < IN_MAXC; ++c) {
+            if (threadIdx.x + c * IN_NT < H) a += xr[c] * xr[c];
+        }
+        for (int d = threadIdx.x + IN_MAXC * IN_NT; d < H; d += IN_NT) a += x[d] * x[d];
         const float inv = rsqrtf(block_sum(a, red) / (float)H + eps);
         half* o = xs + ((size_t)r * hc + s) * H;
-        for (int d = threadIdx.x; d < H; d += blockDim.x)
+#pragma unroll
+        for (int c = 0; c < IN_MAXC; ++c) {
+            const int d = threadIdx.x + c * IN_NT;
+            if (d < H) o[d] = __float2half_rn(xr[c] * inv * (1.f + cst[c]));
+        }
+        for (int d = threadIdx.x + IN_MAXC * IN_NT; d < H; d += IN_NT)
             o[d] = __float2half_rn(x[d] * inv * (1.f + __half2float(nh[(size_t)s * H + d])));
     } else {
         const __nv_bfloat16* x = emb + (size_t)r * H;
-        float a = 0.f;
-        for (int d = threadIdx.x; d < H; d += blockDim.x) {
+#pragma unroll
+        for (int c = 0; c < IN_MAXC; ++c) {
+            const int d = threadIdx.x + c * IN_NT;
+            xr[c] = d < H ? __bfloat162float(x[d]) : 0.f;
+        }
+#pragma unroll
+        for (int c = 0; c < IN_MAXC; ++c) {
+            if (threadIdx.x + c * IN_NT < H) a += xr[c] * xr[c];
+        }
+        for (int d = threadIdx.x + IN_MAXC * IN_NT; d < H; d += IN_NT) {
             const float v = __bfloat162float(x[d]);
             a += v * v;
         }
         const float inv = rsqrtf(block_sum(a, red) / (float)H + eps);
         half* o = xe + (size_t)r * H;
-        for (int d = threadIdx.x; d < H; d += blockDim.x) o[d] = __float2half_rn(__bfloat162float(x[d]) * inv * ne[d]);
+#pragma unroll
+        for (int c = 0; c < IN_MAXC; ++c) {
+            const int d = threadIdx.x + c * IN_NT;
+            if (d < H) o[d] = __float2half_rn(xr[c] * inv * cst[c]);
+        }
+        for (int d = threadIdx.x + IN_MAXC * IN_NT; d < H; d += IN_NT) o[d] = __float2half_rn(__bfloat162float(x[d]) * inv * ne[d]);
     }
 }
 
 __global__ void combine_kernel(const half* __restrict__ h, const half* __restrict__ e, float* __restrict__ dst,
                                int R, int H, int hc) {
+    pdl_trigger();
+    pdl_wait();  // h and e are earlier kernels' outputs; dst may still be read by earlier kernels
     const size_t n = (size_t)R * hc * H;
     for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
         const size_t d = i % H, rs = i / H, r = rs / hc;
@@ -66,6 +118,8 @@ __global__ void copy_i32_kernel(int* __restrict__ dst, const int* __restrict__ s
 __global__ void stage_kernel(int* __restrict__ ids, int* __restrict__ positions, int* __restrict__ row_pos,
                              int* __restrict__ row_slot, int* __restrict__ seq_start, const int* __restrict__ seq_slot,
                              const int* __restrict__ drafts, const int* __restrict__ chain_pos, int n, int stride, int j) {
+    pdl_trigger();
+    pdl_wait();  // drafts are the previous pick's output; the staged arrays may still be read by earlier kernels
     const int s = threadIdx.x;
     if (s < n) {
         ids[s] = drafts[s * stride + j - 1];
@@ -89,6 +143,8 @@ __global__ void __launch_bounds__(1024) pick_kernel(const __nv_bfloat16* __restr
     __shared__ float sv[32];
     __shared__ int si[32];
     __shared__ float ss[32];
+    pdl_trigger();
+    pdl_wait();  // logits are the draft head's output; out_id and out_p may still be read by earlier kernels
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, nw = blockDim.x >> 5;
     float bv = -INFINITY;
     int bi = 0x7fffffff;
@@ -148,6 +204,8 @@ __global__ void __launch_bounds__(512) pick_wide_kernel(const uint32_t* __restri
     __shared__ float sv[16];
     __shared__ int si[16];
     __shared__ float ss[32];
+    pdl_trigger();
+    pdl_wait();  // logits are the draft head's output; out_id and out_p may still be read by earlier kernels
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     uint32_t w[K];
 #pragma unroll
@@ -208,9 +266,9 @@ using namespace mtpk;
 GB_EXPORT int gb_mtp_input(const void* stack, const void* norm_hidden, const void* emb, const void* norm_emb, void* xs,
                            void* xe, int rows, int hc, int H, float eps, void* stream) {
     if (rows < 1 || hc < 1 || H < 1) return (int)cudaErrorInvalidValue;
-    in_kernel<<<rows * (hc + 1), 256, 0, gb_stream(stream)>>>((const float*)stack, (const half*)norm_hidden,
-                                                             (const __nv_bfloat16*)emb, (const float*)norm_emb,
-                                                             (half*)xs, (half*)xe, H, hc, eps);
+    gbp_pdl::launch_pdl(flash_pdl(), in_kernel, dim3((unsigned)(rows * (hc + 1))), dim3(IN_NT), 0, gb_stream(stream),
+                        (const float*)stack, (const half*)norm_hidden, (const __nv_bfloat16*)emb, (const float*)norm_emb, (half*)xs,
+                        (half*)xe, H, hc, eps);
     return GB_CHECK_LAUNCH();
 }
 
@@ -218,7 +276,8 @@ GB_EXPORT int gb_mtp_combine(const void* h, const void* e, void* dst, int rows, 
     if (rows < 1) return (int)cudaErrorInvalidValue;
     const size_t n = (size_t)rows * hc * H;
     const int blocks = (int)((n + 255) / 256 < 1024 ? (n + 255) / 256 : 1024);
-    combine_kernel<<<blocks, 256, 0, gb_stream(stream)>>>((const half*)h, (const half*)e, (float*)dst, rows, H, hc);
+    gbp_pdl::launch_pdl(flash_pdl(), combine_kernel, dim3((unsigned)blocks), dim3(256), 0, gb_stream(stream), (const half*)h,
+                        (const half*)e, (float*)dst, rows, H, hc);
     return GB_CHECK_LAUNCH();
 }
 
@@ -232,17 +291,20 @@ GB_EXPORT int gb_copy_i32(void* dst, const void* src, int n, void* stream) {
 GB_EXPORT int gb_mtp_stage(void* ids, void* positions, void* row_pos, void* row_slot, void* seq_start, const void* seq_slot,
                            const void* drafts, const void* chain_pos, int n, int stride, int j, void* stream) {
     if (j < 1 || n < 1 || n > 32 || stride < j + 1) return (int)cudaErrorInvalidValue;
-    stage_kernel<<<1, 32, 0, gb_stream(stream)>>>((int*)ids, (int*)positions, (int*)row_pos, (int*)row_slot, (int*)seq_start,
-                                                   (const int*)seq_slot, (const int*)drafts, (const int*)chain_pos, n, stride, j);
+    gbp_pdl::launch_pdl(flash_pdl(), stage_kernel, dim3(1), dim3(32), 0, gb_stream(stream), (int*)ids, (int*)positions,
+                        (int*)row_pos, (int*)row_slot, (int*)seq_start, (const int*)seq_slot, (const int*)drafts,
+                        (const int*)chain_pos, n, stride, j);
     return GB_CHECK_LAUNCH();
 }
 
 GB_EXPORT int gb_mtp_pick(const void* logits, int n, void* out_id, void* out_p, int j, void* stream) {
     if (n < 1) return (int)cudaErrorInvalidValue;
     if (n == 64 * 1024 && ((uintptr_t)logits & 3) == 0) {
-        pick_wide_kernel<<<1, 512, 0, gb_stream(stream)>>>((const uint32_t*)logits, (int*)out_id, (float*)out_p, j);
+        gbp_pdl::launch_pdl(flash_pdl(), pick_wide_kernel, dim3(1), dim3(512), 0, gb_stream(stream), (const uint32_t*)logits,
+                            (int*)out_id, (float*)out_p, j);
     } else {
-        pick_kernel<<<1, 1024, 0, gb_stream(stream)>>>((const __nv_bfloat16*)logits, n, (int*)out_id, (float*)out_p, j);
+        gbp_pdl::launch_pdl(flash_pdl(), pick_kernel, dim3(1), dim3(1024), 0, gb_stream(stream), (const __nv_bfloat16*)logits, n,
+                            (int*)out_id, (float*)out_p, j);
     }
     return GB_CHECK_LAUNCH();
 }

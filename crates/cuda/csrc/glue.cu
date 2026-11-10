@@ -81,6 +81,8 @@ __device__ __forceinline__ float block_sum(float v, float* sm) {
 // ---------------------------------------------------------------------------------------------------- embedding
 
 __global__ void embed_vec_k(const u16* table, const int* ids, u16* out, int dim, int vocab) {
+    pdl_trigger();
+    pdl_wait();  // ids are an earlier operation's output; out may still be read by earlier kernels
     const int row = blockIdx.x;
     const int id = ids[row];
     const uint4* src = (const uint4*)(table + (size_t)(unsigned)id * dim);
@@ -803,7 +805,8 @@ GB_EXPORT int gb_embed(const void* table, const int* ids, void* out, int rows, i
     if (rows < 0 || dim <= 0 || vocab < 0) return ERR_INVALID;
     if (rows == 0) return 0;
     if (dim % 8 == 0 && aligned16(table) && aligned16(out))
-        embed_vec_k<<<rows, 128, 0, gb_stream(stream)>>>((const u16*)table, ids, (u16*)out, dim, vocab);
+        gbp_pdl::launch_pdl(flash_pdl(), embed_vec_k, dim3((unsigned)rows), dim3(128), 0, gb_stream(stream), (const u16*)table, ids,
+                            (u16*)out, dim, vocab);
     else
         embed_scalar_k<<<rows, 128, 0, gb_stream(stream)>>>((const u16*)table, ids, (u16*)out, dim, vocab);
     return GB_CHECK_LAUNCH();
