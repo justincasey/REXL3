@@ -801,3 +801,88 @@ fn qsa_attend_staged_equals_warp_loaded_bit_for_bit() {
         assert!(got.iter().any(|&x| x != 0), "{name}: the outputs are all zero");
     }
 }
+
+/// The indexer scores of `rows` (`[rows][nb_cap]` f32 bit patterns) through `qsa::scores` or the kernel it replaced.
+fn score_bits(
+    rig: &Rig,
+    rows: &[(usize, usize)],
+    q: &[u16],
+    f: fn(&DevBuf, &DevBuf, usize, &BlockTable, &qsa::Rows<'_>, &mut DevBuf, usize, &Stream) -> Result<(), gb_cuda::CudaError>,
+    st: &Stream,
+) -> Vec<u32> {
+    let n = rows.len();
+    let nb_cap = rows.iter().map(|&(_, p)| (p + 1) / CR).max().unwrap().max(1);
+    let slot = DevBuf::from_slice(&rows.iter().map(|&(s, _)| s as i32).collect::<Vec<_>>()).unwrap();
+    let pos = DevBuf::from_slice(&rows.iter().map(|&(_, p)| p as i32).collect::<Vec<_>>()).unwrap();
+    let qd = DevBuf::from_slice(q).unwrap();
+    let rr = qsa::Rows { slot: &slot, pos: &pos, rows: n };
+    let mut sc = DevBuf::zeroed(n * nb_cap * 4).unwrap();
+    f(&qd, &rig.pool, rig.pages, &rig.table, &rr, &mut sc, nb_cap, st).unwrap();
+    st.sync().unwrap();
+    sc.to_vec::<f32>().unwrap().iter().map(|v| v.to_bits()).collect()
+}
+
+/// The indexer's scores kernel (queries read four dims at a time, `dot + q * k` as one fma) gives the previous kernel's bits: every
+/// entry of the `[rows][nb_cap]` buffer, written or untouched, for odd row counts (one row, a partial row group of 16, several groups),
+/// positions at block and page boundaries and far past the 256-block thread tile, rows of several sequences in one batch, and a
+/// 4,096-row chunk.
+#[test]
+#[ignore]
+fn qsa_scores_fma_equals_the_previous_kernel_bit_for_bit() {
+    let Some(st) = gpu() else { return };
+    let lens = [2600usize, 4111, 9000, 8400];
+    let rig = Rig::new(&lens, 21, 211, &st);
+    let sets: Vec<(&str, Vec<(usize, usize)>)> = vec![
+        ("one row", vec![(2, 8999)]),
+        ("15 rows", (0..15).map(|i| (1, 3000 + i)).collect()),
+        ("16 rows", (0..16).map(|i| (2, 8000 + 3 * i)).collect()),
+        ("17 rows", (0..17).map(|i| (3, 8300 + i)).collect()),
+        ("block and page boundaries", (0..33).map(|i| (2, 255 + 256 * (i % 34) + i % 4)).collect()),
+        ("short rows", (0..40).map(|i| (0, i)).collect()),
+        ("mixed slots", (0..133).map(|i| (i % 4, 400 + 53 * i % (lens[i % 4] - 400))).collect()),
+        ("chunk grid", (0..4096).map(|i| (3, 4200 + i)).collect()),
+    ];
+    for (name, rows) in sets {
+        let q = rig.queries(&rows, &st);
+        let want = score_bits(&rig, &rows, &q, qsa::scores_ref, &st);
+        let got = score_bits(&rig, &rows, &q, qsa::scores, &st);
+        let bad = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+        eprintln!("{name}: {} rows, {bad} of {} scores differ, hash {:016x}", rows.len(), got.len(), fnv(bytes_of(&got)));
+        assert_eq!(bad, 0, "{name}");
+        assert!(got.iter().any(|&x| x != 0), "{name}: the scores are all zero");
+    }
+}
+
+/// The indexer's scores for a 4,096-row chunk deep in a 24K prompt (positions 20,000..24,095: about 5,000 blocks a row); prints the time of
+/// the kernel and of the one it replaced.
+///     cargo test --release -p gb-cuda --test qsa -- --ignored --nocapture bench_qsa_scores_chunk
+#[test]
+#[ignore]
+fn bench_qsa_scores_chunk() {
+    let Some(st) = gpu() else { return };
+    let rig = Rig::new(&[24200], 5, 1000, &st);
+    let rows: Vec<(usize, usize)> = (0..4096).map(|i| (0, 20000 + i)).collect();
+    let q = rig.queries(&rows, &st);
+    let n = rows.len();
+    let nb_cap = rows.iter().map(|&(_, p)| (p + 1) / CR).max().unwrap();
+    let slot = DevBuf::from_slice(&vec![0i32; n]).unwrap();
+    let pos = DevBuf::from_slice(&rows.iter().map(|&(_, p)| p as i32).collect::<Vec<_>>()).unwrap();
+    let rr = qsa::Rows { slot: &slot, pos: &pos, rows: n };
+    let qd = DevBuf::from_slice(&q).unwrap();
+    let mut sc = DevBuf::zeroed(n * nb_cap * 4).unwrap();
+    type Scores = fn(&DevBuf, &DevBuf, usize, &BlockTable, &qsa::Rows<'_>, &mut DevBuf, usize, &Stream) -> Result<(), gb_cuda::CudaError>;
+    for (name, f) in [("previous", qsa::scores_ref as Scores), ("fma", qsa::scores as Scores)] {
+        let mut best = f64::MAX;
+        for it in 0..6 {
+            st.sync().unwrap();
+            let t0 = std::time::Instant::now();
+            f(&qd, &rig.pool, rig.pages, &rig.table, &rr, &mut sc, nb_cap, &st).unwrap();
+            st.sync().unwrap();
+            if it > 0 {
+                best = best.min(t0.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        let v: Vec<f32> = sc.to_vec().unwrap();
+        eprintln!("BENCH scores {name}: {best:.3} ms  hash {:016x}", fnv(bytes_of(&v)));
+    }
+}
