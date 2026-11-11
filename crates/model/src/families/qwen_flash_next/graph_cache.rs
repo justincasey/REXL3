@@ -18,10 +18,12 @@
 //! window cap counts three entries per window; before the middle part existed a window took two. The defaults leave room for the hot
 //! shapes of one stream (the six prompts of the decode screen, one after the other, made 136 window graphs, about 45 windows, and 24
 //! chain graphs in their first 160 captures, and replayed 10,188 and 891 times; a cap of 128 evicted 8 of those while live). Memory,
-//! measured on a node with four sampled decode streams for 20 minutes: the available memory settles 1.2 GiB below its start with 128
-//! window and 64 chain graphs and 2.3 GiB below with 384 and 64 (that figure includes the n-gram page cache), so the 256 extra window
-//! entries cost about 1.05 GiB, 4.2 MiB each (a single stream's free-memory counter read 2.5 MiB a part). A cap of 192, the same
-//! 64 windows as the old 128, was not measured.
+//! measured on a node with four sampled decode streams for 20 minutes (410 requests, 152,118 tokens at 192 and at 384, the same rate):
+//! the available memory settles at 10.62 GiB with 192 window and 64 chain graphs and at 9.56 GiB with 384 and 64, so the 192 extra
+//! window entries cost about 1.06 GiB (5.6 MiB each here; 4.2 MiB each between 128 and 384 on an earlier build, and a single stream's
+//! free-memory counter read 2.5 MiB a part: the per-entry figure depends on the load). A full harness run
+//! reads the same speed at both (prefill 1,960 and 1,958 tok/s, decode 78.28 and 78.06 tok/s), so the default is 192: the old 64
+//! windows of three parts. 384 was the default before this was measured.
 //!
 //! None of this changes a bit of output: eager launches, a capture's launches and a replay run the same kernels with the same
 //! arguments in the same order; only when a graph exists, and for how long, changes.
@@ -30,7 +32,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
 /// Window graphs (a window is up to three of them, one per part) alive at once.
-pub const DEFAULT_WINDOW_GRAPHS: usize = 384;
+pub const DEFAULT_WINDOW_GRAPHS: usize = 192;
 /// MTP draft-chain graphs alive at once.
 pub const DEFAULT_CHAIN_GRAPHS: usize = 64;
 
