@@ -612,6 +612,15 @@ struct DxRaw {
     uint2 b[2];
 };
 
+// A 32-bit global load into any register. The block_out values were loaded as a 64-bit pair, which needs an even register pair, while the
+// values are used one word at a time from registers the loop keeps for them: the compiler loaded into a temporary pair and moved the words
+// into place at once, so every stage waited for the load it had just issued. Word loads land where they are used.
+__device__ __forceinline__ uint32_t dx_ld32(const void* p) {
+    uint32_t v;
+    asm volatile("ld.global.nc.u32 %0, [%1];\n" : "=r"(v) : "l"(p));
+    return v;
+}
+
 // grid (kDxRank / kDxBN, padded / kDxBM), block 256, dynamic smem kDxSmem. low_hi / low_lo [padded][kDxRank]. LAZY: the streams hold the values
 // BEFORE the post-inject of (block_out, inj_prev), which is applied to every value read, fmaf(bf16, weight, x) as hc_post writes it.
 template <bool LAZY>
@@ -655,8 +664,12 @@ __global__ void __launch_bounds__(kDxThreads, 2)
             for (int i = 0; i < 2; ++i) rw.v[i] = trow < T ? *reinterpret_cast<const float4*>(src + 4 * (tq + 8 * i)) : make_float4(0.f, 0.f, 0.f, 0.f);
             if (LAZY) {
 #pragma unroll
-                for (int i = 0; i < 2; ++i)
-                    rw.b[i] = trow < T ? *reinterpret_cast<const uint2*>(block_out + (size_t)trow * kNiH + d0 + 4 * (tq + 8 * i)) : make_uint2(0u, 0u);
+                for (int i = 0; i < 2; ++i) {
+                    // from a valid row whatever the row: a select on the registers where they are used keeps the load's latency out of the loop
+                    const uint32_t* bp = reinterpret_cast<const uint32_t*>(block_out + (size_t)(trow < T ? trow : 0) * kNiH + d0 + 4 * (tq + 8 * i));
+                    rw.b[i].x = dx_ld32(bp);
+                    rw.b[i].y = dx_ld32(bp + 1);
+                }
             }
         }
     };
@@ -670,8 +683,11 @@ __global__ void __launch_bounds__(kDxThreads, 2)
         const int stream = stage_of(j) * kDxKB / kNiH;
         if (LAZY) {
             const float pw = stream == 0 ? pw4.x : stream == 1 ? pw4.y : stream == 2 ? pw4.z : pw4.w;
-            const float2 b01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rw.b[i].x));
-            const float2 b23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rw.b[i].y));
+            // the block_out values are loaded from a valid row whatever the row: a select on the registers here, not after the load, keeps the
+            // load's latency out of the loop
+            const uint2 bb = trow < T ? rw.b[i] : make_uint2(0u, 0u);
+            const float2 b01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&bb.x));
+            const float2 b23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&bb.y));
             v.x = fmaf(b01.x, pw, v.x);
             v.y = fmaf(b01.y, pw, v.y);
             v.z = fmaf(b23.x, pw, v.z);

@@ -1,0 +1,3 @@
+## New features and improvements
+
+- Qwen3.8-Flash-Next prompt prefill: the down-product kernel of the hyper-connection pre-mix (its on-the-fly form, which reads the previous block's output beside the streams) loads those values one 32-bit word at a time into the registers they are used from. The 64-bit loads needed an even register pair, so the compiler loaded into a temporary pair and moved the words into place at once, and every stage of the loop waited for the load it had just issued (about a quarter of the kernel's stall samples in a profile). Every output bit is unchanged. On a steady 8,108-row chunk (nsys, one GB10, two runs) the kernel takes 304.6 and 307.2 ms before and 298.9 and 293.4 ms after.
