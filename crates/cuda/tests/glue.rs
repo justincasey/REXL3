@@ -921,7 +921,7 @@ fn small_linear_cols_kernel_equals_the_per_row_kernel_and_its_predecessor() {
     st.sync().unwrap();
 }
 
-/// The weight-stationary kernel and its predecessor at the model's prefill widths, 4,012 rows (router, GDN gate projection).
+/// The weight-stationary kernel and its predecessor at the model's prefill widths, 8,192 rows (router, delta-net gate projections).
 ///     cargo test --release -p gb-cuda --test glue bench_small_linear_cols -- --ignored --nocapture
 #[test]
 #[ignore]
@@ -929,12 +929,14 @@ fn bench_small_linear_cols() {
     gpu!();
     let st = Stream::new().unwrap();
     let mut rng = Rng(32);
-    let (rows, k) = (4012usize, 2560usize);
+    let (rows, k) = (8192usize, 2560usize);
     let dx = up(&rand_bf16(&mut rng, rows * k));
+    let t = gb_cuda::moe::EventTimer::new(2).unwrap();
     for &n in &[512usize, 48] {
         let dw = up(&f16_bits(&rng.vec(n * k, -0.2, 0.2)));
         let dy = zeros(rows * n * 2);
-        for (name, reference) in [("previous", true), ("permuted", false)] {
+        let mut hashes = Vec::new();
+        for (name, reference) in [("previous", true), ("current", false)] {
             let run = || unsafe {
                 if reference {
                     glue::small_linear_f16w_rows_ref(cp(&dx), cp(&dw), mp(&dy), rows, k, n, &st).unwrap()
@@ -942,21 +944,23 @@ fn bench_small_linear_cols() {
                     glue::small_linear_f16w_rows(cp(&dx), cp(&dw), mp(&dy), rows, k, n, &st).unwrap()
                 }
             };
-            for _ in 0..5 {
+            for _ in 0..3 {
                 run();
             }
             st.sync().unwrap();
-            let mut best = f64::MAX;
-            for _ in 0..5 {
-                let t0 = std::time::Instant::now();
-                for _ in 0..10 {
-                    run();
-                }
-                st.sync().unwrap();
-                best = best.min(t0.elapsed().as_secs_f64() * 1e6 / 10.0);
+            let mut best = f32::MAX;
+            for _ in 0..8 {
+                t.record(0, &st).unwrap();
+                run();
+                t.record(1, &st).unwrap();
+                best = best.min(t.ms(0, 1).unwrap());
             }
-            eprintln!("BENCH small_linear_cols n {n:>3} {name}: {best:.1} us");
+            let y = dl::<u16>(&dy);
+            let h = y.iter().fold(0xcbf29ce484222325u64, |h, &v| (h ^ v as u64).wrapping_mul(0x100000001b3));
+            hashes.push(h);
+            eprintln!("BENCH small_linear_cols rows {rows} n {n:>3} {name}: {:.1} us hash {h:016x}", best * 1e3);
         }
+        assert_eq!(hashes[0], hashes[1], "outputs differ at n {n}");
     }
 }
 
