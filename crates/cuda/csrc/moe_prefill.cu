@@ -345,7 +345,7 @@ __global__ void __launch_bounds__(128) rot_in_kernel(const void* __restrict__ x,
                                                      const int* __restrict__ spair, const int* __restrict__ nitems,
                                                      const half* __restrict__ suh0, const half* __restrict__ suh1,
                                                      uint32_t* __restrict__ xs0, uint32_t* __restrict__ xs1, int K, int topk, int E) {
-    const int srow = blockIdx.x, mat = blockIdx.z;
+    const int srow = blockIdx.x;
     const int blk = blockIdx.y * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     if (blk * 128 >= K || srow >= nitems[3]) return;
     const int p = spair[srow];
@@ -353,15 +353,20 @@ __global__ void __launch_bounds__(128) rot_in_kernel(const void* __restrict__ x,
     const int e = pick[p];
     const int row = p / topk;
     const int k = blk * 128 + 4 * lane;
-    float v[4], s[4];
-    load4(x, x_dtype, (size_t)row * K + k, v);
-    load4h((mat ? suh1 : suh0) + (size_t)e * K + k, s);
+    // both matrices' rotations of the one 128-wide block of x: its row is read from memory once, not once a matrix
+    float x4[4];
+    load4(x, x_dtype, (size_t)row * K + k, x4);
 #pragma unroll
-    for (int j = 0; j < 4; ++j) v[j] *= s[j];
-    fwht128(v, lane);
+    for (int mat = 0; mat < 2; ++mat) {
+        float v[4], s[4];
+        load4h((mat ? suh1 : suh0) + (size_t)e * K + k, s);
 #pragma unroll
-    for (int j = 0; j < 4; ++j) v[j] *= HAD_SCALE;
-    store_frag4(mat ? xs1 : xs0, srow, k, K, v);
+        for (int j = 0; j < 4; ++j) v[j] = x4[j] * s[j];
+        fwht128(v, lane);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) v[j] *= HAD_SCALE;
+        store_frag4(mat ? xs1 : xs0, srow, k, K, v);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -909,7 +914,7 @@ GB_EXPORT int gb_moe_pf_rot_in(const void* x, int x_dtype, const void* pick, con
         return (int)cudaErrorInvalidValue;
     // the grid covers the most sorted rows there can be (every expert's pairs padded to whole 16-row tiles); the blocks past nitems[3] return
     const long long P = (long long)rows * topk, padded = (P + 15LL * (E < P ? E : P) + 15) / 16 * 16;
-    const dim3 grid((unsigned)padded, (unsigned)((K / 128 + 3) / 4), 2);
+    const dim3 grid((unsigned)padded, (unsigned)((K / 128 + 3) / 4), 1);
     rot_in_kernel<<<grid, 128, 0, gb_stream(stream)>>>(x, x_dtype, static_cast<const int*>(pick), static_cast<const int*>(spair),
                                                        static_cast<const int*>(nitems), static_cast<const half*>(suh0),
                                                        static_cast<const half*>(suh1), static_cast<uint32_t*>(xs0),

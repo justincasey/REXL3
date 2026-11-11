@@ -1,0 +1,3 @@
+## New features and improvements
+
+- The routed experts' input rotation of a prefill chunk (the gathered activation row times the expert's input signs, the 128-wide Hadamard transform, rounded to fp16 and stored in the MMA's fragment order) now produces the gate and the up matrix's inputs in the same block: each 128-wide block of an activation row is read once and rotated twice, where a block per matrix read it twice. Every output is the same fp16 value as before. On a steady 8,108-row chunk the rotation averages 5.34 ms a launch instead of 5.69 ms (273.2 -> 256.2 ms a chunk, nsys on one GB10); an isolated 8,108-row layer takes 5.15 ms instead of 5.62 ms.
