@@ -759,22 +759,38 @@ __global__ void __launch_bounds__(32 * (GRP / HPW))
 // takes the load latency off the warps' critical path. The arithmetic is attend_h's, instruction for instruction: group_scores and
 // group_pv are the same functions on the same operands (the K row of token k ^ (lane >> 2) and the V row of token k of the group, read
 // from shared memory instead of global), so the output is attend_h's bit for bit.
+//
+// The kernel is bound by issue slots (FP32 operations are 80% of its instructions, none of which can be fused or packed without changing
+// a bit), so what is not arithmetic is kept small: the addresses of the copies and reads are built once, not in every group, the copies
+// of a group are one 16-byte read of offsets and six predicated cp.asyncs a warp, the last group of the row (of b % TB tokens) is not
+// part of the loop, and the offset table is refilled in steps that do not wait for global reads.
 constexpr int ATT_THREADS = 32 * (GRP / HPW);
 constexpr int SOFF_BLK = 128;  // tokens one refresh of the offset table covers (16 groups)
+constexpr int SOFF_RING = SOFF_BLK / TB * 12;  // words of one block of the offset table: 12 a group
 static_assert(ATT_THREADS == 96 && SOFF_BLK % TB == 0, "attend_s is built for three warps");
 
 __device__ __forceinline__ unsigned smem_u32(const void* p) { return (unsigned)__cvta_generic_to_shared(p); }
 __device__ __forceinline__ void cp_async16(unsigned dst, const void* src) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src));
 }
+// the copy of a lane of a warp that has none to make (the warp's third row, for warp 2) is predicated off
+__device__ __forceinline__ void cp_async16_if(bool pred, unsigned dst, const void* src) {
+    asm volatile(
+        "{\n.reg .pred p;\nsetp.ne.b32 p, %0, 0;\n@p cp.async.cg.shared.global [%1], [%2], 16;\n}\n" ::"r"((int)pred), "r"(dst), "l"(src));
+}
+__device__ __forceinline__ uint4 lds128(unsigned addr) {
+    uint4 r;
+    asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];\n" : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "r"(addr) : "memory");
+    return r;
+}
 
 // grid (rows, NKV), block 96: warp w serves q heads kvh * GRP + w * HPW .. + HPW - 1, as attend_h<true> with one part.
-__global__ void __launch_bounds__(ATT_THREADS)
+__global__ void __launch_bounds__(ATT_THREADS, 4)
     attend_s(const __nv_bfloat16* __restrict__ qm, const __nv_bfloat16* __restrict__ kc, const __nv_bfloat16* __restrict__ vc,
              const int* __restrict__ table, int max_blocks, const int* __restrict__ row_slot, const int* __restrict__ positions,
              const int* __restrict__ sel, const int* __restrict__ sel_n, __nv_bfloat16* __restrict__ out) {
     __shared__ __align__(128) uint4 tile[2][2][TB][32];  // [stage][K | V][token of the group][16-byte chunk of the 512-byte row]
-    __shared__ __align__(16) unsigned soff[2][SOFF_BLK];  // row offsets (uint4 units) of the tokens, a block of 128 at a time, by parity
+    __shared__ __align__(16) unsigned soff[2 * SOFF_RING];  // row offsets (uint4 units) of the tokens, a block of 128 at a time, by parity
     __shared__ __align__(16) float spk[GRP / HPW][32];
     pdl_trigger();
     pdl_wait();  // q, the selection and the positions are earlier kernels' outputs
@@ -805,57 +821,113 @@ __global__ void __launch_bounds__(ATT_THREADS)
 #pragma unroll
         for (int e = 0; e < 8; ++e) o[h][e] = 0.f;
     }
-    // the offsets of tokens blk * SOFF_BLK .. + SOFF_BLK - 1 (a token past the end reads token 0: its row is never used)
-    auto fill = [&](int blk) {
-        for (int s = threadIdx.x; s < SOFF_BLK; s += ATT_THREADS) {
-            const int i = blk * SOFF_BLK + s;
-            const int ii = i < b ? i : 0;
-            const int tok = ii < CR * n ? CR * sl[ii / CR] + ii % CR : CR * nbq + (ii - CR * n);
-            soff[blk & 1][s] = (((unsigned)tb[tok / PAGE] * PAGE + tok % PAGE) * NKV + kvh) * (D / 8);
+    // The tokens of block blk of the offset table (SOFF_BLK of them; a thread's two are s0 and s1, the second for the first 32 threads
+    // only) are the first CR * n of the row's tokens, the selected blocks', then the tail block's; a token past the end reads token 0 (its
+    // row is never used). A token's offset takes two dependent global reads (its selected block, then its page), so the table is refilled
+    // in three steps on different trips of a block and the reads are in flight while the warps compute.
+    const int s0 = threadIdx.x, s1 = threadIdx.x + ATT_THREADS;
+    const bool two = threadIdx.x < SOFF_BLK - ATT_THREADS;
+    int rt0 = 0, rt1 = 0;  // the selected block, then the token
+    unsigned rp0 = 0, rp1 = 0;  // the page
+    auto list_index = [&](int blk, int s) { return blk * SOFF_BLK + s < b ? blk * SOFF_BLK + s : 0; };
+    auto fill_a = [&](int blk) {
+        const int i0 = list_index(blk, s0), i1 = list_index(blk, s1);
+        rt0 = i0 < CR * n ? sl[i0 / CR] : 0;
+        rt1 = two && i1 < CR * n ? sl[i1 / CR] : 0;
+    };
+    auto fill_b = [&](int blk) {
+        const int i0 = list_index(blk, s0), i1 = list_index(blk, s1);
+        rt0 = i0 < CR * n ? CR * rt0 + i0 % CR : CR * nbq + (i0 - CR * n);
+        rp0 = tb[rt0 / PAGE];
+        if (two) {
+            rt1 = i1 < CR * n ? CR * rt1 + i1 % CR : CR * nbq + (i1 - CR * n);
+            rp1 = tb[rt1 / PAGE];
         }
     };
-    // the K and V rows of group `grp` into stage grp & 1: warp w copies tokens w, w + 3, w + 6, a row a 32-lane cp.async
+    // soff holds a group's offsets in the order its copies are issued: warp w copies tokens w, w + 3, w + 6, which sit in words
+    // 4 w .. 4 w + 2 of the group's 12, so one 16-byte read gives a warp its offsets
+    const int pos0 = (s0 >> 3) * 12 + (s0 & 7) % 3 * 4 + (s0 & 7) / 3;
+    const int pos1 = (s1 >> 3) * 12 + (s1 & 7) % 3 * 4 + (s1 & 7) / 3;
+    auto fill_c = [&](int blk) {
+        soff[(blk & 1) * SOFF_RING + pos0] = (((unsigned)rp0 * PAGE + rt0 % PAGE) * NKV + kvh) * (D / 8);
+        if (two) soff[(blk & 1) * SOFF_RING + pos1] = (((unsigned)rp1 * PAGE + rt1 % PAGE) * NKV + kvh) * (D / 8);
+    };
+    // the K and V rows of group `grp` into stage grp & 1, a row a 32-lane cp.async. The addresses that do not change from group to group
+    // are kept in registers (the empty asm statements): the compiler rebuilds them in every group otherwise.
     const uint4* kg = reinterpret_cast<const uint4*>(kc) + lane;
     const uint4* vg = reinterpret_cast<const uint4*>(vc) + lane;
+    asm("" : "+l"(kg));
+    asm("" : "+l"(vg));
+    constexpr int ROW = 32 * 16;         // bytes of a row
+    constexpr int STAGE = 2 * TB * ROW;  // bytes of a stage: the K rows, then the V rows
+    unsigned sdst = smem_u32(&tile[0][0][w][lane]);
+    asm("" : "+r"(sdst));
+    unsigned soffb = smem_u32(soff) + 16 * w;  // this warp's three offsets of a group are the words 4 w .. 4 w + 2 of the group's 12
+    asm("" : "+r"(soffb));
     auto issue = [&](int grp) {
-        const unsigned* so = soff[(grp >> 4) & 1] + (grp & 15) * TB;
-#pragma unroll
-        for (int u = 0; u < 3; ++u) {
-            const int t = w + 3 * u;
-            if (t < TB) {
-                const unsigned off = so[t];
-                cp_async16(smem_u32(&tile[grp & 1][0][t][lane]), kg + off);
-                cp_async16(smem_u32(&tile[grp & 1][1][t][lane]), vg + off);
-            }
-        }
+        const uint4 so = lds128(soffb + (grp & 31) * 48);  // the two blocks of the table are one ring of 32 groups
+        const unsigned stage = sdst + (grp & 1) * STAGE;
+        cp_async16(stage, kg + so.x);
+        cp_async16(stage + TB * ROW, vg + so.x);
+        cp_async16(stage + 3 * ROW, kg + so.y);
+        cp_async16(stage + 3 * ROW + TB * ROW, vg + so.y);
+        cp_async16_if(w < 2, stage + 6 * ROW, kg + so.z);
+        cp_async16_if(w < 2, stage + 6 * ROW + TB * ROW, vg + so.z);
     };
-    const int groups = (b + TB - 1) / TB;
-    fill(0);
+    // this lane's K row of token k ^ g and V row of token k of group j, scores of the group. The lane's part of the addresses is kept in
+    // registers, the stage's part is the same for the whole warp.
+    int ka[TB];
+#pragma unroll
+    for (int k = 0; k < TB; ++k) {
+        ka[k] = (k ^ g) * ROW + lane * 16;
+        asm("" : "+r"(ka[k]));
+    }
+    unsigned va = TB * ROW + lane * 16;
+    asm("" : "+r"(va));
+    unsigned sbase = smem_u32(&tile[0][0][0][0]);
+    asm("" : "+r"(sbase));
+    uint4 vu[TB];
+    auto stage_load = [&](int j) {
+        const unsigned st = sbase + (j & 1) * STAGE;
+        uint4 ku[TB];
+#pragma unroll
+        for (int k = 0; k < TB; ++k) {
+            ku[k] = lds128(st + ka[k]);
+            vu[k] = lds128(st + va + k * ROW);
+        }
+        return group_scores(ku, qv);
+    };
+    const int groups = (b + TB - 1) / TB, full = b / TB;  // `full` groups of TB tokens, then a group of b % TB tokens if there is one
+    fill_a(0);
+    fill_b(0);
+    fill_c(0);
     __syncthreads();
     issue(0);
     asm volatile("cp.async.commit_group;\n" ::);
-    for (int j = 0; j < groups; ++j) {
+    for (int j = 0; j < full; ++j) {
         asm volatile("cp.async.wait_group 0;\n" ::: "memory");
-        if ((j & 15) == 0) fill(j / 16 + 1);  // first read by the issue of group 16 (j / 16 + 1), 15 barriers later
+        if (__builtin_expect((j & 3) == 0, 0)) {  // block j / 16 + 1 is first read by the issue of group 16 (j / 16 + 1), 15 barriers later
+            const int step = (j >> 2) & 3, blk = j / 16 + 1;
+            if (step == 0)
+                fill_a(blk);
+            else if (step == 1)
+                fill_b(blk);
+            else if (step == 2)
+                fill_c(blk);
+        }
         __syncthreads();  // group j's rows have landed (every thread's copies); every warp is done with group j - 1's stage
         if (j + 1 < groups) {
             issue(j + 1);
             asm volatile("cp.async.commit_group;\n" ::);
         }
-        const uint4(&kt)[TB][32] = tile[j & 1][0];
-        const uint4(&vt)[TB][32] = tile[j & 1][1];
-        uint4 ku[TB], vu[TB];
-#pragma unroll
-        for (int k = 0; k < TB; ++k) {
-            ku[k] = kt[k ^ g][lane];
-            vu[k] = vt[k][lane];
-        }
-        const float sc = group_scores(ku, qv);
-        const int nv = b - TB * j;
-        if (nv >= TB)
-            group_pv<true>(sc, vu, m, l, o, TB, g, qs, spk[w]);
-        else
-            group_pv<false>(sc, vu, m, l, o, nv, g, qs, spk[w]);
+        const float sc = stage_load(j);
+        group_pv<true>(sc, vu, m, l, o, TB, g, qs, spk[w]);
+    }
+    if (full < groups) {
+        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+        __syncthreads();
+        const float sc = stage_load(full);
+        group_pv<false>(sc, vu, m, l, o, b - TB * full, g, qs, spk[w]);
     }
 #pragma unroll
     for (int h = 0; h < HPW; ++h) {
