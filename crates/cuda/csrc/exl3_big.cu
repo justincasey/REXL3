@@ -18,6 +18,7 @@
 // Copyright (c) 2025 Turboderp; see THIRD_PARTY_NOTICES.md). The tile decode is csrc/exl3_linear_decode.cuh.
 
 #include <stdint.h>
+#include <stdlib.h>
 
 #include "common.cuh"
 #include "exl3_grouped.cuh"
@@ -136,6 +137,209 @@ __global__ void __launch_bounds__(WK * 32, 1) big_kernel(const uint32_t* __restr
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// The second form (big2_kernel), for the Flash-Next shared expert's two shapes at 1,024 rows and more: a block (a 64-row group, a 128-column strip) of 8 warps
+// that own 16 columns each. The first form's warps own K quarters of all 128 columns and meet through shared memory (two barriers per 8 rows of every
+// column sweep of every split, 128 barriers a block for the gate/up shape); here a warp runs every chain itself and no warp waits for another but at
+// the stage barrier of a cp.async ring. Per split s and quarter q the warp's accumulators are one fresh fp32 mma chain from +0.0 over the quarter's k tiles
+// (`per` of them, in order); the quarters of a split are added in order (sp = c0; sp += c1; sp += c2; sp += c3), the splits' sums to a running sum in
+// split order (tot = sp of split 0; tot += sp of the others): the values reduce_sweep and group_sums build, element by element, so every output is the
+// first form's bit for bit. A and the trellis stream through the ring (the A fragments of the group's tiles once for all 8 warps), the tile of a
+// (k tile, column tile) is decoded by the one warp that owns the column tile.
+
+__device__ __forceinline__ void cpa16(void* smem, const void* gmem) {
+    const unsigned s = (unsigned)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(s), "l"(gmem) : "memory");
+}
+__device__ __forceinline__ void cpa_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
+template <int N>
+__device__ __forceinline__ void cpa_wait() {
+    asm volatile("cp.async.wait_group %0;" ::"n"(N) : "memory");
+}
+
+constexpr int kLds2 = 128 + 4;     // row stride (floats) of the staging of the sums: 16-byte rows, the 8 rows of a fragment hit different banks
+constexpr int kGuard2 = 4;         // tiles of a group
+
+// One ring stage of the block's 256 threads: the A fragments of the group's first `nt` tiles (KPS k tiles each) and the KPS x 8 trellis tiles of the strip
+// (`T`: the strip's first tile, `stride_k`: words between k tile rows).
+template <int K2, int MT, int KPS>
+__device__ __forceinline__ void load_stage2(uint32_t* sa, const uint32_t* xf, const uint32_t* T, long long stride_k, int tile0, int nt, int KT, int kc,
+                                            int tt) {
+    constexpr int TW = tile_words<K2>();
+    constexpr int AU = MT * KPS * 32;
+#pragma unroll
+    for (int i = 0; i < (AU + 255) / 256; ++i) {
+        const int u = i * 256 + tt;
+        if (u < AU) {
+            const int p = u / (KPS * 32), kk = (u / 32) % KPS, ln = u & 31;
+            if (p < nt) cpa16(sa + (size_t)((p * KPS + kk) * 32 + ln) * 4, xf + ((size_t)(tile0 + p) * KT + kc * KPS + kk) * 128 + ln * 4);
+        }
+    }
+    uint32_t* sb = sa + MT * KPS * 128;
+    constexpr int BU = KPS * 8 * (TW / 4);
+#pragma unroll
+    for (int i = 0; i < (BU + 255) / 256; ++i) {
+        const int u = i * 256 + tt;
+        if (u < BU) {
+            const int c = u % (TW / 4), tl = u / (TW / 4), kk = tl >> 3, tc = tl & 7;
+            cpa16(sb + (size_t)tl * TW + c * 4, T + (size_t)(kc * KPS + kk) * stride_k + (size_t)tc * TW + c * 4);
+        }
+    }
+}
+
+// mma with the accumulator +0.0 as C: the first step of a chain, which starts from +0.0 (no register is zeroed, nothing is copied).
+__device__ __forceinline__ void mma16816_z(float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
+    asm volatile(
+        "{\n\t.reg .f32 z;\n\tmov.f32 z, 0f00000000;\n\tmma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {z,z,z,z};\n}"
+        : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+constexpr int kPer2 = 10;                               // k tiles of a chain (a warp quarter of one split): both shared-expert shapes
+
+// One warp's chains over all k tiles of the block (see above). SPLIT: the layer has K splits (a separate per-split sum), else the quarters' sum is the whole.
+// `chain(d)` runs one quarter's kPer2 k tiles (a whole number of ring stages) into d from +0.0: the first quarter of a split goes straight into the sum it
+// starts, the others into `acc` and are added to it. Leaves the warp's fp32 sums (16 columns x MT * 16 rows, in the mma accumulator layout) in `tot`.
+template <int K2, int CB, int MT, int KPS, int ST, bool SPLIT>
+__device__ __forceinline__ void chains_b(float (&tot)[MT][2][4], uint32_t* sm, const uint32_t* xf, const uint32_t* T, long long stride_k, int tile0, int nt, int KT,
+                                         int SK, int tt, int warp, int lane) {
+    constexpr int TW = tile_words<K2>();
+    constexpr int STAGE_W = MT * KPS * 128 + KPS * 8 * TW;
+    constexpr int CLS = kPer2 / KPS;                    // stages of one chain
+    const int NS = KT / KPS;
+    float acc[MT][2][4];
+    float sp[SPLIT ? MT : 1][SPLIT ? 2 : 1][SPLIT ? 4 : 1];
+#pragma unroll
+    for (int p = 0; p < MT; ++p)
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                acc[p][h][c] = 0.f;
+                tot[p][h][c] = 0.f;
+                if constexpr (SPLIT) sp[p][h][c] = 0.f;
+            }
+#pragma unroll
+    for (int s = 0; s < ST - 1; ++s) {
+        if (s < NS) load_stage2<K2, MT, KPS>(sm + s * STAGE_W, xf, T, stride_k, tile0, nt, KT, s, tt);
+        cpa_commit();
+    }
+    int kc = 0;
+    auto chain = [&](float (&d)[MT][2][4]) {
+#pragma unroll
+        for (int i = 0; i < CLS; ++i) {
+            cpa_wait<ST - 2>();
+            __syncthreads();
+            {
+                const int nk = kc + ST - 1;
+                if (nk < NS) load_stage2<K2, MT, KPS>(sm + (nk % ST) * STAGE_W, xf, T, stride_k, tile0, nt, KT, nk, tt);
+                cpa_commit();
+            }
+            const uint32_t* sa = sm + (kc % ST) * STAGE_W;
+            const uint32_t* sb = sa + MT * KPS * 128;
+#pragma unroll
+            for (int kk = 0; kk < KPS; ++kk) {
+                uint32_t w[lane_words<K2>()], b0[2], b1[2];
+                load_lane_words<K2>(sb + (kk * 8 + warp) * TW, lane, w);
+                decode_lane<K2, CB>(w, lane, b0, b1);
+#pragma unroll
+                for (int p = 0; p < MT; ++p) {
+                    if (p < nt) {
+                        const uint4 av = *reinterpret_cast<const uint4*>(sa + (size_t)((p * KPS + kk) * 32 + lane) * 4);
+                        const uint32_t a[4] = {av.x, av.y, av.z, av.w};
+                        if (i == 0 && kk == 0) {
+                            mma16816_z(d[p][0], a, b0);
+                            mma16816_z(d[p][1], a, b1);
+                        } else {
+                            mma16816(d[p][0], a, b0);
+                            mma16816(d[p][1], a, b1);
+                        }
+                    }
+                }
+            }
+            ++kc;
+        }
+    };
+    auto fold = [&](float (&dst)[MT][2][4], const float (&src)[MT][2][4]) {
+#pragma unroll
+        for (int p = 0; p < MT; ++p)
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+#pragma unroll
+                for (int c = 0; c < 4; ++c) dst[p][h][c] += src[p][h][c];
+    };
+    if constexpr (!SPLIT) {
+        chain(tot);
+#pragma unroll 1
+        for (int q = 1; q < 4; ++q) {
+            chain(acc);
+            fold(tot, acc);
+        }
+    } else {
+#pragma unroll 1
+        for (int s = 0; s < SK; ++s) {
+            if (s == 0) chain(tot);
+            else chain(sp);
+#pragma unroll 1
+            for (int q = 1; q < 4; ++q) {
+                chain(acc);
+                if (s == 0) fold(tot, acc);
+                else fold(sp, acc);
+            }
+            if (s > 0) fold(tot, sp);
+        }
+    }
+    cpa_wait<0>();
+}
+
+template <int K2, int KPS, int ST>
+constexpr size_t smem_big2() {
+    constexpr size_t stage = (size_t)KPS * kTiles * 128 + (size_t)KPS * 8 * tile_words<K2>();
+    constexpr size_t pipe = (size_t)ST * stage, epi = (size_t)kTiles * 16 * kLds2;
+    return (pipe > epi ? pipe : epi) * 4;
+}
+
+// Block (group of up to 64 rows, 128-column strip); `strips_fast` as big_kernel's. KPS k tiles a ring stage, ST stages, MINB blocks an SM.
+template <int K2, int CB, bool SPLIT, int KPS, int ST, int MINB>
+__global__ void __launch_bounds__(256, MINB) big2_kernel(const uint32_t* __restrict__ xf, const uint32_t* __restrict__ T, const half* __restrict__ svh,
+                                                          const half* __restrict__ bias, void* __restrict__ y, int y_dtype, int M, int K, int N, int SK,
+                                                          int strips_fast) {
+    constexpr int MT = kTiles, TW = tile_words<K2>();
+    extern __shared__ __align__(16) uint32_t smem2[];
+    const int m0 = (strips_fast ? blockIdx.y : blockIdx.x) * 16 * MT, nb = strips_fast ? blockIdx.x : blockIdx.y;
+    const int nt = min(MT, (M - m0 + 15) >> 4);
+    const int rows = min(16 * nt, M - m0);
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int KT = K >> 4;
+    const long long stride_k = (long long)(N >> 4) * TW;
+    float tot[MT][2][4];
+    chains_b<K2, CB, MT, KPS, ST, SPLIT>(tot, smem2, xf, T + (size_t)nb * 8 * TW, stride_k, m0 >> 4, nt, KT, SK, tid, warp, lane);
+    __syncthreads();                                     // the ring is the staging now
+    float* stg = reinterpret_cast<float*>(smem2);
+    {
+        const int g = lane >> 2, t4 = lane & 3;
+#pragma unroll
+        for (int p = 0; p < MT; ++p) {
+            if (p < nt) {
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int col = warp * 16 + h * 8 + 2 * t4, r = p * 16 + g;
+                    *reinterpret_cast<float2*>(stg + r * kLds2 + col) = make_float2(tot[p][h][0], tot[p][h][1]);
+                    *reinterpret_cast<float2*>(stg + (r + 8) * kLds2 + col) = make_float2(tot[p][h][2], tot[p][h][3]);
+                }
+            }
+        }
+    }
+    __syncthreads();
+    const int col0 = nb * 128;
+    for (int r = warp; r < rows; r += 8) {
+        const float4 u = *reinterpret_cast<const float4*>(stg + r * kLds2 + 4 * lane);
+        float v[4] = {u.x, u.y, u.z, u.w};
+        finish(v, lane, svh, bias, col0 + 4 * lane);
+        store4(y, y_dtype, (size_t)(m0 + r) * N + col0 + 4 * lane, v);
+    }
+}
+
 // (K splits, warps a block) for a K x N layer: exl3_linear.cu's plan_for, the shape's alone. It must stay identical to that function: a
 // different plan sums K in another order, and the bit-identity tests (every shape of the GLM text model) would fail.
 struct Plan { int sk, wk; };
@@ -192,6 +396,43 @@ int launch_big(const uint32_t* xf, const uint32_t* T, const half* svh, const hal
     return launch_big_pa<WK, K2, CB, tuned ? 2 : 1, tuned ? 1 : 0>(xf, T, svh, bias, y, y_dtype, M, K, N, SK, stride_n, st);
 }
 
+// `REXL3_BIG_SECOND_FORM=0`: the Flash-Next shared expert's two shapes run the first form (big_kernel) too. gb_exl3_big_set_second_form overrides it (tests
+// that run both forms in one process); -1 gives the environment back.
+static int g_second_override = -1;
+inline bool second_form_on() {
+    static const bool env = [] { const char* e = getenv("REXL3_BIG_SECOND_FORM"); return !(e && e[0] == '0'); }();
+    return g_second_override >= 0 ? g_second_override != 0 : env;
+}
+
+// Which calls the second form takes: the MUL1 codebook at 4 .. 8 bits, 1,024 rows or more (the decode windows and every other family keep big_kernel), the
+// Flash-Next shared expert's two shapes (gate/up 2,560 x 640: 4 K splits; down 640 x 2,560: one split), 4 warps in the plan and chains of whole stages.
+bool second_form_takes(int m, int k, int n, int bits, int codebook, const Plan& p) {
+    return second_form_on() && m >= 1024 && codebook == 2 && bits >= 4 && bits <= 8 && p.wk == 4 && ((k == 2560 && n == 640) || (k == 640 && n == 2560)) &&
+           (k / 16) / p.sk / 4 == kPer2;
+}
+
+template <int K2, int CB, bool SPLIT, int KPS, int ST, int MINB>
+int launch_big2_cfg(const uint32_t* xf, const uint32_t* T, const half* svh, const half* bias, void* y, int y_dtype, int M, int K, int N, int SK,
+                    cudaStream_t st) {
+    constexpr size_t smem = smem_big2<K2, KPS, ST>();
+    auto kernel = big2_kernel<K2, CB, SPLIT, KPS, ST, MINB>;
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+    const bool strips_fast = N / 128 <= 24;
+    const unsigned groups = (unsigned)((M + 16 * kTiles - 1) / (16 * kTiles)), strips = (unsigned)(N / 128);
+    const dim3 grid(strips_fast ? strips : groups, strips_fast ? groups : strips);
+    kernel<<<grid, 256, smem, st>>>(xf, T, svh, bias, y, y_dtype, M, K, N, SK, strips_fast ? 1 : 0);
+    return GB_CHECK_LAUNCH();
+}
+
+// The ring per shape (MEASURED on the GB10, the shared expert's shapes at 8,192 rows): a layer with K splits keeps 233 registers a thread (the quarter sum, the
+// split sum and the running sum are all live) and so one 8-warp block an SM, with a whole chain (10 k tiles) in a stage and two stages; the one-split layer fits
+// 128 registers, two blocks an SM, and stages of half a chain.
+template <int K2, int CB, bool SPLIT>
+int launch_big2(const uint32_t* xf, const uint32_t* T, const half* svh, const half* bias, void* y, int y_dtype, int M, int K, int N, int SK, cudaStream_t st) {
+    if constexpr (SPLIT) return launch_big2_cfg<K2, CB, SPLIT, 10, 2, 1>(xf, T, svh, bias, y, y_dtype, M, K, N, SK, st);
+    return launch_big2_cfg<K2, CB, SPLIT, 5, 2, 2>(xf, T, svh, bias, y, y_dtype, M, K, N, SK, st);
+}
+
 #define GB_BIG_FOR_CB(X, K2) X(K2, 0) X(K2, 1) X(K2, 2)
 #define GB_BIG_FOR_ALL(X)                                                                                               \
     GB_BIG_FOR_CB(X, 2) GB_BIG_FOR_CB(X, 4) GB_BIG_FOR_CB(X, 6) GB_BIG_FOR_CB(X, 8) GB_BIG_FOR_CB(X, 10) GB_BIG_FOR_CB(X, 12) \
@@ -217,6 +458,12 @@ GB_EXPORT int gb_exl3_big_plan(int k, int n, int* out) {
     return 0;
 }
 
+// Test hook: 1 / 0 force the second form / the first form for the shared expert's shapes for the calls that follow, -1 returns to REXL3_BIG_SECOND_FORM.
+GB_EXPORT int gb_exl3_big_set_second_form(int v) {
+    g_second_override = v < 0 ? -1 : (v ? 1 : 0);
+    return 0;
+}
+
 // y [m, n] = EXL3 layer applied to x [m, k] for any m >= 1, the decode kernel's bits (see the header). bias may be null. All device pointers.
 GB_EXPORT int gb_exl3_linear_big(const void* x, int x_dtype, const void* trellis, const void* suh, const void* svh, const void* bias,
                                  void* y, int y_dtype, int m, int k, int n, int bits, int codebook, void* workspace,
@@ -232,6 +479,17 @@ GB_EXPORT int gb_exl3_linear_big(const void* x, int x_dtype, const void* trellis
         rot_in_frag_kernel<<<grid, 128, 0, st>>>(x, x_dtype, static_cast<const half*>(suh), xf, k, m);
         const int rc = GB_CHECK_LAUNCH();
         if (rc) return rc;
+    }
+    if (second_form_takes(m, k, n, bits, codebook, p)) {
+        const uint32_t* T2 = static_cast<const uint32_t*>(trellis);
+        const half* S2 = static_cast<const half*>(svh);
+        const half* B2 = static_cast<const half*>(bias);
+#define GB_L2(K2_)                                                                                                              \
+    if (2 * bits == K2_)                                                                                                        \
+        return p.sk > 1 ? launch_big2<K2_, 2, true>(xf, T2, S2, B2, y, y_dtype, m, k, n, p.sk, st)                              \
+                        : launch_big2<K2_, 2, false>(xf, T2, S2, B2, y, y_dtype, m, k, n, p.sk, st);
+        GB_L2(8) GB_L2(10) GB_L2(12) GB_L2(14) GB_L2(16)
+#undef GB_L2
     }
     const uint32_t* T = static_cast<const uint32_t*>(trellis);
     const half* S = static_cast<const half*>(svh);

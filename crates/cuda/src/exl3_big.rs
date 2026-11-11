@@ -30,6 +30,7 @@ mod ffi {
     extern "C" {
         pub fn gb_exl3_big_workspace_bytes(m: i32, k: i32, n: i32, bits: i32) -> usize;
         pub fn gb_exl3_big_plan(k: i32, n: i32, out: *mut i32) -> i32;
+        pub fn gb_exl3_big_set_second_form(v: i32) -> i32;
         #[allow(clippy::too_many_arguments)]
         pub fn gb_exl3_linear_big(
             x: *const c_void,
@@ -89,6 +90,18 @@ pub fn big_plan(k: usize, n: usize) -> Result<(usize, usize), CudaError> {
         let _ = (k, n);
         Err(CudaError(-1))
     }
+}
+
+/// Forces the large-row linear's form for the Flash-Next shared expert's two shapes (2,560 x 640 and 640 x 2,560, the MUL1 codebook at 4 to 8 bits, 1,024
+/// rows or more) for the calls that follow: `Some(true)` the second form (the default: a warp owns 16 columns and runs every chain), `Some(false)` the first
+/// (each warp a K quarter of all 128 columns), `None` the `REXL3_BIG_SECOND_FORM` environment again. Both give the same bits; only the time differs.
+pub fn set_second_form(v: Option<bool>) {
+    #[cfg(not(gb_no_cuda))]
+    unsafe {
+        ffi::gb_exl3_big_set_second_form(v.map_or(-1, i32::from));
+    }
+    #[cfg(gb_no_cuda)]
+    let _ = v;
 }
 
 impl Exl3Weights {
