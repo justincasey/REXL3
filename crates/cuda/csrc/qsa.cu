@@ -682,6 +682,127 @@ __global__ void __launch_bounds__(32 * (GRP / HPW))
     }
 }
 
+// attend_h for one part (a prefill chunk's attention, merged): the K and V rows of a group of TB tokens are staged in shared memory by the
+// block's three warps together (a row is a 512-byte cp.async copy by one warp; the next group's rows are in flight while this group is
+// computed) instead of being loaded by every warp for itself. The three warps of a block serve the same kv head, so they read the same
+// rows: staging them once cuts the L2 -> SM traffic of the kernel to a third (52 GB -> 17 GB a call at 4,096 rows of 2,052 tokens) and
+// takes the load latency off the warps' critical path. The arithmetic is attend_h's, instruction for instruction: group_scores and
+// group_pv are the same functions on the same operands (the K row of token k ^ (lane >> 2) and the V row of token k of the group, read
+// from shared memory instead of global), so the output is attend_h's bit for bit.
+constexpr int ATT_THREADS = 32 * (GRP / HPW);
+constexpr int SOFF_BLK = 128;  // tokens one refresh of the offset table covers (16 groups)
+static_assert(ATT_THREADS == 96 && SOFF_BLK % TB == 0, "attend_s is built for three warps");
+
+__device__ __forceinline__ unsigned smem_u32(const void* p) { return (unsigned)__cvta_generic_to_shared(p); }
+__device__ __forceinline__ void cp_async16(unsigned dst, const void* src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src));
+}
+
+// grid (rows, NKV), block 96: warp w serves q heads kvh * GRP + w * HPW .. + HPW - 1, as attend_h<true> with one part.
+__global__ void __launch_bounds__(ATT_THREADS)
+    attend_s(const __nv_bfloat16* __restrict__ qm, const __nv_bfloat16* __restrict__ kc, const __nv_bfloat16* __restrict__ vc,
+             const int* __restrict__ table, int max_blocks, const int* __restrict__ row_slot, const int* __restrict__ positions,
+             const int* __restrict__ sel, const int* __restrict__ sel_n, __nv_bfloat16* __restrict__ out) {
+    __shared__ __align__(128) uint4 tile[2][2][TB][32];  // [stage][K | V][token of the group][16-byte chunk of the 512-byte row]
+    __shared__ __align__(16) unsigned soff[2][SOFF_BLK];  // row offsets (uint4 units) of the tokens, a block of 128 at a time, by parity
+    __shared__ __align__(16) float spk[GRP / HPW][32];
+    pdl_trigger();
+    pdl_wait();  // q, the selection and the positions are earlier kernels' outputs
+    const int r = blockIdx.x, kvh = blockIdx.y;
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, qs = lane & 3;
+    const int head0 = kvh * GRP + w * HPW;
+    const int p = positions[r], nbq = (p + 1) / CR, n = sel_n[r];
+    const int b = CR * n + (p - CR * nbq + 1);  // one part: the tokens are [0, b)
+    const int slot = row_slot[r];
+    const int* sl = sel + (size_t)r * TOPK;
+    const int* tb = table + (size_t)slot * max_blocks;
+    float qv[HPW][8];
+#pragma unroll
+    for (int s = 0; s < HPW; ++s) {
+        const uint4 u = reinterpret_cast<const uint4*>(qm + ((size_t)r * NQ + head0 + (s ^ qs)) * D)[lane];
+        const __nv_bfloat162* h2 = reinterpret_cast<const __nv_bfloat162*>(&u);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const float2 f = __bfloat1622float2(h2[e]);
+            qv[s][2 * e] = f.x * (0.0625f * LOG2E);
+            qv[s][2 * e + 1] = f.y * (0.0625f * LOG2E);
+        }
+    }
+    float m = -INFINITY, l = 0.f, o[HPW][8];
+#pragma unroll
+    for (int h = 0; h < HPW; ++h) {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) o[h][e] = 0.f;
+    }
+    // the offsets of tokens blk * SOFF_BLK .. + SOFF_BLK - 1 (a token past the end reads token 0: its row is never used)
+    auto fill = [&](int blk) {
+        for (int s = threadIdx.x; s < SOFF_BLK; s += ATT_THREADS) {
+            const int i = blk * SOFF_BLK + s;
+            const int ii = i < b ? i : 0;
+            const int tok = ii < CR * n ? CR * sl[ii / CR] + ii % CR : CR * nbq + (ii - CR * n);
+            soff[blk & 1][s] = (((unsigned)tb[tok / PAGE] * PAGE + tok % PAGE) * NKV + kvh) * (D / 8);
+        }
+    };
+    // the K and V rows of group `grp` into stage grp & 1: warp w copies tokens w, w + 3, w + 6, a row a 32-lane cp.async
+    const uint4* kg = reinterpret_cast<const uint4*>(kc) + lane;
+    const uint4* vg = reinterpret_cast<const uint4*>(vc) + lane;
+    auto issue = [&](int grp) {
+        const unsigned* so = soff[(grp >> 4) & 1] + (grp & 15) * TB;
+#pragma unroll
+        for (int u = 0; u < 3; ++u) {
+            const int t = w + 3 * u;
+            if (t < TB) {
+                const unsigned off = so[t];
+                cp_async16(smem_u32(&tile[grp & 1][0][t][lane]), kg + off);
+                cp_async16(smem_u32(&tile[grp & 1][1][t][lane]), vg + off);
+            }
+        }
+    };
+    const int groups = (b + TB - 1) / TB;
+    fill(0);
+    __syncthreads();
+    issue(0);
+    asm volatile("cp.async.commit_group;\n" ::);
+    for (int j = 0; j < groups; ++j) {
+        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+        if ((j & 15) == 0) fill(j / 16 + 1);  // first read by the issue of group 16 (j / 16 + 1), 15 barriers later
+        __syncthreads();  // group j's rows have landed (every thread's copies); every warp is done with group j - 1's stage
+        if (j + 1 < groups) {
+            issue(j + 1);
+            asm volatile("cp.async.commit_group;\n" ::);
+        }
+        const uint4(&kt)[TB][32] = tile[j & 1][0];
+        const uint4(&vt)[TB][32] = tile[j & 1][1];
+        uint4 ku[TB], vu[TB];
+#pragma unroll
+        for (int k = 0; k < TB; ++k) {
+            ku[k] = kt[k ^ g][lane];
+            vu[k] = vt[k][lane];
+        }
+        const float sc = group_scores(ku, qv);
+        const int nv = b - TB * j;
+        if (nv >= TB)
+            group_pv<true>(sc, vu, m, l, o, TB, g, qs, spk[w]);
+        else
+            group_pv<false>(sc, vu, m, l, o, nv, g, qs, spk[w]);
+    }
+#pragma unroll
+    for (int h = 0; h < HPW; ++h) {
+        // merge_k over one part: mx = m, c = exp2f(m - mx), l = 0 + l * c, o = 0 + o * c, out = bf16(o / l)
+        const float mh = __shfl_sync(0xffffffffu, m, h), lh = __shfl_sync(0xffffffffu, l, h);
+        const float c = exp2f(mh - mh);
+        const float lq = 0.f + lh * c;
+        __nv_bfloat162 pk[4];
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const float o0 = 0.f + o[h][2 * e] * c, o1 = 0.f + o[h][2 * e + 1] * c;
+            pk[e] = __halves2bfloat162(__float2bfloat16_rn(o0 / lq), __float2bfloat16_rn(o1 / lq));
+        }
+        *reinterpret_cast<uint4*>(out + ((size_t)r * NQ + head0 + h) * D + lane * 8) = *reinterpret_cast<const uint4*>(pk);
+    }
+}
+
 // grid (rows, NQ), block D
 __global__ void __launch_bounds__(D) merge_k(const float* __restrict__ part_o, const float* __restrict__ part_m,
                                              const float* __restrict__ part_l, __nv_bfloat16* __restrict__ out, int parts) {
@@ -778,6 +899,18 @@ GB_EXPORT int gb_qsa_attend(const void* q, const void* k_cache, const void* v_ca
 GB_EXPORT int gb_qsa_attend_merged(const void* q, const void* k_cache, const void* v_cache, const int* table, int max_blocks,
                                    const int* row_slot, const int* positions, const int* sel, const int* sel_n, void* out, int rows,
                                    void* stream) {
+    if (rows < qsa::ATTEND_H_MIN_ROWS) return (int)cudaErrorInvalidValue;
+    const dim3 grid(rows, qsa::NKV, 1);
+    qsa::attend_s<<<grid, qsa::ATT_THREADS, 0, gb_stream(stream)>>>(
+        (const __nv_bfloat16*)q, (const __nv_bfloat16*)k_cache, (const __nv_bfloat16*)v_cache, table, max_blocks, row_slot, positions,
+        sel, sel_n, (__nv_bfloat16*)out);
+    return GB_CHECK_LAUNCH();
+}
+
+// gb_qsa_attend_merged through the kernel it replaced (every warp loads its own K and V rows): the reference the tests compare against.
+GB_EXPORT int gb_qsa_attend_merged_ref(const void* q, const void* k_cache, const void* v_cache, const int* table, int max_blocks,
+                                       const int* row_slot, const int* positions, const int* sel, const int* sel_n, void* out,
+                                       int rows, void* stream) {
     if (rows < qsa::ATTEND_H_MIN_ROWS) return (int)cudaErrorInvalidValue;
     const dim3 grid(rows, qsa::NKV, 1);
     qsa::attend_h<true><<<grid, 32 * (qsa::GRP / qsa::ATTEND_HPW), 0, gb_stream(stream)>>>(

@@ -57,6 +57,9 @@ mod ffi {
         pub fn gb_qsa_attend_merged(q: *const c_void, k_cache: *const c_void, v_cache: *const c_void, table: *const c_void,
                                     max_blocks: i32, row_slot: *const c_void, positions: *const c_void, sel: *const c_void,
                                     sel_n: *const c_void, out: *mut c_void, rows: i32, stream: *mut c_void) -> i32;
+        pub fn gb_qsa_attend_merged_ref(q: *const c_void, k_cache: *const c_void, v_cache: *const c_void, table: *const c_void,
+                                        max_blocks: i32, row_slot: *const c_void, positions: *const c_void, sel: *const c_void,
+                                        sel_n: *const c_void, out: *mut c_void, rows: i32, stream: *mut c_void) -> i32;
         pub fn gb_qsa_merge(part_o: *const c_void, part_m: *const c_void, part_l: *const c_void, out: *mut c_void,
                             rows: i32, parts: i32, stream: *mut c_void) -> i32;
     }
@@ -310,4 +313,44 @@ pub fn attend(
         )
     })?;
     CudaError::check(unsafe { ffi::gb_qsa_merge(po as _, pm as _, pl as _, op, rows as i32, parts as i32, st.raw()) })
+}
+
+/// [`attend`] for one part and at least 64 rows through the kernel that staged shared K/V rows replaced (every warp loads its own rows). Only
+/// the tests call it: the two must agree bit for bit.
+pub fn attend_merged_ref(
+    q: &DevBuf,
+    kv: &PagedKv,
+    table: &BlockTable,
+    rr: &Rows<'_>,
+    sel: &DevBuf,
+    sel_n: &DevBuf,
+    out: &mut DevBuf,
+    st: &Stream,
+) -> Result<(), CudaError> {
+    if kv.kv_heads != KvHeads::Two || rr.rows < ATTEND_MERGED_MIN_ROWS {
+        return Err(CudaError(1));
+    }
+    let rows = rr.rows;
+    rr.check()?;
+    let qn = rows * N_Q_HEADS * HEAD_DIM * 2;
+    need(q, qn, "qsa attend q")?;
+    need(sel, rows * TOPK * 4, "qsa attend sel")?;
+    need(sel_n, rows * 4, "qsa attend sel_n")?;
+    need(out, qn, "qsa attend out")?;
+    CudaError::check(unsafe {
+        ffi::gb_qsa_attend_merged_ref(
+            q.ptr(),
+            kv.k.ptr(),
+            kv.v.ptr(),
+            table.buf.ptr(),
+            table.max_blocks as i32,
+            rr.slot.ptr(),
+            rr.pos.ptr(),
+            sel.ptr(),
+            sel_n.ptr(),
+            out.ptr(),
+            rows as i32,
+            st.raw(),
+        )
+    })
 }
