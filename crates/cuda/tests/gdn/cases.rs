@@ -1099,6 +1099,50 @@ fn prefill_is_chunk_invariant_and_batch_invariant() {
     assert_bits_eq("batched prefill conv", hb.slot_conv(2), h1.slot_conv(1));
 }
 
+/// The prefill chain kernel that carries two value rows a thread is bit-identical to the one-row-a-thread kernel it replaced: the output,
+/// the recurrent state of every slot and the conv history, from random (not zero) starting pools, for sequence lengths that end inside a
+/// staging tile and on its edges (1, 2, 15, 16, 17, 31, 32, 33, 100), odd totals, several sequences of different lengths in one launch
+/// with distinct slots, and a 4,096-row chunk.
+#[test]
+fn prefill_two_rows_a_thread_equals_one_row_kernel_bit_for_bit() {
+    need_gpu!();
+    let mut rng = Rng(0x7277);
+    let ctx = Ctx::new(Weights::random(&mut rng));
+    let cases: [(&[usize], &[usize]); 9] = [
+        (&[1], &[2]),
+        (&[2], &[0]),
+        (&[15], &[1]),
+        (&[16, 17], &[3, 0]),
+        (&[31, 32, 33], &[2, 0, 1]),
+        (&[100], &[3]),
+        (&[41, 70], &[0, 2]),
+        (&[1, 16, 17, 300], &[3, 1, 0, 2]),
+        (&[4096], &[1]),
+    ];
+    for (lens, slots) in cases {
+        let total: usize = lens.iter().sum();
+        let inp = Inp::random(&mut rng, total);
+        let start = HostPools::random(&mut rng, 4);
+        let batch = BatchBuf::new(lens, slots).unwrap();
+        let x = DevInp::new(&inp);
+        let mut ws = DevBuf::zeroed(prefill_workspace_bytes_shaped(SHAPE, total)).unwrap();
+        let run = |reference: bool, ws: &mut DevBuf| {
+            let mut pools = DevPools::new(&start);
+            let mut o = DevBuf::zeroed(total * VH * D * 2).unwrap();
+            let f = if reference { prefill_ref_shaped } else { prefill_shaped };
+            f(SHAPE, &ctx.st, &x.view(), &ctx.weights(), &mut pools.s, &mut pools.conv, &batch.view(), ws, &mut o).unwrap();
+            ctx.st.sync().unwrap();
+            (o.to_vec::<u16>().unwrap(), pools.host())
+        };
+        let (want_o, want) = run(true, &mut ws);
+        let (got_o, got) = run(false, &mut ws);
+        assert_bits_eq(&format!("lens {lens:?} o"), &got_o, &want_o);
+        assert_f32_bits_eq(&format!("lens {lens:?} S"), &got.s, &want.s);
+        assert_bits_eq(&format!("lens {lens:?} conv"), &got.conv, &want.conv);
+        assert!(got_o.iter().any(|&x| x != 0), "lens {lens:?}: the outputs are all zero");
+    }
+}
+
 #[test]
 fn prefill_agrees_with_decode_path_approximately() {
     need_gpu!();
