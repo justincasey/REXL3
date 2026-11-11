@@ -360,7 +360,7 @@ __device__ __forceinline__ void ni_ldsm2(uint32_t& r0, uint32_t& r1, const half*
 // splits' sums.
 constexpr size_t kNiLaunchSmem = 49152;
 static_assert(kNiSmem <= kNiLaunchSmem, "the stages fit the launch's shared memory");
-template <bool POST>
+template <bool POST, bool WRITE>
 __global__ void __launch_bounds__(kNiThreads, 2)
     norm_inj_kernel(float* __restrict__ x, const __nv_bfloat16* __restrict__ block_out, const float* __restrict__ inj_prev,
                     const half* __restrict__ nw, const half* __restrict__ inj_w, half* __restrict__ normed_hi, half* __restrict__ normed_lo,
@@ -457,9 +457,11 @@ __global__ void __launch_bounds__(kNiThreads, 2)
             const half2 c = __floats2half2_rn(n0 - h0, n1 - h1), d = __floats2half2_rn(n2 - h2, n3 - h3);
             hi = make_uint2(*reinterpret_cast<const uint32_t*>(&a), *reinterpret_cast<const uint32_t*>(&b));
             lo = make_uint2(*reinterpret_cast<const uint32_t*>(&c), *reinterpret_cast<const uint32_t*>(&d));
-            const size_t go = ((size_t)t * 4 + s) * kNiH + st * kNiKB + q * 4;
-            *reinterpret_cast<uint2*>(normed_hi + go) = hi;
-            *reinterpret_cast<uint2*>(normed_lo + go) = lo;
+            if (WRITE) {
+                const size_t go = ((size_t)t * 4 + s) * kNiH + st * kNiKB + q * 4;
+                *reinterpret_cast<uint2*>(normed_hi + go) = hi;
+                *reinterpret_cast<uint2*>(normed_lo + go) = lo;
+            }
         }
         half* ah = sA + (size_t)(st & 1) * 2 * kNiBM * kNiPad + r * kNiPad + q * 4;
         *reinterpret_cast<uint2*>(ah) = hi;
@@ -507,6 +509,201 @@ __global__ void __launch_bounds__(kNiThreads, 2)
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// The down product from the streams (the Flash-Next shape: H = 2,560, hc = 4, rank = 320, K = hc H = 10,240), bit for bit what the library's
+// two split-K calls and low_kernel leave behind, with the normed rows formed on the fly from the post-inject streams instead of read back
+// from two 84 MB fp16 planes.
+//
+// The library's order (cublasLt algo 67, split-K 4, compute-type reduction; reproduced from the outside with three-leaf experiments and
+// checked on random data, tests/hcg_down.rs): K is cut into stages of 64 k (four k16 units) and split z takes the stages z, z + 4, z + 8,
+// ..; within a split three accumulators run, A = units 0 and 3 of every stage (unit 0 first), B = unit 1, C = unit 2, every unit one
+// m16n8k16 MMA from the accumulator's running value, from +0.0; the split's sum adds the three in an order that depends on the 16-column
+// group g = (n / 16) % 4 of the output column: (A + B) + C for g = 0 and 3, (A + C) + B for g = 1, A + (B + C) for g = 2 (fp32 adds); the
+// splits are added in order, ((S0 + S1) + S2) + S3. The hi and lo planes of the normed rows each run all of that, and the output is the lo
+// total plus the hi total (the second call's beta = 1). low_kernel's expression then turns it into the fp16 hi / lo planes of the low rows.
+//
+// A CTA is 32 rows by 64 columns, 8 warps (warp (wm, wn) = rows 16 wm.., columns 16 wn..), the whole K in the library's order: split by
+// split, 40 stages each. The down weights and the stage's norm weights arrive through a cp.async ring; the stream tiles go global ->
+// registers (three stages in flight) -> a pass that forms the fp16 hi / lo A tiles with post_norm_kernel's expressions, spread between the
+// MMAs of the previous stage -> shared memory, and the MMAs read A and B with ldmatrix. Two CTAs share an SM (99 KB of shared memory and
+// 64K registers between them); the five column CTAs of a row tile are adjacent in the grid, so the streams are read from DRAM once.
+constexpr int kDxBM = 32, kDxBN = 64, kDxKB = 64, kDxThreads = 256, kDxRing = 3, kDxSplit = 4, kDxRank = 320;
+constexpr int kDxK = 4 * kNiH, kDxStages = kDxK / kDxKB, kDxPerSplit = kDxStages / kDxSplit;
+constexpr int kDxBPad = kDxKB + 8, kDxAPad = kDxKB + 8;
+constexpr size_t kDxSmemB = (size_t)kDxRing * kDxBN * kDxBPad * sizeof(half);
+constexpr size_t kDxSmemA = (size_t)2 * 2 * kDxBM * kDxAPad * sizeof(half);
+constexpr size_t kDxSmemW = (size_t)kDxRing * kDxKB * sizeof(half);  // the stage's 64 norm weights
+constexpr size_t kDxSmem = kDxSmemB + kDxSmemA + kDxSmemW;
+static_assert(kNiH % kDxKB == 0 && kDxStages % kDxSplit == 0 && kDxRank % kDxBN == 0, "stages of one stream, a whole number of stages a split");
+static_assert(2 * (kDxSmem + 1024) <= 100 * 1024, "two CTAs an SM");
+
+// grid (kDxRank / kDxBN, padded / kDxBM), block 256, dynamic smem kDxSmem. low_hi / low_lo [padded][kDxRank].
+__global__ void __launch_bounds__(kDxThreads, 2)
+    down_x_kernel(const float* __restrict__ x, const float* __restrict__ rms, const half* __restrict__ nw, const half* __restrict__ down_w,
+                  half* __restrict__ low_hi, half* __restrict__ low_lo, int T) {
+    extern __shared__ __align__(16) unsigned char dx_smem[];
+    half* sB = reinterpret_cast<half*>(dx_smem);
+    half* sA = reinterpret_cast<half*>(dx_smem + kDxSmemB);
+    half* sW = reinterpret_cast<half*>(dx_smem + kDxSmemB + kDxSmemA);
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, t4 = lane & 3;
+    const int wm = w & 1, wn = w >> 1;
+    const int col0 = blockIdx.x * kDxBN, row0 = blockIdx.y * kDxBM;
+
+    // stage j of the loop: split j / 40, its (j % 40)-th stage, which is stage z + 4 i of the 160
+    auto stage_of = [](int j) { return j / kDxPerSplit + kDxSplit * (j % kDxPerSplit); };
+    auto issue_b = [&](int j) {
+        if (j < kDxStages) {
+            const int slot = j % kDxRing, k0 = stage_of(j) * kDxKB;
+#pragma unroll
+            for (int c = 0; c < 2; ++c) {
+                const int idx = tid + c * kDxThreads, n = idx >> 3, q = idx & 7;
+                um_cp16(sB + ((size_t)slot * kDxBN + n) * kDxBPad + 8 * q, down_w + (size_t)(col0 + n) * kDxK + k0 + 8 * q);
+            }
+            if (tid < 8) um_cp16(sW + (size_t)slot * kDxKB + 8 * tid, nw + k0 + 8 * tid);  // norm_w [hc * H]: k0 is the stream's offset too
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+    // thread (row r = tid / 8, float4 columns kq and kq + 8 of the stage's 64): the raw streams of stage j
+    const int tr = tid >> 3, tq = tid & 7, trow = row0 + tr;
+    auto load_raw = [&](int j, float4 (&v)[2]) {
+        if (j < kDxStages) {
+            const int k0 = stage_of(j) * kDxKB, stream = k0 / kNiH, d0 = k0 - stream * kNiH;
+            const float* src = x + ((size_t)(trow < T ? trow : 0) * 4 + stream) * kNiH + d0;
+#pragma unroll
+            for (int i = 0; i < 2; ++i) v[i] = trow < T ? *reinterpret_cast<const float4*>(src + 4 * (tq + 8 * i)) : make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+    };
+    // this thread's row's four rms values: stage j's is the one of its stream
+    const float4 rms4 = trow < T ? *reinterpret_cast<const float4*>(rms + (size_t)trow * 4) : make_float4(0.f, 0.f, 0.f, 0.f);
+    // raw stage j -> A tile (j & 1), part i of 2 (float4 i of this thread's two): post_norm_kernel's expressions
+    auto transform_part = [&](int j, int i, const float4& v) {
+        const int stream = stage_of(j) * kDxKB / kNiH;
+        const float rr = stream == 0 ? rms4.x : stream == 1 ? rms4.y : stream == 2 ? rms4.z : rms4.w;
+        const half* wp = sW + (size_t)(j % kDxRing) * kDxKB;
+        half* ah = sA + (size_t)(j & 1) * 2 * kDxBM * kDxAPad + (size_t)tr * kDxAPad;
+        half* al = ah + (size_t)kDxBM * kDxAPad;
+        const int c = 4 * (tq + 8 * i);
+        const float2 w01 = __half22float2(*reinterpret_cast<const half2*>(wp + c));
+        const float2 w23 = __half22float2(*reinterpret_cast<const half2*>(wp + c + 2));
+        const float n0 = v.x * rr * (1.f + w01.x), n1 = v.y * rr * (1.f + w01.y);
+        const float n2 = v.z * rr * (1.f + w23.x), n3 = v.w * rr * (1.f + w23.y);
+        const float h0 = __half2float(__float2half_rn(n0)), h1 = __half2float(__float2half_rn(n1));
+        const float h2 = __half2float(__float2half_rn(n2)), h3 = __half2float(__float2half_rn(n3));
+        const half2 a = __floats2half2_rn(h0, h1), b = __floats2half2_rn(h2, h3);
+        const half2 cc = __floats2half2_rn(n0 - h0, n1 - h1), d = __floats2half2_rn(n2 - h2, n3 - h3);
+        *reinterpret_cast<uint2*>(ah + c) = make_uint2(*reinterpret_cast<const uint32_t*>(&a), *reinterpret_cast<const uint32_t*>(&b));
+        *reinterpret_cast<uint2*>(al + c) = make_uint2(*reinterpret_cast<const uint32_t*>(&cc), *reinterpret_cast<const uint32_t*>(&d));
+    };
+
+    float acc_hi[3][2][4], acc_lo[3][2][4], tot_hi[2][4], tot_lo[2][4];
+#pragma unroll
+    for (int c = 0; c < 3; ++c)
+#pragma unroll
+        for (int j = 0; j < 2; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc_hi[c][j][e] = acc_lo[c][j][e] = 0.f;
+    const int grp = wn & 3;  // the 16-column group of this warp's two n8 tiles
+
+    auto mma_stage = [&](int j, const float4 (&nv)[2]) {
+        const int slot = j % kDxRing;
+        const half* ahi = sA + (size_t)(j & 1) * 2 * kDxBM * kDxAPad;
+        const half* alo = ahi + (size_t)kDxBM * kDxAPad;
+        const half* bs = sB + (size_t)slot * kDxBN * kDxBPad + (size_t)(wn * 16) * kDxBPad;
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            uint32_t fh[4], fl[4], r4[4];
+            const size_t off = (size_t)(wm * 16 + (lane & 15)) * kDxAPad + u * 16 + (lane >> 4) * 8;
+            um_ldsm4(fh, ahi + off);
+            um_ldsm4(fl, alo + off);
+            um_ldsm4(r4, bs + (size_t)((lane & 7) + ((lane >> 4) << 3)) * kDxBPad + u * 16 + ((lane >> 3) & 1) * 8);
+            const int c = (u == 3) ? 0 : u;
+            um_mma(acc_hi[c][0], fh, r4[0], r4[1]);
+            um_mma(acc_lo[c][0], fl, r4[0], r4[1]);
+            um_mma(acc_hi[c][1], fh, r4[2], r4[3]);
+            um_mma(acc_lo[c][1], fl, r4[2], r4[3]);
+            // the next stage's A tile (half of this thread's elements at units 1 and 3) between the MMAs
+            if ((u & 1) && j + 1 < kDxStages) transform_part(j + 1, u >> 1, nv[u >> 1]);
+        }
+    };
+    // the split's three accumulators added in the order of the output column's 16-column group, folded into the running total
+    auto fold_split = [&](int z) {
+#pragma unroll
+        for (int j = 0; j < 2; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                float sh, sl;
+                {
+                    const float a = acc_hi[0][j][e], b = acc_hi[1][j][e], c = acc_hi[2][j][e];
+                    sh = grp == 1 ? __fadd_rn(__fadd_rn(a, c), b) : grp == 2 ? __fadd_rn(a, __fadd_rn(b, c)) : __fadd_rn(__fadd_rn(a, b), c);
+                }
+                {
+                    const float a = acc_lo[0][j][e], b = acc_lo[1][j][e], c = acc_lo[2][j][e];
+                    sl = grp == 1 ? __fadd_rn(__fadd_rn(a, c), b) : grp == 2 ? __fadd_rn(a, __fadd_rn(b, c)) : __fadd_rn(__fadd_rn(a, b), c);
+                }
+                tot_hi[j][e] = z == 0 ? sh : __fadd_rn(tot_hi[j][e], sh);
+                tot_lo[j][e] = z == 0 ? sl : __fadd_rn(tot_lo[j][e], sl);
+            }
+#pragma unroll
+        for (int c = 0; c < 3; ++c)
+#pragma unroll
+            for (int j = 0; j < 2; ++j)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) acc_hi[c][j][e] = acc_lo[c][j][e] = 0.f;
+    };
+
+    // pipeline: B stages j + 1 .. j + 2 in flight (cp.async groups), the raw streams of stages j + 1, j + 2 in registers (r1, r2) with
+    // stage j + 3's load issued before stage j + 1 is transformed
+    float4 r0[2], r1[2], r2[2], r3[2];
+    load_raw(0, r0);
+    load_raw(1, r1);
+    load_raw(2, r2);
+    issue_b(0);
+    issue_b(1);
+    asm volatile("cp.async.wait_group 1;\n" ::);
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < 2; ++i) transform_part(0, i, r0[i]);
+#pragma unroll 1
+    for (int z = 0; z < kDxSplit; ++z) {
+#pragma unroll 1
+        for (int i = 0; i < kDxPerSplit; ++i) {
+            const int j = z * kDxPerSplit + i;
+            // (groups committed so far: stages up to j + 1) B stage j + 1 has landed
+            asm volatile("cp.async.wait_group 0;\n" ::);
+            __syncthreads();  // ... for every thread; A tile j (transformed last iteration) is visible
+            issue_b(j + 2);
+            load_raw(j + 3, r3);
+            mma_stage(j, r1);
+#pragma unroll
+            for (int q = 0; q < 2; ++q) {
+                r1[q] = r2[q];
+                r2[q] = r3[q];
+            }
+        }
+        fold_split(z);
+    }
+    // output = lo total + hi total, then low_kernel's expressions
+    const float inv = 1.f / 4.f;
+#pragma unroll
+    for (int j = 0; j < 2; ++j)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int row = row0 + wm * 16 + g + 8 * h, col = col0 + wn * 16 + 8 * j + 2 * t4;
+            float hv[2], lv[2];
+#pragma unroll
+            for (int q = 0; q < 2; ++q) {
+                const float L = __fadd_rn(tot_lo[j][2 * h + q], tot_hi[j][2 * h + q]);
+                const float v = L * inv;
+                const float sv = v / (1.f + __expf(-v));
+                const float hh = __half2float(__float2half_rn(sv));
+                hv[q] = sv;
+                lv[q] = sv - hh;
+            }
+            *reinterpret_cast<half2*>(low_hi + (size_t)row * kDxRank + col) = __floats2half2_rn(hv[0], hv[1]);
+            *reinterpret_cast<half2*>(low_lo + (size_t)row * kDxRank + col) = __floats2half2_rn(lv[0], lv[1]);
+        }
 }
 
 // the inject product's output from the 20 splits' sums: the hi sum and the lo sum in split order, the lo sum plus the hi sum, then
@@ -666,24 +863,25 @@ static int hcg_pre(const void* streams, const void* norm_w, const void* down_w, 
     const size_t lt_ws_n = lt_shape(H, hc, rank) ? lt_ws_bytes(padded, hc, rank) : 0;
     cublasLtHandle_t lt = (fast && lt_ws_n) ? lt_handle() : nullptr;
 
+    // the Flash-Next shape with inject rows: norm_inj_kernel forms the inject product's splits (no library inject launches) and the rms, and
+    // down_x_kernel forms the normed rows again on the fly for the down product (no fp16 hi / lo planes through DRAM, no library down GEMMs)
+    const bool ni = lt && inject_w && hc == 4 && H == kNiH;
     // A fixed 64-row GEMM tile gives the same accumulation for a row in every decode window.
     // Initialize only the unused tail of the final tile; valid rows are overwritten by norm_kernel.
-    if (padded != T) {
+    if (padded != T && !ni) {
         if (cudaMemsetAsync(normed_hi + (size_t)T * K, 0, (size_t)(padded - T) * K * sizeof(half), st) != cudaSuccess)
             return (int)cudaErrorUnknown;
         if (cudaMemsetAsync(normed_lo + (size_t)T * K, 0, (size_t)(padded - T) * K * sizeof(half), st) != cudaSuccess)
             return (int)cudaErrorUnknown;
     }
-    // the Flash-Next shape with inject rows: norm_inj_kernel forms the normed rows and the inject product's splits (no library inject launches)
-    const bool ni = lt && inject_w && hc == 4 && H == kNiH;
     int rc = 0;
     if (ni) {
         if (post_block)
-            norm_inj_kernel<true><<<dim3((T + kNiBM - 1) / kNiBM, 4), kNiThreads, kNiLaunchSmem, st>>>(
+            norm_inj_kernel<true, false><<<dim3((T + kNiBM - 1) / kNiBM, 4), kNiThreads, kNiLaunchSmem, st>>>(
                 (float*)streams, (const __nv_bfloat16*)post_block, post_inj, (const half*)norm_w, (const half*)inject_w, normed_hi, normed_lo, G,
                 rms, T, eps);
         else
-            norm_inj_kernel<false><<<dim3((T + kNiBM - 1) / kNiBM, 4), kNiThreads, kNiLaunchSmem, st>>>(
+            norm_inj_kernel<false, false><<<dim3((T + kNiBM - 1) / kNiBM, 4), kNiThreads, kNiLaunchSmem, st>>>(
                 (float*)streams, nullptr, nullptr, (const half*)norm_w, (const half*)inject_w, normed_hi, normed_lo, G, rms, T, eps);
     } else if (post_block) {
         post_norm_kernel<4, 3><<<T, 256, 0, st>>>((float*)streams, (const __nv_bfloat16*)post_block, post_inj, (const half*)norm_w, normed_hi,
@@ -693,56 +891,66 @@ static int hcg_pre(const void* streams, const void* norm_w, const void* down_w, 
     }
     rc = GB_CHECK_LAUNCH();
     if (rc) return rc;
-    // down: one split-K call per half over every row when the large-call algorithm takes it, else the 64-row slab loop
-    bool down_done = false;
-    static bool warned = false;
-    if (lt) {
-        const int a = lt_gemm_abt(lt, kDownAlgo, normed_hi, (const half*)down_w, L, padded, rank, K, 0.f, lt_ws, lt_ws_n, st);
-        if (a > 0) return a;
-        if (a == 0) {
-            const int b = lt_gemm_abt(lt, kDownAlgo, normed_lo, (const half*)down_w, L, padded, rank, K, 1.f, lt_ws, lt_ws_n, st);
-            if (b) return b > 0 ? b : (int)cudaErrorUnknown;  // the first half ran: the second must too
-            down_done = true;
-        }
-    }
-    bool inj_done = !inject_w || ni;
-    if (!inj_done && lt) {
-        const int a = lt_gemm_abt(lt, kInjectAlgo, normed_hi, (const half*)inject_w, Ij, padded, hc, K, 0.f, lt_ws, lt_ws_n, st);
-        if (a > 0) return a;
-        if (a == 0) {
-            const int b = lt_gemm_abt(lt, kInjectAlgo, normed_lo, (const half*)inject_w, Ij, padded, hc, K, 1.f, lt_ws, lt_ws_n, st);
-            if (b) return b > 0 ? b : (int)cudaErrorUnknown;
-            inj_done = true;
-        }
-    }
-    if (lt && (!down_done || !inj_done) && !warned) {
-        warned = true;
-        fprintf(stderr, "rexl3 level=warn hcg: the large-call split-K algorithm refused rows=%d (down %d, inject %d): slab loop\n", padded,
-                (int)down_done, (int)inj_done);
-    }
-    if (!down_done || !inj_done) {
-        for (int row = 0; row < padded; row += 64) {
-            if (!down_done) {
-                if ((rc = gemm_abt(h, normed_hi + (size_t)row * K, (const half*)down_w, L + (size_t)row * rank, 64, rank, K, 0.f))) return rc;
-                if ((rc = gemm_abt(h, normed_lo + (size_t)row * K, (const half*)down_w, L + (size_t)row * rank, 64, rank, K, 1.f))) return rc;
-            }
-            if (!inj_done) {
-                if ((rc = gemm_abt(h, normed_hi + (size_t)row * K, (const half*)inject_w,
-                                    Ij + (size_t)row * hc, 64, hc, K, 0.f))) return rc;
-                if ((rc = gemm_abt(h, normed_lo + (size_t)row * K, (const half*)inject_w,
-                                    Ij + (size_t)row * hc, 64, hc, K, 1.f))) return rc;
-            }
-        }
-    }
-    const size_t n = (size_t)padded * rank + (inject_w && !ni ? (size_t)padded * hc : 0);
-    low_kernel<<<(unsigned)((n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096), 256, 0, st>>>(
-        L, inject_w && !ni ? Ij : nullptr, low_hi, low_lo, inject_w && !ni ? inj_pad : nullptr, padded, rank, hc);
-    if ((rc = GB_CHECK_LAUNCH())) return rc;
     if (ni) {
+        static bool dxattr = false;
+        if (!dxattr) {
+            if (cudaFuncSetAttribute(down_x_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kDxSmem) != cudaSuccess) return (int)cudaErrorUnknown;
+            dxattr = true;
+        }
+        down_x_kernel<<<dim3(kDxRank / kDxBN, padded / kDxBM), kDxThreads, kDxSmem, st>>>((const float*)streams, rms, (const half*)norm_w,
+                                                                                        (const half*)down_w, low_hi, low_lo, T);
+        if ((rc = GB_CHECK_LAUNCH())) return rc;
         inj_reduce_kernel<<<(T * 4 + 255) / 256, 256, 0, st>>>(G, inj_out, T, hc);
         if ((rc = GB_CHECK_LAUNCH())) return rc;
-    } else if (inject_w && cudaMemcpyAsync(inj_out, inj_pad, (size_t)T * hc * sizeof(float), cudaMemcpyDeviceToDevice, st) != cudaSuccess) {
-        return (int)cudaErrorUnknown;
+    } else {
+        // down: one split-K call per half over every row when the large-call algorithm takes it, else the 64-row slab loop
+        bool down_done = false;
+        static bool warned = false;
+        if (lt) {
+            const int a = lt_gemm_abt(lt, kDownAlgo, normed_hi, (const half*)down_w, L, padded, rank, K, 0.f, lt_ws, lt_ws_n, st);
+            if (a > 0) return a;
+            if (a == 0) {
+                const int b = lt_gemm_abt(lt, kDownAlgo, normed_lo, (const half*)down_w, L, padded, rank, K, 1.f, lt_ws, lt_ws_n, st);
+                if (b) return b > 0 ? b : (int)cudaErrorUnknown;  // the first half ran: the second must too
+                down_done = true;
+            }
+        }
+        bool inj_done = !inject_w;
+        if (!inj_done && lt) {
+            const int a = lt_gemm_abt(lt, kInjectAlgo, normed_hi, (const half*)inject_w, Ij, padded, hc, K, 0.f, lt_ws, lt_ws_n, st);
+            if (a > 0) return a;
+            if (a == 0) {
+                const int b = lt_gemm_abt(lt, kInjectAlgo, normed_lo, (const half*)inject_w, Ij, padded, hc, K, 1.f, lt_ws, lt_ws_n, st);
+                if (b) return b > 0 ? b : (int)cudaErrorUnknown;
+                inj_done = true;
+            }
+        }
+        if (lt && (!down_done || !inj_done) && !warned) {
+            warned = true;
+            fprintf(stderr, "rexl3 level=warn hcg: the large-call split-K algorithm refused rows=%d (down %d, inject %d): slab loop\n", padded,
+                    (int)down_done, (int)inj_done);
+        }
+        if (!down_done || !inj_done) {
+            for (int row = 0; row < padded; row += 64) {
+                if (!down_done) {
+                    if ((rc = gemm_abt(h, normed_hi + (size_t)row * K, (const half*)down_w, L + (size_t)row * rank, 64, rank, K, 0.f))) return rc;
+                    if ((rc = gemm_abt(h, normed_lo + (size_t)row * K, (const half*)down_w, L + (size_t)row * rank, 64, rank, K, 1.f))) return rc;
+                }
+                if (!inj_done) {
+                    if ((rc = gemm_abt(h, normed_hi + (size_t)row * K, (const half*)inject_w,
+                                        Ij + (size_t)row * hc, 64, hc, K, 0.f))) return rc;
+                    if ((rc = gemm_abt(h, normed_lo + (size_t)row * K, (const half*)inject_w,
+                                        Ij + (size_t)row * hc, 64, hc, K, 1.f))) return rc;
+                }
+            }
+        }
+        const size_t n = (size_t)padded * rank + (inject_w ? (size_t)padded * hc : 0);
+        low_kernel<<<(unsigned)((n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096), 256, 0, st>>>(
+            L, inject_w ? Ij : nullptr, low_hi, low_lo, inject_w ? inj_pad : nullptr, padded, rank, hc);
+        if ((rc = GB_CHECK_LAUNCH())) return rc;
+        if (inject_w && cudaMemcpyAsync(inj_out, inj_pad, (size_t)T * hc * sizeof(float), cudaMemcpyDeviceToDevice, st) != cudaSuccess) {
+            return (int)cudaErrorUnknown;
+        }
     }
     // up has no split (K = rank): a row is one chain of MMAs over K whatever the GEMM's M, so the slab only sets how long the fp32 G slab
     // stays in L2 between the hi pass, the lo pass and the mix that reads it. The large-call path takes 128-row slabs (MEASURED at 4096
