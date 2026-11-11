@@ -198,6 +198,31 @@ fn big_linear_rows_do_not_depend_on_the_call() {
     let _ = row_bytes;
 }
 
+/// The two block orders of the large-row kernel (the strips of a row group together for a layer of at most 24 strips, the row groups of a strip
+/// together for a wider one) both give the decode path's bits at wide row counts: the Flash-Next shared expert's shapes (2,560 -> 640 and
+/// 640 -> 2,560), a layer of 32 strips, row counts that leave a ragged last 64-row group and 8,192 rows (128 groups).
+#[test]
+fn big_linear_equals_the_decode_path_at_wide_row_counts_in_both_block_orders() {
+    gpu!();
+    let st = Stream::new().unwrap();
+    // (K, N, bits): 5, 5, 20, 20 and 32 strips
+    let shapes: [(usize, usize, usize); 5] = [(2560, 640, 4), (2560, 640, 6), (640, 2560, 4), (640, 2560, 8), (1024, 4096, 3)];
+    let mut total = 0usize;
+    for (i, &(k, n, bits)) in shapes.iter().enumerate() {
+        let (sk, wk) = big_plan(k, n).unwrap();
+        let w = synth(k, n, bits, Codebook::Mul1, i == 1, 400 + i as u64);
+        let mut r = Rng(500 + i as u64);
+        for rows in [4097usize, 5003, 8192] {
+            let x = input(&mut r, rows, k, Dtype::BF16);
+            let want = decode_rows(&w, &st, &x, rows, Dtype::BF16, Dtype::F32);
+            let got = big_rows(&w, &st, &x, rows, Dtype::BF16, Dtype::F32);
+            same(&format!("{k}x{n} {bits}-bit (sk {sk}, wk {wk}), {rows} rows"), &got, &want, n, 4);
+            total += rows;
+        }
+    }
+    eprintln!("{total} rows of 5 wide-call cases bit-identical to the decode path");
+}
+
 /// The decode plan the kernels use is the decode path's: a shape's workspace need (which includes the split-K partials iff SK > 1) and the
 /// big path's plan agree on SK for the shapes of the model.
 #[test]
