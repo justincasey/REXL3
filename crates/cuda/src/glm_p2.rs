@@ -108,7 +108,7 @@ pub fn supported(w: &Exl3Weights) -> bool {
 }
 
 /// The tile of the fixed-tile kernels the GEMM picks for `m` rows of a `k` x `n` layer under `v` (`BM * 10 + SN`), for the tables (a chain
-/// layer of 6 to 8 bits runs the 128 x 128 chain GEMM instead).
+/// layer of 3 to 8 bits runs the 128 x 128 chain GEMM instead).
 pub fn pick_tile(m: usize, k: usize, n: usize, v: Variant) -> i32 {
     // SAFETY: a pure function of its integer arguments
     unsafe { ffi::gb_glm_p2_pick_tile(m as i32, k as i32, n as i32, (v == Variant::Fold128) as i32) }

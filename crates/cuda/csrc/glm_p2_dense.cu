@@ -324,7 +324,7 @@ __global__ void __launch_bounds__(kThreads, (BM == 64 && !(FOLD && SN == 2)) ? 2
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------
-// The chain GEMM for the 6- to 8-bit packs (Flash-Next prefill): the same arithmetic as gemm_kernel<.., FOLD = false> (every output's
+// The chain GEMM for the 3- to 8-bit packs (Flash-Next prefill): the same arithmetic as gemm_kernel<.., FOLD = false> (every output's
 // K sum is ONE chain of m16n8k16 MMAs over kt = 0 .. K/16 - 1 in order from +0.0, the same fragment layouts, the same trellis decoder,
 // the same epilogue), only the work split and the loop's bookkeeping differ: NW warps, each owning TPW 16-column tiles of the CTA's
 // NW * TPW (a multiple of 8: whole 128-column strips) and all BM rows, BK k per stage, ST stages, MINB CTAs an SM, GM M tiles to a
@@ -578,7 +578,7 @@ int launch_gemm_c(const GemmArgs& g, cudaStream_t st) {
     return GB_CHECK_LAUNCH();
 }
 
-// The chain GEMM's configurations (cfg = tile_force - 10000; 1 is what a 6- to 8-bit chain layer runs by default), one row each: NW,
+// The chain GEMM's configurations (cfg = tile_force - 10000; 1 is what a 3- to 8-bit chain layer runs by default), one row each: NW,
 // TPW, BM, BK, ST, MINB, GM. MEASURED on one GB10 (crates/cuda/tests/fn_dense_chain.rs bench, 4,096 rows of the Flash-Next pack's dense
 // layers): the 6-bit layers run 1 CTA an SM through the old 64 x 2 and 128 x 2 tiles (96 KB of stages each), the 128 x 128 tile with
 // two stages is 22 KB a CTA, so two CTAs share an SM and one's epilogue and fill hide under the other's MMAs.
@@ -662,7 +662,7 @@ int dispatch(int bits, int cb, int bm, int sn, const GemmArgs& g, cudaStream_t s
 #undef GP2_T
 }
 
-// The chain GEMM of the 6- to 8-bit packs (gemm_c_kernel) at configuration cfg.
+// The chain GEMM (gemm_c_kernel) at configuration cfg.
 int dispatch_chain_c(int bits, int cb, int cfg, const GemmArgs& g, cudaStream_t st) {
     if (cb != CB_MUL1) return (int)cudaErrorInvalidValue;
     switch (bits) {
@@ -699,7 +699,7 @@ GB_EXPORT int gb_glm_p2_rotate(const void* x, int x_dtype, long long ldx, const 
 // y [m, ldy] (y_dtype, from column 0) = the EXL3 layer applied to the rotated rows a [m, k] fp16 (gb_glm_p2_rotate's output). svh and
 // bias f32 (scale_f32) or fp16; bias may be null. fold: the K order (0 chain, 1 fold128: see the file comment). tile_force 0 (pick) or
 // BM * 10 + SN (641, 642, 1281, 1282; fold128 not 1282) or, chain only, 10000 + a gemm_c_kernel configuration (10001 to 10004), which
-// never changes a bit. The pick of a chain layer of 6 to 8 bits is gemm_c_kernel's configuration 1; every other layer's is pick_tile's
+// never changes a bit. The pick of a chain layer of 3 to 8 bits is gemm_c_kernel's configuration 1; every other layer's is pick_tile's
 // (the 641 .. 1282 kernels stay the reference of the tests). Returns 0 or a cudaError_t; never allocates or synchronizes.
 GB_EXPORT int gb_glm_p2_gemm(const void* a, const void* trellis, const void* svh, const void* bias, int scale_f32, void* y, int y_dtype,
                              long long ldy, int m, int k, int n, int bits, int codebook, int fold, int tile_force, void* stream) {
@@ -707,7 +707,7 @@ GB_EXPORT int gb_glm_p2_gemm(const void* a, const void* trellis, const void* svh
         return (int)cudaErrorInvalidValue;
     GemmArgs g{static_cast<const half*>(a), static_cast<const uint32_t*>(trellis), svh, bias, scale_f32, y, y_dtype, ldy, m, k, n};
     if (!fold && tile_force >= 10000) return dispatch_chain_c(bits, codebook, tile_force - 10000, g, gb_stream(stream));
-    if (!fold && tile_force == 0 && bits >= 6) return dispatch_chain_c(bits, codebook, 1, g, gb_stream(stream));
+    if (!fold && tile_force == 0 && bits >= 3) return dispatch_chain_c(bits, codebook, 1, g, gb_stream(stream));
     int bm = 0, sn = 0;
     const int rc = pick_tile(m, k, n, fold, tile_force, bm, sn);
     if (rc) return rc;
@@ -715,7 +715,7 @@ GB_EXPORT int gb_glm_p2_gemm(const void* a, const void* trellis, const void* svh
 }
 
 // The tile of the 641 .. 1282 kernels that gb_glm_p2_gemm picks for (m, k, n) and a K order when not forced, as BM * 10 + SN (for the
-// tables; a chain layer of 6 to 8 bits runs gemm_c_kernel instead, see gb_glm_p2_gemm).
+// tables; a chain layer of 3 to 8 bits runs gemm_c_kernel instead, see gb_glm_p2_gemm).
 GB_EXPORT int gb_glm_p2_pick_tile(int m, int k, int n, int fold) {
     int bm = 0, sn = 0;
     pick_tile(m, k, n, fold, 0, bm, sn);
