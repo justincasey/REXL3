@@ -1739,4 +1739,3 @@ fn bench_l2_capacity() {
         println!("{mb:4} MB: memset {:6.0} GB/s, read {:6.0} GB/s", mb as f64 / 1024.0 * 1.0737 / w * 1e3, mb as f64 / 1024.0 * 1.0737 / r * 1e3);
     }
 }
-
