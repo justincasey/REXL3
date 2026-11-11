@@ -48,7 +48,7 @@ pub const S_SLOT_ELEMS: usize = VALUE_HEADS * HEAD_DIM * HEAD_DIM;
 /// bf16 elements of one slot of the conv pool.
 pub const CONV_SLOT_ELEMS: usize = CONV_STATE_ROWS * CONV_DIM;
 /// Longest sequence a single [`prefill`] call is meant for.
-pub const PREFILL_MAX_ROWS: usize = 4096;
+pub const PREFILL_MAX_ROWS: usize = 8192;
 
 /// The value-head counts the kernels are built for (16 key heads and a head dim of 128 in both).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]

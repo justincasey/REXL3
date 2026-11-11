@@ -21,7 +21,7 @@
 //! experts.run_prefill_f32_wts(&x, Dtype::BF16, rows, None, &mut out_f32, &mut s, &st)?;
 //! ```
 //!
-//! Preconditions (violations return an error, never undefined behaviour): `1 <= rows <= s.max_rows <= MAX_ROWS` (4,096); `experts <= 1024`,
+//! Preconditions (violations return an error, never undefined behaviour): `1 <= rows <= s.max_rows <= MAX_ROWS_WIDE` (8,192; the other families' chunk is [`MAX_ROWS`], 4,096); `experts <= 1024`,
 //! `topk <= 16`; hidden and expert width multiples of 128 (the EXL3 format's); `x` in fp16, bf16 or fp32 `[rows, hidden]`; `shared` fp32
 //! `[rows, hidden]` (a family computes its shared expert itself, e.g. with [`SharedExpert::forward_big`]); an expert id outside `[0, E)`
 //! in a pick (a dropped or unrouted slot) contributes nothing, as in the decode path; `MoeDims::limit <= 0` disables the SwiGLU clamps.
@@ -192,8 +192,12 @@ mod ffi {
 
 const INVALID: CudaError = CudaError(1);
 
-/// Most rows one prefill call takes.
+/// Most rows one prefill call takes (the other families' chunk width).
 pub const MAX_ROWS: usize = 4096;
+
+/// Most rows one Flash-Next prefill call takes: its scratch and its kernels are row-count free (a pair's value is a function of its
+/// own row and expert), so a chunk of up to this many rows streams every expert's weights once for twice the rows.
+pub const MAX_ROWS_WIDE: usize = 8192;
 
 /// Picks per block of the parallel plan (`csrc/moe_prefill.cu` `kPlanChunk`). The parallel plan's histogram and
 /// scatter grids are `ceil(P / PLAN_CHUNK)` blocks; it is only a partitioning constant, never part of an arithmetic.
@@ -259,7 +263,7 @@ impl PrefillScratch {
     /// The sizes in bytes, by buffer name, computed without allocating: the memory model prices a prefill chunk with it and a GPU test
     /// checks it against [`PrefillScratch::bytes`].
     pub fn items_for(dims: &MoeDims, max_rows: usize) -> Result<Vec<(&'static str, usize)>, CudaError> {
-        if max_rows == 0 || max_rows > MAX_ROWS || dims.experts > 1024 || dims.topk > 16 {
+        if max_rows == 0 || max_rows > MAX_ROWS_WIDE || dims.experts > 1024 || dims.topk > 16 {
             return Err(INVALID);
         }
         let p = max_rows * dims.topk;
@@ -931,7 +935,7 @@ impl SharedScratchBig {
     /// [`SharedScratchBig::new`] for a gated MLP of `hidden` -> `inter` -> `hidden` whose weights are not owned by a
     /// [`SharedExpert`] (a family that keeps its three linears inside a weight Arc).
     pub fn new_dims(hidden: usize, inter: usize, max_rows: usize) -> Result<Self, CudaError> {
-        if max_rows == 0 || max_rows > MAX_ROWS {
+        if max_rows == 0 || max_rows > MAX_ROWS_WIDE {
             return Err(INVALID);
         }
         let ws = Self::bytes_for(hidden, inter, max_rows) - max_rows * inter * 4 * 2 - max_rows * inter * 2;

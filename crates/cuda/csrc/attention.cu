@@ -898,7 +898,7 @@ GB_EXPORT size_t GB_ATTN_EXPORT(gb_attn_prefill_workspace_bytes)(int rows) {
 GB_EXPORT int GB_ATTN_EXPORT(gb_attn_prefill_variant)(const void* q, const void* k_cache, const void* v_cache, const int* block_table,
                                       int max_blocks, int slot, int start, int rows, void* out, int variant,
                                       void* stream) {
-    if (rows < 0 || rows > 4096 || start < 0 || max_blocks <= 0 || slot < 0) return (int)cudaErrorInvalidValue;
+    if (rows < 0 || rows > 8192 || start < 0 || max_blocks <= 0 || slot < 0) return (int)cudaErrorInvalidValue;
     if (rows == 0) return 0;
     const bf16 *qq = (const bf16*)q, *kc = (const bf16*)k_cache, *vc = (const bf16*)v_cache;
     const int* tbl = block_table + (int64_t)slot * max_blocks;

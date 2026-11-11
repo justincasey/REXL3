@@ -1,0 +1,3 @@
+## New features and improvements
+
+- Qwen3.8-Flash-Next prompt prefill accepts chunks of up to 8,192 rows (`--prefill-chunk 8192`; the default stays 4,096). The grouped expert GEMMs stream every expert's weights once per chunk, so a chunk of twice the rows halves their share per prompt token: the routed experts' gate/up and down GEMMs take 232.2 and 158.5 ms per 4,096 rows of a cold prompt, against 269.8 and 188.5 ms with 4,096-row chunks. Rows are computed independently of the chunk they arrive in, so the replies are unchanged; the larger chunk needs about 2.6 GiB more scratch memory at boot. A cold 32K prompt prefills at 1,799.6 and 1,815.1 tok/s with 8,192-row chunks against 1,781.7 and 1,786.5 tok/s with 4,096-row chunks (same node, same session).

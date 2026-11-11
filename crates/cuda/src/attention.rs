@@ -33,7 +33,7 @@ pub const HEAD_DIM: usize = 256;
 /// Keys per decode chunk (absolute: chunk `c` covers positions `[512 c, 512 c + 512)`).
 pub const CHUNK_KEYS: usize = 512;
 pub const MAX_DECODE_ROWS: usize = 128;
-pub const MAX_PREFILL_ROWS: usize = 4096;
+pub const MAX_PREFILL_ROWS: usize = 8192;
 const _: () = assert!(PagedKv::BLOCK_BYTES == 512 * 1024);
 
 /// bf16 elements of one token's K (or V) row for all kv heads (of the default 4-head cache; [`KvHeads::token_elems`] in general).
