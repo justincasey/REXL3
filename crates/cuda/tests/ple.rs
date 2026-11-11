@@ -335,3 +335,101 @@ fn ple_kernels_are_exact_under_programmatic_launches() {
     assert_eq!(texts[0], texts[1], "programmatic launches changed a result");
     assert_eq!(hash, PLE_GOLDEN_HASH, "the plain launches differ from the recorded results:\n{}", texts[0]);
 }
+
+/// f16 bits of values of mixed magnitude (1e-4 .. 64, both signs, some exact zeros, a few subnormals and 65504s): products of any two
+/// of them are exact in f32, which the tiled projection relies on.
+fn mixed_f16(n: usize, seed: u64) -> Vec<u16> {
+    let mut r = Rng(seed);
+    (0..n)
+        .map(|_| {
+            let kind = r.next() % 64;
+            let mag = 2f32.powf(r.uniform(-13.0, 6.0));
+            let v = match kind {
+                0 => 0.0,
+                1 => -0.0,
+                2 => 65504.0,
+                3 => -65504.0,
+                4 => 5.960_464_5e-8 * (1 + r.next() % 1023) as f32,
+                _ => mag * r.uniform(-1.0, 1.0),
+            };
+            f16(v)
+        })
+        .collect()
+}
+
+type Proj = fn(&DevBuf, &DevBuf, &mut DevBuf, usize, usize, usize, &Stream) -> Result<(), gb_cuda::CudaError>;
+
+fn project(
+    f: Proj,
+    x: &DevBuf,
+    w: &DevBuf,
+    rows: usize,
+    k: usize,
+    n: usize,
+    st: &Stream,
+) -> Vec<u16> {
+    let mut y = DevBuf::zeroed(rows * n * 2).unwrap();
+    f(x, w, &mut y, rows, k, n, st).unwrap();
+    st.sync().unwrap();
+    y.to_vec().unwrap()
+}
+
+/// The 128 x 128 tiled prefill projection gives the previous 64 x 64 kernel's bits on odd row counts, tail tiles (rows, columns and k not
+/// multiples of the tiles or of 8), the model's widths and magnitudes spanning the f16 range.
+#[test]
+#[ignore]
+fn ple_tiled_projection_equals_the_previous_kernel_bit_for_bit() {
+    let Some(st) = gpu() else { return };
+    let shapes: [(usize, usize, usize); 14] = [
+        (1, 2560, 2560),
+        (7, 2560, 129),
+        (63, 2560, 2560),
+        (64, 2560, 2560),
+        (65, 2560, 100),
+        (127, 640, 257),
+        (129, 2560, 2560),
+        (130, 17, 130),
+        (200, 2563, 131),
+        (255, 16, 128),
+        (256, 33, 256),
+        (1000, 2560, 2560),
+        (4012, 2560, 10240),
+        (4012, 2560, 2560),
+    ];
+    for (i, &(rows, k, n)) in shapes.iter().enumerate() {
+        let x = DevBuf::from_slice(&mixed_f16(rows * k, 100 + i as u64)).unwrap();
+        let w = DevBuf::from_slice(&mixed_f16(n * k, 200 + i as u64)).unwrap();
+        let new = project(ple::proj_prefill, &x, &w, rows, k, n, &st);
+        let old = project(ple::proj_prefill_ref, &x, &w, rows, k, n, &st);
+        let bad = new.iter().zip(&old).filter(|(a, b)| a != b).count();
+        assert_eq!(bad, 0, "{rows} rows, k {k}, n {n}: {bad} of {} outputs differ", new.len());
+    }
+}
+
+/// The two prefill projections at the real shape (a 4,012-row chunk: 2,560 -> 10,240 key and 2,560 -> 2,560 value columns); prints the time
+/// of each kernel.
+///     cargo test --release -p gb-cuda --test ple -- --ignored --nocapture bench_ple_projection_chunk
+#[test]
+#[ignore]
+fn bench_ple_projection_chunk() {
+    let Some(st) = gpu() else { return };
+    let (rows, k) = (4012usize, 2560usize);
+    let x = DevBuf::from_slice(&mixed_f16(rows * k, 1)).unwrap();
+    for n in [10240usize, 2560] {
+        let w = DevBuf::from_slice(&mixed_f16(n * k, 2)).unwrap();
+        let mut y = DevBuf::zeroed(rows * n * 2).unwrap();
+        for (name, f) in [("previous", ple::proj_prefill_ref as Proj), ("tiled", ple::proj_prefill as Proj)] {
+            let mut best = f64::MAX;
+            for it in 0..6 {
+                st.sync().unwrap();
+                let t0 = std::time::Instant::now();
+                f(&x, &w, &mut y, rows, k, n, &st).unwrap();
+                st.sync().unwrap();
+                if it > 0 {
+                    best = best.min(t0.elapsed().as_secs_f64() * 1e3);
+                }
+            }
+            eprintln!("BENCH n {n} {name}: {best:.3} ms");
+        }
+    }
+}
