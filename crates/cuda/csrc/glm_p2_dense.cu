@@ -123,10 +123,11 @@ struct GemmArgs {
 // The block's tile: blockIdx.x walks kGroupM M tiles fastest inside a group, then the column blocks, then the groups (the threadblock
 // swizzle): the CTAs resident at once share a few column blocks' trellis and a group's A rows, so both stay in L2.
 constexpr int kGroupM = 8;
+template <int GM = kGroupM>
 __device__ __forceinline__ void tile_of(int bid, int num_m, int num_n, int& mt, int& nt) {
-    const int group = kGroupM * num_n;
-    const int gid = bid / group, first = gid * kGroupM;
-    const int gsz = min(num_m - first, kGroupM);
+    const int group = GM * num_n;
+    const int gid = bid / group, first = gid * GM;
+    const int gsz = min(num_m - first, GM);
     const int in = bid % group;
     mt = first + in % gsz;
     nt = in / gsz;
@@ -322,6 +323,276 @@ __global__ void __launch_bounds__(kThreads, (BM == 64 && !(FOLD && SN == 2)) ? 2
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------------------------
+// The chain GEMM for the 6- to 8-bit packs (Flash-Next prefill): the same arithmetic as gemm_kernel<.., FOLD = false> (every output's
+// K sum is ONE chain of m16n8k16 MMAs over kt = 0 .. K/16 - 1 in order from +0.0, the same fragment layouts, the same trellis decoder,
+// the same epilogue), only the work split and the loop's bookkeeping differ: NW warps, each owning TPW 16-column tiles of the CTA's
+// NW * TPW (a multiple of 8: whole 128-column strips) and all BM rows, BK k per stage, ST stages, MINB CTAs an SM, GM M tiles to a
+// raster group. The accumulators of a (row, column) never leave the one thread that owns them and see the k tiles in order, so
+// nothing here moves a bit. The per-thread addresses (cp.async sources and destinations, ldmatrix and decoder-word reads) are made
+// once before the k loop, so the loop itself is the decode, the MMAs and a few adds.
+
+// 16-byte chunk c of row r of a BM x BK fp16 tile in shared memory (in 16-byte units), swizzled so the 8 rows of an ldmatrix phase and
+// the cp.async stores hit distinct banks. The swizzle depends on r mod 8 only (so a row offset of a multiple of 8 never changes it).
+template <int BK>
+__device__ __forceinline__ int a_swz(int r) {
+    return BK == 64 ? (r & 7) : ((r >> 1) & 3);
+}
+template <int BK>
+__device__ __forceinline__ int a_chunk(int r, int c) {
+    constexpr int CPR = BK / 8;
+    return r * CPR + (c ^ a_swz<BK>(r));
+}
+
+__device__ __forceinline__ void cp_async16_u32(uint32_t smem, const void* gmem) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(smem), "l"(gmem));
+}
+__device__ __forceinline__ void cp_async16_zfill(uint32_t smem, const void* gmem, bool valid) {
+    const int n = valid ? 16 : 0;
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem), "l"(gmem), "r"(n));
+}
+template <int IMM>
+__device__ __forceinline__ void ldsm_x4_at(uint32_t (&a)[4], uint32_t addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4 + %5];\n"
+                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+                 : "r"(addr), "n"(IMM));
+}
+
+// The MMAs of m16 tiles P .. MT - 1 of a k step: A by ldmatrix at la plus the tile's row offset (a compile-time immediate).
+template <int P, int MT, int TPW, int CPR>
+__device__ __forceinline__ void mma_rows(float (&acc)[MT][TPW][2][4], uint32_t la, const uint32_t (&b)[TPW][2][2]) {
+    if constexpr (P < MT) {
+        uint32_t a[4];
+        ldsm_x4_at<P * 16 * CPR * 16>(a, la);
+#pragma unroll
+        for (int j = 0; j < TPW; ++j) {
+            mma16816(acc[P][j][0], a, b[j][0]);
+            mma16816(acc[P][j][1], a, b[j][1]);
+        }
+        mma_rows<P + 1, MT, TPW, CPR>(acc, la, b);
+    }
+}
+
+constexpr int kEpiLds = 128 + 8;  // floats per staged row: 16-byte aligned, and the float2 stores of a half warp hit 32 distinct banks
+
+template <int K2, int NW, int TPW, int BM, int BK, int ST>
+constexpr size_t smem_bytes_c() {
+    constexpr size_t stage = (size_t)BM * BK * 2 + (size_t)(BK / 16) * (NW * TPW) * tile_words<K2>() * 4;
+    constexpr size_t pipe = ST * stage;
+    constexpr size_t epi = (size_t)64 * kEpiLds * 4;
+    return pipe > epi ? pipe : epi;
+}
+
+template <int K2, int CB, int NW, int TPW, int BM, int BK, int ST, int MINB, int GM>
+__global__ void __launch_bounds__(NW * 32, MINB) gemm_c_kernel(const GemmArgs g) {
+    constexpr int NT = NW * 32;
+    constexpr int TW = tile_words<K2>();
+    constexpr int LW = lane_words<K2>();
+    constexpr int MT = BM / 16;
+    constexpr int TN = NW * TPW;       // 16-column tiles of the CTA
+    constexpr int SS = TN / 8;         // 128-column strips of the CTA
+    constexpr int KK = BK / 16;
+    constexpr int CPR = BK / 8;        // 16-byte chunks of an A row of a stage
+    constexpr int A_BYTES = BM * BK * 2;
+    constexpr int B_WORDS = KK * TN * TW;
+    constexpr int STAGE = A_BYTES + B_WORDS * 4;
+    constexpr int NH = BM / 64;        // 64-row halves of the epilogue
+    constexpr int A_IT = BM * CPR / NT;   // A chunks a thread copies a stage
+    constexpr int ARI = NT / CPR;         // rows between a thread's consecutive A chunks
+    constexpr int CH = B_WORDS / 4;       // B chunks of a stage
+    constexpr int CH_ROW = TN * TW / 4;   // ... of one k tile row
+    constexpr int B_IT = (CH + NT - 1) / NT;
+    static_assert(TN % 8 == 0 && BM % 64 == 0 && (BK == 32 || BK == 64) && BM * CPR % NT == 0 && ARI % 8 == 0, "tile shape");
+    extern __shared__ __align__(128) unsigned char smem[];
+
+    const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+    const int g8 = lane >> 2, t4 = lane & 3;
+    const int M = g.M, K = g.K, N = g.N;
+    const int strips = N / 128;
+    int mt, nt;
+    tile_of<GM>(blockIdx.x, (M + BM - 1) / BM, (strips + SS - 1) / SS, mt, nt);
+    const int m0 = mt * BM, s0 = nt * SS;
+    const int my_strips = min(SS, strips - s0);
+    const bool active = (warp * TPW) / 8 < my_strips;
+    const int KC = K / BK;
+    const int tiles_n = N / 16;
+    const uint32_t sbase = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+
+    // ---- the copies of a stage: this thread's chunks of A and B
+    const bool full_m = m0 + BM <= M;
+    const int a_r = t / CPR, a_c = t % CPR;
+    const uint32_t a_dst = sbase + a_chunk<BK>(a_r, a_c) * 16;
+    const half* a_src = g.a + (size_t)(m0 + a_r) * K + a_c * 8;
+    const size_t a_stride = (size_t)ARI * K;
+    const int ch_valid = my_strips * 8 * TW / 4;
+    const uint32_t* b_src[B_IT];
+    uint32_t b_dst[B_IT];
+    uint32_t b_ok = 0;
+#pragma unroll
+    for (int i = 0; i < B_IT; ++i) {
+        const int c = i * NT + t, kl = c / CH_ROW, w = c % CH_ROW;
+        b_dst[i] = sbase + A_BYTES + (kl * TN * TW + w * 4) * 4;
+        b_src[i] = g.T + ((size_t)kl * tiles_n + s0 * 8) * TW + w * 4;
+        b_ok |= (uint32_t)(c < CH && w < ch_valid) << i;
+    }
+    const size_t b_kc = (size_t)KK * tiles_n * TW;  // words between a k stage's rows of tiles in the trellis
+
+    auto load_stage = [&](int s, int kc) {
+        const uint32_t soff = s * STAGE;
+        const half* pa = a_src + (size_t)kc * BK;
+#pragma unroll
+        for (int i = 0; i < A_IT; ++i) {
+            const half* q = pa + (size_t)i * a_stride;
+            if (full_m) {
+                cp_async16_u32(a_dst + soff + i * NT * 16, q);
+            } else {
+                const bool ok = m0 + a_r + i * ARI < M;
+                cp_async16_zfill(a_dst + soff + i * NT * 16, ok ? q : g.a, ok);
+            }
+        }
+        const size_t bo = (size_t)kc * b_kc;
+#pragma unroll
+        for (int i = 0; i < B_IT; ++i)
+            if ((b_ok >> i) & 1u) cp_async16_u32(b_dst[i] + soff, b_src[i] + bo);
+    };
+
+    float acc[MT][TPW][2][4];
+#pragma unroll
+    for (int p = 0; p < MT; ++p)
+#pragma unroll
+        for (int j = 0; j < TPW; ++j)
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+#pragma unroll
+                for (int c = 0; c < 4; ++c) acc[p][j][h][c] = 0.f;
+
+#pragma unroll
+    for (int s = 0; s < ST - 1; ++s) {
+        if (s < KC) load_stage(s, s);
+        cp_async_commit();
+    }
+
+    // ---- the reads of a stage: ldmatrix rows of A, and the words of this lane's trellis windows
+    const int lr = (lane & 7) + 8 * ((lane >> 3) & 1), lc = lane >> 4;
+    uint32_t ld_a[KK];
+#pragma unroll
+    for (int kk = 0; kk < KK; ++kk) ld_a[kk] = sbase + (lr * CPR + ((kk * 2 + lc) ^ a_swz<BK>(lr))) * 16;
+    int w0, w_off;
+    lane_start<K2>(lane, w0, w_off);
+    int lw[LW];
+#pragma unroll
+    for (int i = 0; i < LW; ++i) lw[i] = A_BYTES + (warp * TPW * TW + (w0 + i) % TW) * 4;
+
+#pragma unroll 1
+    for (int kc = 0; kc < KC; ++kc) {
+        cp_async_wait<ST - 2>();
+        __syncthreads();
+        {
+            const int nk = kc + ST - 1;
+            if (nk < KC) load_stage(nk % ST, nk);
+            cp_async_commit();
+        }
+        if (!active) continue;
+        const int soff = (kc % ST) * STAGE;
+#pragma unroll
+        for (int kk = 0; kk < KK; ++kk) {
+            uint32_t b[TPW][2][2];
+#pragma unroll
+            for (int j = 0; j < TPW; ++j) {
+                uint32_t w[LW];
+#pragma unroll
+                for (int i = 0; i < LW; ++i)
+                    w[i] = *reinterpret_cast<const uint32_t*>(smem + soff + lw[i] + (kk * TN + j) * TW * 4);
+                decode_lane<K2, CB>(w, lane, b[j][0], b[j][1]);
+            }
+            mma_rows<0, MT, TPW, CPR>(acc, ld_a[kk] + soff, b);
+        }
+    }
+    cp_async_wait<0>();
+
+    // Epilogue, a 128-column strip and 64 rows at a time: the fp32 sums through shared memory, then per row (one warp, 4 columns a
+    // lane): H_128, * 1/sqrt 128, * svh, + bias: gemm_kernel's epilogue, line for line.
+    float* stg = reinterpret_cast<float*>(smem);
+    const int rows = min(BM, M - m0);
+#pragma unroll 1
+    for (int s = 0; s < my_strips; ++s) {
+#pragma unroll
+        for (int hh = 0; hh < NH; ++hh) {
+            if (hh * 64 >= rows) continue;
+            __syncthreads();
+            if (active && (warp * TPW) / 8 == s) {
+#pragma unroll
+                for (int pl = 0; pl < 4; ++pl)
+#pragma unroll
+                    for (int j = 0; j < TPW; ++j)
+#pragma unroll
+                        for (int h = 0; h < 2; ++h) {
+                            const int col = ((warp * TPW + j) % 8) * 16 + h * 8 + 2 * t4;
+                            const int r = pl * 16 + g8;
+                            const float(&c)[4] = acc[hh * 4 + pl][j][h];
+                            *reinterpret_cast<float2*>(stg + r * kEpiLds + col) = make_float2(c[0], c[1]);
+                            *reinterpret_cast<float2*>(stg + (r + 8) * kEpiLds + col) = make_float2(c[2], c[3]);
+                        }
+            }
+            __syncthreads();
+
+            const int n = (s0 + s) * 128 + 4 * lane;
+            float sv[4], bv[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                sv[j] = load_scale(g.svh, g.scale_f32, n + j);
+                if (g.bias) bv[j] = load_scale(g.bias, g.scale_f32, n + j);
+            }
+            const int rn = min(64, rows - hh * 64);
+            for (int r = warp; r < rn; r += NW) {
+                const float4 u = *reinterpret_cast<const float4*>(stg + r * kEpiLds + 4 * lane);
+                float v[4] = {u.x, u.y, u.z, u.w};
+                fwht128(v, lane);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    float x = (v[j] * HAD_SCALE) * sv[j];
+                    if (g.bias) x = x + bv[j];
+                    v[j] = x;
+                }
+                store4(g.y, g.y_dtype, (size_t)(m0 + hh * 64 + r) * g.ldy + n, v);
+            }
+        }
+    }
+}
+
+template <int K2, int CB, int NW, int TPW, int BM, int BK, int ST, int MINB, int GM>
+int launch_gemm_c(const GemmArgs& g, cudaStream_t st) {
+    constexpr size_t sm = smem_bytes_c<K2, NW, TPW, BM, BK, ST>();
+    static_assert(sm * MINB <= 101376 - 1024 * MINB, "the CTAs of an SM must fit the 99 KB of shared memory");
+    static bool attr = false;  // idempotent; a race between host threads sets the same value twice
+    if (!attr) {
+        const cudaError_t e = cudaFuncSetAttribute(gemm_c_kernel<K2, CB, NW, TPW, BM, BK, ST, MINB, GM>,
+                                                   cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+        if (e != cudaSuccess) return (int)e;
+        attr = true;
+    }
+    constexpr int ss = NW * TPW / 8;
+    const int strips = g.N / 128;
+    const unsigned blocks = (unsigned)(((g.M + BM - 1) / BM) * ((strips + ss - 1) / ss));
+    gemm_c_kernel<K2, CB, NW, TPW, BM, BK, ST, MINB, GM><<<blocks, NW * 32, sm, st>>>(g);
+    return GB_CHECK_LAUNCH();
+}
+
+// The chain GEMM's configurations (cfg = tile_force - 10000; 1 is what a 6- to 8-bit chain layer runs by default), one row each: NW,
+// TPW, BM, BK, ST, MINB, GM. MEASURED on one GB10 (crates/cuda/tests/fn_dense_chain.rs bench, 4,096 rows of the Flash-Next pack's dense
+// layers): the 6-bit layers run 1 CTA an SM through the old 64 x 2 and 128 x 2 tiles (96 KB of stages each), the 128 x 128 tile with
+// two stages is 22 KB a CTA, so two CTAs share an SM and one's epilogue and fill hide under the other's MMAs.
+template <int K2, int CB>
+int dispatch_c(int cfg, const GemmArgs& g, cudaStream_t st) {
+    switch (cfg) {
+        case 1: return launch_gemm_c<K2, CB, 4, 2, 128, 64, 2, 2, 16>(g, st);
+        case 2: return launch_gemm_c<K2, CB, 8, 1, 128, 64, 2, 2, 16>(g, st);
+        case 3: return launch_gemm_c<K2, CB, 4, 2, 128, 32, 4, 2, 16>(g, st);
+        case 4: return launch_gemm_c<K2, CB, 8, 1, 64, 64, 3, 2, 16>(g, st);
+        default: return (int)cudaErrorInvalidValue;
+    }
+}
+
 template <int K2, int BM, int SN>
 constexpr size_t smem_bytes() {
     constexpr size_t stage = (size_t)BM * kBK * 2 + (size_t)(kBK / 16) * 8 * SN * tile_words<K2>() * 4;
@@ -391,6 +662,21 @@ int dispatch(int bits, int cb, int bm, int sn, const GemmArgs& g, cudaStream_t s
 #undef GP2_T
 }
 
+// The chain GEMM of the 6- to 8-bit packs (gemm_c_kernel) at configuration cfg.
+int dispatch_chain_c(int bits, int cb, int cfg, const GemmArgs& g, cudaStream_t st) {
+    if (cb != CB_MUL1) return (int)cudaErrorInvalidValue;
+    switch (bits) {
+        case 2: return dispatch_c<4, CB_MUL1>(cfg, g, st);
+        case 3: return dispatch_c<6, CB_MUL1>(cfg, g, st);
+        case 4: return dispatch_c<8, CB_MUL1>(cfg, g, st);
+        case 5: return dispatch_c<10, CB_MUL1>(cfg, g, st);
+        case 6: return dispatch_c<12, CB_MUL1>(cfg, g, st);
+        case 7: return dispatch_c<14, CB_MUL1>(cfg, g, st);
+        case 8: return dispatch_c<16, CB_MUL1>(cfg, g, st);
+        default: return (int)cudaErrorInvalidValue;
+    }
+}
+
 bool dtype_ok(int d) { return d >= 0 && d <= 2; }
 
 }  // namespace
@@ -412,20 +698,24 @@ GB_EXPORT int gb_glm_p2_rotate(const void* x, int x_dtype, long long ldx, const 
 
 // y [m, ldy] (y_dtype, from column 0) = the EXL3 layer applied to the rotated rows a [m, k] fp16 (gb_glm_p2_rotate's output). svh and
 // bias f32 (scale_f32) or fp16; bias may be null. fold: the K order (0 chain, 1 fold128: see the file comment). tile_force 0 (pick) or
-// BM * 10 + SN (641, 642, 1281, 1282; fold128 not 1282), which never changes a bit. Returns 0 or a cudaError_t; never allocates or
-// synchronizes.
+// BM * 10 + SN (641, 642, 1281, 1282; fold128 not 1282) or, chain only, 10000 + a gemm_c_kernel configuration (10001 to 10004), which
+// never changes a bit. The pick of a chain layer of 6 to 8 bits is gemm_c_kernel's configuration 1; every other layer's is pick_tile's
+// (the 641 .. 1282 kernels stay the reference of the tests). Returns 0 or a cudaError_t; never allocates or synchronizes.
 GB_EXPORT int gb_glm_p2_gemm(const void* a, const void* trellis, const void* svh, const void* bias, int scale_f32, void* y, int y_dtype,
                              long long ldy, int m, int k, int n, int bits, int codebook, int fold, int tile_force, void* stream) {
     if (m < 1 || !gb_glm_p2_supported(k, n, bits, codebook) || !dtype_ok(y_dtype) || !a || !trellis || !svh || !y || ldy < n)
         return (int)cudaErrorInvalidValue;
     GemmArgs g{static_cast<const half*>(a), static_cast<const uint32_t*>(trellis), svh, bias, scale_f32, y, y_dtype, ldy, m, k, n};
+    if (!fold && tile_force >= 10000) return dispatch_chain_c(bits, codebook, tile_force - 10000, g, gb_stream(stream));
+    if (!fold && tile_force == 0 && bits >= 6) return dispatch_chain_c(bits, codebook, 1, g, gb_stream(stream));
     int bm = 0, sn = 0;
     const int rc = pick_tile(m, k, n, fold, tile_force, bm, sn);
     if (rc) return rc;
     return fold ? dispatch<true>(bits, codebook, bm, sn, g, gb_stream(stream)) : dispatch<false>(bits, codebook, bm, sn, g, gb_stream(stream));
 }
 
-// The tile gb_glm_p2_gemm picks for (m, k, n) and a K order when not forced, as BM * 10 + SN (for the tables).
+// The tile of the 641 .. 1282 kernels that gb_glm_p2_gemm picks for (m, k, n) and a K order when not forced, as BM * 10 + SN (for the
+// tables; a chain layer of 6 to 8 bits runs gemm_c_kernel instead, see gb_glm_p2_gemm).
 GB_EXPORT int gb_glm_p2_pick_tile(int m, int k, int n, int fold) {
     int bm = 0, sn = 0;
     pick_tile(m, k, n, fold, 0, bm, sn);

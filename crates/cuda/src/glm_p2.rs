@@ -107,7 +107,8 @@ pub fn supported(w: &Exl3Weights) -> bool {
     unsafe { ffi::gb_glm_p2_supported(w.k as i32, w.n as i32, w.bits as i32, codebook_code(w.codebook)) == 1 }
 }
 
-/// The tile the GEMM picks for `m` rows of a `k` x `n` layer under `v` (`BM * 10 + SN`), for the tables.
+/// The tile of the fixed-tile kernels the GEMM picks for `m` rows of a `k` x `n` layer under `v` (`BM * 10 + SN`), for the tables (a chain
+/// layer of 6 to 8 bits runs the 128 x 128 chain GEMM instead).
 pub fn pick_tile(m: usize, k: usize, n: usize, v: Variant) -> i32 {
     // SAFETY: a pure function of its integer arguments
     unsafe { ffi::gb_glm_p2_pick_tile(m as i32, k as i32, n as i32, (v == Variant::Fold128) as i32) }
@@ -155,8 +156,8 @@ pub fn linear(
     linear_tiled(w, x, y, rows, x_dtype, y_dtype, ws, 0, st)
 }
 
-/// [`linear`] with a forced tile shape (`0`: the kernel's pick, else `BM * 10 + SN`: 641, 642, 1281, 1282). The tile never changes a bit
-/// (the tests check that).
+/// [`linear`] with a forced tile shape (`0`: the kernel's pick, else `BM * 10 + SN`: 641, 642, 1281, 1282, or for the chain order
+/// `10000 +` a configuration of the 128 x 128 chain GEMM: 10001 to 10004). The tile never changes a bit (the tests check that).
 #[allow(clippy::too_many_arguments)]
 pub fn linear_tiled(
     w: &Exl3Weights,
