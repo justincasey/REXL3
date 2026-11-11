@@ -594,6 +594,12 @@ pub struct FlashNextModel {
     /// The hyper-connection post-inject of the block just run, not yet applied to `x_streams`: the next pre-mix applies it
     /// (fused into its norm pass when it can), anything else that reads the streams first calls [`Model::flush_post`].
     pending_post: Option<PostKind>,
+    /// The attention block's post-inject when the MLP pre-mix has applied it on the fly (to every value it read) and left `x_streams` as
+    /// it was: `x_streams` plus this plus `pending_post` is the stream stack. The next attention pre-mix writes both, one pass
+    /// (`REXL3_HCG_LAZY_POST=0` writes the stack at every pre-mix instead); anything else that reads the streams calls [`Model::flush_post`].
+    unwritten_post: Option<PostKind>,
+    /// Whether the MLP pre-mix of tiled prefill may leave the stack unwritten (`REXL3_HCG_LAZY_POST`, on by default).
+    lazy_post: bool,
     pending: BTreeMap<usize, usize>,
     /// Replayable windows and draft chains (bounded; a graph after a shape's second sighting: see `graph_cache`) and what they
     /// have done (`/metrics`, the `flash_next_graphs` event).
@@ -1275,6 +1281,8 @@ impl FlashNextModel {
             mixed_rows: 0,
             last_window: None,
             pending_post: None,
+            unwritten_post: None,
+            lazy_post: env_on("REXL3_HCG_LAZY_POST"),
             pending: BTreeMap::new(),
             graphs: GraphCache::new(
                 graph_cache::limit_from_env(graph_cache::ENV_WINDOW_GRAPHS, graph_cache::DEFAULT_WINDOW_GRAPHS),
@@ -2174,6 +2182,54 @@ impl FlashNextModel {
         // the previous block's post-inject: fused into the pre-mix's norm pass where hcg takes it, a launch of its own otherwise
         let post = self.pending_post.take();
         let hcg_on = self.fast && hcg_for_mode(self.hcg && self.hcg_scratch.is_some(), mode);
+        // The Flash-Next prefill writes the stack once a layer: the MLP pre-mix applies the attention block's post-inject on the fly (the same
+        // fma on every value it reads) and leaves `x_streams` as it was, and the next attention pre-mix applies that post and the MLP block's
+        // together and writes the stack. Every kernel computes the values the in-place posts would have written.
+        let lazy_on = hcg_on && self.lazy_post && hcx::post_lazy_fusable(h, hc, rank) && mix.inject.is_some();
+        let lagged = self.unwritten_post.take();
+        if lazy_on && attn && lagged == Some(PostKind::Attn) && post == Some(PostKind::Mlp) {
+            let s = self.hcg_scratch.as_mut().expect("hcg on: scratch allocated");
+            hcx::pre_gemm_post2(
+                &mut self.x_streams,
+                &self.block_out,
+                &mut self.inj_attn,
+                &self.moe_out,
+                &self.inj_mlp,
+                mix,
+                &mut self.x_mixed,
+                s,
+                h,
+                hc,
+                rank,
+                EPS,
+                rows,
+                &self.stream,
+            )?;
+            return Ok(());
+        }
+        if let Some(l) = lagged {
+            self.run_post(l, rows)?;
+        }
+        if lazy_on && !attn && post == Some(PostKind::Attn) {
+            let s = self.hcg_scratch.as_mut().expect("hcg on: scratch allocated");
+            hcx::pre_gemm_post_lazy(
+                &self.x_streams,
+                &self.block_out,
+                &self.inj_attn,
+                mix,
+                &mut self.x_mixed,
+                &mut self.inj_mlp,
+                s,
+                h,
+                hc,
+                rank,
+                EPS,
+                rows,
+                &self.stream,
+            )?;
+            self.unwritten_post = Some(PostKind::Attn);
+            return Ok(());
+        }
         // (the block after an attention block is the MLP's pre-mix and the other way round: the post's `inj` is never the one being written)
         let fused = post.filter(|p| hcg_on && hcx::post_fusable(h, hc) && (*p == PostKind::Attn) != attn);
         // the decode kernels (not hcg) take the post themselves: the pre-mix of the other block kind reads block_out / inj of the pending post
@@ -2316,8 +2372,12 @@ impl FlashNextModel {
         Ok(())
     }
 
-    /// Apply a post-inject the next pre-mix has not taken yet (anything that reads or swaps `x_streams` calls this first).
+    /// Apply the post-injects the next pre-mix has not taken yet, the one it applied on the fly first (anything that reads or swaps
+    /// `x_streams` calls this first).
     fn flush_post(&mut self, rows: usize) -> Result<(), ModelError> {
+        if let Some(p) = self.unwritten_post.take() {
+            self.run_post(p, rows)?;
+        }
         if let Some(p) = self.pending_post.take() {
             self.run_post(p, rows)?;
         }
@@ -2732,6 +2792,7 @@ impl FlashNextModel {
         g_embed(&w.embed, &self.ids, &self.block_out, rows, h, self.cfg.vocab, &self.stream)?;
         fn_mhc::hc_expand(&self.block_out, &mut self.x_streams, h, hc, rows, &self.stream)?;
         self.pending_post = None;
+        self.unwritten_post = None;
         self.run_layers(b, mode, 0, upto)?;
         // the split's two graphs are captured and replayed independently: the head applies its own last post-inject (the tail
         // would otherwise find, or miss, it depending on which graph happened to be captured in this call)

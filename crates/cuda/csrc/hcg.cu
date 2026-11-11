@@ -209,11 +209,13 @@ constexpr size_t kU2RingBytes = kU2Ring * kU2StageHalves * sizeof(half);
 constexpr size_t kU2GsBytes = (size_t)4 * kU2Rows * kU2GsPad * sizeof(float);
 constexpr size_t kU2Smem = kU2RingBytes > kU2GsBytes ? kU2RingBytes : kU2GsBytes;
 
-// grid (H / 64, padded / 64), block 512, dynamic smem kU2Smem. low rows are valid up to the 64-row padding (zeros past T).
+// grid (H / 64, padded / 64), block 512, dynamic smem kU2Smem. low rows are valid up to the 64-row padding (zeros past T). LAZY: the streams
+// hold the values BEFORE the post-inject of (block_out, inj_prev), applied to every x read here (fmaf(bf16, weight, x), hc_post's expression).
+template <bool LAZY>
 __global__ void __launch_bounds__(kU2Threads, 1)
     up_mix_kernel(const half* __restrict__ low_hi, const half* __restrict__ low_lo, const half* __restrict__ up_w,
-                  const float* __restrict__ x, const float* __restrict__ rms, const half* __restrict__ nw,
-                  __nv_bfloat16* __restrict__ y, int T, int H, int rank) {
+                  const float* __restrict__ x, const __nv_bfloat16* __restrict__ block_out, const float* __restrict__ inj_prev,
+                  const float* __restrict__ rms, const half* __restrict__ nw, __nv_bfloat16* __restrict__ y, int T, int H, int rank) {
     extern __shared__ __align__(16) unsigned char u2_smem[];
     half* sm = reinterpret_cast<half*>(u2_smem);
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, t4 = lane & 3;
@@ -288,7 +290,8 @@ __global__ void __launch_bounds__(kU2Threads, 1)
     const int row = tid >> 3, q = tid & 7, t = r0 + row;
     float4 xp[4][2];
     float rp[4];
-    uint2 wp[4][2];
+    uint2 wp[4][2], bp[2];
+    float4 pw;
     if (t < T) {
 #pragma unroll
         for (int s = 0; s < 4; ++s) {
@@ -298,6 +301,11 @@ __global__ void __launch_bounds__(kU2Threads, 1)
                 xp[s][c] = *reinterpret_cast<const float4*>(x + ((size_t)t * 4 + s) * H + d0 + 32 * c + 4 * q);
                 wp[s][c] = *reinterpret_cast<const uint2*>(nw + (size_t)s * H + d0 + 32 * c + 4 * q);
             }
+        }
+        if (LAZY) {
+            pw = *reinterpret_cast<const float4*>(inj_prev + (size_t)t * 4);
+#pragma unroll
+            for (int c = 0; c < 2; ++c) bp[c] = *reinterpret_cast<const uint2*>(block_out + (size_t)t * H + d0 + 32 * c + 4 * q);
         }
     }
     __syncthreads();
@@ -327,7 +335,16 @@ __global__ void __launch_bounds__(kU2Threads, 1)
 #pragma unroll
         for (int c = 0; c < 2; ++c) {
             const float4 gv4 = *reinterpret_cast<const float4*>(gs + ((size_t)s * kU2Rows + row) * kU2GsPad + 32 * c + 4 * q);
-            const float4 xv = xp[s][c];
+            float4 xv = xp[s][c];
+            if (LAZY) {
+                const float pws = s == 0 ? pw.x : s == 1 ? pw.y : s == 2 ? pw.z : pw.w;
+                const float2 b01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&bp[c].x));
+                const float2 b23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&bp[c].y));
+                xv.x = fmaf(b01.x, pws, xv.x);
+                xv.y = fmaf(b01.y, pws, xv.y);
+                xv.z = fmaf(b23.x, pws, xv.z);
+                xv.w = fmaf(b23.y, pws, xv.w);
+            }
             const float gg[4] = {gv4.x, gv4.y, gv4.z, gv4.w};
             const float xs[4] = {xv.x, xv.y, xv.z, xv.w};
             const float2 w01 = __half22float2(*reinterpret_cast<const half2*>(&wp[s][c].x));
@@ -362,11 +379,18 @@ __global__ void __launch_bounds__(kU2Threads, 1)
 // the unchanged norm_kernel / post_norm_kernel: pass 1 (the previous block's post-inject written back in place, the rms of the new values)
 // has post_norm_kernel's thread-to-element map and sums, pass 2 forms normed = x * rms * (1 + nw) in its expressions and writes the fp16
 // hi / lo split of it for the down GEMMs.
+//
+// The post-inject comes in three forms (NP posts, XW = the new streams are written back): NP = 1 with XW is the previous block's post written
+// in place; NP = 2 with XW applies two blocks' posts in order, x1 = fma(b1, w1, x), x2 = fma(b2, w2, x1), and writes x2 (the two in-place
+// hc_post launches in one pass); NP = 1 without XW leaves the streams untouched and applies the post to every value it reads (pass 1 and
+// the stages of pass 2, whose block_out tile rides the ring beside the x tile), so that the later readers of the streams (down_x_kernel
+// and up_mix_kernel with LAZY) apply the same post to the same values: the same fma on the same operands, never written to memory in between.
 constexpr int kNiH = 2560, kNiBM = 16, kNiKB = 64, kNiPad = kNiKB + 8, kNiThreads = 256, kNiRing = 3;
 constexpr size_t kNiSmemB = (size_t)kNiRing * 8 * kNiPad * sizeof(half);               // the 4 inject rows (and 4 zero rows) of the n8 tile
 constexpr size_t kNiSmemX = (size_t)kNiRing * kNiBM * kNiKB * sizeof(float);
 constexpr size_t kNiSmemA = (size_t)2 * 2 * kNiBM * kNiPad * sizeof(half);
-constexpr size_t kNiSmem = kNiSmemB + kNiSmemX + kNiSmemA + kNiBM * sizeof(float);
+constexpr size_t kNiSmemO = (size_t)kNiRing * kNiBM * kNiKB * sizeof(__nv_bfloat16);  // the block_out tiles of the on-the-fly form
+constexpr size_t kNiSmem = kNiSmemB + kNiSmemX + kNiSmemA + kNiBM * sizeof(float) + kNiSmemO;
 
 __device__ __forceinline__ void ni_ldsm2(uint32_t& r0, uint32_t& r1, const half* p) {
     const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(p));
@@ -378,20 +402,23 @@ __device__ __forceinline__ void ni_ldsm2(uint32_t& r0, uint32_t& r1, const half*
 // splits' sums.
 constexpr size_t kNiLaunchSmem = 49152;
 static_assert(kNiSmem <= kNiLaunchSmem, "the stages fit the launch's shared memory");
-template <bool POST, bool WRITE>
+template <int NP, bool XW>
 __global__ void __launch_bounds__(kNiThreads, 2)
     norm_inj_kernel(float* __restrict__ x, const __nv_bfloat16* __restrict__ block_out, const float* __restrict__ inj_prev,
-                    const half* __restrict__ nw, const half* __restrict__ inj_w, half* __restrict__ normed_hi, half* __restrict__ normed_lo,
-                    float* __restrict__ Q, float* __restrict__ rms_out, int T, float eps) {
+                    const __nv_bfloat16* __restrict__ block_out2, const float* __restrict__ inj_prev2, const half* __restrict__ nw,
+                    const half* __restrict__ inj_w, float* __restrict__ Q, float* __restrict__ rms_out, int T, float eps) {
+    static_assert(NP >= 0 && NP <= 2 && (XW || NP == 1), "the forms: no post, one or two posts written back, one post applied on the fly");
+    constexpr bool kLazy = NP == 1 && !XW;
     extern __shared__ __align__(16) unsigned char ni_smem[];
     half* sB = reinterpret_cast<half*>(ni_smem);
     float* sX = reinterpret_cast<float*>(ni_smem + kNiSmemB);
     half* sA = reinterpret_cast<half*>(ni_smem + kNiSmemB + kNiSmemX);
     float* sR = reinterpret_cast<float*>(ni_smem + kNiSmemB + kNiSmemX + kNiSmemA);
+    __nv_bfloat16* sO = reinterpret_cast<__nv_bfloat16*>(ni_smem + kNiSmemB + kNiSmemX + kNiSmemA + kNiBM * sizeof(float));
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, t4 = lane & 3;
     const int r0 = (int)(blockIdx.x >> 2) * kNiBM, s = blockIdx.x & 3;
 
-    // pass 1: post-inject (in place) and the rms of (row, stream). Lane l of the warp holds, for j = 0..7, the partial sum of post_norm_kernel's
+    // pass 1: post-inject (in place, when XW) and the rms of (row, stream). Lane l of the warp holds, for j = 0..7, the partial sum of post_norm_kernel's
     // thread 32 j + l (its float4 at m = 32 j + l + 256 c for c = 0, 1, 2, m < 640, summed in c order); the warp butterfly of each j is
     // block_sum's warp sum, and the eight warp sums are added in warp order from 0.f.
     for (int lr = w; lr < kNiBM; lr += kNiThreads / 32) {
@@ -402,8 +429,9 @@ __global__ void __launch_bounds__(kNiThreads, 2)
             float a[8];
 #pragma unroll
             for (int j = 0; j < 8; ++j) a[j] = 0.f;
-            float wv = 0.f;
-            if (POST) wv = inj_prev[(size_t)t * 4 + s];
+            float wv = 0.f, wv2 = 0.f;
+            if (NP >= 1) wv = inj_prev[(size_t)t * 4 + s];
+            if (NP == 2) wv2 = inj_prev2[(size_t)t * 4 + s];
 #pragma unroll
             for (int c = 0; c < 3; ++c) {
 #pragma unroll
@@ -411,7 +439,7 @@ __global__ void __launch_bounds__(kNiThreads, 2)
                     const int m = 32 * j + lane + 256 * c;
                     if (m >= kNiH / 4) continue;
                     float4 v = *reinterpret_cast<const float4*>(xr + 4 * m);
-                    if (POST) {
+                    if (NP >= 1) {
                         const uint2 u = *reinterpret_cast<const uint2*>(block_out + (size_t)t * kNiH + 4 * m);
                         const float2 b01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.x));
                         const float2 b23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.y));
@@ -420,7 +448,16 @@ __global__ void __launch_bounds__(kNiThreads, 2)
                         n.y = fmaf(b01.y, wv, v.y);
                         n.z = fmaf(b23.x, wv, v.z);
                         n.w = fmaf(b23.y, wv, v.w);
-                        *reinterpret_cast<float4*>(xr + 4 * m) = n;
+                        if (NP == 2) {
+                            const uint2 u2 = *reinterpret_cast<const uint2*>(block_out2 + (size_t)t * kNiH + 4 * m);
+                            const float2 c01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u2.x));
+                            const float2 c23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u2.y));
+                            n.x = fmaf(c01.x, wv2, n.x);
+                            n.y = fmaf(c01.y, wv2, n.y);
+                            n.z = fmaf(c23.x, wv2, n.z);
+                            n.w = fmaf(c23.y, wv2, n.w);
+                        }
+                        if (XW) *reinterpret_cast<float4*>(xr + 4 * m) = n;
                         v = n;
                     }
                     a[j] += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
@@ -449,20 +486,37 @@ __global__ void __launch_bounds__(kNiThreads, 2)
 
     constexpr int kRow = 4 * kNiH;
     const half* iw = inj_w + (size_t)s * kNiH;
-    // stage st (k in [64 st, 64 st + 64) of the stream) into ring slot st % 3: the four inject rows and the raw x tile
+    // the post weight of the row this thread transforms (the on-the-fly form applies the post to the raw stage tiles)
+    float wvr = 0.f;
+    if (kLazy && r0 + (tid >> 4) < T) wvr = inj_prev[(size_t)(r0 + (tid >> 4)) * 4 + s];
+    // stage st (k in [64 st, 64 st + 64) of the stream) into ring slot st % 3: the four inject rows, the raw x tile and, on the fly, the
+    // block_out tile of the same columns
     auto issue = [&](int st) {
         const int slot = st % kNiRing, k0 = st * kNiKB;
         if (tid < 32) um_cp16(sB + ((size_t)slot * 8 + (tid >> 3)) * kNiPad + (tid & 7) * 8, iw + (size_t)(tid >> 3) * kRow + k0 + (tid & 7) * 8);
         const int r = tid >> 4, q = tid & 15, t = r0 + r;
         if (t < T) um_cp16(sX + (size_t)slot * kNiBM * kNiKB + r * kNiKB + q * 4, x + ((size_t)t * 4 + s) * kNiH + k0 + q * 4);
+        if (kLazy && tid < kNiBM * kNiKB / 8) {
+            const int ro = tid >> 3, ch = tid & 7;
+            if (r0 + ro < T) um_cp16(sO + (size_t)slot * kNiBM * kNiKB + ro * kNiKB + ch * 8, block_out + (size_t)(r0 + ro) * kNiH + k0 + ch * 8);
+        }
         asm volatile("cp.async.commit_group;\n" ::);
     };
-    // raw stage st -> A tile (st & 1) and the hi / lo columns of the normed rows: post_norm_kernel's expressions
+    // raw stage st -> A tile (st & 1): the hi / lo columns of the normed rows, post_norm_kernel's expressions
     auto transform = [&](int st) {
         const int slot = st % kNiRing, r = tid >> 4, q = tid & 15, t = r0 + r;
         uint2 hi = make_uint2(0u, 0u), lo = make_uint2(0u, 0u);
         if (t < T) {
-            const float4 v = *reinterpret_cast<const float4*>(sX + (size_t)slot * kNiBM * kNiKB + r * kNiKB + q * 4);
+            float4 v = *reinterpret_cast<const float4*>(sX + (size_t)slot * kNiBM * kNiKB + r * kNiKB + q * 4);
+            if (kLazy) {
+                const uint2 u = *reinterpret_cast<const uint2*>(sO + (size_t)slot * kNiBM * kNiKB + r * kNiKB + q * 4);
+                const float2 b01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.x));
+                const float2 b23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&u.y));
+                v.x = fmaf(b01.x, wvr, v.x);
+                v.y = fmaf(b01.y, wvr, v.y);
+                v.z = fmaf(b23.x, wvr, v.z);
+                v.w = fmaf(b23.y, wvr, v.w);
+            }
             const half* wp = nw + (size_t)s * kNiH + st * kNiKB + q * 4;
             const float2 w01 = __half22float2(*reinterpret_cast<const half2*>(wp));
             const float2 w23 = __half22float2(*reinterpret_cast<const half2*>(wp + 2));
@@ -475,11 +529,6 @@ __global__ void __launch_bounds__(kNiThreads, 2)
             const half2 c = __floats2half2_rn(n0 - h0, n1 - h1), d = __floats2half2_rn(n2 - h2, n3 - h3);
             hi = make_uint2(*reinterpret_cast<const uint32_t*>(&a), *reinterpret_cast<const uint32_t*>(&b));
             lo = make_uint2(*reinterpret_cast<const uint32_t*>(&c), *reinterpret_cast<const uint32_t*>(&d));
-            if (WRITE) {
-                const size_t go = ((size_t)t * 4 + s) * kNiH + st * kNiKB + q * 4;
-                *reinterpret_cast<uint2*>(normed_hi + go) = hi;
-                *reinterpret_cast<uint2*>(normed_lo + go) = lo;
-            }
         }
         half* ah = sA + (size_t)(st & 1) * 2 * kNiBM * kNiPad + r * kNiPad + q * 4;
         *reinterpret_cast<uint2*>(ah) = hi;
@@ -557,10 +606,19 @@ constexpr size_t kDxSmem = kDxSmemB + kDxSmemA + kDxSmemW;
 static_assert(kNiH % kDxKB == 0 && kDxStages % kDxSplit == 0 && kDxRank % kDxBN == 0, "stages of one stream, a whole number of stages a split");
 static_assert(2 * (kDxSmem + 1024) <= 100 * 1024, "two CTAs an SM");
 
-// grid (kDxRank / kDxBN, padded / kDxBM), block 256, dynamic smem kDxSmem. low_hi / low_lo [padded][kDxRank].
+// One thread's raw inputs of a stage: its two float4 of the streams and, in the on-the-fly form, the matching bf16 block_out values.
+struct DxRaw {
+    float4 v[2];
+    uint2 b[2];
+};
+
+// grid (kDxRank / kDxBN, padded / kDxBM), block 256, dynamic smem kDxSmem. low_hi / low_lo [padded][kDxRank]. LAZY: the streams hold the values
+// BEFORE the post-inject of (block_out, inj_prev), which is applied to every value read, fmaf(bf16, weight, x) as hc_post writes it.
+template <bool LAZY>
 __global__ void __launch_bounds__(kDxThreads, 2)
-    down_x_kernel(const float* __restrict__ x, const float* __restrict__ rms, const half* __restrict__ nw, const half* __restrict__ down_w,
-                  half* __restrict__ low_hi, half* __restrict__ low_lo, int T) {
+    down_x_kernel(const float* __restrict__ x, const __nv_bfloat16* __restrict__ block_out, const float* __restrict__ inj_prev,
+                  const float* __restrict__ rms, const half* __restrict__ nw, const half* __restrict__ down_w, half* __restrict__ low_hi,
+                  half* __restrict__ low_lo, int T) {
     extern __shared__ __align__(16) unsigned char dx_smem[];
     half* sB = reinterpret_cast<half*>(dx_smem);
     half* sA = reinterpret_cast<half*>(dx_smem + kDxSmemB);
@@ -586,21 +644,39 @@ __global__ void __launch_bounds__(kDxThreads, 2)
     auto issue_w = [&](int j) {
         if (j < kDxStages && tid < 8) um_cp16(sW + (size_t)(j % kDxRing) * kDxKB + 8 * tid, nw + stage_of(j) * kDxKB + 8 * tid);
     };
-    // thread (row r = tid / 8, float4 columns kq and kq + 8 of the stage's 64): the raw streams of stage j
+    // thread (row r = tid / 8, float4 columns kq and kq + 8 of the stage's 64): the raw streams of stage j and, on the fly, the block_out
+    // values of the same columns
     const int tr = tid >> 3, tq = tid & 7, trow = row0 + tr;
-    auto load_raw = [&](int j, float4 (&v)[2]) {
+    auto load_raw = [&](int j, DxRaw& rw) {
         if (j < kDxStages) {
             const int k0 = stage_of(j) * kDxKB, stream = k0 / kNiH, d0 = k0 - stream * kNiH;
             const float* src = x + ((size_t)(trow < T ? trow : 0) * 4 + stream) * kNiH + d0;
 #pragma unroll
-            for (int i = 0; i < 2; ++i) v[i] = trow < T ? *reinterpret_cast<const float4*>(src + 4 * (tq + 8 * i)) : make_float4(0.f, 0.f, 0.f, 0.f);
+            for (int i = 0; i < 2; ++i) rw.v[i] = trow < T ? *reinterpret_cast<const float4*>(src + 4 * (tq + 8 * i)) : make_float4(0.f, 0.f, 0.f, 0.f);
+            if (LAZY) {
+#pragma unroll
+                for (int i = 0; i < 2; ++i)
+                    rw.b[i] = trow < T ? *reinterpret_cast<const uint2*>(block_out + (size_t)trow * kNiH + d0 + 4 * (tq + 8 * i)) : make_uint2(0u, 0u);
+            }
         }
     };
-    // this thread's row's four rms values: stage j's is the one of its stream
+    // this thread's row's four rms values: stage j's is the one of its stream (and, on the fly, the four post weights)
     const float4 rms4 = trow < T ? *reinterpret_cast<const float4*>(rms + (size_t)trow * 4) : make_float4(0.f, 0.f, 0.f, 0.f);
+    float4 pw4 = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (LAZY && trow < T) pw4 = *reinterpret_cast<const float4*>(inj_prev + (size_t)trow * 4);
     // raw stage j -> A tile (j & 1), part i of 2 (float4 i of this thread's two): post_norm_kernel's expressions
-    auto transform_part = [&](int j, int i, const float4& v) {
+    auto transform_part = [&](int j, int i, const DxRaw& rw) {
+        float4 v = rw.v[i];
         const int stream = stage_of(j) * kDxKB / kNiH;
+        if (LAZY) {
+            const float pw = stream == 0 ? pw4.x : stream == 1 ? pw4.y : stream == 2 ? pw4.z : pw4.w;
+            const float2 b01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rw.b[i].x));
+            const float2 b23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&rw.b[i].y));
+            v.x = fmaf(b01.x, pw, v.x);
+            v.y = fmaf(b01.y, pw, v.y);
+            v.z = fmaf(b23.x, pw, v.z);
+            v.w = fmaf(b23.y, pw, v.w);
+        }
         const float rr = stream == 0 ? rms4.x : stream == 1 ? rms4.y : stream == 2 ? rms4.z : rms4.w;
         const half* wp = sW + (size_t)(j % kDxRing) * kDxKB;
         half* ah = sA + (size_t)(j & 1) * 2 * kDxBM * kDxAPad + (size_t)tr * kDxAPad;
@@ -627,7 +703,7 @@ __global__ void __launch_bounds__(kDxThreads, 2)
             for (int e = 0; e < 4; ++e) acc_hi[c][j][e] = acc_lo[c][j][e] = 0.f;
     const int grp = wn & 3;  // the 16-column group of this warp's two n8 tiles
 
-    auto mma_stage = [&](int j, const float4 (&nv)[2]) {
+    auto mma_stage = [&](int j, const DxRaw& nv) {
         const int slot = j % kDxRing;
         const half* ahi = sA + (size_t)(j & 1) * 2 * kDxBM * kDxAPad;
         const half* alo = ahi + (size_t)kDxBM * kDxAPad;
@@ -648,7 +724,7 @@ __global__ void __launch_bounds__(kDxThreads, 2)
             um_mma(acc_hi[c][1], fh, r4[2], r4[3]);
             um_mma(acc_lo[c][1], fl, r4[2], r4[3]);
             // the next stage's A tile (half of this thread's elements after the second and the fourth unit) between the MMAs
-            if ((p & 1) && j + 1 < kDxStages) transform_part(j + 1, p >> 1, nv[p >> 1]);
+            if ((p & 1) && j + 1 < kDxStages) transform_part(j + 1, p >> 1, nv);
         }
     };
     // the split's three accumulators added in the order of the output column's 16-column group, folded into the running total
@@ -681,7 +757,7 @@ __global__ void __launch_bounds__(kDxThreads, 2)
     // up to j - 2 have landed (B of stage j, W of stage j + 1) and the previous iteration's group may still fly. The raw streams of stages
     // j + 1, j + 2, j + 3 sit in three register sets used round robin (the loop is unrolled by three: no copies between sets): iteration j
     // transforms stage j + 1 from set (j + 1) % 3 between its MMAs, then loads stage j + 4 into that set.
-    float4 rb[3][2];
+    DxRaw rb[3];
     load_raw(0, rb[0]);
     load_raw(1, rb[1]);
     load_raw(2, rb[2]);
@@ -695,7 +771,7 @@ __global__ void __launch_bounds__(kDxThreads, 2)
     asm volatile("cp.async.wait_group 1;\n" ::);
     __syncthreads();
 #pragma unroll
-    for (int i = 0; i < 2; ++i) transform_part(0, i, rb[0][i]);
+    for (int i = 0; i < 2; ++i) transform_part(0, i, rb[0]);
     load_raw(3, rb[0]);
 #pragma unroll 1
     for (int j0 = 0; j0 < kDxStages; j0 += 3) {
@@ -859,16 +935,29 @@ GB_EXPORT size_t gb_hcg_scratch_bytes(int rows, int H, int hc, int rank) {
            al(padded * K * 4) + 2 * al(padded * hc * 4) + (lt_shape(H, hc, rank) ? al(lt_ws_bytes((int)padded, hc, rank)) : 0);
 }
 
+// The previous blocks' post-injects a pre-mix takes (hc = 4): `block` / `inj` is one (the streams become streams + bf16(block) * inj per
+// stream, in place), `block2` / `inj2` a second one applied after it (written back as well), `lazy` applies the first to every value the
+// pre-mix reads and leaves the streams as they were. The second and the lazy form exist for the Flash-Next shape only.
+struct PostArgs {
+    const void* block = nullptr;
+    const float* inj = nullptr;
+    const void* block2 = nullptr;
+    const float* inj2 = nullptr;
+    bool lazy = false;
+};
+
 // y [T][H] bf16 (+ inj [T][hc] f32 when inject_w is non-null) from streams [T][hc][H] f32. scratch holds
 // gb_hcg_scratch_bytes(T, H, hc, rank). H % 4 == 0, rank >= 1. The weight operands are read exactly at their declared
 // stride `rank` (down [rank][hc*H], up [hc*H][rank], inject [hc][hc*H]); no read extends past a weight buffer.
 static int hcg_pre(const void* streams, const void* norm_w, const void* down_w, const void* up_w,
                    const void* inject_w, void* y_out, float* inj_out, void* scratch, int H, int hc, int rank,
-                   float eps, int T, void* stream, bool fast, const void* post_block = nullptr, const float* post_inj = nullptr) {
+                   float eps, int T, void* stream, bool fast, const PostArgs& post = PostArgs{}) {
     if (T < 1 || H % 4 || hc < 1 || rank < 1 || !scratch || (inject_w != nullptr) != (inj_out != nullptr))
         return (int)cudaErrorInvalidValue;
-    // the fused hc_post: in-place on `streams`, hc = 4, H up to 3 x 1024
-    if ((post_block != nullptr) != (post_inj != nullptr) || (post_block && (hc != 4 || H > 3 * 1024))) return (int)cudaErrorInvalidValue;
+    // the fused hc_post: in place on `streams` (or on the fly), hc = 4, H up to 3 x 1024
+    if ((post.block != nullptr) != (post.inj != nullptr) || (post.block && (hc != 4 || H > 3 * 1024))) return (int)cudaErrorInvalidValue;
+    if ((post.block2 != nullptr) != (post.inj2 != nullptr) || (post.block2 && (!post.block || post.lazy))) return (int)cudaErrorInvalidValue;
+    if (post.lazy && !post.block) return (int)cudaErrorInvalidValue;
     cublasHandle_t h = handle();
     if (!h) return (int)cudaErrorUnknown;
     cudaStream_t st = gb_stream(stream);
@@ -909,15 +998,25 @@ static int hcg_pre(const void* streams, const void* norm_w, const void* down_w, 
     // the first of them brings from DRAM and the others find in L2 (stream-major order read it from DRAM four times, 20 MB each)
     const dim3 ni_grid(((T + kNiBM - 1) / kNiBM) * 4, 1);
     if (ni) {
-        if (post_block)
-            norm_inj_kernel<true, false><<<ni_grid, kNiThreads, kNiLaunchSmem, st>>>(
-                (float*)streams, (const __nv_bfloat16*)post_block, post_inj, (const half*)norm_w, (const half*)inject_w, normed_hi, normed_lo, G,
-                rms, T, eps);
+        if (post.block2)
+            norm_inj_kernel<2, true><<<ni_grid, kNiThreads, kNiLaunchSmem, st>>>(
+                (float*)streams, (const __nv_bfloat16*)post.block, post.inj, (const __nv_bfloat16*)post.block2, post.inj2, (const half*)norm_w,
+                (const half*)inject_w, G, rms, T, eps);
+        else if (post.lazy)
+            norm_inj_kernel<1, false><<<ni_grid, kNiThreads, kNiLaunchSmem, st>>>(
+                (float*)streams, (const __nv_bfloat16*)post.block, post.inj, nullptr, nullptr, (const half*)norm_w, (const half*)inject_w, G, rms, T,
+                eps);
+        else if (post.block)
+            norm_inj_kernel<1, true><<<ni_grid, kNiThreads, kNiLaunchSmem, st>>>(
+                (float*)streams, (const __nv_bfloat16*)post.block, post.inj, nullptr, nullptr, (const half*)norm_w, (const half*)inject_w, G, rms, T,
+                eps);
         else
-            norm_inj_kernel<false, false><<<ni_grid, kNiThreads, kNiLaunchSmem, st>>>(
-                (float*)streams, nullptr, nullptr, (const half*)norm_w, (const half*)inject_w, normed_hi, normed_lo, G, rms, T, eps);
-    } else if (post_block) {
-        post_norm_kernel<4, 3><<<T, 256, 0, st>>>((float*)streams, (const __nv_bfloat16*)post_block, post_inj, (const half*)norm_w, normed_hi,
+            norm_inj_kernel<0, true><<<ni_grid, kNiThreads, kNiLaunchSmem, st>>>(
+                (float*)streams, nullptr, nullptr, nullptr, nullptr, (const half*)norm_w, (const half*)inject_w, G, rms, T, eps);
+    } else if (post.lazy || post.block2) {
+        return (int)cudaErrorInvalidValue;  // the on-the-fly and the two-post forms exist for the Flash-Next shape only
+    } else if (post.block) {
+        post_norm_kernel<4, 3><<<T, 256, 0, st>>>((float*)streams, (const __nv_bfloat16*)post.block, post.inj, (const half*)norm_w, normed_hi,
                                                   normed_lo, rms, H, eps);
     } else {
         norm_kernel<<<T, 256, 0, st>>>((const float*)streams, (const half*)norm_w, normed_hi, normed_lo, rms, H, hc, eps);
@@ -925,13 +1024,20 @@ static int hcg_pre(const void* streams, const void* norm_w, const void* down_w, 
     rc = GB_CHECK_LAUNCH();
     if (rc) return rc;
     if (ni) {
-        static bool dxattr = false;
-        if (!dxattr) {
-            if (cudaFuncSetAttribute(down_x_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kDxSmem) != cudaSuccess) return (int)cudaErrorUnknown;
-            dxattr = true;
+        static bool dxattr[2] = {false, false};
+        const int li = post.lazy ? 1 : 0;
+        if (!dxattr[li]) {
+            const auto fn = post.lazy ? down_x_kernel<true> : down_x_kernel<false>;
+            if (cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kDxSmem) != cudaSuccess) return (int)cudaErrorUnknown;
+            dxattr[li] = true;
         }
-        down_x_kernel<<<dim3(kDxRank / kDxBN, padded / kDxBM), kDxThreads, kDxSmem, st>>>((const float*)streams, rms, (const half*)norm_w,
-                                                                                        (const half*)down_w, low_hi, low_lo, T);
+        const dim3 dg(kDxRank / kDxBN, padded / kDxBM);
+        if (post.lazy)
+            down_x_kernel<true><<<dg, kDxThreads, kDxSmem, st>>>((const float*)streams, (const __nv_bfloat16*)post.block, post.inj, rms,
+                                                                 (const half*)norm_w, (const half*)down_w, low_hi, low_lo, T);
+        else
+            down_x_kernel<false><<<dg, kDxThreads, kDxSmem, st>>>((const float*)streams, nullptr, nullptr, rms, (const half*)norm_w,
+                                                                  (const half*)down_w, low_hi, low_lo, T);
         if ((rc = GB_CHECK_LAUNCH())) return rc;
         inj_reduce_kernel<<<(T * 4 + 255) / 256, 256, 0, st>>>(G, inj_out, T, hc);
         if ((rc = GB_CHECK_LAUNCH())) return rc;
@@ -996,13 +1102,21 @@ static int hcg_pre(const void* streams, const void* norm_w, const void* down_w, 
         mix_kernel<<<T, 256, 0, st>>>((const float*)streams, G, rms, (const half*)norm_w, (__nv_bfloat16*)y_out, H, hc);
     } else {
         // up + mix as one kernel: G never reaches DRAM
-        static bool attr = false;
-        if (!attr) {
-            if (cudaFuncSetAttribute(up_mix_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kU2Smem) != cudaSuccess) return (int)cudaErrorUnknown;
-            attr = true;
+        static bool attr[2] = {false, false};
+        const int li = post.lazy ? 1 : 0;
+        if (!attr[li]) {
+            const auto fn = post.lazy ? up_mix_kernel<true> : up_mix_kernel<false>;
+            if (cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kU2Smem) != cudaSuccess) return (int)cudaErrorUnknown;
+            attr[li] = true;
         }
-        up_mix_kernel<<<dim3(H / kU2D, padded / kU2Rows), kU2Threads, kU2Smem, st>>>(
-            low_hi, low_lo, (const half*)up_w, (const float*)streams, rms, (const half*)norm_w, (__nv_bfloat16*)y_out, T, H, rank);
+        const dim3 ug(H / kU2D, padded / kU2Rows);
+        if (post.lazy)
+            up_mix_kernel<true><<<ug, kU2Threads, kU2Smem, st>>>(low_hi, low_lo, (const half*)up_w, (const float*)streams,
+                                                                 (const __nv_bfloat16*)post.block, post.inj, rms, (const half*)norm_w,
+                                                                 (__nv_bfloat16*)y_out, T, H, rank);
+        else
+            up_mix_kernel<false><<<ug, kU2Threads, kU2Smem, st>>>(low_hi, low_lo, (const half*)up_w, (const float*)streams, nullptr, nullptr, rms,
+                                                                  (const half*)norm_w, (__nv_bfloat16*)y_out, T, H, rank);
     }
     return GB_CHECK_LAUNCH();
 }
@@ -1020,7 +1134,38 @@ GB_EXPORT int gb_hcg_pre_post(void* streams, const void* post_block, const float
                               const void* up_w, const void* inject_w, void* y_out, float* inj_out, void* scratch, int H, int hc,
                               int rank, float eps, int T, void* stream) {
     if (!post_block || !post_inj) return (int)cudaErrorInvalidValue;
-    return hcg_pre(streams, norm_w, down_w, up_w, inject_w, y_out, inj_out, scratch, H, hc, rank, eps, T, stream, true, post_block, post_inj);
+    PostArgs post;
+    post.block = post_block;
+    post.inj = post_inj;
+    return hcg_pre(streams, norm_w, down_w, up_w, inject_w, y_out, inj_out, scratch, H, hc, rank, eps, T, stream, true, post);
+}
+
+// gb_hcg_pre_post with two blocks' post-injects: `streams` first becomes (streams + bf16(block1) * inj1) + bf16(block2) * inj2 per stream, the
+// two in-place hc_post launches in one pass, written back. The Flash-Next shape only (hidden 2,560, four streams, rank 320, inject rows).
+GB_EXPORT int gb_hcg_pre_post2(void* streams, const void* block1, const float* inj1, const void* block2, const float* inj2, const void* norm_w,
+                               const void* down_w, const void* up_w, const void* inject_w, void* y_out, float* inj_out, void* scratch, int H,
+                               int hc, int rank, float eps, int T, void* stream) {
+    if (!block1 || !inj1 || !block2 || !inj2) return (int)cudaErrorInvalidValue;
+    PostArgs post;
+    post.block = block1;
+    post.inj = inj1;
+    post.block2 = block2;
+    post.inj2 = inj2;
+    return hcg_pre(streams, norm_w, down_w, up_w, inject_w, y_out, inj_out, scratch, H, hc, rank, eps, T, stream, true, post);
+}
+
+// gb_hcg_pre_post without writing the post-injected streams back: the pre-mix reads streams + bf16(post_block) * post_inj (the same fma, on
+// every value it reads) and leaves `streams` as it was. The caller owes the write (a later pre-mix or hc_post applies the same post again,
+// on the streams as they stand). The Flash-Next shape only (hidden 2,560, four streams, rank 320, inject rows).
+GB_EXPORT int gb_hcg_pre_post_lazy(const void* streams, const void* post_block, const float* post_inj, const void* norm_w, const void* down_w,
+                                   const void* up_w, const void* inject_w, void* y_out, float* inj_out, void* scratch, int H, int hc,
+                                   int rank, float eps, int T, void* stream) {
+    if (!post_block || !post_inj) return (int)cudaErrorInvalidValue;
+    PostArgs post;
+    post.block = post_block;
+    post.inj = post_inj;
+    post.lazy = true;
+    return hcg_pre(const_cast<void*>(streams), norm_w, down_w, up_w, inject_w, y_out, inj_out, scratch, H, hc, rank, eps, T, stream, true, post);
 }
 
 // the 64-row slab loop on every shape: the reference gb_hcg_pre is compared against bit for bit

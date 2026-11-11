@@ -76,6 +76,16 @@ mod ffi {
             up_w: *const c_void, inject_w: *const c_void, y_out: *mut c_void, inj_out: *mut f32, scratch: *mut c_void,
             h: i32, hc: i32, rank: i32, eps: f32, t: i32, stream: *mut c_void,
         ) -> i32;
+        pub fn gb_hcg_pre_post2(
+            streams: *mut c_void, block1: *const c_void, inj1: *const f32, block2: *const c_void, inj2: *const f32, norm_w: *const c_void,
+            down_w: *const c_void, up_w: *const c_void, inject_w: *const c_void, y_out: *mut c_void, inj_out: *mut f32,
+            scratch: *mut c_void, h: i32, hc: i32, rank: i32, eps: f32, t: i32, stream: *mut c_void,
+        ) -> i32;
+        pub fn gb_hcg_pre_post_lazy(
+            streams: *const c_void, post_block: *const c_void, post_inj: *const f32, norm_w: *const c_void, down_w: *const c_void,
+            up_w: *const c_void, inject_w: *const c_void, y_out: *mut c_void, inj_out: *mut f32, scratch: *mut c_void,
+            h: i32, hc: i32, rank: i32, eps: f32, t: i32, stream: *mut c_void,
+        ) -> i32;
         pub fn gb_hcg_pre_ref(
             streams: *const c_void, norm_w: *const c_void, down_w: *const c_void, up_w: *const c_void,
             inject_w: *const c_void, y_out: *mut c_void, inj_out: *mut f32, scratch: *mut c_void,
@@ -602,6 +612,120 @@ pub fn pre_gemm_post(
             yp,
             ip,
             sp,
+            h as i32,
+            hc as i32,
+            rank as i32,
+            eps,
+            rows as i32,
+            st.raw(),
+        )
+    })
+}
+
+/// Whether [`pre_gemm_post2`] and [`pre_gemm_post_lazy`] take this shape: the Flash-Next one (hidden 2,560, four streams, rank 320), the
+/// shape the norm and inject, down and up + mix kernels are written for.
+pub fn post_lazy_fusable(h: usize, hc: usize, rank: usize) -> bool {
+    h == 2560 && hc == 4 && rank == 320
+}
+
+/// [`pre_gemm_post`] with two blocks' post-injects in one pass: `streams` first becomes
+/// `(streams + bf16(block1) * inj1) + bf16(block2) * inj2` per stream (what two `fn_mhc::hc_post` calls in that order write, bit for bit) and
+/// is written back, then the pre-mix reads the new values. The pre-mix's own inject rows go to `inj1`, the buffer the first post's weights
+/// were read from (the kernel has read them before the rows are written, in stream order). Needs [`post_lazy_fusable`] and inject rows.
+pub fn pre_gemm_post2(
+    streams: &mut DevBuf,
+    block1: &DevBuf,
+    inj1: &mut DevBuf,
+    block2: &DevBuf,
+    inj2: &DevBuf,
+    mix: &Mixer<'_>,
+    y_out: &mut DevBuf,
+    scratch: &mut DevBuf,
+    h: usize,
+    hc: usize,
+    rank: usize,
+    eps: f32,
+    rows: usize,
+    st: &Stream,
+) -> Result<(), CudaError> {
+    if mix.inject.is_none() || !post_lazy_fusable(h, hc, rank) {
+        eprintln!("rexl3 level=error launch contract: hcg pre_gemm_post2 needs the Flash-Next shape with inject rows");
+        return Err(CudaError(1));
+    }
+    mix.check(h, hc, rank, "hcg")?;
+    need(streams, rows * hc * h * 4, "hcg streams")?;
+    need(block1, rows * h * 2, "hcg post block_out")?;
+    need(inj1, rows * hc * 4, "hcg post inj")?;
+    need(block2, rows * h * 2, "hcg post block_out 2")?;
+    need(inj2, rows * hc * 4, "hcg post inj 2")?;
+    need(y_out, rows * h * 2, "hcg y")?;
+    need(scratch, gemm_scratch_bytes(rows, h, hc, rank), "hcg scratch")?;
+    CudaError::check(unsafe {
+        ffi::gb_hcg_pre_post2(
+            streams.ptr(),
+            block1.ptr(),
+            inj1.ptr() as *const f32,
+            block2.ptr(),
+            inj2.ptr() as *const f32,
+            mix.norm.ptr(),
+            mix.down.ptr(),
+            mix.up.ptr(),
+            mix.inject.map_or(core::ptr::null(), |b| b.ptr()),
+            y_out.ptr(),
+            inj1.ptr() as *mut f32,
+            scratch.ptr(),
+            h as i32,
+            hc as i32,
+            rank as i32,
+            eps,
+            rows as i32,
+            st.raw(),
+        )
+    })
+}
+
+/// [`pre_gemm_post`] without the write: the pre-mix reads `streams + bf16(block_out) * inj_prev` (the same fused multiply-add of each
+/// value, in the norm and inject, down and up + mix kernels alike) and `streams` stays as it was, so the outputs are those of
+/// [`pre_gemm_post`] and the streams are not. The caller owes the write: the next pre-mix ([`pre_gemm_post2`]) or `hc_post` applies this
+/// post again, on the streams as they stand, in front of the posts that follow. Needs [`post_lazy_fusable`] and inject rows (`inj_out`).
+pub fn pre_gemm_post_lazy(
+    streams: &DevBuf,
+    block_out: &DevBuf,
+    inj_prev: &DevBuf,
+    mix: &Mixer<'_>,
+    y_out: &mut DevBuf,
+    inj_out: &mut DevBuf,
+    scratch: &mut DevBuf,
+    h: usize,
+    hc: usize,
+    rank: usize,
+    eps: f32,
+    rows: usize,
+    st: &Stream,
+) -> Result<(), CudaError> {
+    if mix.inject.is_none() || !post_lazy_fusable(h, hc, rank) {
+        eprintln!("rexl3 level=error launch contract: hcg pre_gemm_post_lazy needs the Flash-Next shape with inject rows");
+        return Err(CudaError(1));
+    }
+    mix.check(h, hc, rank, "hcg")?;
+    need(streams, rows * hc * h * 4, "hcg streams")?;
+    need(block_out, rows * h * 2, "hcg post block_out")?;
+    need(inj_prev, rows * hc * 4, "hcg post inj")?;
+    need(y_out, rows * h * 2, "hcg y")?;
+    need(inj_out, rows * hc * 4, "hcg inj")?;
+    need(scratch, gemm_scratch_bytes(rows, h, hc, rank), "hcg scratch")?;
+    CudaError::check(unsafe {
+        ffi::gb_hcg_pre_post_lazy(
+            streams.ptr(),
+            block_out.ptr(),
+            inj_prev.ptr() as *const f32,
+            mix.norm.ptr(),
+            mix.down.ptr(),
+            mix.up.ptr(),
+            mix.inject.map_or(core::ptr::null(), |b| b.ptr()),
+            y_out.ptr(),
+            inj_out.ptr() as *mut f32,
+            scratch.ptr(),
             h as i32,
             hc as i32,
             rank as i32,
