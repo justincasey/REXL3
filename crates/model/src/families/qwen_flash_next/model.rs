@@ -2403,7 +2403,8 @@ impl FlashNextModel {
                     }
                 } else {
                     let inp = PreInputs { qkv: &self.qkv, a: &self.ga, b: &self.gb };
-                    gdn::prefill(
+                    // the chain kernel ends with the gated norm of z (the same bits as the norm kernel after it)
+                    gdn::prefill_gated(
                         st,
                         &inp,
                         &wts,
@@ -2411,23 +2412,28 @@ impl FlashNextModel {
                         &mut self.pools.conv[li],
                         &batch,
                         &mut self.gdn_prefill_ws,
+                        &self.z,
+                        &m.norm,
+                        EPS,
                         &mut self.mixer_out,
                     )?;
                 }
                 if fork {
                     cgraph::join(st, &self.side, &self.ev_join)?;
                 }
-                fn_glue::gated_rmsnorm_sigmoid(
-                    None,
-                    &self.z,
-                    &m.norm,
-                    &mut self.mixer_out,
-                    rows,
-                    gdn::VALUE_HEADS,
-                    gdn::HEAD_DIM,
-                    EPS,
-                    st,
-                )?;
+                if window {
+                    fn_glue::gated_rmsnorm_sigmoid(
+                        None,
+                        &self.z,
+                        &m.norm,
+                        &mut self.mixer_out,
+                        rows,
+                        gdn::VALUE_HEADS,
+                        gdn::HEAD_DIM,
+                        EPS,
+                        st,
+                    )?;
+                }
                 lin(&m.out_proj, &self.mixer_out, &mut self.block_out, rows, mode, &mut self.ws, &mut self.prefill_ws, st)?;
             }
             MixerWeights::Full(m) => {

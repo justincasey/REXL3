@@ -427,6 +427,26 @@ mod ffi {
             o: *mut c_void,
             stream: *mut c_void,
         ) -> i32;
+        pub fn gb_gdn_prefill_gated(
+            qkv: *const c_void,
+            a: *const c_void,
+            b: *const c_void,
+            conv_w: *const c_void,
+            a_log: *const f32,
+            dt_bias: *const f32,
+            s: *mut f32,
+            conv_pool: *mut c_void,
+            seq_start: *const i32,
+            slot: *const i32,
+            n_seq: i32,
+            rows: i32,
+            workspace: *mut c_void,
+            z: *const c_void,
+            norm_w: *const f32,
+            eps: f32,
+            o: *mut c_void,
+            stream: *mut c_void,
+        ) -> i32;
 
         // the same launchers built for 32 value heads (csrc/gdn_hv32.cu)
         pub fn gb_gdn_pre_hv32(
@@ -1496,6 +1516,56 @@ pub fn prefill_ref_shaped(
     o: &mut DevBuf,
 ) -> Result<(), CudaError> {
     prefill_launch(true, shape, stream, x, w, s_pool, conv_pool, batch, ws, o)
+}
+
+/// [`prefill`] with the head's gated RMS norm ([`crate::fn_glue::gated_rmsnorm_sigmoid`] over `o`, `z` and `norm_w`, 128-wide heads) fused into
+/// the recurrence kernel: `o` holds the normed output, bit for bit what [`prefill`] followed by that kernel leaves, and the pools are
+/// [`prefill`]'s. `z` is bf16 `[rows, 48, 128]`, `norm_w` f32 `[128]`. The default (48 value heads) shape only.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_gated(
+    stream: &Stream,
+    x: &PreInputs,
+    w: &PreWeights,
+    s_pool: &mut DevBuf,
+    conv_pool: &mut DevBuf,
+    batch: &Batch<'_>,
+    ws: &mut DevBuf,
+    z: &DevBuf,
+    norm_w: &DevBuf,
+    eps: f32,
+    o: &mut DevBuf,
+) -> Result<(), CudaError> {
+    let shape = GdnShape::Hv48;
+    check_inputs(shape, x, batch.rows);
+    check_pre_weights(shape, w);
+    need(o, batch.rows * shape.v_dim() * 2, "o");
+    need(z, batch.rows * shape.v_dim() * 2, "z");
+    need(norm_w, 128 * 4, "norm weight");
+    need(ws, prefill_workspace_bytes_shaped(shape, batch.rows), "workspace");
+    check_pools(shape, batch, s_pool, conv_pool);
+    let rc = unsafe {
+        ffi::gb_gdn_prefill_gated(
+            x.qkv.ptr(),
+            x.a.ptr(),
+            x.b.ptr(),
+            w.conv_w.ptr(),
+            w.a_log.ptr() as *const f32,
+            w.dt_bias.ptr() as *const f32,
+            s_pool.ptr() as *mut f32,
+            conv_pool.ptr(),
+            batch.seq_start.ptr() as *const i32,
+            batch.slot.ptr() as *const i32,
+            batch.n_seq as i32,
+            batch.rows as i32,
+            ws.ptr(),
+            z.ptr(),
+            norm_w.ptr() as *const f32,
+            eps,
+            o.ptr(),
+            stream.raw(),
+        )
+    };
+    CudaError::check(rc)
 }
 
 #[allow(clippy::too_many_arguments)]
