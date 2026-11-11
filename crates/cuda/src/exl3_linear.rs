@@ -138,6 +138,8 @@ mod ffi {
         pub fn gb_exl3_prefill_pin_for(k: i32, n: i32, tile: *mut u32, stages: *mut u32, custom: *mut u32) -> i32;
         pub fn gb_exl3_plan(k: i32, n: i32, sk: *mut i32, wk: *mut i32) -> i32;
         pub fn gb_pdl_set_mask(mask: i32) -> i32;
+        pub fn gb_exl3_set_fuse(mask: i32) -> i32;
+        pub fn gb_exl3_fused_in(m: i32, k: i32, n: i32, bits: i32) -> i32;
         pub fn gb_exl3_prefill_pin_check(m: i32, k: i32, n: i32) -> i32;
         pub fn gb_exl3_prefill_scratch_bytes(m: i32, k: i32, n: i32) -> usize;
         pub fn gb_exl3_prefill_gemm(
@@ -267,6 +269,37 @@ pub fn set_pdl_mask(mask: i32) -> Result<(), CudaError> {
     {
         let _ = mask;
         Err(CudaError(-1))
+    }
+}
+
+/// Test hook: which launches the decode path folds into the linear kernel: bit 1 the input rotation of 1 to 8 rows (the kernel rotates
+/// its own input instead of a `rot_in` launch ahead of it). The environment variable `REXL3_EXL3_FUSE` sets it at start. The bits do not
+/// depend on it; only the launch count and the speed.
+#[doc(hidden)]
+pub fn set_fuse_mask(mask: i32) -> Result<(), CudaError> {
+    #[cfg(not(gb_no_cuda))]
+    unsafe {
+        CudaError::check(ffi::gb_exl3_set_fuse(mask))
+    }
+    #[cfg(gb_no_cuda)]
+    {
+        let _ = mask;
+        Err(CudaError(-1))
+    }
+}
+
+/// Whether [`Exl3Weights::forward`] of `m` rows of a `k` x `n` layer of `bits` bits rotates its own input under the current fuse mask (see
+/// [`set_fuse_mask`]): the mask is on, `m` is 1 to 8 and the rotated rows fit beside the weight ring in shared memory.
+#[doc(hidden)]
+pub fn fused_in(m: usize, k: usize, n: usize, bits: usize) -> bool {
+    #[cfg(not(gb_no_cuda))]
+    unsafe {
+        ffi::gb_exl3_fused_in(m as i32, k as i32, n as i32, bits as i32) != 0
+    }
+    #[cfg(gb_no_cuda)]
+    {
+        let _ = (m, k, n, bits);
+        false
     }
 }
 

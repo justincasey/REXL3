@@ -1163,6 +1163,10 @@ impl FlashNextModel {
         // launches; only timing changes, never a bit. `REXL3_GLM_PDL` (0..31) overrides.
         let pdl = std::env::var("REXL3_GLM_PDL").ok().and_then(|v| v.trim().parse::<i32>().ok()).unwrap_or(9) & 31;
         gb_cuda::exl3_linear::set_pdl_mask(pdl).map_err(|e| ModelError::Config(format!("pdl mask: {e}")))?;
+        // The EXL3 decode linear rotates its own input on the layers where that pays (csrc/exl3_linear.cu, ring_plan): the same bits with
+        // one launch fewer. `REXL3_EXL3_FUSE` (0 off, 1 the layers where it pays, 2 every 4-warp layer that fits) overrides.
+        let fuse = std::env::var("REXL3_EXL3_FUSE").ok().and_then(|v| v.trim().parse::<i32>().ok()).unwrap_or(1) & 3;
+        gb_cuda::exl3_linear::set_fuse_mask(fuse).map_err(|e| ModelError::Config(format!("fuse mask: {e}")))?;
         let win_qkv = (0..lin_layers).map(|_| DevBuf::zeroed(WINDOW_ROWS * gdn::CONV_DIM * 2)).collect::<Result<Vec<_>, _>>()?;
         let conv_table = gdn::conv_layer_table(&win_qkv.iter().collect::<Vec<_>>(), &pools.conv.iter().collect::<Vec<_>>())?;
         let mut m = Self {

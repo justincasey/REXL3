@@ -11,6 +11,11 @@
 // whose N is too narrow to fill the GPU splits K, writes the fp32 partials to the workspace and a second kernel
 // adds them in split order.
 //
+// INPUT ROTATION (decode path of up to 8 rows, env REXL3_EXL3_FUSE): x * suh, H / sqrt(128) rounded to fp16 is either a launch of its own
+// ahead of the linear (rot_in_kernel) or, on the layers where that pays (4-warp blocks, a wide grid: ring_plan), done by the linear kernel's own
+// warps: each warp rotates the 128-column blocks of x its k range touches into shared memory (rot_chunk, rot_in_kernel's statements, so its
+// bits) one block ahead of its loop and reads its A fragments from there. Nothing about the sums changes: the same halves reach the same mmas.
+//
 // ABI conventions: x/y/xh pointers 16-byte aligned, K and N multiples of 128, dtype codes F16=0, BF16=1, F32=2,
 // codebook codes 3INST=0, MCG=1, MUL1=2, `bits` an integer 1..8 (trellis [K/16, N/16, 16*bits] int16, row-major;
 // the kernels read it as int32 words in place, no repack; the decode path of 1 to 16 rows copies it in 16-byte pieces, so the
@@ -44,11 +49,18 @@ constexpr int kMaxRows = 128;
 #define RING_MINB4 4
 #endif
 
-// Bytes of the ring kernel's shared memory before its mbarriers: RS step slots a warp (128 K2 bytes each), which share their space
-// with the cross-warp reduction's red (WK warps x rh rows x 128 floats), the larger of the two, 8-byte aligned.
+// The fused input rotation (decode path, M <= kFuseRows rows): each warp rotates one 128-column block of the rows it is about to
+// multiply (see rot_chunk) into a private buffer of kAPitch halves a row (a 16-byte pad keeps the fragment reads conflict free).
+constexpr int kFuseRows = 8;
+constexpr int kAPitch = 128 + 8;
+
+// Bytes of the ring kernel's shared memory before its mbarriers: RS step slots a warp (128 K2 bytes each) followed, with the fused input
+// rotation (arows > 0 rows), by the warp's rotated block, and the two share their space with the cross-warp reduction's red (WK warps x
+// rh rows x 128 floats, used once the k loop is over): the largest of the three, 8-byte aligned.
 template <int K2, int WK>
-__host__ __device__ constexpr size_t ring_region(int rs, int rh) {
-    const size_t slots = (size_t)WK * rs * (128 * K2), red = (size_t)WK * rh * 128 * sizeof(float);
+__host__ __device__ constexpr size_t ring_region(int rs, int rh, int arows = 0) {
+    const size_t slots = (size_t)WK * rs * (128 * K2) + (size_t)WK * arows * kAPitch * sizeof(half);
+    const size_t red = (size_t)WK * rh * 128 * sizeof(float);
     return ((slots > red ? slots : red) + 7) & ~size_t(7);
 }
 
@@ -169,6 +181,38 @@ __global__ void __launch_bounds__(128) rot_in_kernel(const void* __restrict__ x,
     store4(xh, F16, (size_t)row * K + k, v);
 }
 
+// rot_in_kernel's work for the decode kernel's own warps (the fused input rotation): the 128-column block c of the first M rows, one
+// row at a time (4 columns a lane), into dst [M][kAPitch] halves, RB rows' loads in flight together. The arithmetic is rot_in_kernel's,
+// statement for statement (x * suh, fwht128, * HAD_SCALE, round to fp16), so the halves are the ones that kernel stores to xh.
+template <int RB, int DT>
+__device__ __forceinline__ void rot_chunk_t(const void* x, const half* suh, half* dst, int M, int K, int c, int lane) {
+    const int k = c * 128 + 4 * lane;
+    float s[4];
+    load4(suh, F16, k, s);
+#pragma unroll 1
+    for (int r0 = 0; r0 < M; r0 += RB) {
+        float v[RB][4];
+#pragma unroll
+        for (int d = 0; d < RB; ++d) load4(x, DT, (size_t)min(r0 + d, M - 1) * K + k, v[d]);   // rows past M repeat the last: not stored
+#pragma unroll
+        for (int d = 0; d < RB; ++d) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) v[d][j] *= s[j];
+            fwht128(v[d], lane);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) v[d][j] *= HAD_SCALE;
+            if (r0 + d < M) store4(dst + (size_t)(r0 + d) * kAPitch, F16, 4 * lane, v[d]);
+        }
+    }
+}
+
+template <int RB>
+__device__ __forceinline__ void rot_chunk(const void* x, int x_dtype, const half* suh, half* dst, int M, int K, int c, int lane) {
+    if (x_dtype == F32) rot_chunk_t<RB, F32>(x, suh, dst, M, K, c, lane);
+    else if (x_dtype == BF16) rot_chunk_t<RB, BF16>(x, suh, dst, M, K, c, lane);
+    else rot_chunk_t<RB, F16>(x, suh, dst, M, K, c, lane);
+}
+
 // The same rotated input in the mma's A-fragment order, for the decode kernel: xf is [ceil(M / 16)][K / 16][32 lanes][4 words],
 // lane (g, t) of a 16 x 16 tile holding the words a0 = (row g, columns 2t, 2t + 1), a1 = (row g + 8, same), a2 = (row g,
 // columns 2t + 8, 2t + 9), a3 = (row g + 8, same), so a warp loads a tile's fragment in one 512-byte read instead of four
@@ -246,11 +290,15 @@ __global__ void __launch_bounds__(128) rot_out_kernel(const float* __restrict__ 
 // SM): the kernel runs in 128 registers, so 2 blocks of 8 warps or 4 of 4 share an SM, a wave of 80 or 96 blocks is resident at
 // once and the blocks' prologues and epilogues overlap each other's streaming. Which words a lane decodes, the order of the mmas
 // and every sum after them are those of the register loop; only the timing differs.
-template <int K2, int CB, int WK, int NT, int H>
+// FI (the ring kernel only, M <= kFuseRows rows): the kernel rotates its own input. xh is not read: each warp rotates, after the programmatic
+// wait, the 128-column blocks of x it multiplies, one block ahead of its k loop, into shared memory (rot_chunk), instead of a separate
+// rot_in_kernel launch and a round trip of xh through global memory. Every A fragment is the word the unfused path reads from xh.
+template <int K2, int CB, int WK, int NT, int H, bool FI = false>
 __global__ void __launch_bounds__(WK * 32, (NT == 1 && H == 1) ? (WK == 8 ? RING_MINB8 : RING_MINB4) : 1) linear_kernel(
     const half* __restrict__ xh, const uint32_t* __restrict__ T, long long stride_k, long long stride_nb,
     const half* __restrict__ svh, const half* __restrict__ bias, void* __restrict__ y, int y_dtype,
-    float* __restrict__ Z, int M, int K, int N, int SK, int ZM, int RS) {
+    float* __restrict__ Z, int M, int K, int N, int SK, int ZM, int RS, const void* __restrict__ xin, int x_dtype,
+    const half* __restrict__ suh) {
     // ZM (lane E, the TP splits): write every split's fp32 partials to Z and finish nothing, also when SK == 1 (a rank's share of a
     // parent's K splits can be one split). The partials are the same sums the finishing paths use: the warp-order sum per split.
     constexpr int TW = tile_words<K2>();
@@ -265,7 +313,7 @@ __global__ void __launch_bounds__(WK * 32, (NT == 1 && H == 1) ? (WK == 8 ? RING
     constexpr bool RING = NT == 1 && H == 1;                  // M <= 16: the trellis words come through a shared-memory ring
     constexpr uint32_t STEP_BYTES = 128 * K2;                 // a k step: 8 tiles of 16 K2 bytes, contiguous
     char* const ring = reinterpret_cast<char*>(red);          // RS slots a warp, then (past red's space) one mbarrier a slot
-    uint64_t* const bars = reinterpret_cast<uint64_t*>(ring + ring_region<K2, WK>(RS, RH));
+    uint64_t* const bars = reinterpret_cast<uint64_t*>(ring + ring_region<K2, WK>(RS, RH, FI ? M : 0));
 
     const int nb = blockIdx.x, split = blockIdx.y;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -337,12 +385,26 @@ __global__ void __launch_bounds__(WK * 32, (NT == 1 && H == 1) ? (WK == 8 ? RING
 #pragma unroll
                     for (int q = 0; q < LW; ++q) off[q] = (word + q) % TW;
                 }
-                pdl_wait();                                          // the rotated input (xh) is the predecessor's output
+                pdl_wait();                                          // the rotated input (xh) or x itself (FI) is the predecessor's output
+                // FI: this warp's rotated 128-column block [M][kAPitch] and the lane's two A rows of it (g and g + 8, clamped as x0 / x1 are)
+                half* const ab = reinterpret_cast<half*>(ring + (size_t)WK * RS * STEP_BYTES) + (size_t)warp * M * kAPitch;
+                const half* const ar0 = ab + (size_t)min(g, M - 1) * kAPitch + 2 * t;
+                const half* const ar1 = ab + (size_t)min(g + 8, M - 1) * kAPitch + 2 * t;
                 uint32_t a[4];
-                a[0] = __ldg(reinterpret_cast<const uint32_t*>(x0[0] + kt0 * 16 + 2 * t));
-                a[1] = __ldg(reinterpret_cast<const uint32_t*>(x1[0] + kt0 * 16 + 2 * t));
-                a[2] = __ldg(reinterpret_cast<const uint32_t*>(x0[0] + kt0 * 16 + 2 * t + 8));
-                a[3] = __ldg(reinterpret_cast<const uint32_t*>(x1[0] + kt0 * 16 + 2 * t + 8));
+                if constexpr (FI) {
+                    rot_chunk<4>(xin, x_dtype, suh, ab, M, K, kt0 >> 3, lane);
+                    __syncwarp();                                    // the block is written by every lane, read by every lane
+                    const int o = (kt0 & 7) * 16;
+                    a[0] = *reinterpret_cast<const uint32_t*>(ar0 + o);
+                    a[1] = *reinterpret_cast<const uint32_t*>(ar1 + o);
+                    a[2] = *reinterpret_cast<const uint32_t*>(ar0 + o + 8);
+                    a[3] = *reinterpret_cast<const uint32_t*>(ar1 + o + 8);
+                } else {
+                    a[0] = __ldg(reinterpret_cast<const uint32_t*>(x0[0] + kt0 * 16 + 2 * t));
+                    a[1] = __ldg(reinterpret_cast<const uint32_t*>(x1[0] + kt0 * 16 + 2 * t));
+                    a[2] = __ldg(reinterpret_cast<const uint32_t*>(x0[0] + kt0 * 16 + 2 * t + 8));
+                    a[3] = __ldg(reinterpret_cast<const uint32_t*>(x1[0] + kt0 * 16 + 2 * t + 8));
+                }
                 int slot = 0;
                 uint32_t phase = 0;
 #pragma unroll 1
@@ -350,10 +412,23 @@ __global__ void __launch_bounds__(WK * 32, (NT == 1 && H == 1) ? (WK == 8 ? RING
                     const int kt = kt0 + i;
                     uint32_t an[4] = {0u, 0u, 0u, 0u};
                     if (i + 1 < per_warp) {                          // the next step's A fragment, one step ahead
-                        an[0] = __ldg(reinterpret_cast<const uint32_t*>(x0[0] + (kt + 1) * 16 + 2 * t));
-                        an[1] = __ldg(reinterpret_cast<const uint32_t*>(x1[0] + (kt + 1) * 16 + 2 * t));
-                        an[2] = __ldg(reinterpret_cast<const uint32_t*>(x0[0] + (kt + 1) * 16 + 2 * t + 8));
-                        an[3] = __ldg(reinterpret_cast<const uint32_t*>(x1[0] + (kt + 1) * 16 + 2 * t + 8));
+                        if constexpr (FI) {
+                            if (((kt + 1) & 7) == 0) {               // the next step opens the next 128-column block: rotate it first,
+                                __syncwarp();                        // once every lane has its words of the finished one (it waits for
+                                rot_chunk<4>(xin, x_dtype, suh, ab, M, K, (kt + 1) >> 3, lane);   // the weights anyway)
+                                __syncwarp();
+                            }
+                            const int o = ((kt + 1) & 7) * 16;
+                            an[0] = *reinterpret_cast<const uint32_t*>(ar0 + o);
+                            an[1] = *reinterpret_cast<const uint32_t*>(ar1 + o);
+                            an[2] = *reinterpret_cast<const uint32_t*>(ar0 + o + 8);
+                            an[3] = *reinterpret_cast<const uint32_t*>(ar1 + o + 8);
+                        } else {
+                            an[0] = __ldg(reinterpret_cast<const uint32_t*>(x0[0] + (kt + 1) * 16 + 2 * t));
+                            an[1] = __ldg(reinterpret_cast<const uint32_t*>(x1[0] + (kt + 1) * 16 + 2 * t));
+                            an[2] = __ldg(reinterpret_cast<const uint32_t*>(x0[0] + (kt + 1) * 16 + 2 * t + 8));
+                            an[3] = __ldg(reinterpret_cast<const uint32_t*>(x1[0] + (kt + 1) * 16 + 2 * t + 8));
+                        }
                     }
                     mbar_wait(bar_s + 8 * slot, phase);
                     const uint32_t* const sm = reinterpret_cast<const uint32_t*>(ring_w + (size_t)slot * STEP_BYTES);
@@ -574,10 +649,26 @@ struct LinArgs {
     int y_dtype; float* Z; int M, K, N; Plan plan;
     int zmode = 0;                                           // 1: the split partials to Z, nothing finished (gb_exl3_linear_ex)
     bool pdl = false;                                        // the launches carry the programmatic-dependent-launch attribute (decode path)
+    const void* x = nullptr; int x_dtype = 0; const half* suh = nullptr;   // the unrotated input and its scales: launch_linear rotates it
+    int fuse = 0;                                            // fuse_mask(): the ring kernel may rotate its own input (ring_plan decides)
 };
 
 // The decode path's launches carry the PDL attribute when the mask has gbp_pdl::kExl3 (env REXL3_GLM_PDL, hook gb_pdl_set_mask).
 inline bool pdl_exl3() { return gbp_pdl::on(gbp_pdl::kExl3); }
+
+// Which launches the decode path folds into the linear kernel (env REXL3_EXL3_FUSE, read once; the test hook gb_exl3_set_fuse; 0, every launch
+// as before, until a model sets it): bit 0 is the input rotation of 1 to kFuseRows rows (linear_kernel's FI) on the layers where it pays
+// (ring_plan); bit 1 takes every 4-warp layer that fits whatever its grid (how the tests reach the kernel on small shapes). Only the launch
+// count and the timing change, never a bit.
+enum : int { kFuseIn = 1, kFuseInAll = 2, kFuseAll = 3 };
+inline int g_fuse = -1;
+inline int fuse_mask() {
+    if (g_fuse < 0) {
+        const char* e = getenv("REXL3_EXL3_FUSE");
+        g_fuse = e ? (atoi(e) & kFuseAll) : 0;
+    }
+    return g_fuse;
+}
 template <typename... KArgs, typename... Args>
 int launch_k(bool pdl, void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t st, Args... args) {
     return gbp_pdl::launch_pdl(pdl, kernel, grid, block, smem, st, args...);
@@ -624,33 +715,101 @@ inline int ring_stages(int k2, int wk, int per_warp) {
     return s < 1 ? 1 : (s > cap ? cap : s);
 }
 
+int rotate_in(const void* x, int x_dtype, const void* suh, void* xh, int m, int k, cudaStream_t st, bool pdl = false) {
+    const dim3 grid((unsigned)m, (unsigned)((k / 128 + 3) / 4));
+    return launch_k(pdl, rot_in_kernel, grid, dim3(128), 0, st, x, x_dtype, (const half*)suh, (half*)xh, k);
+}
+
+// the same, into the decode kernel's fragment order (see rot_in_frag_kernel)
+int rotate_in_frag(const void* x, int x_dtype, const void* suh, void* xf, int m, int k, cudaStream_t st, bool pdl = false) {
+    const dim3 grid((unsigned)((m + 15) / 16 * 16), (unsigned)((k / 128 + 3) / 4));
+    return launch_k(pdl, rot_in_frag_kernel, grid, dim3(128), 0, st, x, x_dtype, (const half*)suh, (uint32_t*)xf, k, m);
+}
+
+// What a ring launch (M <= 16) runs: its stages (RS), its dynamic shared memory, and whether the kernel rotates its own input (FI, see
+// linear_kernel). That needs the window's rows in shared memory beside the ring, so FI takes the unfused stage count where that fits what an
+// SM hosts (RING_MINB4 blocks of the size below), fewer stages (down to 2) where it does not, and is not taken at all (the rotation stays a
+// launch of its own) for more than kFuseRows rows or where two stages do not fit either.
+struct RingPlan {
+    int rs;
+    size_t smem;
+    bool fused;
+};
+
+#ifndef RING_FUSED_BUDGET4
+#define RING_FUSED_BUDGET4 24576
+#endif
+
+// Layers of 4-warp blocks whose grid is at least this many blocks (the ones whose N is narrow enough to split K and wide enough to fill the SMs:
+// z, out_proj and o_proj of the Flash-Next pack) take the fused rotation under kFuseIn: measured on the decode window, it removes their rot_in
+// launch and its hop and the loop pays nothing for it, where the 8-warp layers (qkv, q) and the layers of a few blocks (k, v, the indexer) pay
+// the rotation's latency in the kernel and lose what the launch saved. The 8-warp blocks never fuse (their instances are not built).
+constexpr int kFuseMinBlocks = 128;
+
+template <int K2, int WK>
+RingPlan ring_plan(const LinArgs& a, int rh) {
+    const int rs = ring_stages(K2, WK, (a.K >> 4) / a.plan.sk / WK);
+    if constexpr (WK == 4) {
+        const bool pays = (a.N / 128) * a.plan.sk >= kFuseMinBlocks;
+        if (a.M <= kFuseRows && (((a.fuse & kFuseIn) && pays) || (a.fuse & kFuseInAll))) {
+            for (int s = rs; s >= (rs < 2 ? rs : 2); --s) {
+                const size_t smem = ring_region<K2, WK>(s, rh, a.M) + (size_t)WK * s * 8;
+                if (smem <= RING_FUSED_BUDGET4) return {s, smem, true};
+            }
+        }
+    }
+    return {rs, ring_region<K2, WK>(rs, rh) + (size_t)WK * rs * 8, false};
+}
+
+template <int K2>
+RingPlan ring_plan_of(const LinArgs& a, int rh) {
+    return a.plan.wk == 4 ? ring_plan<K2, 4>(a, rh) : ring_plan<K2, 8>(a, rh);
+}
+
 template <int K2, int CB, int NT, int H>
-void launch_linear_nt(const LinArgs& a, const dim3& grid, int rh, cudaStream_t st) {
+void launch_linear_nt(const LinArgs& a, const dim3& grid, int rh, const RingPlan& rp, cudaStream_t st) {
     constexpr int RC = (8 / H) * 16;
+    constexpr bool RING = NT == 1 && H == 1;
     // the stage of finished sums (16 NT rows x 128 columns) exists when a block rotates and stores the rows itself
     const size_t stage = (H > 1 && a.plan.sk == 1 && !a.zmode) ? (size_t)16 * NT * 128 * sizeof(float) : 0;
-    const int rs = (NT == 1 && H == 1) ? ring_stages(K2, a.plan.wk, (a.K >> 4) / a.plan.sk / a.plan.wk) : 1;
+    const int rs = RING ? rp.rs : 1;
     if (a.plan.wk == 4) {
-        const size_t smem = (NT == 1 && H == 1) ? ring_region<K2, 4>(rs, rh) + 4 * rs * 8 : 4 * rh * RC * sizeof(float) + stage;
+        const size_t smem = RING ? rp.smem : 4 * rh * RC * sizeof(float) + stage;
+        if constexpr (RING) {
+            if (rp.fused) {
+                launch_k(a.pdl, linear_kernel<K2, CB, 4, NT, H, true>, grid, dim3(128), smem, st, a.xh, a.T, a.stride_k, a.stride_nb, a.svh,
+                         a.bias, a.y, a.y_dtype, a.Z, a.M, a.K, a.N, a.plan.sk, a.zmode, rs, a.x, a.x_dtype, a.suh);
+                return;
+            }
+        }
         launch_k(a.pdl, linear_kernel<K2, CB, 4, NT, H>, grid, dim3(128), smem, st, a.xh, a.T, a.stride_k, a.stride_nb, a.svh, a.bias,
-                 a.y, a.y_dtype, a.Z, a.M, a.K, a.N, a.plan.sk, a.zmode, rs);
+                 a.y, a.y_dtype, a.Z, a.M, a.K, a.N, a.plan.sk, a.zmode, rs, a.x, a.x_dtype, a.suh);
     } else {
-        const size_t smem = (NT == 1 && H == 1) ? ring_region<K2, 8>(rs, rh) + 8 * rs * 8 : 8 * rh * RC * sizeof(float) + stage;
+        const size_t smem = RING ? rp.smem : 8 * rh * RC * sizeof(float) + stage;
         launch_k(a.pdl, linear_kernel<K2, CB, 8, NT, H>, grid, dim3(256), smem, st, a.xh, a.T, a.stride_k, a.stride_nb, a.svh, a.bias,
-                 a.y, a.y_dtype, a.Z, a.M, a.K, a.N, a.plan.sk, a.zmode, rs);
+                 a.y, a.y_dtype, a.Z, a.M, a.K, a.N, a.plan.sk, a.zmode, rs, a.x, a.x_dtype, a.suh);
     }
 }
 
 template <int K2, int CB>
 int launch_linear(const LinArgs& a, cudaStream_t st) {
-    if (group_tiles(a.M) == 1 && (reinterpret_cast<uintptr_t>(a.T) & 15)) return (int)cudaErrorInvalidValue;   // the ring copies 16-byte pieces
+    const int nt = group_tiles(a.M);
+    if (nt == 1 && (reinterpret_cast<uintptr_t>(a.T) & 15)) return (int)cudaErrorInvalidValue;   // the ring copies 16-byte pieces
     const dim3 grid((unsigned)(a.N / 128), (unsigned)a.plan.sk);
     const int rh = a.M < 8 ? a.M : 8;
-    switch (group_tiles(a.M)) {
-        case 4: launch_linear_nt<K2, CB, 4, sweeps_of<K2, CB>(4)>(a, grid, rh, st); break;
-        case 3: launch_linear_nt<K2, CB, 3, sweeps_of<K2, CB>(3)>(a, grid, rh, st); break;
-        case 2: launch_linear_nt<K2, CB, 2, sweeps_of<K2, CB>(2)>(a, grid, rh, st); break;
-        default: launch_linear_nt<K2, CB, 1, sweeps_of<K2, CB>(1)>(a, grid, rh, st); break;
+    const RingPlan rp = nt == 1 ? ring_plan_of<K2>(a, rh) : RingPlan{1, 0, false};
+    if (!rp.fused) {
+        // the rotated input: more than one 16-row pass reads its A fragments in fragment order; one pass (up to 16 rows, the
+        // bandwidth-bound case) reads the rows themselves, which for a handful of rows is less to fetch than whole padded tiles
+        const int rc = nt >= 2 ? rotate_in_frag(a.x, a.x_dtype, a.suh, const_cast<half*>(a.xh), a.M, a.K, st, a.pdl)
+                               : rotate_in(a.x, a.x_dtype, a.suh, const_cast<half*>(a.xh), a.M, a.K, st, a.pdl);
+        if (rc) return rc;
+    }
+    switch (nt) {
+        case 4: launch_linear_nt<K2, CB, 4, sweeps_of<K2, CB>(4)>(a, grid, rh, rp, st); break;
+        case 3: launch_linear_nt<K2, CB, 3, sweeps_of<K2, CB>(3)>(a, grid, rh, rp, st); break;
+        case 2: launch_linear_nt<K2, CB, 2, sweeps_of<K2, CB>(2)>(a, grid, rh, rp, st); break;
+        default: launch_linear_nt<K2, CB, 1, sweeps_of<K2, CB>(1)>(a, grid, rh, rp, st); break;
     }
     const int rc = GB_CHECK_LAUNCH();
     if (rc || a.plan.sk == 1 || a.zmode) return rc;
@@ -711,17 +870,6 @@ int dispatch_unpack_k2(int k2, int cb, const uint32_t* T, half* W, int k, int n,
     GB_EXL3_FOR_ALL(GB_U)
 #undef GB_U
     return (int)cudaErrorInvalidValue;
-}
-
-int rotate_in(const void* x, int x_dtype, const void* suh, void* xh, int m, int k, cudaStream_t st, bool pdl = false) {
-    const dim3 grid((unsigned)m, (unsigned)((k / 128 + 3) / 4));
-    return launch_k(pdl, rot_in_kernel, grid, dim3(128), 0, st, x, x_dtype, (const half*)suh, (half*)xh, k);
-}
-
-// the same, into the decode kernel's fragment order (see rot_in_frag_kernel)
-int rotate_in_frag(const void* x, int x_dtype, const void* suh, void* xf, int m, int k, cudaStream_t st, bool pdl = false) {
-    const dim3 grid((unsigned)((m + 15) / 16 * 16), (unsigned)((k / 128 + 3) / 4));
-    return launch_k(pdl, rot_in_frag_kernel, grid, dim3(128), 0, st, x, x_dtype, (const half*)suh, (uint32_t*)xf, k, m);
 }
 
 bool dtype_ok(int d) { return d >= 0 && d <= 2; }
@@ -828,14 +976,14 @@ GB_EXPORT int gb_exl3_linear(const void* x, int x_dtype, const void* trellis, co
     char* ws = static_cast<char*>(workspace);
     half* xh = reinterpret_cast<half*>(ws);
     float* Z = p.sk > 1 ? reinterpret_cast<float*>(ws + xf_bytes(m, k)) : nullptr;
-    // more than one 16-row pass reads its A fragments in fragment order; one pass (up to 16 rows, the bandwidth-bound case) reads
-    // the rows themselves, which for a handful of rows is less to fetch than whole padded tiles
-    int rc = group_tiles(m) >= 2 ? rotate_in_frag(x, x_dtype, suh, xh, m, k, st, pdl_exl3()) : rotate_in(x, x_dtype, suh, xh, m, k, st, pdl_exl3());
-    if (rc) return rc;
     const int tw = 8 * bits;                                 // words a tile: 4 * K2
     LinArgs a{xh, static_cast<const uint32_t*>(trellis), (long long)(n / 16) * tw, 8LL * tw, (const half*)svh,
               (const half*)bias, y, y_dtype, Z, m, k, n, p};
     a.pdl = pdl_exl3();
+    a.x = x;
+    a.x_dtype = x_dtype;
+    a.suh = static_cast<const half*>(suh);
+    a.fuse = fuse_mask();
     return dispatch_linear(bits, codebook, a, st);
 }
 
@@ -853,12 +1001,14 @@ GB_EXPORT int gb_exl3_linear_k2(const void* x, int x_dtype, const void* trellis,
     char* ws = static_cast<char*>(workspace);
     half* xh = reinterpret_cast<half*>(ws);
     float* Z = p.sk > 1 ? reinterpret_cast<float*>(ws + xf_bytes(m, k)) : nullptr;
-    int rc = group_tiles(m) >= 2 ? rotate_in_frag(x, x_dtype, suh, xh, m, k, st, pdl_exl3()) : rotate_in(x, x_dtype, suh, xh, m, k, st, pdl_exl3());
-    if (rc) return rc;
     const int tw = 4 * k2;                                 // words a tile: 4 * K2
     LinArgs a{xh, static_cast<const uint32_t*>(trellis), (long long)(n / 16) * tw, 8LL * tw, (const half*)svh,
               (const half*)bias, y, y_dtype, Z, m, k, n, p};
     a.pdl = pdl_exl3();
+    a.x = x;
+    a.x_dtype = x_dtype;
+    a.suh = static_cast<const half*>(suh);
+    a.fuse = fuse_mask();
     return dispatch_linear_k2(k2, codebook, a, st);
 }
 
@@ -907,13 +1057,15 @@ GB_EXPORT int gb_exl3_linear_ex(const void* x, int x_dtype, const void* trellis,
     char* ws = static_cast<char*>(workspace);
     half* xh = reinterpret_cast<half*>(ws);
     float* Z = z ? static_cast<float*>(z) : (p.sk > 1 ? reinterpret_cast<float*>(ws + xf_bytes(m, k)) : nullptr);
-    int rc = group_tiles(m) >= 2 ? rotate_in_frag(x, x_dtype, suh, xh, m, k, st, pdl_exl3()) : rotate_in(x, x_dtype, suh, xh, m, k, st, pdl_exl3());
-    if (rc) return rc;
     const int tw = 8 * bits;
     LinArgs a{xh, static_cast<const uint32_t*>(trellis), (long long)(stride_n / 16) * tw, 8LL * tw, (const half*)svh,
               (const half*)bias, y, y_dtype, Z, m, k, n, p};
     a.zmode = z != nullptr;
     a.pdl = pdl_exl3();
+    a.x = x;
+    a.x_dtype = x_dtype;
+    a.suh = static_cast<const half*>(suh);
+    a.fuse = fuse_mask();
     return dispatch_linear(bits, codebook, a, st);
 }
 
@@ -1028,6 +1180,36 @@ GB_EXPORT int gb_exl3_prefill_pin_for(int k, int n, unsigned* tile, unsigned* st
 GB_EXPORT int gb_pdl_set_mask(int mask) {
     gbp_pdl::g_mask = mask & gbp_pdl::kAll;
     return 0;
+}
+
+// Test hook: which launches the decode path folds into the linear kernel (env REXL3_EXL3_FUSE sets it at start): bit 1 the input rotation of
+// 1 to 8 rows. The bits do not depend on it; only the launch count and the speed.
+GB_EXPORT int gb_exl3_set_fuse(int mask) {
+    g_fuse = mask & kFuseAll;
+    return 0;
+}
+
+// Whether gb_exl3_linear on `m` rows of a K x N layer of `bits` bits rotates its own input now (the fuse mask is on, 1 to kFuseRows rows, and
+// the rotated rows fit beside the ring): how a test knows it exercises the fused kernel and not the launch it falls back to.
+GB_EXPORT int gb_exl3_fused_in(int m, int k, int n, int bits) {
+    if (m < 1 || m > kMaxRows || !shape_ok(k, n, bits, 0) || group_tiles(m) != 1) return 0;
+    LinArgs a{};
+    a.M = m;
+    a.K = k;
+    a.N = n;
+    a.plan = plan_for(k, n);
+    a.fuse = fuse_mask();
+    const int rh = m < 8 ? m : 8;
+    switch (bits) {
+        case 1: return ring_plan_of<2>(a, rh).fused;
+        case 2: return ring_plan_of<4>(a, rh).fused;
+        case 3: return ring_plan_of<6>(a, rh).fused;
+        case 4: return ring_plan_of<8>(a, rh).fused;
+        case 5: return ring_plan_of<10>(a, rh).fused;
+        case 6: return ring_plan_of<12>(a, rh).fused;
+        case 7: return ring_plan_of<14>(a, rh).fused;
+        default: return ring_plan_of<16>(a, rh).fused;
+    }
 }
 
 GB_EXPORT int gb_exl3_plan(int k, int n, int* sk, int* wk) {
