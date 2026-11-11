@@ -108,7 +108,7 @@ template <int WK, int K2, int CB, int H, int PD, int AP>
 __global__ void __launch_bounds__(WK * 32, 1) big_kernel(const uint32_t* __restrict__ xf, const uint32_t* __restrict__ T,
                                                          const half* __restrict__ svh, const half* __restrict__ bias,
                                                          void* __restrict__ y, int y_dtype, int M, int K, int N, int SK,
-                                                         int stride_n) {
+                                                         int stride_n, int strips_fast) {
     constexpr int NT = kTiles;
     constexpr int TW = tile_words<K2>();
     constexpr int RC = (8 / H) * 16;
@@ -116,7 +116,7 @@ __global__ void __launch_bounds__(WK * 32, 1) big_kernel(const uint32_t* __restr
     float* red = smem;                                       // WK * 8 * RC floats
     float* stage = smem + WK * 8 * RC;                       // 16 NT * 128 floats
 
-    const int m0 = blockIdx.x * 16 * NT, nb = blockIdx.y;
+    const int m0 = (strips_fast ? blockIdx.y : blockIdx.x) * 16 * NT, nb = strips_fast ? blockIdx.x : blockIdx.y;
     const int nt = min(NT, (M - m0 + 15) >> 4);
     const int rows = min(16 * nt, M - m0);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -172,9 +172,14 @@ int launch_big_pa(const uint32_t* xf, const uint32_t* T, const half* svh, const 
     constexpr int H = sweeps_of<K2, CB>(kTiles);
     constexpr int RC = (8 / H) * 16;
     const size_t smem = ((size_t)WK * 8 * RC + (size_t)16 * kTiles * 128) * sizeof(float);
-    const dim3 grid((unsigned)((M + 16 * kTiles - 1) / (16 * kTiles)), (unsigned)(N / 128));
+    // A narrow layer (at most 24 strips of 128 columns: its whole weight set is a few MB) runs the strips of a row group together, so that the
+    // group's rotated input is read from DRAM once and the weights stay in L2; a wide one runs the row groups of a strip together (the weights
+    // are what is streamed). Which block runs when never changes a bit.
+    const bool strips_fast = N / 128 <= 24;
+    const unsigned groups = (unsigned)((M + 16 * kTiles - 1) / (16 * kTiles)), strips = (unsigned)(N / 128);
+    const dim3 grid(strips_fast ? strips : groups, strips_fast ? groups : strips);
     big_kernel<WK, K2, CB, H, PD, AP><<<grid, WK * 32, smem, st>>>(xf, T, svh, bias, y, y_dtype, M, K, N, SK,
-                                                                  (int)stride_n);
+                                                                  (int)stride_n, strips_fast ? 1 : 0);
     return GB_CHECK_LAUNCH();
 }
 
