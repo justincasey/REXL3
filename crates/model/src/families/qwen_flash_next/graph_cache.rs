@@ -14,10 +14,14 @@
 //! trace of 7,050 windows through both rules: 502 captures against 1,136 for a plain second-sighting rule, and 23.1% of the windows
 //! replayed against 23.6%.) At most [`DEFAULT_WINDOW_GRAPHS`] window graphs and [`DEFAULT_CHAIN_GRAPHS`] chain graphs are alive at
 //! once; a capture that finds its cache full retires the least recently launched graph first (that shape starts over at its next
-//! sighting). A window is cached as up to three graphs (parts), so the window cap counts three entries per window. The defaults leave
-//! room for the hot shapes of one stream (the six prompts of the decode screen, one after the other, made 136 window graphs, about 45
-//! windows, and 24 chain graphs in their first 160 captures, and replayed 10,188 and 891 times) and cost at most
-//! 384 x 2.5 MiB + 64 x 7.4 MiB = 1.4 GiB (a part took 2.5 MiB of unified memory; the chain figure is the whole-window one, an upper bound).
+//! sighting). A window is cached as up to three graphs (parts: before the PLE stage, the PLE stage with a few layers, the rest), so the
+//! window cap counts three entries per window; before the middle part existed a window took two. The defaults leave room for the hot
+//! shapes of one stream (the six prompts of the decode screen, one after the other, made 136 window graphs, about 45 windows, and 24
+//! chain graphs in their first 160 captures, and replayed 10,188 and 891 times; a cap of 128 evicted 8 of those while live). Memory,
+//! measured on a node with four sampled decode streams for 20 minutes: the available memory settles 1.2 GiB below its start with 128
+//! window and 64 chain graphs and 2.3 GiB below with 384 and 64 (that figure includes the n-gram page cache), so the 256 extra window
+//! entries cost about 1.05 GiB, 4.2 MiB each (a single stream's free-memory counter read 2.5 MiB a part). A cap of 192, the same
+//! 64 windows as the old 128, was not measured.
 //!
 //! None of this changes a bit of output: eager launches, a capture's launches and a replay run the same kernels with the same
 //! arguments in the same order; only when a graph exists, and for how long, changes.
