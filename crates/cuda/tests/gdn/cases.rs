@@ -1291,6 +1291,244 @@ fn prefill_gated_chain_equals_chain_then_norm_across_the_chunk_width() {
     }
 }
 
+/// The prefill pre kernel that leaves room beside another kernel (a warp walks 128 rows of one 128-channel unit with the conv window in registers, on a few
+/// persistent blocks an SM) writes exactly the workspace of the kernel a block a (row, 4 units) wrote: q, k, v, g and beta, every byte, with a
+/// history from random pools, for runs that end inside and on the edge of a 128-row run, sequences that start in the middle of one and
+/// shorter than the 3-row window, several sequences with distinct slots, and a 4,012, an 8,192 and a 9,500-row chunk, at every block count.
+/// 48 value heads only.
+#[test]
+fn prefill_pre_in_few_blocks_equals_the_pre_kernel_bit_for_bit() {
+    need_gpu!();
+    if SHAPE != GdnShape::Hv48 {
+        return;
+    }
+    let mut rng = Rng(0x9e4e);
+    let ctx = Ctx::new(Weights::random(&mut rng));
+    let cases: [(&[usize], &[usize]); 15] = [
+        (&[1], &[2]),
+        (&[2], &[0]),
+        (&[3], &[1]),
+        (&[63], &[1]),
+        (&[64], &[3]),
+        (&[65], &[0]),
+        (&[127], &[1]),
+        (&[128], &[2]),
+        (&[129], &[2]),
+        (&[257], &[3]),
+        (&[1, 2, 3, 61, 64, 130], &[3, 0, 5, 1, 4, 2]),
+        (&[100, 28, 1, 200], &[2, 0, 3, 1]),
+        (&[4012], &[1]),
+        (&[8192], &[1]),
+        (&[9500, 7], &[0, 3]),
+    ];
+    for (lens, slots) in cases {
+        let total: usize = lens.iter().sum();
+        let inp = Inp::random(&mut rng, total);
+        let start = HostPools::random(&mut rng, 6);
+        let batch = BatchBuf::new(lens, slots).unwrap();
+        let x = DevInp::new(&inp);
+        let pools = DevPools::new(&start);
+        let bytes = prefill_workspace_bytes_shaped(SHAPE, total);
+        let run = |ctas: i32| {
+            let mut ws = DevBuf::zeroed(bytes).unwrap();
+            prefill_gated_pre(&ctx.st, &x.view(), &ctx.weights(), &pools.conv, &batch.view(), &mut ws, 0..total, ctas).unwrap();
+            ctx.st.sync().unwrap();
+            ws.to_vec::<u8>().unwrap()
+        };
+        let want = run(0);
+        assert!(want.iter().any(|&b| b != 0), "lens {lens:?}: the workspace is all zero");
+        for ctas in [1, 2, 3, 8, 64] {
+            assert_bits_eq(&format!("lens {lens:?} workspace at {ctas} blocks an SM"), &run(ctas), &want);
+        }
+        // the rows in three launches, cut at odd rows (the history of a launch is the previous rows of the same qkv)
+        let (a, b) = (total / 3 + 1, (2 * total / 3 + 5).min(total));
+        for ctas in [1, 4] {
+            let mut ws = DevBuf::zeroed(bytes).unwrap();
+            for (lo, hi) in [(0, a), (a, b), (b, total)] {
+                prefill_gated_pre(&ctx.st, &x.view(), &ctx.weights(), &pools.conv, &batch.view(), &mut ws, lo..hi, ctas).unwrap();
+            }
+            ctx.st.sync().unwrap();
+            assert_bits_eq(&format!("lens {lens:?} workspace in launches cut at {a}, {b} at {ctas} blocks an SM"), &ws.to_vec::<u8>().unwrap(), &want);
+        }
+    }
+}
+
+/// The pre half on a stream of its own beside other work (a second prefill on a third stream, which shares no buffer with it), joined
+/// with events in front of the chain half, leaves the output, the recurrent state and the conv history of the in-order prefill, bit for bit,
+/// three times over (a race would not repeat). 48 value heads only.
+#[test]
+fn prefill_pre_beside_other_work_on_a_stream_of_its_own_equals_in_order_bit_for_bit() {
+    need_gpu!();
+    if SHAPE != GdnShape::Hv48 {
+        return;
+    }
+    use gb_cuda::graph::{join, wait};
+    use gb_cuda::rt::Event;
+    let mut rng = Rng(0x51de);
+    let ctx = Ctx::new(Weights::random(&mut rng));
+    let nw = DevBuf::from_slice(&rng.vec(D, 0.4, 1.8)).unwrap();
+    let eps = 1e-6f32;
+    let side = Stream::new_nonblocking().unwrap();
+    let other = Stream::new_nonblocking().unwrap();
+    let (ev_fork, ev_join) = (Event::new().unwrap(), Event::new().unwrap());
+    // the other work: its own inputs, pools, workspace and output
+    let other_rows = 8192usize;
+    let other_inp = Inp::random(&mut rng, other_rows);
+    let other_x = DevInp::new(&other_inp);
+    let other_start = HostPools::random(&mut rng, 2);
+    let mut other_pools = DevPools::new(&other_start);
+    let other_batch = BatchBuf::new(&[other_rows], &[1]).unwrap();
+    let mut other_ws = DevBuf::zeroed(prefill_workspace_bytes_shaped(SHAPE, other_rows)).unwrap();
+    let mut other_o = DevBuf::zeroed(other_rows * VH * D * 2).unwrap();
+    let cases: [(&[usize], &[usize]); 4] = [(&[8192], &[1]), (&[9500], &[0]), (&[4097, 33, 1, 8192], &[2, 0, 3, 1]), (&[17], &[2])];
+    for (lens, slots) in cases {
+        let total: usize = lens.iter().sum();
+        let inp = Inp::random(&mut rng, total);
+        let zh: Vec<u16> = rng.vec(total * VH * D, -6.0, 6.0).iter().map(|&x| f32_to_bf16(x)).collect();
+        let z = DevBuf::from_slice(&zh).unwrap();
+        let start = HostPools::random(&mut rng, 4);
+        let batch = BatchBuf::new(lens, slots).unwrap();
+        let x = DevInp::new(&inp);
+        let mut ws = DevBuf::zeroed(prefill_workspace_bytes_shaped(SHAPE, total)).unwrap();
+        let mut pools = DevPools::new(&start);
+        let mut o = DevBuf::zeroed(total * VH * D * 2).unwrap();
+        prefill_gated(&ctx.st, &x.view(), &ctx.weights(), &mut pools.s, &mut pools.conv, &batch.view(), &mut ws, &z, &nw, eps, &mut o).unwrap();
+        ctx.st.sync().unwrap();
+        let (want_o, want) = (o.to_vec::<u16>().unwrap(), pools.host());
+        for rep in 0..3 {
+            let mut pools = DevPools::new(&start);
+            let mut o = DevBuf::zeroed(total * VH * D * 2).unwrap();
+            let mut ws = DevBuf::zeroed(prefill_workspace_bytes_shaped(SHAPE, total)).unwrap();
+            ev_fork.record(&ctx.st).unwrap();
+            wait(&side, &ev_fork).unwrap();
+            wait(&other, &ev_fork).unwrap();
+            prefill_gated_pre(&side, &x.view(), &ctx.weights(), &pools.conv, &batch.view(), &mut ws, 0..total, 1).unwrap();
+            for _ in 0..2 {
+                prefill_shaped(
+                    SHAPE,
+                    &other,
+                    &other_x.view(),
+                    &ctx.weights(),
+                    &mut other_pools.s,
+                    &mut other_pools.conv,
+                    &other_batch.view(),
+                    &mut other_ws,
+                    &mut other_o,
+                )
+                .unwrap();
+            }
+            join(&ctx.st, &side, &ev_join).unwrap();
+            join(&ctx.st, &other, &ev_join).unwrap();
+            prefill_gated_chain(&ctx.st, &mut pools.s, &batch.view(), &mut ws, &z, &nw, eps, &mut o, 0..total).unwrap();
+            prefill_gated_commit(&ctx.st, &x.view(), &mut pools.conv, &batch.view()).unwrap();
+            ctx.st.sync().unwrap();
+            let (got_o, got) = (o.to_vec::<u16>().unwrap(), pools.host());
+            assert_bits_eq(&format!("lens {lens:?} rep {rep} o"), &got_o, &want_o);
+            assert_f32_bits_eq(&format!("lens {lens:?} rep {rep} S"), &got.s, &want.s);
+            assert_bits_eq(&format!("lens {lens:?} rep {rep} conv"), &got.conv, &want.conv);
+        }
+    }
+}
+
+/// The pre half of an 8,192-row chunk (the 8,108-row chunk of a 32K prompt is the same shape), alone on the GPU: the kernel a block a (row, 4 units)
+/// and the few-blocks kernel at 1, 2, 4 and 8 blocks an SM.
+///     cargo test --release -p gb-cuda --test gdn -- --ignored --nocapture bench_prefill_pre_blocks
+#[test]
+#[ignore]
+fn bench_prefill_pre_blocks() {
+    need_gpu!();
+    if SHAPE != GdnShape::Hv48 {
+        return;
+    }
+    let mut rng = Rng(65);
+    let ctx = Ctx::new(Weights::random(&mut rng));
+    let rows = 8108usize;
+    let inp = Inp::random(&mut rng, rows);
+    let x = DevInp::new(&inp);
+    let pools = DevPools::new(&HostPools::random(&mut rng, 2));
+    let batch = BatchBuf::new(&[rows], &[1]).unwrap();
+    let mut ws = DevBuf::zeroed(prefill_workspace_bytes_shaped(SHAPE, rows)).unwrap();
+    for ctas in [0, 1, 2, 4, 8] {
+        let t = timed(&ctx.st, 20, |_| {
+            prefill_gated_pre(&ctx.st, &x.view(), &ctx.weights(), &pools.conv, &batch.view(), &mut ws, 0..rows, ctas).unwrap()
+        });
+        eprintln!("BENCH {rows} rows, pre at {ctas} blocks an SM (0: block a row): {:.3} ms", t * 1e3);
+    }
+}
+
+/// A prefill chunk run as the engine runs it beside other work, in pieces: the pre kernel of piece i + 1 on a stream of its own beside the gated chain over
+/// piece i, each chain piece after the pre piece that wrote its rows (events), the conv commit last, leaves the output, the recurrent state of every slot and
+/// the conv history of one in-order launch over every row, bit for bit, three times over (a race would not repeat). The cuts fall inside tiles and 64-row
+/// runs, one row in, one row from the end, in the middle of a sequence and on a sequence boundary; the batches carry several sequences with distinct
+/// slots. 48 value heads only.
+#[test]
+fn prefill_in_pieces_with_the_pre_beside_the_chain_equals_one_launch_bit_for_bit() {
+    need_gpu!();
+    if SHAPE != GdnShape::Hv48 {
+        return;
+    }
+    use gb_cuda::graph::{fork, wait};
+    use gb_cuda::rt::Event;
+    let mut rng = Rng(0x71ec);
+    let ctx = Ctx::new(Weights::random(&mut rng));
+    let nw = DevBuf::from_slice(&rng.vec(D, 0.4, 1.8)).unwrap();
+    let eps = 1e-6f32;
+    let side = Stream::new_nonblocking().unwrap();
+    let ev_fork = Event::new().unwrap();
+    let ev: Vec<Event> = (0..8).map(|_| Event::new().unwrap()).collect();
+    let cases: [(&[usize], &[usize], &[usize]); 8] = [
+        (&[9], &[2], &[1]),
+        (&[100], &[3], &[1, 17, 99]),
+        (&[1024], &[1], &[63, 64, 65, 513]),
+        (&[4012], &[1], &[1003, 2006, 3009]),
+        (&[8192], &[1], &[1024, 2048, 4096, 5000, 8191]),
+        (&[9500], &[0], &[2375, 4750, 7125]),
+        (&[300, 70, 41, 1], &[2, 0, 3, 1], &[1, 70, 300, 301, 370, 411]),
+        (&[4097, 33, 4095], &[1, 3, 0], &[1024, 4096, 4097, 4130, 6000, 8200]),
+    ];
+    for (lens, slots, inner_cuts) in cases {
+        let total: usize = lens.iter().sum();
+        let inp = Inp::random(&mut rng, total);
+        let zh: Vec<u16> = rng.vec(total * VH * D, -6.0, 6.0).iter().map(|&x| f32_to_bf16(x)).collect();
+        let z = DevBuf::from_slice(&zh).unwrap();
+        let start = HostPools::random(&mut rng, 4);
+        let batch = BatchBuf::new(lens, slots).unwrap();
+        let x = DevInp::new(&inp);
+        let mut ws = DevBuf::zeroed(prefill_workspace_bytes_shaped(SHAPE, total)).unwrap();
+        let mut pools = DevPools::new(&start);
+        let mut o = DevBuf::zeroed(total * VH * D * 2).unwrap();
+        prefill_gated(&ctx.st, &x.view(), &ctx.weights(), &mut pools.s, &mut pools.conv, &batch.view(), &mut ws, &z, &nw, eps, &mut o).unwrap();
+        ctx.st.sync().unwrap();
+        let (want_o, want) = (o.to_vec::<u16>().unwrap(), pools.host());
+        // the cuts: every inner cut that falls inside the chunk, at most seven, in row order
+        let mut cuts: Vec<usize> = std::iter::once(0).chain(inner_cuts.iter().copied().filter(|&c| c > 0 && c < total)).chain(std::iter::once(total)).collect();
+        cuts.sort_unstable();
+        cuts.dedup();
+        let pieces = cuts.len() - 1;
+        assert!(pieces <= 8);
+        for rep in 0..3 {
+            let mut pools = DevPools::new(&start);
+            let mut o = DevBuf::zeroed(total * VH * D * 2).unwrap();
+            let mut ws = DevBuf::zeroed(prefill_workspace_bytes_shaped(SHAPE, total)).unwrap();
+            fork(&ctx.st, &side, &ev_fork).unwrap();
+            for i in 0..pieces {
+                prefill_gated_pre(&side, &x.view(), &ctx.weights(), &pools.conv, &batch.view(), &mut ws, cuts[i]..cuts[i + 1], 1).unwrap();
+                ev[i].record(&side).unwrap();
+            }
+            for i in 0..pieces {
+                wait(&ctx.st, &ev[i]).unwrap();
+                prefill_gated_chain(&ctx.st, &mut pools.s, &batch.view(), &mut ws, &z, &nw, eps, &mut o, cuts[i]..cuts[i + 1]).unwrap();
+            }
+            prefill_gated_commit(&ctx.st, &x.view(), &mut pools.conv, &batch.view()).unwrap();
+            ctx.st.sync().unwrap();
+            let (got_o, got) = (o.to_vec::<u16>().unwrap(), pools.host());
+            assert_bits_eq(&format!("lens {lens:?} cuts {cuts:?} rep {rep} o"), &got_o, &want_o);
+            assert_f32_bits_eq(&format!("lens {lens:?} cuts {cuts:?} rep {rep} S"), &got.s, &want.s);
+            assert_bits_eq(&format!("lens {lens:?} cuts {cuts:?} rep {rep} conv"), &got.conv, &want.conv);
+        }
+    }
+}
+
 /// One layer of an 8,192-row chunk through the fused prefill (pre, chain with the gated norm, conv commit), timed, with the hashes of its
 /// output and state (random inputs, random starting state) so two builds can be compared from their logs.
 ///     cargo test --release -p gb-cuda --test gdn -- --ignored --nocapture bench_prefill_gated_8192
