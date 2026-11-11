@@ -380,7 +380,7 @@ fn project(
 #[ignore]
 fn ple_tiled_projection_equals_the_previous_kernel_bit_for_bit() {
     let Some(st) = gpu() else { return };
-    let shapes: [(usize, usize, usize); 14] = [
+    let shapes: [(usize, usize, usize); 15] = [
         (1, 2560, 2560),
         (7, 2560, 129),
         (63, 2560, 2560),
@@ -395,6 +395,7 @@ fn ple_tiled_projection_equals_the_previous_kernel_bit_for_bit() {
         (1000, 2560, 2560),
         (4012, 2560, 10240),
         (4012, 2560, 2560),
+        (8192, 2560, 10240),
     ];
     for (i, &(rows, k, n)) in shapes.iter().enumerate() {
         let x = DevBuf::from_slice(&mixed_f16(rows * k, 100 + i as u64)).unwrap();

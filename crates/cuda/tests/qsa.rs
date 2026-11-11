@@ -851,6 +851,15 @@ fn qsa_scores_fma_equals_the_previous_kernel_bit_for_bit() {
         assert_eq!(bad, 0, "{name}");
         assert!(got.iter().any(|&x| x != 0), "{name}: the scores are all zero");
     }
+    // an 8,192-row chunk (the engine's largest) of a 14K sequence, positions 2,000..10,191
+    let rig = Rig::new(&[10300], 22, 1500, &st);
+    let rows: Vec<(usize, usize)> = (0..8192).map(|i| (0, 2000 + i)).collect();
+    let q = rig.queries(&rows, &st);
+    let want = score_bits(&rig, &rows, &q, qsa::scores_ref, &st);
+    let got = score_bits(&rig, &rows, &q, qsa::scores, &st);
+    let bad = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+    eprintln!("chunk 8192: {bad} of {} scores differ", got.len());
+    assert_eq!(bad, 0, "chunk 8192");
 }
 
 /// The indexer's scores for a 4,096-row chunk deep in a 24K prompt (positions 20,000..24,095: about 5,000 blocks a row); prints the time of

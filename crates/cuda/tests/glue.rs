@@ -895,8 +895,8 @@ fn small_linear_cols_kernel_equals_the_per_row_kernel_and_its_predecessor() {
     ] {
         let w16 = f16_bits(&rng.vec(n * k, -0.2, 0.2));
         let dw = up(&w16);
-        for &rows in &[1usize, 2, 3, 4, 5, 7, 8, 9, 31, 63, 64, 65, 200, 1001, 4012] {
-            if rows * n > 1_200_000 && rows != 4012 {
+        for &rows in &[1usize, 2, 3, 4, 5, 7, 8, 9, 31, 63, 64, 65, 200, 1001, 4012, 8192] {
+            if rows * n > 1_200_000 && rows != 4012 && rows != 8192 {
                 continue;
             }
             let dx = up(&rand_bf16(&mut rng, rows * k));

@@ -1158,7 +1158,7 @@ fn prefill_gated_norm_fused_equals_chain_then_norm_bit_for_bit() {
     let ctx = Ctx::new(Weights::random(&mut rng));
     let nw = DevBuf::from_slice(&rng.vec(D, 0.4, 1.8)).unwrap();
     let eps = 1e-6f32;
-    let cases: [(&[usize], &[usize]); 10] = [
+    let cases: [(&[usize], &[usize]); 11] = [
         (&[1], &[2]),
         (&[2], &[0]),
         (&[15], &[1]),
@@ -1169,6 +1169,7 @@ fn prefill_gated_norm_fused_equals_chain_then_norm_bit_for_bit() {
         (&[1, 16, 17, 300], &[3, 1, 0, 2]),
         (&[4012], &[1]),
         (&[4096], &[1]),
+        (&[8192], &[1]),
     ];
     for (lens, slots) in cases {
         let total: usize = lens.iter().sum();
