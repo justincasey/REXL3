@@ -802,6 +802,57 @@ fn qsa_attend_staged_equals_warp_loaded_bit_for_bit() {
     }
 }
 
+/// The merged prefill attention (`qsa::attend` with one part and 64 rows or more) and the kernel that loads every row through global memory
+/// (`qsa::attend_merged_ref`) on the same rows: bf16 outputs of both, queries `main_queries(rows.len(), seed)`.
+fn merged_and_reference(rig: &Rig, rows: &[(usize, usize)], seed: u64, st: &Stream) -> (Vec<u16>, Vec<u16>) {
+    let n = rows.len();
+    let q = rig.queries(rows, st);
+    let (_, sel, sel_n, _) = rig.select(rows, &q, st);
+    let qm = main_queries(n, seed);
+    let slot = DevBuf::from_slice(&rows.iter().map(|&(s, _)| s as i32).collect::<Vec<_>>()).unwrap();
+    let pos = DevBuf::from_slice(&rows.iter().map(|&(_, p)| p as i32).collect::<Vec<_>>()).unwrap();
+    let rr = qsa::Rows { slot: &slot, pos: &pos, rows: n };
+    let (qd, sd, nd) = (DevBuf::from_slice(&qm).unwrap(), DevBuf::from_slice(&sel).unwrap(), DevBuf::from_slice(&sel_n).unwrap());
+    let mut ws = DevBuf::zeroed(qsa::attend_workspace_bytes(n, 1)).unwrap();
+    let width = N_Q_HEADS * HEAD_DIM;
+    let mut got = DevBuf::zeroed(n * width * 2).unwrap();
+    let mut want = DevBuf::zeroed(n * width * 2).unwrap();
+    qsa::attend(&qd, &rig.kv, &rig.table, &rr, &sd, &nd, 1, &mut ws, &mut got, st).unwrap();
+    qsa::attend_merged_ref(&qd, &rig.kv, &rig.table, &rr, &sd, &nd, &mut want, st).unwrap();
+    st.sync().unwrap();
+    (got.to_vec().unwrap(), want.to_vec().unwrap())
+}
+
+/// The merged prefill attention is bit-identical to the global-memory kernel for every position of a sequence's first 2,300 (every total of
+/// 1..=2,300 tokens: each residue of the 8-token group, of the 128-token offset block and of the group count; the dense rows, the sparse
+/// threshold at position 2,047 and the first rows with all 512 blocks selected) and for batches of 64..=8,192 rows (odd counts, the
+/// neighbours of powers of two) at random positions of four sequences in one launch.
+#[test]
+#[ignore]
+fn qsa_attend_merged_equals_the_reference_over_positions_and_row_counts() {
+    let Some(st) = gpu() else { return };
+    let lens = [2600usize, 4111, 9000, 8400];
+    let rig = Rig::new(&lens, 7, 97, &st);
+    let mut sets: Vec<(String, Vec<(usize, usize)>)> = vec![("every position 0..2300".into(), (0..2300).map(|p| (0, p)).collect())];
+    let mut rng = Rng(99);
+    for n in [64usize, 65, 100, 127, 128, 129, 191, 255, 257, 513, 1000, 1025, 2049, 4097, 6001, 8191, 8192] {
+        let rows = (0..n)
+            .map(|_| {
+                let s = rng.next() as usize % lens.len();
+                (s, rng.next() as usize % lens[s])
+            })
+            .collect();
+        sets.push((format!("{n} random rows"), rows));
+    }
+    for (name, rows) in sets {
+        let (got, want) = merged_and_reference(&rig, &rows, 4242 + rows.len() as u64, &st);
+        let bad = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+        eprintln!("{name}: {} rows, {bad} of {} bf16 outputs differ, hash {:016x}", rows.len(), got.len(), fnv(bytes_of(&got)));
+        assert_eq!(bad, 0, "{name}");
+        assert!(got.iter().any(|&x| x != 0), "{name}: the outputs are all zero");
+    }
+}
+
 /// The indexer scores of `rows` (`[rows][nb_cap]` f32 bit patterns) through `qsa::scores` or the kernel it replaced.
 fn score_bits(
     rig: &Rig,
