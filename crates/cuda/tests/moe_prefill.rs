@@ -1571,6 +1571,45 @@ fn the_unified_item_list_is_the_merge_of_the_classes() {
     }
 }
 
+/// A Flash-Next layer of 8,192 rows (the widest chunk, `MAX_ROWS_WIDE`) gives every row the bits it gets in two calls of 4,096 rows, in the
+/// production form (f32 weights, the shared expert's finish fused into the combine, bf16 out), for both down widths the pack has.
+#[test]
+fn qwen_shaped_prefill_of_8192_rows_equals_two_calls_of_4096() {
+    gpu!();
+    let st = Stream::new().unwrap();
+    let d = qwen_dims();
+    let (rows, half) = (8192usize, 4096usize);
+    for (bg, bd, sigma) in [(3usize, 4usize, 0.8f64), (3, 5, 1.2)] {
+        let ex = synth_layer(d, bg, bd, Codebook::Mul1, 740 + bd as u64);
+        let mut r = Rng(741 + bd as u64);
+        let x = qwen_x_bf16(&mut r, rows * d.hidden);
+        let (pick, wts) = qwen_route(&mut r, rows, d.experts, d.topk, sigma);
+        let gate = qwen_x_bf16(&mut r, rows);
+        let shared: Vec<f32> = (0..rows * d.hidden).map(|_| normal(&mut r) as f32).collect();
+        let mut s = PrefillScratch::new(&d, rows).unwrap();
+        s.use_parallel_plan(true);
+        s.set_picks_f32(&pick, &wts).unwrap();
+        let (xd, gd, sd) = (up(&x), up(&gate), up(&shared));
+        let mut out = DevBuf::zeroed(rows * d.hidden * 2).unwrap();
+        ex.run_prefill_f32_wts_finish(&xd, Dtype::BF16, rows, &sd, &gd, &mut out, &mut s, &st).unwrap();
+        let whole: Vec<u16> = sync_dl(&out, &st);
+        let mut s2 = PrefillScratch::new(&d, half).unwrap();
+        s2.use_parallel_plan(true);
+        for part in 0..2 {
+            let (r0, r1) = (part * half, (part + 1) * half);
+            s2.set_picks_f32(&pick[r0 * d.topk..r1 * d.topk], &wts[r0 * d.topk..r1 * d.topk]).unwrap();
+            let (xp, gp, sp) = (up(&x[r0 * d.hidden..r1 * d.hidden]), up(&gate[r0..r1]), up(&shared[r0 * d.hidden..r1 * d.hidden]));
+            let mut o2 = DevBuf::zeroed(half * d.hidden * 2).unwrap();
+            ex.run_prefill_f32_wts_finish(&xp, Dtype::BF16, half, &sp, &gp, &mut o2, &mut s2, &st).unwrap();
+            let got: Vec<u16> = sync_dl(&o2, &st);
+            let want = &whole[r0 * d.hidden..r1 * d.hidden];
+            if let Some(i) = got.iter().zip(want).position(|(a, b)| a != b) {
+                panic!("down {bd} bits: half {part}, row {} column {} differs between the 8,192-row call and the 4,096-row call", r0 + i / d.hidden, i % d.hidden);
+            }
+        }
+    }
+}
+
 /// Per-stage milliseconds of one Flash-Next layer of 4,096 rows (L2 flushed before each call) and the hashes of its outputs (`REXL3_BENCH_ROWS`,
 /// `REXL3_BENCH_SIGMA`, `REXL3_BENCH_DOWN_BITS`, `REXL3_BENCH_ITERS` change the shape of the run).
 #[test]
@@ -1700,3 +1739,4 @@ fn bench_l2_capacity() {
         println!("{mb:4} MB: memset {:6.0} GB/s, read {:6.0} GB/s", mb as f64 / 1024.0 * 1.0737 / w * 1e3, mb as f64 / 1024.0 * 1.0737 / r * 1e3);
     }
 }
+

@@ -3657,6 +3657,52 @@ mod tests {
         }
     }
 
+    /// Real-pack gate: a cold prompt prefilled in chunks of 2,048, 4,096 and 8,192 rows leaves the same logits in its last rows, bit for bit
+    /// (the chunk width is a speed choice only), with the prompt crossing the 8,192-row chunk edge and ending in a ragged chunk.
+    #[test]
+    fn real_pack_prefill_chunk_widths_give_the_same_logits_bit_for_bit() {
+        use std::path::PathBuf;
+        if std::env::var("REXL3_FN_REAL").ok().as_deref() != Some("1") {
+            eprintln!("not run: REXL3_FN_REAL=1 and REXL3_FLASH_NEXT_DIR are required for chunk-grid parity");
+            return;
+        }
+        let dir = PathBuf::from(std::env::var("REXL3_FLASH_NEXT_DIR").expect("set the real-pack directory"));
+        assert!(gb_cuda::device_available(), "real-pack chunk-grid parity needs an idle CUDA device");
+        // 9,500 rows end in a 1,308-row chunk on every one of the three grids, so the last 32 rows are the same rows of the same chunk length
+        let n = 9500usize;
+        let mut reference: Option<(Vec<i32>, Vec<u32>, Vec<u16>)> = None;
+        for chunk in [2048usize, 4096, 8192] {
+            let opts = ModelOptions { slots: 1, kv_pages: 64, max_context: 16384, prefill_rows: chunk, warm: false };
+            let mut m = FlashNextModel::load(&dir, opts).unwrap();
+            m.begin_slot(0).unwrap();
+            let vocab = m.vocab_size() as u64;
+            let prompt: Vec<u32> = (0..n).map(|i| ((i as u64 * 2_654_435_761) % (vocab - 16) + 8) as u32).collect();
+            let path = PrefillPath::for_prompt(n);
+            let mut last = None;
+            let mut logits = Vec::new();
+            for first in (0..n).step_by(chunk) {
+                let end = (first + chunk).min(n);
+                let b = RowBatch::from_requests(&[RowRequest { slot: 0, first_position: first as u64, tokens: prompt[first..end].to_vec() }]);
+                last = m.prefill_chunk(&b, path, (end == n).then_some(8)).unwrap();
+                if end == n {
+                    logits = vec![0u16; 32 * m.vocab_size()];
+                    m.last_rows_logits(end - first - 32, 32, &mut logits).unwrap();
+                }
+                m.mtp_after_prefill(0, first, &prompt[first..end], prompt.get(end).copied(), path).unwrap();
+            }
+            let c = last.unwrap();
+            let got = (c.ids.clone(), c.vals.iter().map(|v| v.to_bits()).collect::<Vec<u32>>(), logits);
+            match &reference {
+                None => reference = Some(got),
+                Some(want) => {
+                    assert_eq!(got.0, want.0, "candidate ids differ at a chunk width of {chunk} rows");
+                    assert_eq!(got.1, want.1, "candidate values differ at a chunk width of {chunk} rows");
+                    assert!(got.2 == want.2, "the last 32 rows' logits differ at a chunk width of {chunk} rows");
+                }
+            }
+        }
+    }
+
     /// The one switch a prefill chunk is allowed to make, and the row counts that must not change it.
     #[test]
     fn the_prefill_path_follows_the_prompt_total_and_not_the_chunk() {
