@@ -385,12 +385,13 @@ __global__ void __launch_bounds__(kU2Threads, 1)
 // hc_post launches in one pass); NP = 1 without XW leaves the streams untouched and applies the post to every value it reads (pass 1 and
 // the stages of pass 2, whose block_out tile rides the ring beside the x tile), so that the later readers of the streams (down_x_kernel
 // and up_mix_kernel with LAZY) apply the same post to the same values: the same fma on the same operands, never written to memory in between.
-constexpr int kNiH = 2560, kNiBM = 16, kNiKB = 64, kNiPad = kNiKB + 8, kNiThreads = 256, kNiRing = 3;
+constexpr int kNiH = 2560, kNiBM = 16, kNiKB = 64, kNiPad = kNiKB + 8, kNiThreads = 256, kNiRing = 5, kNiAhead = kNiRing - 1;
 constexpr size_t kNiSmemB = (size_t)kNiRing * 8 * kNiPad * sizeof(half);               // the 4 inject rows (and 4 zero rows) of the n8 tile
 constexpr size_t kNiSmemX = (size_t)kNiRing * kNiBM * kNiKB * sizeof(float);
 constexpr size_t kNiSmemA = (size_t)2 * 2 * kNiBM * kNiPad * sizeof(half);
 constexpr size_t kNiSmemO = (size_t)kNiRing * kNiBM * kNiKB * sizeof(__nv_bfloat16);  // the block_out tiles of the on-the-fly form
-constexpr size_t kNiSmem = kNiSmemB + kNiSmemX + kNiSmemA + kNiBM * sizeof(float) + kNiSmemO;
+constexpr size_t kNiSmemW = (size_t)kNiRing * kNiKB * sizeof(half);                    // the stage's 64 norm weights
+constexpr size_t kNiSmem = kNiSmemB + kNiSmemX + kNiSmemA + kNiBM * sizeof(float) + kNiSmemO + kNiSmemW;
 
 __device__ __forceinline__ void ni_ldsm2(uint32_t& r0, uint32_t& r1, const half* p) {
     const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(p));
@@ -415,6 +416,7 @@ __global__ void __launch_bounds__(kNiThreads, 2)
     half* sA = reinterpret_cast<half*>(ni_smem + kNiSmemB + kNiSmemX);
     float* sR = reinterpret_cast<float*>(ni_smem + kNiSmemB + kNiSmemX + kNiSmemA);
     __nv_bfloat16* sO = reinterpret_cast<__nv_bfloat16*>(ni_smem + kNiSmemB + kNiSmemX + kNiSmemA + kNiBM * sizeof(float));
+    half* sW = reinterpret_cast<half*>(ni_smem + kNiSmemB + kNiSmemX + kNiSmemA + kNiBM * sizeof(float) + kNiSmemO);
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, t4 = lane & 3;
     const int r0 = (int)(blockIdx.x >> 2) * kNiBM, s = blockIdx.x & 3;
 
@@ -489,11 +491,12 @@ __global__ void __launch_bounds__(kNiThreads, 2)
     // the post weight of the row this thread transforms (the on-the-fly form applies the post to the raw stage tiles)
     float wvr = 0.f;
     if (kLazy && r0 + (tid >> 4) < T) wvr = inj_prev[(size_t)(r0 + (tid >> 4)) * 4 + s];
-    // stage st (k in [64 st, 64 st + 64) of the stream) into ring slot st % 3: the four inject rows, the raw x tile and, on the fly, the
-    // block_out tile of the same columns
+    // stage st (k in [64 st, 64 st + 64) of the stream) into ring slot st % kNiRing: the four inject rows, the raw x tile, the stage's norm weights
+    // and, on the fly, the block_out tile of the same columns
     auto issue = [&](int st) {
         const int slot = st % kNiRing, k0 = st * kNiKB;
         if (tid < 32) um_cp16(sB + ((size_t)slot * 8 + (tid >> 3)) * kNiPad + (tid & 7) * 8, iw + (size_t)(tid >> 3) * kRow + k0 + (tid & 7) * 8);
+        if (tid >= 32 && tid < 32 + kNiKB / 8) um_cp16(sW + (size_t)slot * kNiKB + (tid - 32) * 8, nw + (size_t)s * kNiH + k0 + (tid - 32) * 8);
         const int r = tid >> 4, q = tid & 15, t = r0 + r;
         if (t < T) um_cp16(sX + (size_t)slot * kNiBM * kNiKB + r * kNiKB + q * 4, x + ((size_t)t * 4 + s) * kNiH + k0 + q * 4);
         if (kLazy && tid < kNiBM * kNiKB / 8) {
@@ -517,7 +520,7 @@ __global__ void __launch_bounds__(kNiThreads, 2)
                 v.z = fmaf(b23.x, wvr, v.z);
                 v.w = fmaf(b23.y, wvr, v.w);
             }
-            const half* wp = nw + (size_t)s * kNiH + st * kNiKB + q * 4;
+            const half* wp = sW + (size_t)slot * kNiKB + q * 4;
             const float2 w01 = __half22float2(*reinterpret_cast<const half2*>(wp));
             const float2 w23 = __half22float2(*reinterpret_cast<const half2*>(wp + 2));
             const float rr = sR[r];
@@ -537,16 +540,19 @@ __global__ void __launch_bounds__(kNiThreads, 2)
 
     float ih[4] = {0.f, 0.f, 0.f, 0.f}, il[4] = {0.f, 0.f, 0.f, 0.f};     // warp 0 (rows 0..15): the inject chains
     constexpr int kNK = kNiH / kNiKB;
-    issue(0);
-    asm volatile("cp.async.wait_group 0;\n" ::);
+    // kNiAhead stages are in flight: the group of stage st is the st-th commit (an empty group once the stages run out), so at the top of
+    // iteration i the groups up to stage i + 1 have landed when at most kNiAhead - 2 are pending
+#pragma unroll
+    for (int st = 0; st < kNiAhead; ++st) issue(st);
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(kNiAhead - 1));
     __syncthreads();
     transform(0);
-    issue(1);
 #pragma unroll 1
     for (int i = 0; i < kNK; ++i) {
-        asm volatile("cp.async.wait_group 0;\n" ::);
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(kNiAhead - 2));
         __syncthreads();
-        if (i + 2 < kNK) issue(i + 2);
+        if (i + kNiAhead < kNK) issue(i + kNiAhead);
+        else asm volatile("cp.async.commit_group;\n" ::);
         if (i + 1 < kNK) transform(i + 1);
         if (w == 0) {
             const half* a_hi = sA + (size_t)(i & 1) * 2 * kNiBM * kNiPad;

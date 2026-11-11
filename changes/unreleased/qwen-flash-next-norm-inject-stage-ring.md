@@ -1,0 +1,3 @@
+## New features and improvements
+
+- Qwen3.8-Flash-Next prompt prefill: the norm + inject kernel of the hyper-connection pre-mix keeps four stages of its second pass in flight instead of one (a ring of five stages instead of three, waiting for the stage it transforms rather than for every load), and the norm weights of a stage now arrive through the ring with the stream tile instead of as a dependent global load inside each transform, which had put a full memory latency into every one of the 40 stages of a tile (about an eighth of the kernel's stall samples in a profile). Every output bit is unchanged. On a steady 8,108-row chunk (nsys, one GB10, a run on each of two GB10s) the kernel takes 287.8 and 286.9 ms before and 247.6 and 250.9 ms after.
