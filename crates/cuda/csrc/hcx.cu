@@ -671,7 +671,11 @@ struct PkArgs {
     const uint4* up;
 };
 
-// k1p launch for 1..3 rows (see launch_k1u; at four rows the packed kernels measured slower in the decode graph): PK_NJ rows a warp, jobs = rank / 4 + ninj / 4 groups a stream.
+// Rows k1p serves: a pass of 8 rows keeps 255 registers a thread and spills a little; in the decode graph it measured slower than k1u there
+// (window span 48.08 vs 47.16 ms, rows 4 to 7 gain 0.6-1.0 ms), so a pass of 8 rows runs k1u on the fp16 rows and k2tp on the packed ones.
+constexpr int K1P_MAX_ROWS = 7;
+
+// k1p launch for 1..K1P_MAX_ROWS rows (see launch_k1u): PK_NJ rows a warp, jobs = rank / 4 + ninj / 4 groups a stream.
 static int launch_k1p(int nt, const float* x, const half* nw, const PkArgs& pk, float* P, float* ss, int t0, int H, int hc, int rank,
                       int ninj, cudaStream_t st, const __nv_bfloat16* bo, const float* ijp) {
     const int R = rank + ninj;
@@ -681,17 +685,17 @@ static int launch_k1p(int nt, const float* x, const half* nw, const PkArgs& pk, 
     case N: {                                                                                                          \
         const int warps = ((R + PK_NJ - 1) / PK_NJ) * hc + N * hc;                                                     \
         return bo ? gbp_pdl::launch_pdl(pdl, k1p_kernel<N, true>, dim3(warps), dim3(32), 0, st, x, nw, pk.down, pk.inj, \
-                                        P, ss, t0, H, hc, rank, ninj, bo, ijp)                       \
+                                        P, ss, t0, H, hc, rank, ninj, bo, ijp)                                         \
                   : gbp_pdl::launch_pdl(pdl, k1p_kernel<N, false>, dim3(warps), dim3(32), 0, st, x, nw, pk.down,       \
-                                        pk.inj, P, ss, t0, H, hc, rank, ninj, bo, ijp);              \
+                                        pk.inj, P, ss, t0, H, hc, rank, ninj, bo, ijp);                                \
     }
-        K1P_CASE(1) K1P_CASE(2) K1P_CASE(3)
+        K1P_CASE(1) K1P_CASE(2) K1P_CASE(3) K1P_CASE(4) K1P_CASE(5) K1P_CASE(6) K1P_CASE(7)
 #undef K1P_CASE
         default: return (int)cudaErrorInvalidValue;
     }
 }
 
-// k2tp launch for 1..3 rows (see launch_k2t).
+// k2tp launch for 1..8 rows (see launch_k2t).
 static int launch_k2tp(int nt, float* x, const half* nw, const uint4* pup, const float* P, const float* ss, __nv_bfloat16* y,
                        float* inj_out, int t0, int H, int rank, int ninj, float eps, cudaStream_t st, const __nv_bfloat16* bo,
                        const float* ijp) {
@@ -705,7 +709,7 @@ static int launch_k2tp(int nt, float* x, const half* nw, const uint4* pup, const
                                         pup, P, ss, y, inj_out, t0, H, rank, ninj, eps, pdl ? 1 : 0, bo, ijp)          \
                   : gbp_pdl::launch_pdl(pdl, k2tp_kernel<N, false>, dim3(blocks), dim3(K2T_WPB * 32), smem, st, x, nw, \
                                         pup, P, ss, y, inj_out, t0, H, rank, ninj, eps, pdl ? 1 : 0, bo, ijp);
-        K2TP_CASE(1) K2TP_CASE(2) K2TP_CASE(3)
+        K2TP_CASE(1) K2TP_CASE(2) K2TP_CASE(3) K2TP_CASE(4) K2TP_CASE(5) K2TP_CASE(6) K2TP_CASE(7) K2TP_CASE(8)
 #undef K2TP_CASE
         default: return (int)cudaErrorInvalidValue;
     }
@@ -735,7 +739,7 @@ static int hcx_pre_impl(const void* streams, const void* hc_norm_w, const void* 
         const bool use_k2b = !ref;
         const bool use_k2t = !ref && hc == 4 && rk <= 512;
         int rc;
-        if (!ref && pk && nt <= 3) {
+        if (!ref && pk && nt <= K1P_MAX_ROWS) {
             rc = launch_k1p(nt, (const float*)streams, (const half*)hc_norm_w, *pk, P, ss, t0, H, hc, rk, ninj, st,
                             (const __nv_bfloat16*)block_out, inj_prev);
         } else if (!ref) {
@@ -749,7 +753,7 @@ static int hcx_pre_impl(const void* streams, const void* hc_norm_w, const void* 
             rc = GB_CHECK_LAUNCH();
         }
         if (rc) return rc;
-        if (use_k2t && pk && !ref && nt <= 3) {
+        if (use_k2t && pk && !ref) {
             rc = launch_k2tp(nt, (float*)streams, (const half*)hc_norm_w, pk->up, P, ss, (__nv_bfloat16*)y_out,
                              inject_w ? inj_out : nullptr, t0, H, rk, ninj, eps, st, (const __nv_bfloat16*)block_out, inj_prev);
         } else if (use_k2t) {
@@ -790,7 +794,7 @@ GB_EXPORT int gb_hcx_pre_post(void* streams, const void* block_out, const float*
                         rank, eps, num_tokens, stream, false, nullptr, block_out, inj_prev);
 }
 
-// The same with the down and inject rows read from the packed copy (hcx_pk.cuh) for up to three rows a pass: the same bits. H = 2,560,
+// The same with the down and inject rows read from the packed copy (hcx_pk.cuh), for every row count: the same bits. H = 2,560,
 // hc = 4, rank = 320 (packed_ok on the host).
 GB_EXPORT int gb_hcx_pre_pk(const void* streams, const void* hc_norm_w, const void* down_w, const void* up_w, const void* inject_w,
                             void* y_out, float* inj_out, void* scratch, unsigned int hidden_size, unsigned int hc_mult,

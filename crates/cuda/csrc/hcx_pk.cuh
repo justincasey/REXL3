@@ -59,7 +59,7 @@ __device__ __forceinline__ void pk_copy_lut(uint32_t* lut, const uint4* __restri
     for (int i = tid; i < 256; i += threads) reinterpret_cast<uint4*>(lut)[i] = __ldg(g + i);
 }
 
-// A job's slots into registers (the weights are constants of the call, so this may run before the predecessor has finished).
+// A job's slots into registers (pk1_check_kernel's load; the decode kernels request them in stages, see k1p_kernel).
 __device__ __forceinline__ void pk_load_job(const uint4* __restrict__ jb, uint4 (&Ls)[PK_LS], uint32_t (&Cw)[PK_CW]) {
 #pragma unroll
     for (int k = 0; k < PK_LS; ++k) Ls[k] = __ldg(jb + k * 32);
@@ -73,15 +73,40 @@ __device__ __forceinline__ void pk_load_job(const uint4* __restrict__ jb, uint4 
     }
 }
 
-// k1p: k1u with the weights of PK_NJ rows a warp read from the packed copy, all of a warp's 33 slots requested up front. Every sum is the
-// one k1u makes (the decoded floats are the fp16 weights widened, the add order per (row, window row) is the chunk order of lane l).
-// rows of `pdown` are down rows [0, rank), of `pinj` the inject rows; rank % 4 == 0 and ninj in {0, 4}.
+// Stage p of a job is chunk pair p: the four L slots 5j + p and the code words 10p .. 10p + 9, i.e. the code slots k with 4k < 10 (p + 1); a code
+// slot that straddles two stages is requested with the first one.
+__host__ __device__ constexpr int pk_stage_first_code(int p) { return p == 0 ? 0 : (10 * p + 3) / 4; }  // 0, 3, 5, 8, 10
+
+__device__ __forceinline__ void pk_load_stage(const uint4* __restrict__ jb, int p, uint4 (&Ls)[PK_NP][PK_NJ], uint32_t (&Cw)[PK_CW]) {
+#pragma unroll
+    for (int j = 0; j < PK_NJ; ++j) Ls[p][j] = __ldg(jb + (PK_NP * j + p) * 32);
+#pragma unroll
+    for (int k = 0; k < PK_CS; ++k) {
+        if (k >= pk_stage_first_code(p) && 4 * k < 10 * (p + 1)) {
+            const uint4 u = __ldg(jb + (PK_LS + k) * 32);
+            Cw[4 * k] = u.x;
+            Cw[4 * k + 1] = u.y;
+            Cw[4 * k + 2] = u.z;
+            Cw[4 * k + 3] = u.w;
+        }
+    }
+}
+
+// k1p: k1u with the weights of PK_NJ rows a warp read from the packed copy. Every sum is the one k1u makes (the decoded floats are the fp16
+// weights widened, the add order per (row, window row) is the chunk order of lane l). rows of `pdown` are down rows [0, rank), of `pinj` the
+// inject rows; rank % 4 == 0 and ninj in {0, 4}.
+//
+// The warp's 16.9 KB of weights are not all requested up front (a warp then holds 132 registers of weights and, with a window's x rows on top,
+// spills at four rows and more; and nothing is computed until the last request is out, so the arithmetic of the whole job runs after the
+// last byte has landed): stages 0 and 1 go out before the wait for the predecessor, stage p + 2 while stage p is computed, and a warp barrier
+// after each stage keeps the compiler from hoisting the later requests, so about two stages (7 KB) are in flight and three are in registers.
+// A chunk's four rows are decoded together and the window rows then loop innermost, so only one row's x chunk is live at a time.
 template <int NT, bool POST>
-__global__ void __launch_bounds__(32, 16) k1p_kernel(const float* __restrict__ x, const half* __restrict__ nw,
-                                                    const uint4* __restrict__ pdown, const uint4* __restrict__ pinj,
-                                                    float* __restrict__ P, float* __restrict__ ss, int t0, int H, int hc,
-                                                    int rank, int ninj,
-                                                    const __nv_bfloat16* __restrict__ bo, const float* __restrict__ ijp) {
+__global__ void __launch_bounds__(32, 8) k1p_kernel(const float* __restrict__ x, const half* __restrict__ nw,
+                                                   const uint4* __restrict__ pdown, const uint4* __restrict__ pinj,
+                                                   float* __restrict__ P, float* __restrict__ ss, int t0, int H, int hc,
+                                                   int rank, int ninj,
+                                                   const __nv_bfloat16* __restrict__ bo, const float* __restrict__ ijp) {
     __shared__ __align__(16) uint32_t lut[1024];
     const int lane = threadIdx.x;
     const int R = rank + ninj;
@@ -91,10 +116,11 @@ __global__ void __launch_bounds__(32, 16) k1p_kernel(const float* __restrict__ x
         const int s = blockIdx.x / gps, g = blockIdx.x % gps;
         const bool isinj = g * PK_NJ >= rank;
         const uint4* jb = (isinj ? pinj + (size_t)s * (PK_SL * 32) : pdown + ((size_t)s * (rank / PK_NJ) + g) * (PK_SL * 32)) + lane;
-        uint4 Ls[PK_LS];
+        uint4 Ls[PK_NP][PK_NJ];
         uint32_t Cw[PK_CW];
-        pk_load_job(jb, Ls, Cw);
         pk_copy_lut(lut, isinj ? pinj + (size_t)hc * (PK_SL * 32) : pdown + (size_t)hc * (rank / PK_NJ) * (PK_SL * 32), lane, 32);
+        pk_load_stage(jb, 0, Ls, Cw);
+        pk_load_stage(jb, 1, Ls, Cw);
         __syncwarp();
         const half* n = nw + (size_t)s * H;
         const float* xs = x + (size_t)t0 * HC + (size_t)s * H;
@@ -112,43 +138,44 @@ __global__ void __launch_bounds__(32, 16) k1p_kernel(const float* __restrict__ x
         }
 #pragma unroll
         for (int p = 0; p < PK_NP; ++p) {
+            if (p + 2 < PK_NP) pk_load_stage(jb, p + 2, Ls, Cw);
 #pragma unroll
             for (int c = 0; c < 2; ++c) {
                 const int d = 8 * lane + 256 * (2 * p + c);
-                float4 xa[NT], xb[NT];
-#pragma unroll
-                for (int t = 0; t < NT; ++t) {
-                    const float* xr = xs + (size_t)t * HC + d;
-                    xa[t] = __ldg(reinterpret_cast<const float4*>(xr));
-                    xb[t] = __ldg(reinterpret_cast<const float4*>(xr + 4));
-                    if constexpr (POST) {
-                        const uint4 u = __ldg(reinterpret_cast<const uint4*>(bo + (size_t)(t0 + t) * H + d));
-                        xa[t].x = fmaf(__uint_as_float(u.x << 16), ij[t], xa[t].x);
-                        xa[t].y = fmaf(__uint_as_float(u.x & 0xffff0000u), ij[t], xa[t].y);
-                        xa[t].z = fmaf(__uint_as_float(u.y << 16), ij[t], xa[t].z);
-                        xa[t].w = fmaf(__uint_as_float(u.y & 0xffff0000u), ij[t], xa[t].w);
-                        xb[t].x = fmaf(__uint_as_float(u.z << 16), ij[t], xb[t].x);
-                        xb[t].y = fmaf(__uint_as_float(u.z & 0xffff0000u), ij[t], xb[t].y);
-                        xb[t].z = fmaf(__uint_as_float(u.w << 16), ij[t], xb[t].z);
-                        xb[t].w = fmaf(__uint_as_float(u.w & 0xffff0000u), ij[t], xb[t].w);
-                    }
-                }
                 float nv[8];
                 h8(n + d, nv);
                 float onep[8];
 #pragma unroll
                 for (int i = 0; i < 8; ++i) onep[i] = 1.f + nv[i];
+                float wv[PK_NJ][8];
 #pragma unroll
                 for (int j = 0; j < PK_NJ; ++j) {
-                    float wv[8];
-                    const uint4 sl = Ls[PK_NP * j + p];
-                    pk_dec8(c ? sl.z : sl.x, c ? sl.w : sl.y, Cw, 320 * p + 80 * j + 40 * c, lut, wv);
+                    const uint4 sl = Ls[p][j];
+                    pk_dec8(c ? sl.z : sl.x, c ? sl.w : sl.y, Cw, 320 * p + 80 * j + 40 * c, lut, wv[j]);
 #pragma unroll
-                    for (int i = 0; i < 8; ++i) wv[i] *= onep[i];
+                    for (int i = 0; i < 8; ++i) wv[j][i] *= onep[i];
+                }
 #pragma unroll
-                    for (int t = 0; t < NT; ++t) acc[j][t] = dot8_acc(acc[j][t], wv, xa[t], xb[t]);
+                for (int t = 0; t < NT; ++t) {
+                    const float* xr = xs + (size_t)t * HC + d;
+                    float4 xa = __ldg(reinterpret_cast<const float4*>(xr));
+                    float4 xb = __ldg(reinterpret_cast<const float4*>(xr + 4));
+                    if constexpr (POST) {
+                        const uint4 u = __ldg(reinterpret_cast<const uint4*>(bo + (size_t)(t0 + t) * H + d));
+                        xa.x = fmaf(__uint_as_float(u.x << 16), ij[t], xa.x);
+                        xa.y = fmaf(__uint_as_float(u.x & 0xffff0000u), ij[t], xa.y);
+                        xa.z = fmaf(__uint_as_float(u.y << 16), ij[t], xa.z);
+                        xa.w = fmaf(__uint_as_float(u.y & 0xffff0000u), ij[t], xa.w);
+                        xb.x = fmaf(__uint_as_float(u.z << 16), ij[t], xb.x);
+                        xb.y = fmaf(__uint_as_float(u.z & 0xffff0000u), ij[t], xb.y);
+                        xb.z = fmaf(__uint_as_float(u.w << 16), ij[t], xb.z);
+                        xb.w = fmaf(__uint_as_float(u.w & 0xffff0000u), ij[t], xb.w);
+                    }
+#pragma unroll
+                    for (int j = 0; j < PK_NJ; ++j) acc[j][t] = dot8_acc(acc[j][t], wv[j], xa, xb);
                 }
             }
+            __syncwarp();
         }
         constexpr int NEL = PK_NJ * NT;
 #pragma unroll
