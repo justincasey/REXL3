@@ -1,6 +1,6 @@
 //! The packed hyper-connection mixers (`hcx::pack_mixer`, 13 bits a weight): the packed kernels give the bits of the fp16 kernels for
-//! `pre` and for `pre_post` at the family's shape, 1..8 rows and row counts that run several passes (past three rows a pass keeps the
-//! fp16 kernels), with the programmatic launch attribute off and on; a tensor the format cannot hold keeps the fp16 path.
+//! `pre` and for `pre_post` at the family's shape, 1..8 rows and row counts that run several passes, with the programmatic launch
+//! attribute off and on; a tensor the format cannot hold keeps the fp16 path.
 #![allow(clippy::needless_range_loop)]
 mod common;
 use common::Rng;
@@ -88,7 +88,7 @@ fn packed_mixers_equal_fp16_kernels_pre_and_pre_post() {
         assert!(packed.bytes() < fp16 * 83 / 100, "packed {} fp16 {}", packed.bytes(), fp16);
         for mask in [0, PDL_HCX] {
             gb_cuda::exl3_linear::set_pdl_mask(mask).unwrap();
-            for t in [1usize, 2, 3, 4, 5, 8, 11, 17] {
+            for t in [1usize, 2, 3, 4, 5, 6, 7, 8, 11, 17] {
                 let mut r = Rng(seed * 7919 + t as u64);
                 let x: Vec<f32> = r.vec(t * HC * H, -2.0, 2.0);
                 let bo: Vec<u16> = (0..t * H).map(|_| bf(r.uniform(-3.0, 3.0))).collect();
