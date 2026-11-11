@@ -1143,6 +1143,98 @@ fn prefill_two_rows_a_thread_equals_one_row_kernel_bit_for_bit() {
     }
 }
 
+/// The prefill with the gated RMS norm fused into the chain kernel (128 value rows a block, the norm of each tile's steps at the tile's end)
+/// leaves exactly the bits of the prefill followed by the gated-norm kernel: the normed output, the recurrent state of every slot and the
+/// conv history, from random starting pools, for sequence lengths that end inside a 16-step tile and on its edges (1, 2, 15, 16, 17, 31,
+/// 32, 33, 100), odd totals, several sequences of different lengths in one launch with distinct slots, and a 4,096-row chunk. 48 value
+/// heads only (the norm's width is the model's).
+#[test]
+fn prefill_gated_norm_fused_equals_chain_then_norm_bit_for_bit() {
+    need_gpu!();
+    if SHAPE != GdnShape::Hv48 {
+        return;
+    }
+    let mut rng = Rng(0x6a7e);
+    let ctx = Ctx::new(Weights::random(&mut rng));
+    let nw = DevBuf::from_slice(&rng.vec(D, 0.4, 1.8)).unwrap();
+    let eps = 1e-6f32;
+    let cases: [(&[usize], &[usize]); 10] = [
+        (&[1], &[2]),
+        (&[2], &[0]),
+        (&[15], &[1]),
+        (&[16, 17], &[3, 0]),
+        (&[31, 32, 33], &[2, 0, 1]),
+        (&[100], &[3]),
+        (&[41, 70], &[0, 2]),
+        (&[1, 16, 17, 300], &[3, 1, 0, 2]),
+        (&[4012], &[1]),
+        (&[4096], &[1]),
+    ];
+    for (lens, slots) in cases {
+        let total: usize = lens.iter().sum();
+        let inp = Inp::random(&mut rng, total);
+        let zh: Vec<u16> = rng.vec(total * VH * D, -6.0, 6.0).iter().map(|&x| f32_to_bf16(x)).collect();
+        let z = DevBuf::from_slice(&zh).unwrap();
+        let start = HostPools::random(&mut rng, 4);
+        let batch = BatchBuf::new(lens, slots).unwrap();
+        let x = DevInp::new(&inp);
+        let mut ws = DevBuf::zeroed(prefill_workspace_bytes_shaped(SHAPE, total)).unwrap();
+        let mut run = |fused: bool| {
+            let mut pools = DevPools::new(&start);
+            let mut o = DevBuf::zeroed(total * VH * D * 2).unwrap();
+            if fused {
+                prefill_gated(&ctx.st, &x.view(), &ctx.weights(), &mut pools.s, &mut pools.conv, &batch.view(), &mut ws, &z, &nw, eps, &mut o)
+                    .unwrap();
+            } else {
+                prefill_shaped(SHAPE, &ctx.st, &x.view(), &ctx.weights(), &mut pools.s, &mut pools.conv, &batch.view(), &mut ws, &mut o)
+                    .unwrap();
+                gb_cuda::fn_glue::gated_rmsnorm_sigmoid(None, &z, &nw, &mut o, total, VH, D, eps, &ctx.st).unwrap();
+            }
+            ctx.st.sync().unwrap();
+            (o.to_vec::<u16>().unwrap(), pools.host())
+        };
+        let (want_o, want) = run(false);
+        let (got_o, got) = run(true);
+        assert_bits_eq(&format!("lens {lens:?} o"), &got_o, &want_o);
+        assert_f32_bits_eq(&format!("lens {lens:?} S"), &got.s, &want.s);
+        assert_bits_eq(&format!("lens {lens:?} conv"), &got.conv, &want.conv);
+        assert!(got_o.iter().any(|&x| x != 0), "lens {lens:?}: the outputs are all zero");
+    }
+}
+
+/// The chain kernel and the gated norm after it against the fused kernel, one layer of a 4,096-row chunk (and of 4,012 rows, the size of a
+/// steady chunk of a 32K prompt).
+///     cargo test --release -p gb-cuda --test gdn -- --ignored --nocapture bench_prefill_gated_norm
+#[test]
+#[ignore]
+fn bench_prefill_gated_norm() {
+    need_gpu!();
+    if SHAPE != GdnShape::Hv48 {
+        return;
+    }
+    let mut rng = Rng(63);
+    let ctx = Ctx::new(Weights::random(&mut rng));
+    let nw = DevBuf::from_slice(&rng.vec(D, 0.4, 1.8)).unwrap();
+    for rows in [4012usize, 4096] {
+        let inp = Inp::random(&mut rng, rows);
+        let x = DevInp::new(&inp);
+        let zh: Vec<u16> = rng.vec(rows * VH * D, -6.0, 6.0).iter().map(|&x| f32_to_bf16(x)).collect();
+        let z = DevBuf::from_slice(&zh).unwrap();
+        let mut pools = DevPools { s: DevBuf::zeroed(S_SLOT * 4).unwrap(), conv: DevBuf::zeroed(CONV_SLOT * 2).unwrap() };
+        let batch = BatchBuf::new(&[rows], &[0]).unwrap();
+        let mut ws = DevBuf::zeroed(prefill_workspace_bytes_shaped(SHAPE, rows)).unwrap();
+        let mut o = DevBuf::zeroed(rows * VH * D * 2).unwrap();
+        let t_old = timed(&ctx.st, 10, |_| {
+            prefill_shaped(SHAPE, &ctx.st, &x.view(), &ctx.weights(), &mut pools.s, &mut pools.conv, &batch.view(), &mut ws, &mut o).unwrap();
+            gb_cuda::fn_glue::gated_rmsnorm_sigmoid(None, &z, &nw, &mut o, rows, VH, D, 1e-6, &ctx.st).unwrap();
+        });
+        let t_new = timed(&ctx.st, 10, |_| {
+            prefill_gated(&ctx.st, &x.view(), &ctx.weights(), &mut pools.s, &mut pools.conv, &batch.view(), &mut ws, &z, &nw, 1e-6, &mut o).unwrap()
+        });
+        eprintln!("BENCH {rows} rows, pre + chain + norm: previous {:.3} ms, fused {:.3} ms", t_old * 1e3, t_new * 1e3);
+    }
+}
+
 #[test]
 fn prefill_agrees_with_decode_path_approximately() {
     need_gpu!();
