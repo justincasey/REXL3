@@ -756,3 +756,48 @@ fn bench_qsa_topk_chunk() {
     assert!(s1 == sel0 && n1 == sel_n0, "selection differs from the pipeline's");
     eprintln!("BENCH topk best {best:.3} ms  selection {:016x}", fnv(bytes_of(&s1)));
 }
+
+/// A prefill chunk's attention (one part, 64 rows and more) through the kernel that stages the block's K and V rows in shared memory
+/// and through the kernel that loaded them warp by warp: the bf16 outputs are bit-identical. Row sets cover every selection length from
+/// a handful of tokens (dense rows at the start of a sequence: totals 1..71, every residue of the 8-token group and of the 128-token
+/// offset block) over the sparse threshold (positions 2,047..2,120) to the full 512 selected blocks plus the tail block, odd row counts,
+/// rows of several sequences in one batch, and a chunk of 4,096 rows.
+#[test]
+#[ignore]
+fn qsa_attend_staged_equals_warp_loaded_bit_for_bit() {
+    let Some(st) = gpu() else { return };
+    let lens = [2600usize, 4111, 9000, 8400];
+    let rig = Rig::new(&lens, 7, 97, &st);
+    let sets: Vec<(&str, Vec<(usize, usize)>)> = vec![
+        ("dense start, totals 1..71", (0..71).map(|i| (0, i)).collect()),
+        ("dense, 131 rows", (0..131).map(|i| (0, 30 + 17 * i % 2500)).collect()),
+        ("threshold", (0..74).map(|i| (1, 2047 + i)).collect()),
+        ("block boundaries", (0..97).map(|i| (1, 3 + (44 * i) % 4100)).collect()),
+        ("tail of a long sequence", (0..65).map(|i| (2, 8935 + i)).collect()),
+        ("mixed slots", (0..133).map(|i| (i % 4, 1000 + 61 * i % (lens[i % 4] - 1000))).collect()),
+        ("chunk grid", (0..4096).map(|i| (3, 4200 + i)).collect()),
+    ];
+    let width = N_Q_HEADS * HEAD_DIM;
+    for (name, rows) in sets {
+        let n = rows.len();
+        assert!(n >= 64);
+        let q = rig.queries(&rows, &st);
+        let (_, sel, sel_n, _) = rig.select(&rows, &q, &st);
+        let qm = main_queries(n, 4242);
+        let slot = DevBuf::from_slice(&rows.iter().map(|&(s, _)| s as i32).collect::<Vec<_>>()).unwrap();
+        let pos = DevBuf::from_slice(&rows.iter().map(|&(_, p)| p as i32).collect::<Vec<_>>()).unwrap();
+        let rr = qsa::Rows { slot: &slot, pos: &pos, rows: n };
+        let (qd, sd, nd) = (DevBuf::from_slice(&qm).unwrap(), DevBuf::from_slice(&sel).unwrap(), DevBuf::from_slice(&sel_n).unwrap());
+        let mut ws = DevBuf::zeroed(qsa::attend_workspace_bytes(n, 1)).unwrap();
+        let mut got = DevBuf::zeroed(n * width * 2).unwrap();
+        let mut want = DevBuf::zeroed(n * width * 2).unwrap();
+        qsa::attend(&qd, &rig.kv, &rig.table, &rr, &sd, &nd, 1, &mut ws, &mut got, &st).unwrap();
+        qsa::attend_merged_ref(&qd, &rig.kv, &rig.table, &rr, &sd, &nd, &mut want, &st).unwrap();
+        st.sync().unwrap();
+        let (got, want): (Vec<u16>, Vec<u16>) = (got.to_vec().unwrap(), want.to_vec().unwrap());
+        let bad = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+        eprintln!("{name}: {n} rows, {bad} of {} bf16 outputs differ, hash {:016x}", got.len(), fnv(bytes_of(&got)));
+        assert_eq!(bad, 0, "{name}");
+        assert!(got.iter().any(|&x| x != 0), "{name}: the outputs are all zero");
+    }
+}
