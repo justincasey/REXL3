@@ -693,6 +693,14 @@ int launch_down(const DnArgs& a, cudaStream_t st) {
     return launch_down_pa<K2, CB, NT, 1, kAp<K2, CB>>(a, st);
 }
 
+// `REXL3_MOE_PF_TEAMBAR=0`: the gate/up blocks' two teams meet at every stage's barrier (the block-wide __syncthreads) instead of each at its own named barrier.
+// gb_moe_pf_set_team_barrier overrides it (tests that run both forms in one process); -1 gives the environment back.
+static int g_team_bar_override = -1;
+inline int team_bar() {
+    static const int env = [] { const char* e = getenv("REXL3_MOE_PF_TEAMBAR"); return (e && e[0] == '0') ? 0 : 1; }();
+    return g_team_bar_override >= 0 ? g_team_bar_override : env;
+}
+
 // The second form (moe_prefill_v2.cuh): one launch per class as the first form's, the same grid and item lists.
 template <int K2, int CB, int MT>
 int launch_gateup2(const GuArgs& a, cudaStream_t st) {
@@ -700,7 +708,7 @@ int launch_gateup2(const GuArgs& a, cudaStream_t st) {
     auto kernel = gateup2_kernel<K2, CB, MT, kGuKps, gu_st(MT)>;
     set_smem(kernel, smem);
     const dim3 grid((unsigned)(a.N / 128), (unsigned)a.cap);
-    kernel<<<grid, 512, smem, st>>>(a.xs0, a.xs1, a.tp0, a.tp1, a.items, a.nitems, a.svh_g, a.svh_u, a.suh_d, a.xd, a.K, a.N, a.limit);
+    kernel<<<grid, 512, smem, st>>>(a.xs0, a.xs1, a.tp0, a.tp1, a.items, a.nitems, a.svh_g, a.svh_u, a.suh_d, a.xd, a.K, a.N, a.limit, team_bar());
     return GB_CHECK_LAUNCH();
 }
 
@@ -721,7 +729,7 @@ int launch_gateup2u(const GuArgs& a, cudaStream_t st) {
     auto kernel = gateup2u_kernel<K2, CB, kGuKps>;
     set_smem(kernel, smem);
     const dim3 grid((unsigned)(a.N / 128), (unsigned)a.cap);
-    kernel<<<grid, 512, smem, st>>>(a.xs0, a.xs1, a.tp0, a.tp1, a.items, a.nitems, a.svh_g, a.svh_u, a.suh_d, a.xd, a.K, a.N, a.limit);
+    kernel<<<grid, 512, smem, st>>>(a.xs0, a.xs1, a.tp0, a.tp1, a.items, a.nitems, a.svh_g, a.svh_u, a.suh_d, a.xd, a.K, a.N, a.limit, team_bar());
     return GB_CHECK_LAUNCH();
 }
 
@@ -815,6 +823,12 @@ int launch_down_set(const DnArgs& a, bool unified, cudaStream_t st) {
 
 // ---------------------------------------------------------------------------------------------------------------
 // C ABI
+
+// Test hook: 1 / 0 force the gate/up blocks' per-team / block-wide stage barrier for the launches that follow, -1 returns to REXL3_MOE_PF_TEAMBAR.
+GB_EXPORT int gb_moe_pf_set_team_barrier(int v) {
+    g_team_bar_override = v < 0 ? -1 : (v ? 1 : 0);
+    return 0;
+}
 
 // Item slots a class holds for P pairs and E experts: enough for every grouping (groups of 4 tiles of the padded rows, plus one
 // remainder group an expert).

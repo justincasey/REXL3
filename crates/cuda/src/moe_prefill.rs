@@ -81,6 +81,7 @@ mod ffi {
             stream: *mut c_void,
         ) -> i32;
         pub fn gb_moe_pf_unify(items: *mut c_void, nitems: *mut c_void, cap: i32, stream: *mut c_void) -> i32;
+        pub fn gb_moe_pf_set_team_barrier(v: i32) -> i32;
         pub fn gb_moe_pf_rot_in(
             x: *const c_void,
             x_dtype: i32,
@@ -219,6 +220,14 @@ fn codebook_code(cb: gb_exl3::Codebook) -> i32 {
 pub fn item_cap(pairs: usize, experts: usize) -> usize {
     let e = experts.min(pairs);
     (pairs + 15 * e) / 16 / 4 + e + 1
+}
+
+/// Forces the gate/up blocks' stage barrier for the launches that follow: `Some(true)` one named barrier a team (the default), `Some(false)` the block-wide
+/// `__syncthreads`, `None` the `REXL3_MOE_PF_TEAMBAR` environment again. Both give the same bits (tests run each in one process); only the time differs.
+pub fn set_team_barrier(v: Option<bool>) {
+    unsafe {
+        ffi::gb_moe_pf_set_team_barrier(v.map_or(-1, i32::from));
+    }
 }
 
 /// Rows of the sorted order at most: every expert's pairs padded to whole 16-row tiles.

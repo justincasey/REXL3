@@ -59,7 +59,7 @@ __device__ __forceinline__ void load_stage2(uint32_t* sa, const uint32_t* XS, co
 // mma accumulator layout). Every thread of the team calls it with the same trip counts (it holds the team's barriers).
 template <int K2, int CB, int MT, int KPS, int ST, int NTH>
 __device__ __forceinline__ void chains2(float (&tot)[MT][2][4], uint32_t* sm, const uint32_t* XS, const uint32_t* T, int tile0, int nt, int KT, size_t tn,
-                                        int nb, int tt, int warp, int lane) {
+                                        int nb, int tt, int warp, int lane, int tbar) {
     constexpr int TW = tile_words<K2>();
     constexpr int STAGE_W = MT * KPS * 128 + KPS * 8 * TW;
     const int NS = KT / KPS;
@@ -81,7 +81,10 @@ __device__ __forceinline__ void chains2(float (&tot)[MT][2][4], uint32_t* sm, co
 #pragma unroll 1
     for (int kc = 0; kc < NS; ++kc) {
         cpa_wait<ST - 2>();
-        __syncthreads();
+        // tbar > 0: the barrier of the NTH threads of this team (named barrier tbar), not of the whole block: the two teams of a gate/up block share nothing
+        // until the epilogue (each has its own A, its own trellis and its own ring), so they need not meet at every stage
+        if (tbar) asm volatile("bar.sync %0, %1;" ::"r"(tbar), "n"(NTH) : "memory");
+        else __syncthreads();
         {
             const int nk = kc + ST - 1;
             if (nk < NS) load_stage2<K2, MT, KPS, NTH>(sm + (nk % ST) * STAGE_W, XS, T, tile0, nt, KT, tn, nb, nk, tt);
@@ -198,7 +201,7 @@ template <int K2, int CB, int MT, int KPS, int ST>
 __device__ __noinline__ void gateup2_item(const int4 item, const uint32_t* __restrict__ XS0, const uint32_t* __restrict__ XS1,
                                              const uint64_t* __restrict__ TP0, const uint64_t* __restrict__ TP1,
                                              const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d,
-                                             uint32_t* __restrict__ xd, int K, int N, float limit) {
+                                             uint32_t* __restrict__ xd, int K, int N, float limit, int team_bar) {
     constexpr int TW = tile_words<K2>();
     constexpr int STAGE_W = MT * KPS * 128 + KPS * 8 * TW;
     constexpr int STG_W = MT * 16 * kLds2;
@@ -210,7 +213,8 @@ __device__ __noinline__ void gateup2_item(const int4 item, const uint32_t* __res
     const uint32_t* XS = team ? XS1 : XS0;
     const int KT = K >> 4;
     float tot[MT][2][4];
-    chains2<K2, CB, MT, KPS, ST, 256>(tot, smem2 + team * (ST * STAGE_W), XS, T, tile0, nt, KT, (size_t)(N >> 4), nb, tt, warp, lane);
+    chains2<K2, CB, MT, KPS, ST, 256>(tot, smem2 + team * (ST * STAGE_W), XS, T, tile0, nt, KT, (size_t)(N >> 4), nb, tt, warp, lane,
+                                      team_bar ? 1 + team : 0);
     __syncthreads();                                   // the rings are the staging now
     float* stg = reinterpret_cast<float*>(smem2) + team * STG_W;
     tot_to_stage<MT>(tot, stg, nt, warp, lane);
@@ -253,10 +257,11 @@ __global__ void __launch_bounds__(512, 1) gateup2_kernel(const uint32_t* __restr
                                                          const uint64_t* __restrict__ TP0, const uint64_t* __restrict__ TP1,
                                                          const int4* __restrict__ items, const int* __restrict__ nitems,
                                                          const half* __restrict__ svh_g, const half* __restrict__ svh_u,
-                                                         const half* __restrict__ suh_d, uint32_t* __restrict__ xd, int K, int N, float limit) {
+                                                         const half* __restrict__ suh_d, uint32_t* __restrict__ xd, int K, int N, float limit,
+                                                         int team_bar) {
     const int it = blockIdx.y;
     if (it >= nitems[0]) return;
-    gateup2_item<K2, CB, MT, KPS, ST>(items[it], XS0, XS1, TP0, TP1, svh_g, svh_u, suh_d, xd, K, N, limit);
+    gateup2_item<K2, CB, MT, KPS, ST>(items[it], XS0, XS1, TP0, TP1, svh_g, svh_u, suh_d, xd, K, N, limit, team_bar);
 }
 
 // One launch for every item, in the order of the unified list (an expert's items one after the other, so the 5 column blocks of the items of an expert
@@ -267,16 +272,17 @@ __global__ void __launch_bounds__(512, 1) gateup2u_kernel(const uint32_t* __rest
                                                           const uint64_t* __restrict__ TP0, const uint64_t* __restrict__ TP1,
                                                           const int4* __restrict__ items, const int* __restrict__ nitems,
                                                           const half* __restrict__ svh_g, const half* __restrict__ svh_u,
-                                                          const half* __restrict__ suh_d, uint32_t* __restrict__ xd, int K, int N, float limit) {
+                                                          const half* __restrict__ suh_d, uint32_t* __restrict__ xd, int K, int N, float limit,
+                                                          int team_bar) {
     const int it = blockIdx.y;
     if (it >= nitems[0]) return;
     const int4 item = items[it];
     if (item.z == 1)
-        gateup2_item<K2, CB, 1, KPS, gu_st(1)>(item, XS0, XS1, TP0, TP1, svh_g, svh_u, suh_d, xd, K, N, limit);
+        gateup2_item<K2, CB, 1, KPS, gu_st(1)>(item, XS0, XS1, TP0, TP1, svh_g, svh_u, suh_d, xd, K, N, limit, team_bar);
     else if (item.z == 2)
-        gateup2_item<K2, CB, 2, KPS, gu_st(2)>(item, XS0, XS1, TP0, TP1, svh_g, svh_u, suh_d, xd, K, N, limit);
+        gateup2_item<K2, CB, 2, KPS, gu_st(2)>(item, XS0, XS1, TP0, TP1, svh_g, svh_u, suh_d, xd, K, N, limit, team_bar);
     else
-        gateup2_item<K2, CB, 4, KPS, gu_st(4)>(item, XS0, XS1, TP0, TP1, svh_g, svh_u, suh_d, xd, K, N, limit);
+        gateup2_item<K2, CB, 4, KPS, gu_st(4)>(item, XS0, XS1, TP0, TP1, svh_g, svh_u, suh_d, xd, K, N, limit, team_bar);
 }
 
 template <int K2, int CB, int MT, int KPS, int ST>
@@ -289,7 +295,7 @@ __device__ __noinline__ void down2_item(const int4 item, const uint32_t* __restr
     const uint32_t* T = reinterpret_cast<const uint32_t*>(TP[e]);
     const int KT = K >> 4;
     float tot[MT][2][4];
-    chains2<K2, CB, MT, KPS, ST, 256>(tot, smem2, XS, T, tile0, nt, KT, (size_t)(N >> 4), nb, tid, warp, lane);
+    chains2<K2, CB, MT, KPS, ST, 256>(tot, smem2, XS, T, tile0, nt, KT, (size_t)(N >> 4), nb, tid, warp, lane, 0);
     __syncthreads();
     float* stg = reinterpret_cast<float*>(smem2);
     tot_to_stage<MT>(tot, stg, nt, warp, lane);
