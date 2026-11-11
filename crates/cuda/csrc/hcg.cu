@@ -355,7 +355,7 @@ __device__ __forceinline__ void ni_ldsm2(uint32_t& r0, uint32_t& r1, const half*
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n" : "=r"(r0), "=r"(r1) : "r"(a));
 }
 
-// grid (ceil(T / 16), 4), block 256, dynamic smem kNiLaunchSmem (what two CTAs an SM leave of the 99 KB: a CTA's 16 rows of one stream are
+// grid (4 ceil(T / 16)): CTA i is row tile i / 4, stream i % 4; block 256, dynamic smem kNiLaunchSmem (what two CTAs an SM leave of the 99 KB: a CTA's 16 rows of one stream are
 // 164 KB, so the 96 CTAs in flight keep 15.7 MB of streams between pass 1 and pass 2 in L2). Q [2 (hi, lo)][20][T][4] gets the inject
 // splits' sums.
 constexpr size_t kNiLaunchSmem = 49152;
@@ -371,7 +371,7 @@ __global__ void __launch_bounds__(kNiThreads, 2)
     half* sA = reinterpret_cast<half*>(ni_smem + kNiSmemB + kNiSmemX);
     float* sR = reinterpret_cast<float*>(ni_smem + kNiSmemB + kNiSmemX + kNiSmemA);
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, g = lane >> 2, t4 = lane & 3;
-    const int r0 = blockIdx.x * kNiBM, s = blockIdx.y;
+    const int r0 = (int)(blockIdx.x >> 2) * kNiBM, s = blockIdx.x & 3;
 
     // pass 1: post-inject (in place) and the rms of (row, stream). Lane l of the warp holds, for j = 0..7, the partial sum of post_norm_kernel's
     // thread 32 j + l (its float4 at m = 32 j + l + 256 c for c = 0, 1, 2, m < 640, summed in c order); the warp butterfly of each j is
@@ -875,13 +875,16 @@ static int hcg_pre(const void* streams, const void* norm_w, const void* down_w, 
             return (int)cudaErrorUnknown;
     }
     int rc = 0;
+    // one CTA a (16 rows, stream), the four streams of a row tile adjacent in the grid: they all read the tile's rows of block_out, which
+    // the first of them brings from DRAM and the others find in L2 (stream-major order read it from DRAM four times, 20 MB each)
+    const dim3 ni_grid(((T + kNiBM - 1) / kNiBM) * 4, 1);
     if (ni) {
         if (post_block)
-            norm_inj_kernel<true, false><<<dim3((T + kNiBM - 1) / kNiBM, 4), kNiThreads, kNiLaunchSmem, st>>>(
+            norm_inj_kernel<true, false><<<ni_grid, kNiThreads, kNiLaunchSmem, st>>>(
                 (float*)streams, (const __nv_bfloat16*)post_block, post_inj, (const half*)norm_w, (const half*)inject_w, normed_hi, normed_lo, G,
                 rms, T, eps);
         else
-            norm_inj_kernel<false, false><<<dim3((T + kNiBM - 1) / kNiBM, 4), kNiThreads, kNiLaunchSmem, st>>>(
+            norm_inj_kernel<false, false><<<ni_grid, kNiThreads, kNiLaunchSmem, st>>>(
                 (float*)streams, nullptr, nullptr, (const half*)norm_w, (const half*)inject_w, normed_hi, normed_lo, G, rms, T, eps);
     } else if (post_block) {
         post_norm_kernel<4, 3><<<T, 256, 0, st>>>((float*)streams, (const __nv_bfloat16*)post_block, post_inj, (const half*)norm_w, normed_hi,

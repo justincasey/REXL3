@@ -1,0 +1,3 @@
+## New features and improvements
+
+- Qwen3.8-Flash-Next prompt prefill launches the hyper-connection pre-mix's norm + inject kernel with the four streams of a 16-row tile next to each other in the grid. Each of the four reads the same 16 rows of the previous block's output; in stream-major order the first stream's reads had left the L2 long before the fourth stream's came, so the 20 MB output was fetched from DRAM four times a call and now once. Every output bit is unchanged (the mixed rows, the inject rows and the post-injected streams stay equal to the 64-row slab loop). On a 4,016-row chunk the kernel takes 1.78 ms instead of 2.09 ms with a warm L2 and 1.82 ms instead of 2.17 ms with the L2 filled by other data.
