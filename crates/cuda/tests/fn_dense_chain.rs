@@ -2,7 +2,7 @@
 //! Flash-Next pack's shapes (6-bit trellis; the GDN in_proj_qkv / in_proj_z / out_proj and the full-attention q / k / v / o and the
 //! indexer's qk projection), bf16 in and out as the model calls it.
 //!
-//! Gates (not ignored): the chain GEMM the 6- to 8-bit layers run by default and every one of its configurations (`tile_force`
+//! Gates (not ignored): the chain GEMM the 3- to 8-bit layers run by default and every one of its configurations (`tile_force`
 //! 10001 ..= 10004) give, bit for bit, what the old fixed-tile kernel gives (`tile_force` 642, 1282: the `gemm_kernel` the Tiled
 //! prefill ran before), on the pack's shapes and on odd strip counts, at row counts that straddle the 64 / 128-row tiles (1, 7, 33,
 //! 127, 128, 129, 1000, 4,096), on random trellis and scales and on adversarial activations (zero rows, rows that overflow fp16 after
@@ -90,9 +90,37 @@ fn acts(seed: u64, rows: usize, k: usize, f16: bool) -> Vec<u16> {
                 2 => enc(if f16 { 6.0e3 * u } else { 3.0e4 * u }),
                 3 => enc(u * if f16 { 1.0e-7 } else { 1.0e-30 }),
                 4 => (r.next_u64() as u16 % if f16 { 0x3ff } else { 0x7f }) | if u < 0.0 { 0x8000 } else { 0 },
-                5 => enc(if c == spot { if f16 { 6.0e4 } else { 1.0e38 } } else { 1.0e-2 * u }),
-                6 => if c == spot { if f16 { 0x7e00 } else { 0x7fc0 } } else { enc(u) },
-                7 => if c == spot { if f16 { 0x7c00 } else { 0x7f80 } } else { enc(u) },
+                5 => enc(if c == spot {
+                    if f16 {
+                        6.0e4
+                    } else {
+                        1.0e38
+                    }
+                } else {
+                    1.0e-2 * u
+                }),
+                6 => {
+                    if c == spot {
+                        if f16 {
+                            0x7e00
+                        } else {
+                            0x7fc0
+                        }
+                    } else {
+                        enc(u)
+                    }
+                }
+                7 => {
+                    if c == spot {
+                        if f16 {
+                            0x7c00
+                        } else {
+                            0x7f80
+                        }
+                    } else {
+                        enc(u)
+                    }
+                }
                 _ => enc(if r.next_u64() % 64 == 0 { 64.0 * u.signum() } else { 0.0 }),
             };
             out.push(bits);
@@ -181,9 +209,18 @@ fn chain_gemm_equals_the_old_kernel_on_odd_strip_counts_and_every_bit_width() {
     gpu!();
     let st = Stream::new().unwrap();
     // N / 128 = 1, 3, 5, 7, 5 strips: the 256-column tiles of the old kernel and the 128-column tiles of the new one end mid-tile
-    for (i, &(k, n, bits)) in [(128usize, 128usize, 6usize), (384, 640, 6), (640, 384, 7), (2560, 640, 8), (1536, 896, 6), (256, 640, 3), (512, 384, 4), (768, 256, 5)]
-        .iter()
-        .enumerate()
+    for (i, &(k, n, bits)) in [
+        (128usize, 128usize, 6usize),
+        (384, 640, 6),
+        (640, 384, 7),
+        (2560, 640, 8),
+        (1536, 896, 6),
+        (256, 640, 3),
+        (512, 384, 4),
+        (768, 256, 5),
+    ]
+    .iter()
+    .enumerate()
     {
         let w = layer(k, n, bits, 1100 + i as u64);
         for &rows in &[1usize, 33, 129, 300] {
@@ -258,7 +295,12 @@ fn bench_dense_chain_on_the_flash_next_shapes() {
         eprintln!("{line}  (x{calls} a chunk, pick {})", glm_p2::pick_tile(rows, k, n, Variant::Chain));
     }
     for (ti, &tile) in tiles.iter().enumerate() {
-        eprintln!("BENCH chunk total tile {tile}: {:.1} ms for {:.2} TFLOP = {:.1} TF/s", total[ti], total_flop / 1e3, total_flop / total[ti]);
+        eprintln!(
+            "BENCH chunk total tile {tile}: {:.1} ms for {:.2} TFLOP = {:.1} TF/s",
+            total[ti],
+            total_flop / 1e3,
+            total_flop / total[ti]
+        );
     }
 }
 
@@ -279,7 +321,8 @@ fn bench_dense_chain_fill_and_epilogue() {
             st.sync().unwrap();
             let t = std::time::Instant::now();
             for r in 0..8 {
-                glm_p2::linear_variant(&ws_[r % 4], &x, &mut y, rows, Dtype::BF16, Dtype::BF16, &mut ws, Variant::Chain, 10001, &st).unwrap();
+                glm_p2::linear_variant(&ws_[r % 4], &x, &mut y, rows, Dtype::BF16, Dtype::BF16, &mut ws, Variant::Chain, 10001, &st)
+                    .unwrap();
             }
             st.sync().unwrap();
             if it > 0 {
@@ -288,5 +331,53 @@ fn bench_dense_chain_fill_and_epilogue() {
         }
         let ms = median(v);
         eprintln!("FILL K {k:5} N {n}: {ms:.3} ms = {:.1} TF", 2.0 * rows as f64 * k as f64 * n as f64 / 1e9 / ms);
+    }
+}
+
+/// The chain GEMM at the narrower bit widths: the old tiles beside the new configuration 1 (which the pick takes from 3 bits up).
+#[test]
+#[ignore]
+fn bench_dense_chain_narrow_bit_widths() {
+    gpu!();
+    let rows = 4096usize;
+    let st = Stream::new().unwrap();
+    let tiles: [i32; 3] = [642, 1282, 10001];
+    for (i, &(k, n, bits)) in [
+        (2560usize, 10240usize, 5usize),
+        (2560, 10240, 4),
+        (2560, 10240, 3),
+        (6144, 2560, 4),
+        (5120, 17408, 4),
+        (17408, 5120, 4),
+        (5120, 5120, 4),
+        (2560, 640, 5),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let ws_: Vec<Exl3Weights> = (0..4).map(|c| layer(k, n, bits, 8000 + 10 * i as u64 + c)).collect();
+        let x = upload(&acts(3 + i as u64, rows, k, false));
+        let mut y = DevBuf::alloc(rows * n * 2).unwrap();
+        let mut ws = DevBuf::alloc(glm_p2::workspace_bytes(rows, k)).unwrap();
+        let tf = 2.0 * rows as f64 * k as f64 * n as f64 / 1e9;
+        let mut line = format!("NARROW K {k:5} N {n:5} {bits}b:");
+        for &tile in &tiles {
+            let mut v = Vec::new();
+            for it in 0..6 {
+                st.sync().unwrap();
+                let t = std::time::Instant::now();
+                for r in 0..8 {
+                    glm_p2::linear_variant(&ws_[r % 4], &x, &mut y, rows, Dtype::BF16, Dtype::BF16, &mut ws, Variant::Chain, tile, &st)
+                        .unwrap();
+                }
+                st.sync().unwrap();
+                if it > 0 {
+                    v.push(t.elapsed().as_secs_f64() * 1e3 / 8.0);
+                }
+            }
+            let ms = median(v);
+            line += &format!(" | {tile} {ms:6.3} ms {:5.1} TF", tf / ms);
+        }
+        eprintln!("{line}");
     }
 }
