@@ -381,3 +381,38 @@ fn bench_dense_chain_narrow_bit_widths() {
         eprintln!("{line}");
     }
 }
+
+/// The chain GEMM at the row counts of a prompt's last chunk and of short chunks: the old tiles beside the new configuration 1.
+#[test]
+#[ignore]
+fn bench_dense_chain_row_counts() {
+    gpu!();
+    let st = Stream::new().unwrap();
+    let tiles: [i32; 5] = [641, 642, 1281, 1282, 10001];
+    for (i, &(k, n, bits)) in [(2560usize, 10240usize, 6usize), (6144, 2560, 6), (2560, 512, 6)].iter().enumerate() {
+        let ws_: Vec<Exl3Weights> = (0..4).map(|c| layer(k, n, bits, 9000 + 10 * i as u64 + c)).collect();
+        for &rows in &[16usize, 64, 128, 200, 512, 1024, 2048] {
+            let x = upload(&acts(3 + i as u64, rows, k, false));
+            let mut y = DevBuf::alloc(rows * n * 2).unwrap();
+            let mut ws = DevBuf::alloc(glm_p2::workspace_bytes(rows, k)).unwrap();
+            let mut line = format!("ROWS K {k:5} N {n:5} rows {rows:5}:");
+            for &tile in &tiles {
+                let mut v = Vec::new();
+                for it in 0..8 {
+                    st.sync().unwrap();
+                    let t = std::time::Instant::now();
+                    for r in 0..8 {
+                        let w = &ws_[r % 4];
+                        glm_p2::linear_variant(w, &x, &mut y, rows, Dtype::BF16, Dtype::BF16, &mut ws, Variant::Chain, tile, &st).unwrap();
+                    }
+                    st.sync().unwrap();
+                    if it > 0 {
+                        v.push(t.elapsed().as_secs_f64() * 1e6 / 8.0);
+                    }
+                }
+                line += &format!(" | {tile} {:7.1} us", median(v));
+            }
+            eprintln!("{line}");
+        }
+    }
+}
