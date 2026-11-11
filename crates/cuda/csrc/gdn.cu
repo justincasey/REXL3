@@ -596,30 +596,22 @@ __global__ void __launch_bounds__(TPR * ROWS) chain_kernel(
 // and gates) is double buffered: the next tile's global loads are issued before the current tile's steps and stored into the other buffer
 // after them, so a tile costs one barrier and no exposed load latency.
 // ---------------------------------------------------------------------------------------------------------------
-// GATED (ROWS = 128: one block holds all 128 value rows of a head, 256 threads) ends every tile with the head's gated RMS norm of each of
-// the tile's steps, gated_rmsnorm_sigmoid_k's arithmetic operation for operation (glue.cu), so `o` is the chain's output followed by that
-// kernel: the bf16 chain outputs go to shared memory, and one warp a step reads them back four values a lane (lane l: values 4l .. 4l + 3, as
-// that kernel's lanes do), sums the squares in the same order, normalises, multiplies by the sigmoid of z and rounds to bf16. The chain's
-// own arithmetic is the same lines in both builds.
-template <int ROWS, int TPR, int STEPS, bool GATED = false>
-__global__ void __launch_bounds__(TPR * ROWS / 2, GATED ? 1 : 0) chain_rows_kernel(
+// The gated norm of the prompt chain lives in chain_gated_kernel below, which runs this kernel's arithmetic.
+template <int ROWS, int TPR, int STEPS>
+__global__ void __launch_bounds__(TPR * ROWS / 2) chain_rows_kernel(
         const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
         const float* __restrict__ g, const float* __restrict__ beta, float* S, const int* __restrict__ seq_start,
-        const int* __restrict__ slot, __nv_bfloat16* __restrict__ o, const __nv_bfloat16* __restrict__ z = nullptr,
-        const float* __restrict__ nw = nullptr, float eps = 0.0f) {
+        const int* __restrict__ slot, __nv_bfloat16* __restrict__ o) {
     constexpr int NT = TPR * ROWS / 2;  // threads per block: TPR threads a row pair
     constexpr int J = 32 / TPR;         // float4 chunks of a key row each thread owns (chunk index TPR*j + part)
     constexpr int KI = STEPS * 32 / NT;  // key (and query) chunk items a thread stages per tile
     constexpr int VI = STEPS * (ROWS / 2) / NT;  // value pairs a thread stages per tile
     static_assert(TPR == 4 && (ROWS == 64 || ROWS == 128) && STEPS * 32 % NT == 0 && STEPS * (ROWS / 2) % NT == 0 &&
-                      NT == 2 * ROWS && STEPS <= 32 && (!GATED || (ROWS == 128 && STEPS == 2 * (NT / 32))),
+                      NT == 2 * ROWS && STEPS <= 32,
                   "the staging maps below are built for 128 or 256 threads, 64 or 128 rows and 4 threads a row pair");
     __shared__ float4 ks[2][STEPS][DK / 4], qs[2][STEPS][DK / 4];
     __shared__ unsigned vs[2][STEPS][ROWS / 2];  // two bf16 values (rows 2p, 2p + 1) a word
     __shared__ float gs[2][STEPS], bs[2][STEPS];
-    // GATED: the two tiles' outputs, two bf16 values (rows 2p, 2p + 1) a word: ob[(tile parity * STEPS + step) * ROWS / 2 + p], dynamic shared
-    // memory (the static part is 48 KB on its own; the launch opts in to the 8 KB more)
-    extern __shared__ __align__(16) unsigned ob[];
     const int head = blockIdx.x, seq = blockIdx.z;
     const int begin = seq_start[seq], W = seq_start[seq + 1] - begin;
     if (W <= 0) return;
@@ -679,47 +671,6 @@ __global__ void __launch_bounds__(TPR * ROWS / 2, GATED ? 1 : 0) chain_rows_kern
         if (threadIdx.x < n) gs[buf][threadIdx.x] = gb;
         else if (threadIdx.x >= 32 && threadIdx.x < 32 + n) bs[buf][threadIdx.x - 32] = gb;
     };
-    // GATED: the step's norm of tile `tile_t0` (outputs in ob[obuf], z and the weights from global memory); a warp takes steps warp and
-    // warp + NT / 32 of the tile, its z rows loaded ahead of the chain steps that hide their latency
-    uint2 zr[2];
-    float nwl[4];
-    if (GATED) {
-#pragma unroll
-        for (int i = 0; i < 4; ++i) nwl[i] = nw[4 * lane + i];
-    }
-    auto load_z = [&](int tile_t0, int nn) {
-#pragma unroll
-        for (int u = 0; u < 2; ++u) {
-            const int tt = warp + (NT / 32) * u;
-            if (tt < nn) zr[u] = *reinterpret_cast<const uint2*>(z + ((size_t)(begin + tile_t0 + tt) * HV + head) * DK + 4 * lane);
-        }
-    };
-    auto epilogue_step = [&](int u, int tile_t0, int obuf, int nn) {
-        const int tt = warp + (NT / 32) * u;
-        if (tt < nn) {
-            const uint2 ow = *reinterpret_cast<const uint2*>(&ob[(obuf * STEPS + tt) * (ROWS / 2) + 2 * lane]);
-            const float ov[4] = {__uint_as_float(ow.x << 16), __uint_as_float(ow.x & 0xFFFF0000u), __uint_as_float(ow.y << 16),
-                                 __uint_as_float(ow.y & 0xFFFF0000u)};
-            const float zv[4] = {__uint_as_float(zr[u].x << 16), __uint_as_float(zr[u].x & 0xFFFF0000u),
-                                 __uint_as_float(zr[u].y << 16), __uint_as_float(zr[u].y & 0xFFFF0000u)};
-            float ss = 0.f;
-#pragma unroll
-            for (int i = 0; i < 4; ++i) ss = ss + ov[i] * ov[i];
-            ss = warp_sum(ss);
-            const float inv = 1.0f / sqrtf(ss / (float)DK + eps);
-            unsigned short rr[4];
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const float yn = (ov[i] * inv) * nwl[i];
-                const float gate = 1.0f / (1.0f + expf(-zv[i]));
-                rr[i] = __bfloat16_as_ushort(__float2bfloat16_rn(yn * gate));
-            }
-            uint2 res;
-            res.x = rr[0] | ((unsigned)rr[1] << 16);
-            res.y = rr[2] | ((unsigned)rr[3] << 16);
-            *reinterpret_cast<uint2*>(o + ((size_t)(begin + tile_t0 + tt) * HV + head) * DK + 4 * lane) = res;
-        }
-    };
     load_tile(0);
     store_tile(0, 0);
     __syncthreads();
@@ -727,7 +678,6 @@ __global__ void __launch_bounds__(TPR * ROWS / 2, GATED ? 1 : 0) chain_rows_kern
         const int n = min(STEPS, W - t0);
         const bool more = t0 + STEPS < W;
         if (more) load_tile(t0 + STEPS);
-        if (GATED && t0 > 0) load_z(t0 - STEPS, STEPS);
 #pragma unroll 8
         for (int tt = 0; tt < n; ++tt) {
             const float gt = gs[buf][tt], bt = bs[buf][tt];
@@ -784,30 +734,290 @@ __global__ void __launch_bounds__(TPR * ROWS / 2, GATED ? 1 : 0) chain_rows_kern
                 for (int r = 0; r < 2; ++r) out[r] = out[r] + __shfl_xor_sync(0xffffffffu, out[r], d);
             }
             if (part == 0) {
-                if (GATED) {
-                    const __nv_bfloat162 pk = __floats2bfloat162_rn(out[0], out[1]);
-                    ob[(buf * STEPS + tt) * (ROWS / 2) + pair] = *reinterpret_cast<const unsigned*>(&pk);
-                } else {
-                    *reinterpret_cast<__nv_bfloat162*>(o + ((size_t)(begin + t0 + tt) * HV + head) * DK + row0 + 2 * pair) =
-                        __floats2bfloat162_rn(out[0], out[1]);
-                }
+                *reinterpret_cast<__nv_bfloat162*>(o + ((size_t)(begin + t0 + tt) * HV + head) * DK + row0 + 2 * pair) =
+                    __floats2bfloat162_rn(out[0], out[1]);
             }
-        }
-        if (GATED && t0 > 0) {  // the previous tile's norm of this warp's two steps
-            epilogue_step(0, t0 - STEPS, buf ^ 1, STEPS);
-            epilogue_step(1, t0 - STEPS, buf ^ 1, STEPS);
         }
         if (more) store_tile(t0 + STEPS, buf ^ 1);
         __syncthreads();
     }
-    if (GATED) {  // the last tile's norm
-        const int last = ((W - 1) / STEPS) * STEPS;
-        load_z(last, W - last);
-        epilogue_step(0, last, (last / STEPS) & 1, W - last);
-        epilogue_step(1, last, (last / STEPS) & 1, W - last);
-    }
 #pragma unroll
     for (int r = 0; r < 2; ++r) {
+#pragma unroll
+        for (int j = 0; j < J; ++j)
+            *reinterpret_cast<float4*>(sp0 + (size_t)r * DK + 4 * (TPR * j + part)) =
+                make_float4(s[r][4 * j], s[r][4 * j + 1], s[r][4 * j + 2], s[r][4 * j + 3]);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The gated prefill chain with the next step's decay and key product run inside this step's update loop.
+// Every operation on every state element is chain_rows_kernel's, in the same order, with the same operands: a step's work on one element is
+//     s = fma(k, delta, s)    o = fma(s, q, o)    s = s * g'    m' = fma(s, k', m')        (k', g' the NEXT step's key and decay)
+// where chain_rows_kernel runs the last three lines' first, second and third as separate passes over the state (the decay and key product
+// belong to the next step there, and the output to this one). The accumulation chains are untouched: m and o are four partial sums a row
+// and thread over its eight key chunks in ascending order, folded (0 + 1) + (2 + 3) and across the four threads of the row by xor-shuffles
+// 1 then 2; delta = (v' - mem) * beta'. Fusing the passes removes the second sweep over the state's registers (one load of the key chunk
+// serves both uses: it stays in registers from one step's product to the next step's update) and lets the output's two shuffles and the
+// bf16 store overlap the next step's work instead of ending a pass.
+// The staged tile carries one more step than it computes (its first step of the next tile: key, decay, value, beta) because the last step
+// of a tile starts the next one's product; past the end of the sequence that extra step is neutral (key 0, decay 1.0f: x * 1.0f == x
+// exactly, so the state stored at the end is the last update's, untouched). The first step's decay and product run before the loop.
+// ---------------------------------------------------------------------------------------------------------------
+template <int STEPS>
+__global__ void __launch_bounds__(256, 1) chain_gated_kernel(
+        const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+        const float* __restrict__ g, const float* __restrict__ beta, float* S, const int* __restrict__ seq_start,
+        const int* __restrict__ slot, __nv_bfloat16* __restrict__ o, const __nv_bfloat16* __restrict__ z,
+        const float* __restrict__ nw, float eps) {
+    constexpr int R = 2, TPR = 4, ROWS = 128;
+    constexpr int NT = ROWS / R * TPR;  // R value rows a thread, TPR threads a row: 256 threads
+    constexpr int J = 32 / TPR;         // float4 chunks of a key row each thread owns (chunk index TPR*j + part)
+    constexpr int NW = NT / 32;
+    constexpr int EP = STEPS / NW;      // steps of a tile's norm a warp takes
+    constexpr int KK = (STEPS + NW) / NW;  // key items a thread stages: the tile's steps and the next tile's first
+    constexpr int KQ = STEPS / NW;
+    static_assert(STEPS == 16 && STEPS % NW == 0, "the staging maps below are built for 256 threads and 16-step tiles");
+    constexpr int VE = (STEPS + 1) * (ROWS / 2);  // value words of a tile with its look-ahead step
+    constexpr int VI = (VE + NT - 1) / NT;
+    __shared__ float4 ks[2][STEPS + 1][DK / 4], qs[2][STEPS][DK / 4];
+    __shared__ unsigned vs[2][STEPS + 1][ROWS / 2];  // two bf16 values (rows 2p, 2p + 1) a word
+    __shared__ float gs[2][STEPS + 1], bs[2][STEPS + 1];
+    extern __shared__ __align__(16) unsigned ob[];   // the two tiles' outputs: ob[(tile parity * STEPS + step) * ROWS / 2 + p]
+    const int head = blockIdx.x, seq = blockIdx.z;
+    const int begin = seq_start[seq], W = seq_start[seq + 1] - begin;
+    if (W <= 0) return;
+    const int grp = threadIdx.x / TPR, part = threadIdx.x % TPR;
+    const int key_head = head / (HV / HK);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    float s[R][4 * J];
+    float* sp0 = S + (size_t)slot[seq] * S_SLOT + ((size_t)head * DK + R * grp) * DK;
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int j = 0; j < J; ++j) {
+            const float4 t = *reinterpret_cast<const float4*>(sp0 + (size_t)r * DK + 4 * (TPR * j + part));
+            s[r][4 * j] = t.x; s[r][4 * j + 1] = t.y; s[r][4 * j + 2] = t.z; s[r][4 * j + 3] = t.w;
+        }
+    }
+    // tile t0 (STEPS steps and the next tile's first) into registers: loads past the sequence's end are clamped to its last row (always
+    // valid memory, written straight into the staging registers) and made neutral when stored
+    uint2 kraw[KK], qraw[KQ];
+    unsigned vraw[VI];
+    float gb = 0.0f;
+    auto load_tile = [&](int t0) {
+        const int n = min(STEPS, W - t0);
+#pragma unroll
+        for (int u = 0; u < KK; ++u) {
+            const int st = warp + NW * u;
+            if (st <= n) kraw[u] = *reinterpret_cast<const uint2*>(k + ((size_t)(begin + min(t0 + st, W - 1)) * HK + key_head) * DK + 4 * lane);
+        }
+#pragma unroll
+        for (int u = 0; u < KQ; ++u) {
+            const int st = warp + NW * u;
+            if (st < n) qraw[u] = *reinterpret_cast<const uint2*>(q + ((size_t)(begin + t0 + st) * HK + key_head) * DK + 4 * lane);
+        }
+#pragma unroll
+        for (int u = 0; u < VI; ++u) {
+            const int i = threadIdx.x + NT * u, st = i / (ROWS / 2), pr = i % (ROWS / 2);
+            if (i < VE && st <= n) vraw[u] = *reinterpret_cast<const unsigned*>(v + ((size_t)(begin + min(t0 + st, W - 1)) * HV + head) * DK + 2 * pr);
+        }
+        if (threadIdx.x <= n) gb = g[(size_t)(begin + min(t0 + (int)threadIdx.x, W - 1)) * HV + head];
+        else if (threadIdx.x >= 32 && threadIdx.x - 32 <= n) gb = beta[(size_t)(begin + min(t0 + (int)threadIdx.x - 32, W - 1)) * HV + head];
+    };
+    auto store_tile = [&](int t0, int buf) {
+        const int n = min(STEPS, W - t0);
+#pragma unroll
+        for (int u = 0; u < KK; ++u) {
+            const int st = warp + NW * u;
+            if (st <= n) {
+                const bool real = t0 + st < W;  // past the end: key 0
+                const __nv_bfloat162 ka = *reinterpret_cast<const __nv_bfloat162*>(&kraw[u].x), kb = *reinterpret_cast<const __nv_bfloat162*>(&kraw[u].y);
+                ks[buf][st][lane] = real ? make_float4(__low2float(ka), __high2float(ka), __low2float(kb), __high2float(kb)) : make_float4(0.f, 0.f, 0.f, 0.f);
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < KQ; ++u) {
+            const int st = warp + NW * u;
+            if (st < n) {
+                const __nv_bfloat162 qa = *reinterpret_cast<const __nv_bfloat162*>(&qraw[u].x), qb = *reinterpret_cast<const __nv_bfloat162*>(&qraw[u].y);
+                qs[buf][st][lane] = make_float4(__low2float(qa), __high2float(qa), __low2float(qb), __high2float(qb));
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < VI; ++u) {
+            const int i = threadIdx.x + NT * u, st = i / (ROWS / 2), pr = i % (ROWS / 2);
+            if (i < VE && st <= n) vs[buf][st][pr] = t0 + st < W ? vraw[u] : 0u;
+        }
+        if (threadIdx.x <= n) gs[buf][threadIdx.x] = t0 + (int)threadIdx.x < W ? gb : 1.0f;  // past the end: decay 1.0f (x * 1.0f == x)
+        else if (threadIdx.x >= 32 && threadIdx.x - 32 <= n) bs[buf][threadIdx.x - 32] = t0 + (int)threadIdx.x - 32 < W ? gb : 0.0f;
+    };
+    // the head's gated RMS norm of tile `tile_t0`'s steps (outputs in ob[obuf]): a warp takes steps warp + NW * u, its z rows loaded
+    // ahead of the chain steps that hide their latency (chain_rows_kernel's code)
+    uint2 zr[EP];
+    float nwl[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) nwl[i] = nw[4 * lane + i];
+    auto load_z = [&](int tile_t0, int nn) {
+#pragma unroll
+        for (int u = 0; u < EP; ++u) {
+            const int tt = warp + NW * u;
+            if (tt < nn) zr[u] = *reinterpret_cast<const uint2*>(z + ((size_t)(begin + tile_t0 + tt) * HV + head) * DK + 4 * lane);
+        }
+    };
+    auto epilogue_step = [&](int u, int tile_t0, int obuf, int nn) {
+        const int tt = warp + NW * u;
+        if (tt < nn) {
+            const uint2 ow = *reinterpret_cast<const uint2*>(&ob[(obuf * STEPS + tt) * (ROWS / 2) + 2 * lane]);
+            const float ov[4] = {__uint_as_float(ow.x << 16), __uint_as_float(ow.x & 0xFFFF0000u), __uint_as_float(ow.y << 16),
+                                 __uint_as_float(ow.y & 0xFFFF0000u)};
+            const float zv[4] = {__uint_as_float(zr[u].x << 16), __uint_as_float(zr[u].x & 0xFFFF0000u),
+                                 __uint_as_float(zr[u].y << 16), __uint_as_float(zr[u].y & 0xFFFF0000u)};
+            float ss = 0.f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) ss = ss + ov[i] * ov[i];
+            ss = warp_sum(ss);
+            const float inv = 1.0f / sqrtf(ss / (float)DK + eps);
+            unsigned short rr[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float yn = (ov[i] * inv) * nwl[i];
+                const float gate = 1.0f / (1.0f + expf(-zv[i]));
+                rr[i] = __bfloat16_as_ushort(__float2bfloat16_rn(yn * gate));
+            }
+            uint2 res;
+            res.x = rr[0] | ((unsigned)rr[1] << 16);
+            res.y = rr[2] | ((unsigned)rr[3] << 16);
+            *reinterpret_cast<uint2*>(o + ((size_t)(begin + tile_t0 + tt) * HV + head) * DK + 4 * lane) = res;
+        }
+    };
+    auto epilogue_tile = [&](int tile_t0, int obuf, int nn) {
+#pragma unroll
+        for (int u = 0; u < EP; ++u) epilogue_step(u, tile_t0, obuf, nn);
+    };
+    load_tile(0);
+    store_tile(0, 0);
+    __syncthreads();
+    // step 0's decay and key product; kc keeps the step's key chunks for its update
+    float4 kc[J];
+    float delta[R];
+    {
+        const float g0 = gs[0][0], b0 = bs[0][0];
+        float vt[R];
+#pragma unroll
+        for (int w = 0; w < R / 2; ++w) {
+            const unsigned vw = vs[0][0][(R / 2) * grp + w];
+            vt[2 * w] = __uint_as_float(vw << 16);
+            vt[2 * w + 1] = __uint_as_float(vw & 0xffff0000u);
+        }
+        float m[R][4];
+#pragma unroll
+        for (int r = 0; r < R; ++r) m[r][0] = m[r][1] = m[r][2] = m[r][3] = 0.0f;
+#pragma unroll
+        for (int j = 0; j < J; ++j) {
+            const float4 kk = ks[0][0][TPR * j + part];
+            kc[j] = kk;
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                s[r][4 * j] = s[r][4 * j] * g0;
+                s[r][4 * j + 1] = s[r][4 * j + 1] * g0;
+                s[r][4 * j + 2] = s[r][4 * j + 2] * g0;
+                s[r][4 * j + 3] = s[r][4 * j + 3] * g0;
+                m[r][0] = __fmaf_rn(s[r][4 * j], kk.x, m[r][0]);
+                m[r][1] = __fmaf_rn(s[r][4 * j + 1], kk.y, m[r][1]);
+                m[r][2] = __fmaf_rn(s[r][4 * j + 2], kk.z, m[r][2]);
+                m[r][3] = __fmaf_rn(s[r][4 * j + 3], kk.w, m[r][3]);
+            }
+        }
+        float mem[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) mem[r] = (m[r][0] + m[r][1]) + (m[r][2] + m[r][3]);
+#pragma unroll
+        for (int d = 1; d < TPR; d <<= 1) {
+#pragma unroll
+            for (int r = 0; r < R; ++r) mem[r] = mem[r] + __shfl_xor_sync(0xffffffffu, mem[r], d);
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) delta[r] = (vt[r] - mem[r]) * b0;
+    }
+    for (int t0 = 0, buf = 0; t0 < W; t0 += STEPS, buf ^= 1) {
+        const int n = min(STEPS, W - t0);
+        const bool more = t0 + STEPS < W;
+        if (more) load_tile(t0 + STEPS);
+        if (t0 > 0) load_z(t0 - STEPS, STEPS);
+#pragma unroll 16
+        for (int tt = 0; tt < n; ++tt) {
+            // this step's update and output, the next step's decay and key product
+            const float gn = gs[buf][tt + 1], bn = bs[buf][tt + 1];
+            float vt[R];
+#pragma unroll
+            for (int w = 0; w < R / 2; ++w) {
+                const unsigned vw = vs[buf][tt + 1][(R / 2) * grp + w];
+                vt[2 * w] = __uint_as_float(vw << 16);
+                vt[2 * w + 1] = __uint_as_float(vw & 0xffff0000u);
+            }
+            float m[R][4], oo[R][4];
+#pragma unroll
+            for (int r = 0; r < R; ++r) m[r][0] = m[r][1] = m[r][2] = m[r][3] = oo[r][0] = oo[r][1] = oo[r][2] = oo[r][3] = 0.0f;
+#pragma unroll
+            for (int j = 0; j < J; ++j) {
+                const float4 kn = ks[buf][tt + 1][TPR * j + part];
+                const float4 qq = qs[buf][tt][TPR * j + part];
+                const float4 kk = kc[j];
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    s[r][4 * j] = __fmaf_rn(kk.x, delta[r], s[r][4 * j]);
+                    s[r][4 * j + 1] = __fmaf_rn(kk.y, delta[r], s[r][4 * j + 1]);
+                    s[r][4 * j + 2] = __fmaf_rn(kk.z, delta[r], s[r][4 * j + 2]);
+                    s[r][4 * j + 3] = __fmaf_rn(kk.w, delta[r], s[r][4 * j + 3]);
+                    oo[r][0] = __fmaf_rn(s[r][4 * j], qq.x, oo[r][0]);
+                    oo[r][1] = __fmaf_rn(s[r][4 * j + 1], qq.y, oo[r][1]);
+                    oo[r][2] = __fmaf_rn(s[r][4 * j + 2], qq.z, oo[r][2]);
+                    oo[r][3] = __fmaf_rn(s[r][4 * j + 3], qq.w, oo[r][3]);
+                    s[r][4 * j] = s[r][4 * j] * gn;
+                    s[r][4 * j + 1] = s[r][4 * j + 1] * gn;
+                    s[r][4 * j + 2] = s[r][4 * j + 2] * gn;
+                    s[r][4 * j + 3] = s[r][4 * j + 3] * gn;
+                    m[r][0] = __fmaf_rn(s[r][4 * j], kn.x, m[r][0]);
+                    m[r][1] = __fmaf_rn(s[r][4 * j + 1], kn.y, m[r][1]);
+                    m[r][2] = __fmaf_rn(s[r][4 * j + 2], kn.z, m[r][2]);
+                    m[r][3] = __fmaf_rn(s[r][4 * j + 3], kn.w, m[r][3]);
+                }
+                kc[j] = kn;
+            }
+            float mem[R], out[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) mem[r] = (m[r][0] + m[r][1]) + (m[r][2] + m[r][3]);
+#pragma unroll
+            for (int r = 0; r < R; ++r) out[r] = (oo[r][0] + oo[r][1]) + (oo[r][2] + oo[r][3]);
+#pragma unroll
+            for (int d = 1; d < TPR; d <<= 1) {
+#pragma unroll
+                for (int r = 0; r < R; ++r) mem[r] = mem[r] + __shfl_xor_sync(0xffffffffu, mem[r], d);
+#pragma unroll
+                for (int r = 0; r < R; ++r) out[r] = out[r] + __shfl_xor_sync(0xffffffffu, out[r], d);
+            }
+#pragma unroll
+            for (int r = 0; r < R; ++r) delta[r] = (vt[r] - mem[r]) * bn;
+            if (part == 0) {
+#pragma unroll
+                for (int w = 0; w < R / 2; ++w) {
+                    const __nv_bfloat162 pk = __floats2bfloat162_rn(out[2 * w], out[2 * w + 1]);
+                    ob[(buf * STEPS + tt) * (ROWS / 2) + (R / 2) * grp + w] = *reinterpret_cast<const unsigned*>(&pk);
+                }
+            }
+        }
+        if (t0 > 0) epilogue_tile(t0 - STEPS, buf ^ 1, STEPS);  // the previous tile's norm of this warp's steps
+        if (more) store_tile(t0 + STEPS, buf ^ 1);
+        __syncthreads();
+    }
+    {  // the last tile's norm
+        const int last = ((W - 1) / STEPS) * STEPS;
+        load_z(last, W - last);
+        epilogue_tile(last, (last / STEPS) & 1, W - last);
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
 #pragma unroll
         for (int j = 0; j < J; ++j)
             *reinterpret_cast<float4*>(sp0 + (size_t)r * DK + 4 * (TPR * j + part)) =
@@ -982,7 +1192,7 @@ GB_EXPORT int GB_GDN_EXPORT(gb_gdn_commit_conv_rows)(const void* qkv, void* conv
 
 GB_EXPORT size_t GB_GDN_EXPORT(gb_gdn_prefill_workspace_bytes)(int rows) { return PrefillWs((size_t)(rows > 0 ? rows : 0)).total; }
 
-// z, nw, eps: the gated norm of the fused build (the chain kernel with GATED, 128 value rows a block); nullptr otherwise
+// z, nw, eps: the gated norm of the fused build (chain_gated_kernel, 128 value rows a block); nullptr otherwise
 static int prefill_launch(bool one_row_a_thread, const void* qkv, const void* a, const void* b, const void* conv_w, const float* a_log,
                           const float* dt_bias, float* S, void* conv_pool, const int* seq_start, const int* slot, int n_seq, int rows,
                           void* workspace, void* o, void* stream, const void* z = nullptr, const float* nw = nullptr, float eps = 0.0f) {
@@ -1001,9 +1211,9 @@ static int prefill_launch(bool one_row_a_thread, const void* qkv, const void* a,
             q, k, v, g, beta, S, seq_start, slot, (__nv_bfloat16*)o);
     } else if (z) {
         constexpr int OB_BYTES = 2 * PF_STEPS * (DK / 2) * (int)sizeof(unsigned);
-        rc = cudaFuncSetAttribute(chain_rows_kernel<DK, PF_TPR, PF_STEPS, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, OB_BYTES);
+        rc = cudaFuncSetAttribute(chain_gated_kernel<PF_STEPS>, cudaFuncAttributeMaxDynamicSharedMemorySize, OB_BYTES);
         if (rc) return rc;
-        chain_rows_kernel<DK, PF_TPR, PF_STEPS, true><<<dim3(HV, 1, n_seq), PF_TPR * DK / 2, OB_BYTES, st>>>(
+        chain_gated_kernel<PF_STEPS><<<dim3(HV, 1, n_seq), PF_TPR * DK / 2, OB_BYTES, st>>>(
             q, k, v, g, beta, S, seq_start, slot, (__nv_bfloat16*)o, (const __nv_bfloat16*)z, nw, eps);
     } else {
         chain_rows_kernel<PF_ROWS, PF_TPR, PF_STEPS><<<dim3(HV, DK / PF_ROWS, n_seq), PF_TPR * PF_ROWS / 2, 0, st>>>(
