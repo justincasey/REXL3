@@ -83,7 +83,7 @@ fn the_down_kernel_equals_the_slab_loop_on_the_chunk_grid_and_ragged_rows() {
     let mix = fn_mhc::Mixer { norm: &nw, down: &down, up: &up, inject: Some(&inject) };
     let mut rng = Rng(0xfeed);
     let mut checked = 0usize;
-    for t in [1usize, 63, 64, 65, 127, 128, 129, 191, 1000, 2049, 4016, 4095, 4096] {
+    for t in [1usize, 63, 64, 65, 127, 128, 129, 191, 1000, 2049, 4016, 4095, 4096, 8191, 8192] {
         let x = streams(&mut rng, t);
         let block: Vec<u16> = (0..t * H).map(|_| bf(rng.uniform(-4., 4.))).collect();
         let injp: Vec<f32> = (0..t * HC).map(|_| rng.uniform(-1.5, 1.5)).collect();
@@ -115,5 +115,5 @@ fn the_down_kernel_equals_the_slab_loop_on_the_chunk_grid_and_ragged_rows() {
             checked += t * H;
         }
     }
-    eprintln!("down kernel == slab loop: 13 row counts x {{plain, fused post-inject}}, {checked} mixed outputs and their inject rows and streams, every bit equal");
+    eprintln!("down kernel == slab loop: 15 row counts x {{plain, fused post-inject}}, {checked} mixed outputs and their inject rows and streams, every bit equal");
 }
