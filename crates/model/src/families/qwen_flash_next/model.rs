@@ -456,6 +456,10 @@ pub struct FlashNextModel {
     ev_fork: Event,
     ev_join: Event,
     fork_join: bool,
+    /// A tiled prefill chunk's GDN layers run the pre kernel of each piece of the chunk's rows on `side`, beside the recurrence over the piece before
+    /// it on the main stream; `pf_ev[i]` marks the end of piece i's pre kernel. Off with `REXL3_PF_PIPELINE=0`.
+    pf_pipe: bool,
+    pf_ev: Vec<Event>,
     /// Paged KV of the 12 trunk attention layers, in layer order (`PagedKv::with_kv_heads(pages, KvHeads::Two)`).
     pub kv: Vec<PagedKv>,
     /// The MTP layer's paged KV (same page table); `None` without an MTP head.
@@ -639,6 +643,14 @@ pub struct FlashNextModel {
     hcg: bool,
     hcg_scratch: Option<DevBuf>,
 }
+
+/// A tiled prefill chunk's GDN layers cut the chunk's rows into at most this many pieces of at least `PF_PIECE_ROWS_MIN` rows each, and run the
+/// pre kernel of each piece beside the recurrence over the piece before it: the first piece's pre kernel runs alone (`PF_PRE_FIRST_BLOCKS`
+/// 4-warp blocks an SM), the others beside the recurrence (`PF_PRE_BLOCKS`: one block an SM is all that fits beside its register file).
+const PF_PIECES: usize = 4;
+const PF_PIECE_ROWS_MIN: usize = 1024;
+const PF_PRE_FIRST_BLOCKS: i32 = 4;
+const PF_PRE_BLOCKS: i32 = 1;
 
 /// An on-by-default switch: only `0` turns it off.
 fn env_on(key: &str) -> bool {
@@ -1181,6 +1193,8 @@ impl FlashNextModel {
             ev_fork: Event::new()?,
             ev_join: Event::new()?,
             fork_join: env_on("REXL3_FORK"),
+            pf_pipe: env_on("REXL3_PF_PIPELINE"),
+            pf_ev: (0..PF_PIECES).map(|_| Event::new()).collect::<Result<Vec<_>, _>>()?,
             kv,
             mtp_kv,
             qsa_pool,
@@ -2434,6 +2448,8 @@ impl FlashNextModel {
                 // z is read only by the gated norm after the recurrence: in a window its projection runs on the side stream,
                 // next to qkv (the two share no buffer and no workspace), and is joined back in front of that norm
                 let fork = window && self.fork_join;
+                // a tiled prefill chunk of at least two pieces of rows: the pre kernel of piece i + 1 runs beside the recurrence over piece i, below
+                let pieces = if self.pf_pipe && matches!(mode, Mode::Prefill(PrefillPath::Tiled)) { (rows / PF_PIECE_ROWS_MIN).min(PF_PIECES) } else { 1 };
                 if fork {
                     cgraph::fork(st, &self.side, &self.ev_fork)?;
                     lin(&m.in_proj_z, &self.x_mixed, &mut self.z, rows, mode, &mut self.ws2, &mut self.prefill_ws, &self.side)?;
@@ -2465,6 +2481,28 @@ impl FlashNextModel {
                     } else {
                         gdn::window(st, &self.recs[par][li], &self.pools.s[li], &batch, &mut self.mixer_out)?;
                     }
+                } else if pieces > 1 {
+                    let inp = PreInputs { qkv: &self.qkv, a: &self.ga, b: &self.gb };
+                    // The chunk in `pieces` runs of rows: the pre kernel of piece i + 1 (side stream, a few warps an SM: its blocks fit beside the
+                    // recurrence's) runs beside the recurrence over piece i (this stream). The recurrence over piece i waits for the pre piece
+                    // that wrote its rows and for nothing else; the state pool carries it from piece to piece, as from chunk to chunk. The pre
+                    // pieces read qkv, a, b and the committed history and write their own rows of the workspace, which the recurrence over
+                    // the other rows never touches; the commit, which overwrites the history, comes after every recurrence piece, hence after
+                    // every pre piece. The next layer's writers of qkv, a, b and the workspace come after the commit on this stream (the
+                    // side stream's next launch waits for an event recorded here after it).
+                    let cut = |i: usize| rows * i / pieces;
+                    self.ev_fork.record(st)?;
+                    cgraph::wait(&self.side, &self.ev_fork)?;
+                    for i in 0..pieces {
+                        let blocks = if i == 0 { PF_PRE_FIRST_BLOCKS } else { PF_PRE_BLOCKS };
+                        gdn::prefill_gated_pre(&self.side, &inp, &wts, &self.pools.conv[li], &batch, &mut self.gdn_prefill_ws, cut(i)..cut(i + 1), blocks)?;
+                        self.pf_ev[i].record(&self.side)?;
+                    }
+                    for i in 0..pieces {
+                        cgraph::wait(st, &self.pf_ev[i])?;
+                        gdn::prefill_gated_chain(st, &mut self.pools.s[li], &batch, &mut self.gdn_prefill_ws, &self.z, &m.norm, EPS, &mut self.mixer_out, cut(i)..cut(i + 1))?;
+                    }
+                    gdn::prefill_gated_commit(st, &inp, &mut self.pools.conv[li], &batch)?;
                 } else {
                     let inp = PreInputs { qkv: &self.qkv, a: &self.ga, b: &self.gb };
                     // the chain kernel ends with the gated norm of z (the same bits as the norm kernel after it)

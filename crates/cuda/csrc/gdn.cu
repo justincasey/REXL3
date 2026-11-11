@@ -178,6 +178,143 @@ __global__ void __launch_bounds__(128) pre_kernel(
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// pre for a prefill chunk, in a shape that fits beside another kernel. pre_kernel gives every (row, unit) a warp of its own (a 4-row window and
+// 16 scalar conv-weight loads a unit, 8192 x 20 blocks that take every slot of the GPU). Here a warp owns one 128-channel unit and walks
+// PRE_RUN consecutive rows of it: the unit's conv weights sit in shared memory (as floats), the three previous rows of its channels stay in
+// registers, the next rows stream in through a ring of PRE_RING rows in shared memory (cp.async: no registers, and a deep prefetch for the one
+// warp a scheduler this kernel gets beside another kernel), and the decay and beta of the run's rows are computed 32 rows a pass at the end, one
+// row a lane. A block of 4 warps needs 48 registers a thread and 16 KB of shared memory, and few warps an SM stream the chunk. A (row, unit)'s
+// arithmetic is pre_kernel's for a chain (no parent tree), operation for operation. Rows past a sequence start take their taps from the pool's
+// history, as in pre_kernel; a run restarts the window at its first row and at every sequence start.
+// ---------------------------------------------------------------------------------------------------------------
+constexpr int PRE_RUN = 128;  // rows a warp walks
+constexpr int PRE_RING = 8;   // rows of qkv a warp stages (a power of two): PRE_RING - 1 in flight
+
+// the chunk streams through once (a row is loaded one time and kept in registers for its three successors; q, k, v are read back by the
+// chain later), so the loads and stores are cache-streaming: they must not push another kernel's operands out of the L2
+__device__ __forceinline__ uint2 ld_row8(const __nv_bfloat16* p) { return __ldcs(reinterpret_cast<const uint2*>(p)); }
+__device__ __forceinline__ void st_row8(__nv_bfloat16* p, const float (&x)[4]) {
+    const __nv_bfloat162 a = __floats2bfloat162_rn(x[0], x[1]);
+    const __nv_bfloat162 b = __floats2bfloat162_rn(x[2], x[3]);
+    uint2 w;
+    w.x = *reinterpret_cast<const unsigned*>(&a);
+    w.y = *reinterpret_cast<const unsigned*>(&b);
+    __stcs(reinterpret_cast<uint2*>(p), w);
+}
+__device__ __forceinline__ void cp_async8(void* smem, const void* gmem) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"(static_cast<unsigned>(__cvta_generic_to_shared(smem))), "l"(gmem));
+}
+__device__ __forceinline__ float bf_lo(unsigned w) { return __uint_as_float(w << 16); }
+__device__ __forceinline__ float bf_hi(unsigned w) { return __uint_as_float(w & 0xffff0000u); }
+// channel c (compile-time) of four bf16 packed in a uint2
+__device__ __forceinline__ float bf_at(uint2 t, int c) { return c == 0 ? bf_lo(t.x) : c == 1 ? bf_hi(t.x) : c == 2 ? bf_lo(t.y) : bf_hi(t.y); }
+
+__global__ void __launch_bounds__(128, 10) pre_rows_kernel(
+        const __nv_bfloat16* __restrict__ qkv, const __nv_bfloat16* __restrict__ a, const __nv_bfloat16* __restrict__ b,
+        const __nv_bfloat16* __restrict__ conv_w, const float* __restrict__ a_log, const float* __restrict__ dt_bias,
+        const __nv_bfloat16* __restrict__ conv_pool, const int* __restrict__ seq_start, const int* __restrict__ slot,
+        int n_seq, __nv_bfloat16* __restrict__ q, __nv_bfloat16* __restrict__ k, __nv_bfloat16* __restrict__ v,
+        float* __restrict__ g, float* __restrict__ beta, int row_lo, int row_hi) {
+    pdl_wait();
+    __shared__ float4 wsm[4][4][32];       // a warp's unit: channel c of lane l: taps 0..3 of channel 4 l + c
+    __shared__ uint2 ring[4][PRE_RING][32];  // a warp's staged rows: lane l holds channels 4 l .. 4 l + 3 of the unit
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int n_tasks = ((row_hi - row_lo + PRE_RUN - 1) / PRE_RUN) * (NUNITS / 4);
+    for (int task = blockIdx.x; task < n_tasks; task += gridDim.x) {
+        const int unit = (task % (NUNITS / 4)) * 4 + warp;
+        const int r0 = row_lo + (task / (NUNITS / 4)) * PRE_RUN, r1 = min(r0 + PRE_RUN, row_hi);
+        const int ch0 = unit * DK + lane * 4;
+        __syncwarp();
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const size_t e = (size_t)(ch0 + c) * 4;
+            wsm[warp][c][lane] = make_float4(__bfloat162float(conv_w[e]), __bfloat162float(conv_w[e + 1]), __bfloat162float(conv_w[e + 2]),
+                                             __bfloat162float(conv_w[e + 3]));
+        }
+        __syncwarp();
+
+        int seq = find_seq(seq_start, n_seq, r0);
+        int start = seq_start[seq], next_start = seq + 1 < n_seq ? seq_start[seq + 1] : 0x7fffffff;
+        uint2 tap[3];
+#pragma unroll
+        for (int i = 0; i < PRE_RING - 1; ++i) {
+            if (r0 + i < r1) cp_async8(&ring[warp][(r0 + i) & (PRE_RING - 1)][lane], qkv + (size_t)(r0 + i) * CONV + ch0);
+            asm volatile("cp.async.commit_group;\n" ::);
+        }
+        for (int row = r0; row < r1; ++row) {
+            // the row PRE_RING - 1 ahead takes the slot the previous row used; the oldest group is this row's
+            if (row + PRE_RING - 1 < r1) cp_async8(&ring[warp][(row + PRE_RING - 1) & (PRE_RING - 1)][lane], qkv + (size_t)(row + PRE_RING - 1) * CONV + ch0);
+            asm volatile("cp.async.commit_group;\n" ::);
+            asm volatile("cp.async.wait_group %0;\n" ::"n"(PRE_RING - 1));
+            const uint2 cur = ring[warp][row & (PRE_RING - 1)][lane];
+            if (row >= next_start) {
+                do ++seq; while (seq + 1 < n_seq && seq_start[seq + 1] <= row);
+                start = seq_start[seq];
+                next_start = seq + 1 < n_seq ? seq_start[seq + 1] : 0x7fffffff;
+            }
+            if (row == r0 || row == start) {
+                const int lt = row - start;
+                const size_t pool = (size_t)slot[seq] * KEEP;
+#pragma unroll
+                for (int j = 0; j < 3; ++j) {
+                    const int idx = lt - 3 + j;  // window row x[t-3+j]
+                    tap[j] = idx >= 0 ? ld_row8(qkv + (size_t)(start + idx) * CONV + ch0) : ld_row8(conv_pool + (pool + 3 + idx) * CONV + ch0);
+                }
+            }
+            float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                const float4 wv = wsm[warp][c][lane];  // taps 0..3 of this lane's channel c
+                acc[c] = acc[c] + bf_at(tap[0], c) * wv.x;
+                acc[c] = acc[c] + bf_at(tap[1], c) * wv.y;
+                acc[c] = acc[c] + bf_at(tap[2], c) * wv.z;
+                acc[c] = acc[c] + bf_at(cur, c) * wv.w;
+            }
+            tap[0] = tap[1];
+            tap[1] = tap[2];
+            tap[2] = cur;
+            float c[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) c[i] = round_bf16(acc[i] / (1.0f + expf(-acc[i])));
+
+            if (unit < 2 * HK) {
+                float ss = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) ss = ss + c[i] * c[i];
+                ss = warp_sum(ss);
+                const float inv = 1.0f / sqrtf(ss + L2_EPS);
+                const bool is_q = unit < HK;
+                float out[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const float t = c[i] * inv;
+                    out[i] = is_q ? t * Q_SCALE : t;
+                }
+                __nv_bfloat16* dst = (is_q ? q : k) + ((size_t)row * HK + (is_q ? unit : unit - HK)) * DK + lane * 4;
+                st_row8(dst, out);
+            } else {
+                st_row8(v + ((size_t)row * HV + (unit - 2 * HK)) * DK + lane * 4, c);
+            }
+        }
+        if (unit >= 2 * HK) {
+            // the run's decay and beta, a row a lane
+            const int hv = unit - 2 * HK;
+            const float ea = expf(a_log[hv]), dtb = dt_bias[hv];
+            for (int rb = r0; rb < r1; rb += 32) {
+                const int row = rb + lane;
+                if (row < r1) {
+                    const float av = __bfloat162float(a[(size_t)row * HV + hv]) + dtb;
+                    const float sp = av > 20.0f ? av : log1pf(expf(av));
+                    g[(size_t)row * HV + hv] = expf(-ea * sp);
+                    const float bv = __bfloat162float(b[(size_t)row * HV + hv]);
+                    beta[(size_t)row * HV + hv] = 1.0f / (1.0f + expf(-bv));
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // Decode-path step (window and commit replay): the ONE routine that advances state. A warp holds R value rows, lane
 // l the keys 4l..4l+3 of each. Every op is rounded alone (--fmad=false); sums are lane-local then an xor butterfly.
 // ---------------------------------------------------------------------------------------------------------------
@@ -763,13 +900,15 @@ __global__ void __launch_bounds__(TPR * ROWS / 2) chain_rows_kernel(
 // The staged tile carries one more step than it computes (its first step of the next tile: key, decay, value, beta) because the last step
 // of a tile starts the next one's product; past the end of the sequence that extra step is neutral (key 0, decay 1.0f: x * 1.0f == x
 // exactly, so the state stored at the end is the last update's, untouched). The first step's decay and product run before the loop.
+// A launch covers the rows [row_lo, row_hi) of every sequence it meets (the whole batch: 0, rows): a later launch over the next rows starts from
+// the state this one stored, which is the state the same steps leave in registers (the chunk boundary of a prompt is the same thing).
 // ---------------------------------------------------------------------------------------------------------------
 template <int STEPS>
 __global__ void __launch_bounds__(256, 1) chain_gated_kernel(
         const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
         const float* __restrict__ g, const float* __restrict__ beta, float* S, const int* __restrict__ seq_start,
         const int* __restrict__ slot, __nv_bfloat16* __restrict__ o, const __nv_bfloat16* __restrict__ z,
-        const float* __restrict__ nw, float eps) {
+        const float* __restrict__ nw, float eps, int row_lo, int row_hi) {
     constexpr int R = 2, TPR = 4, ROWS = 128;
     constexpr int NT = ROWS / R * TPR;  // R value rows a thread, TPR threads a row: 256 threads
     constexpr int J = 32 / TPR;         // float4 chunks of a key row each thread owns (chunk index TPR*j + part)
@@ -785,7 +924,8 @@ __global__ void __launch_bounds__(256, 1) chain_gated_kernel(
     __shared__ float gs[2][STEPS + 1], bs[2][STEPS + 1];
     extern __shared__ __align__(16) unsigned ob[];   // the two tiles' outputs: ob[(tile parity * STEPS + step) * ROWS / 2 + p]
     const int head = blockIdx.x, seq = blockIdx.z;
-    const int begin = seq_start[seq], W = seq_start[seq + 1] - begin;
+    // the rows [row_lo, row_hi) of the sequence: the state in the pool carries the recurrence from one launch to the next, as from one chunk
+    const int begin = max(seq_start[seq], row_lo), W = min(seq_start[seq + 1], row_hi) - begin;
     if (W <= 0) return;
     const int grp = threadIdx.x / TPR, part = threadIdx.x % TPR;
     const int key_head = head / (HV / HK);
@@ -1053,6 +1193,29 @@ int launch_pre(const __nv_bfloat16* qkv, const __nv_bfloat16* a, const __nv_bflo
     return GB_CHECK_LAUNCH();
 }
 
+// The prefill pre kernel (pre_rows_kernel) for the rows [row_lo, row_hi), over `ctas_per_sm` persistent blocks of 4 warps an SM.
+int launch_pre_rows(const __nv_bfloat16* qkv, const __nv_bfloat16* a, const __nv_bfloat16* b, const __nv_bfloat16* conv_w,
+                    const float* a_log, const float* dt_bias, const __nv_bfloat16* conv_pool, const int* seq_start,
+                    const int* slot, int n_seq, int row_lo, int row_hi, __nv_bfloat16* q, __nv_bfloat16* k, __nv_bfloat16* v, float* g,
+                    float* beta, int ctas_per_sm, cudaStream_t st) {
+    if (row_hi <= row_lo || n_seq <= 0) return 0;
+    static int sms = 0;
+    if (!sms) {
+        int dev = 0, n = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+        // the kernel uses no shared memory, so by default an SM that runs it takes the smallest shared-memory configuration, and a kernel
+        // that needs tens of KB a block waits for the SM to drain; the largest configuration lets it start beside the blocks
+        cudaFuncSetAttribute(pre_rows_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, (int)cudaSharedmemCarveoutMaxShared);
+        sms = n > 0 ? n : 48;
+    }
+    const int tasks = ((row_hi - row_lo + PRE_RUN - 1) / PRE_RUN) * (NUNITS / 4);
+    const int blocks = min(tasks, sms * min(max(ctas_per_sm, 1), 8));
+    gbp_pdl::launch_pdl(flash_pdl(), pre_rows_kernel, dim3(blocks), dim3(128), 0, st, qkv, a, b, conv_w, a_log, dt_bias, conv_pool,
+                        seq_start, slot, n_seq, q, k, v, g, beta, row_lo, row_hi);
+    return GB_CHECK_LAUNCH();
+}
+
 }  // namespace
 
 GB_EXPORT int GB_GDN_EXPORT(gb_gdn_pre)(const void* qkv, const void* a, const void* b, const void* conv_w, const float* a_log,
@@ -1192,20 +1355,41 @@ GB_EXPORT int GB_GDN_EXPORT(gb_gdn_commit_conv_rows)(const void* qkv, void* conv
 
 GB_EXPORT size_t GB_GDN_EXPORT(gb_gdn_prefill_workspace_bytes)(int rows) { return PrefillWs((size_t)(rows > 0 ? rows : 0)).total; }
 
-// z, nw, eps: the gated norm of the fused build (chain_gated_kernel, 128 value rows a block); nullptr otherwise
-static int prefill_launch(bool one_row_a_thread, const void* qkv, const void* a, const void* b, const void* conv_w, const float* a_log,
-                          const float* dt_bias, float* S, void* conv_pool, const int* seq_start, const int* slot, int n_seq, int rows,
-                          void* workspace, void* o, void* stream, const void* z = nullptr, const float* nw = nullptr, float eps = 0.0f) {
+// The pre half of a prefill chunk: the conv, the l2 norms, the decay and beta of the rows [row_lo, row_hi) (of the chunk's `rows`, whose
+// workspace layout it is), into the workspace (q, k, v, g, beta). ctas_per_sm > 0: pre_rows_kernel on that many blocks an SM (it leaves room
+// beside another kernel), else pre_kernel on a block a (row, 4 units), which takes every row.
+static int prefill_pre(const void* qkv, const void* a, const void* b, const void* conv_w, const float* a_log, const float* dt_bias,
+                       const void* conv_pool, const int* seq_start, const int* slot, int n_seq, int rows, int row_lo, int row_hi,
+                       void* workspace, void* stream, int ctas_per_sm) {
     if (rows <= 0 || n_seq <= 0) return 0;
+    if (row_lo < 0 || row_hi > rows || row_lo > row_hi) return (int)cudaErrorInvalidValue;
+    const PrefillWs w((size_t)rows);
+    char* ws = (char*)workspace;
+    if (ctas_per_sm > 0)
+        return launch_pre_rows((const __nv_bfloat16*)qkv, (const __nv_bfloat16*)a, (const __nv_bfloat16*)b, (const __nv_bfloat16*)conv_w, a_log,
+                               dt_bias, (const __nv_bfloat16*)conv_pool, seq_start, slot, n_seq, row_lo, row_hi, (__nv_bfloat16*)(ws + w.q),
+                               (__nv_bfloat16*)(ws + w.k), (__nv_bfloat16*)(ws + w.v), (float*)(ws + w.g), (float*)(ws + w.beta), ctas_per_sm,
+                               gb_stream(stream));
+    if (row_lo != 0 || row_hi != rows) return (int)cudaErrorInvalidValue;
+    return launch_pre((const __nv_bfloat16*)qkv, (const __nv_bfloat16*)a, (const __nv_bfloat16*)b, (const __nv_bfloat16*)conv_w, a_log, dt_bias,
+                      (const __nv_bfloat16*)conv_pool, seq_start, slot, n_seq, rows, (__nv_bfloat16*)(ws + w.q), (__nv_bfloat16*)(ws + w.k),
+                      (__nv_bfloat16*)(ws + w.v), (float*)(ws + w.g), (float*)(ws + w.beta), gb_stream(stream));
+}
+
+// The chain half: the recurrence over the workspace's rows [row_lo, row_hi). z, nw, eps: the gated norm of the fused build (chain_gated_kernel,
+// 128 value rows a block, the only build that takes a row range); nullptr otherwise, where the range is the whole chunk.
+static int prefill_chain(bool one_row_a_thread, float* S, const int* seq_start, const int* slot, int n_seq, int rows, int row_lo, int row_hi,
+                         void* workspace, void* o, void* stream, const void* z = nullptr, const float* nw = nullptr, float eps = 0.0f) {
+    if (rows <= 0 || n_seq <= 0) return 0;
+    if (row_lo < 0 || row_hi > rows || row_lo > row_hi) return (int)cudaErrorInvalidValue;
+    if (row_lo == row_hi) return 0;
     cudaStream_t st = gb_stream(stream);
     const PrefillWs w((size_t)rows);
     char* ws = (char*)workspace;
     __nv_bfloat16 *q = (__nv_bfloat16*)(ws + w.q), *k = (__nv_bfloat16*)(ws + w.k), *v = (__nv_bfloat16*)(ws + w.v);
     float *g = (float*)(ws + w.g), *beta = (float*)(ws + w.beta);
-    int rc = launch_pre((const __nv_bfloat16*)qkv, (const __nv_bfloat16*)a, (const __nv_bfloat16*)b,
-                        (const __nv_bfloat16*)conv_w, a_log, dt_bias, (const __nv_bfloat16*)conv_pool, seq_start, slot,
-                        n_seq, rows, q, k, v, g, beta, st);
-    if (rc) return rc;
+    int rc = 0;
+    if (!z && (row_lo != 0 || row_hi != rows)) return (int)cudaErrorInvalidValue;
     if (one_row_a_thread) {
         chain_kernel<PF_ROWS, PF_TPR, PF_STEPS><<<dim3(HV, DK / PF_ROWS, n_seq), PF_TPR * PF_ROWS, 0, st>>>(
             q, k, v, g, beta, S, seq_start, slot, (__nv_bfloat16*)o);
@@ -1214,16 +1398,32 @@ static int prefill_launch(bool one_row_a_thread, const void* qkv, const void* a,
         rc = cudaFuncSetAttribute(chain_gated_kernel<PF_STEPS>, cudaFuncAttributeMaxDynamicSharedMemorySize, OB_BYTES);
         if (rc) return rc;
         chain_gated_kernel<PF_STEPS><<<dim3(HV, 1, n_seq), PF_TPR * DK / 2, OB_BYTES, st>>>(
-            q, k, v, g, beta, S, seq_start, slot, (__nv_bfloat16*)o, (const __nv_bfloat16*)z, nw, eps);
+            q, k, v, g, beta, S, seq_start, slot, (__nv_bfloat16*)o, (const __nv_bfloat16*)z, nw, eps, row_lo, row_hi);
     } else {
         chain_rows_kernel<PF_ROWS, PF_TPR, PF_STEPS><<<dim3(HV, DK / PF_ROWS, n_seq), PF_TPR * PF_ROWS / 2, 0, st>>>(
             q, k, v, g, beta, S, seq_start, slot, (__nv_bfloat16*)o);
     }
-    rc = GB_CHECK_LAUNCH();
-    if (rc) return rc;
-    conv_commit_kernel<<<dim3(CONV / 256, n_seq), 256, 0, st>>>((const __nv_bfloat16*)qkv, (__nv_bfloat16*)conv_pool,
-                                                                seq_start, slot, nullptr, nullptr, 0);
     return GB_CHECK_LAUNCH();
+}
+
+// The conv history commit of a prefill chunk: the last three rows of every sequence into the pool. After the pre half (it reads the history
+// this overwrites) and after the chain half (nothing else reads qkv later).
+static int prefill_commit(const void* qkv, void* conv_pool, const int* seq_start, const int* slot, int n_seq, void* stream) {
+    if (n_seq <= 0) return 0;
+    conv_commit_kernel<<<dim3(CONV / 256, n_seq), 256, 0, gb_stream(stream)>>>((const __nv_bfloat16*)qkv, (__nv_bfloat16*)conv_pool, seq_start,
+                                                                               slot, nullptr, nullptr, 0);
+    return GB_CHECK_LAUNCH();
+}
+
+static int prefill_launch(bool one_row_a_thread, const void* qkv, const void* a, const void* b, const void* conv_w, const float* a_log,
+                          const float* dt_bias, float* S, void* conv_pool, const int* seq_start, const int* slot, int n_seq, int rows,
+                          void* workspace, void* o, void* stream) {
+    if (rows <= 0 || n_seq <= 0) return 0;
+    int rc = prefill_pre(qkv, a, b, conv_w, a_log, dt_bias, conv_pool, seq_start, slot, n_seq, rows, 0, rows, workspace, stream, 0);
+    if (rc) return rc;
+    rc = prefill_chain(one_row_a_thread, S, seq_start, slot, n_seq, rows, 0, rows, workspace, o, stream);
+    if (rc) return rc;
+    return prefill_commit(qkv, conv_pool, seq_start, slot, n_seq, stream);
 }
 
 GB_EXPORT int GB_GDN_EXPORT(gb_gdn_prefill)(const void* qkv, const void* a, const void* b, const void* conv_w, const float* a_log,
@@ -1239,11 +1439,25 @@ GB_EXPORT int GB_GDN_EXPORT(gb_gdn_prefill_ref)(const void* qkv, const void* a, 
     return prefill_launch(true, qkv, a, b, conv_w, a_log, dt_bias, S, conv_pool, seq_start, slot, n_seq, rows, workspace, o, stream);
 }
 
-// gb_gdn_prefill with the head's gated RMS norm fused into the chain kernel (see chain_rows_kernel): `o` is gb_gdn_prefill's output run
-// through gb_gated_rmsnorm_sigmoid(o, z, nw, o, rows, HV, 128, eps) bit for bit. z bf16 [rows][HV][128], nw f32 [128] (aligned 16).
-GB_EXPORT int GB_GDN_EXPORT(gb_gdn_prefill_gated)(const void* qkv, const void* a, const void* b, const void* conv_w, const float* a_log,
-                             const float* dt_bias, float* S, void* conv_pool, const int* seq_start, const int* slot,
-                             int n_seq, int rows, void* workspace, const void* z, const float* nw, float eps, void* o, void* stream) {
+// gb_gdn_prefill with the head's gated RMS norm fused into the chain kernel (see chain_rows_kernel), in pieces so that the caller can run other
+// work beside them: `o` is gb_gdn_prefill's output run through gb_gated_rmsnorm_sigmoid(o, z, nw, o, rows, HV, 128, eps) bit for bit once the
+// pre half has run over every row, the chain half over every row in order (any cut of the rows into launches), and the commit after them. The
+// pre half of rows [lo, hi) reads their qkv, a, b and the conv history and writes only their workspace rows; the chain half of [lo, hi) reads
+// their workspace rows (and z, the state pool) and writes their o rows and the state. `rows` is the chunk's, whose workspace layout both use.
+// z bf16 [rows][HV][128], nw f32 [128] (aligned 16).
+GB_EXPORT int GB_GDN_EXPORT(gb_gdn_prefill_gated_pre)(const void* qkv, const void* a, const void* b, const void* conv_w, const float* a_log,
+                             const float* dt_bias, const void* conv_pool, const int* seq_start, const int* slot, int n_seq, int rows,
+                             int row_lo, int row_hi, void* workspace, void* stream, int ctas_per_sm) {
+    return prefill_pre(qkv, a, b, conv_w, a_log, dt_bias, conv_pool, seq_start, slot, n_seq, rows, row_lo, row_hi, workspace, stream, ctas_per_sm);
+}
+
+GB_EXPORT int GB_GDN_EXPORT(gb_gdn_prefill_gated_chain)(float* S, const int* seq_start, const int* slot, int n_seq, int rows, int row_lo,
+                             int row_hi, void* workspace, const void* z, const float* nw, float eps, void* o, void* stream) {
     if (!z || !nw || ((uintptr_t)z & 7) || ((uintptr_t)o & 7)) return (int)cudaErrorInvalidValue;
-    return prefill_launch(false, qkv, a, b, conv_w, a_log, dt_bias, S, conv_pool, seq_start, slot, n_seq, rows, workspace, o, stream, z, nw, eps);
+    return prefill_chain(false, S, seq_start, slot, n_seq, rows, row_lo, row_hi, workspace, o, stream, z, nw, eps);
+}
+
+GB_EXPORT int GB_GDN_EXPORT(gb_gdn_prefill_gated_commit)(const void* qkv, void* conv_pool, const int* seq_start, const int* slot, int n_seq,
+                             void* stream) {
+    return prefill_commit(qkv, conv_pool, seq_start, slot, n_seq, stream);
 }

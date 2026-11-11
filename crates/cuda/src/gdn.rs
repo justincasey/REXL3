@@ -427,24 +427,45 @@ mod ffi {
             o: *mut c_void,
             stream: *mut c_void,
         ) -> i32;
-        pub fn gb_gdn_prefill_gated(
+        pub fn gb_gdn_prefill_gated_pre(
             qkv: *const c_void,
             a: *const c_void,
             b: *const c_void,
             conv_w: *const c_void,
             a_log: *const f32,
             dt_bias: *const f32,
-            s: *mut f32,
-            conv_pool: *mut c_void,
+            conv_pool: *const c_void,
             seq_start: *const i32,
             slot: *const i32,
             n_seq: i32,
             rows: i32,
+            row_lo: i32,
+            row_hi: i32,
+            workspace: *mut c_void,
+            stream: *mut c_void,
+            ctas_per_sm: i32,
+        ) -> i32;
+        pub fn gb_gdn_prefill_gated_chain(
+            s: *mut f32,
+            seq_start: *const i32,
+            slot: *const i32,
+            n_seq: i32,
+            rows: i32,
+            row_lo: i32,
+            row_hi: i32,
             workspace: *mut c_void,
             z: *const c_void,
             norm_w: *const f32,
             eps: f32,
             o: *mut c_void,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn gb_gdn_prefill_gated_commit(
+            qkv: *const c_void,
+            conv_pool: *mut c_void,
+            seq_start: *const i32,
+            slot: *const i32,
+            n_seq: i32,
             stream: *mut c_void,
         ) -> i32;
 
@@ -1520,7 +1541,8 @@ pub fn prefill_ref_shaped(
 
 /// [`prefill`] with the head's gated RMS norm ([`crate::fn_glue::gated_rmsnorm_sigmoid`] over `o`, `z` and `norm_w`, 128-wide heads) fused into
 /// the recurrence kernel: `o` holds the normed output, bit for bit what [`prefill`] followed by that kernel leaves, and the pools are
-/// [`prefill`]'s. `z` is bf16 `[rows, 48, 128]`, `norm_w` f32 `[128]`. The default (48 value heads) shape only.
+/// [`prefill`]'s. `z` is bf16 `[rows, 48, 128]`, `norm_w` f32 `[128]`. The default (48 value heads) shape only. It is [`prefill_gated_pre`],
+/// [`prefill_gated_chain`] and [`prefill_gated_commit`] over every row, in order on one stream.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_gated(
     stream: &Stream,
@@ -1535,33 +1557,111 @@ pub fn prefill_gated(
     eps: f32,
     o: &mut DevBuf,
 ) -> Result<(), CudaError> {
+    prefill_gated_pre(stream, x, w, conv_pool, batch, ws, 0..batch.rows, 0)?;
+    prefill_gated_chain(stream, s_pool, batch, ws, z, norm_w, eps, o, 0..batch.rows)?;
+    prefill_gated_commit(stream, x, conv_pool, batch)
+}
+
+/// The first piece of [`prefill_gated`]: the conv, the l2 norms, the decay and beta of the rows `rows` of the chunk, into the same rows of `ws`.
+/// It reads `x` (`qkv`, `a`, `b`) and `conv_pool` (the history the previous chunk committed) and writes only those rows of `ws`, so work that
+/// touches none of them (the recurrence over other rows) may run beside it on another stream; [`prefill_gated_chain`] over a row must be
+/// ordered after the pre piece that holds it. `ctas_per_sm` 0: one block a (row, four 128-channel units), which takes every SM slot and only
+/// runs the whole chunk (`rows` = all of it); more than 0 (at most 8): that many persistent 4-warp blocks an SM, any range of rows. A block
+/// takes 48 registers a thread and 16 KB of shared memory, so one of them fits beside the gated chain's block, which holds 59 K of an SM's 64 K
+/// registers.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_gated_pre(
+    stream: &Stream,
+    x: &PreInputs,
+    w: &PreWeights,
+    conv_pool: &DevBuf,
+    batch: &Batch<'_>,
+    ws: &mut DevBuf,
+    rows: std::ops::Range<usize>,
+    ctas_per_sm: i32,
+) -> Result<(), CudaError> {
     let shape = GdnShape::Hv48;
     check_inputs(shape, x, batch.rows);
     check_pre_weights(shape, w);
-    need(o, batch.rows * shape.v_dim() * 2, "o");
-    need(z, batch.rows * shape.v_dim() * 2, "z");
-    need(norm_w, 128 * 4, "norm weight");
     need(ws, prefill_workspace_bytes_shaped(shape, batch.rows), "workspace");
-    check_pools(shape, batch, s_pool, conv_pool);
+    need(conv_pool, batch.n_slots * shape.conv_slot_elems() * 2, "conv pool");
     let rc = unsafe {
-        ffi::gb_gdn_prefill_gated(
+        ffi::gb_gdn_prefill_gated_pre(
             x.qkv.ptr(),
             x.a.ptr(),
             x.b.ptr(),
             w.conv_w.ptr(),
             w.a_log.ptr() as *const f32,
             w.dt_bias.ptr() as *const f32,
-            s_pool.ptr() as *mut f32,
             conv_pool.ptr(),
             batch.seq_start.ptr() as *const i32,
             batch.slot.ptr() as *const i32,
             batch.n_seq as i32,
             batch.rows as i32,
+            rows.start as i32,
+            rows.end as i32,
+            ws.ptr(),
+            stream.raw(),
+            ctas_per_sm,
+        )
+    };
+    CudaError::check(rc)
+}
+
+/// The second piece of [`prefill_gated`]: the recurrence over the rows `rows` of the chunk that [`prefill_gated_pre`] left in `ws`, with the
+/// gated norm of `z`, for every sequence that has rows there. The recurrent state in `s_pool` carries it from one piece to the next, so the
+/// pieces, launched in row order, leave the bits one launch over every row leaves.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_gated_chain(
+    stream: &Stream,
+    s_pool: &mut DevBuf,
+    batch: &Batch<'_>,
+    ws: &mut DevBuf,
+    z: &DevBuf,
+    norm_w: &DevBuf,
+    eps: f32,
+    o: &mut DevBuf,
+    rows: std::ops::Range<usize>,
+) -> Result<(), CudaError> {
+    let shape = GdnShape::Hv48;
+    need(o, batch.rows * shape.v_dim() * 2, "o");
+    need(z, batch.rows * shape.v_dim() * 2, "z");
+    need(norm_w, 128 * 4, "norm weight");
+    need(ws, prefill_workspace_bytes_shaped(shape, batch.rows), "workspace");
+    need(s_pool, batch.n_slots * shape.s_slot_elems() * 4, "S pool");
+    let rc = unsafe {
+        ffi::gb_gdn_prefill_gated_chain(
+            s_pool.ptr() as *mut f32,
+            batch.seq_start.ptr() as *const i32,
+            batch.slot.ptr() as *const i32,
+            batch.n_seq as i32,
+            batch.rows as i32,
+            rows.start as i32,
+            rows.end as i32,
             ws.ptr(),
             z.ptr(),
             norm_w.ptr() as *const f32,
             eps,
             o.ptr(),
+            stream.raw(),
+        )
+    };
+    CudaError::check(rc)
+}
+
+/// The last piece of [`prefill_gated`]: the conv history commit (the last three rows of every sequence's `x.qkv` into `conv_pool`). Ordered
+/// after every [`prefill_gated_pre`] (they read the history it overwrites).
+pub fn prefill_gated_commit(stream: &Stream, x: &PreInputs, conv_pool: &mut DevBuf, batch: &Batch<'_>) -> Result<(), CudaError> {
+    let shape = GdnShape::Hv48;
+    need(x.qkv, batch.rows * shape.conv_dim() * 2, "qkv");
+    need(conv_pool, batch.n_slots * shape.conv_slot_elems() * 2, "conv pool");
+    let rc = unsafe {
+        ffi::gb_gdn_prefill_gated_commit(
+            x.qkv.ptr(),
+            conv_pool.ptr(),
+            batch.seq_start.ptr() as *const i32,
+            batch.slot.ptr() as *const i32,
+            batch.n_seq as i32,
             stream.raw(),
         )
     };
