@@ -223,6 +223,62 @@ fn big_linear_equals_the_decode_path_at_wide_row_counts_in_both_block_orders() {
     eprintln!("{total} rows of 5 wide-call cases bit-identical to the decode path");
 }
 
+/// The second form of the large-row linear (the Flash-Next shared expert's two shapes, 2,560 -> 640 with 4 K splits and 640 -> 2,560 with one, the MUL1
+/// codebook at 4 to 8 bits, 1,024 rows or more: a warp owns 16 columns and runs every chain) gives the first form's bits (each warp a K quarter of all 128
+/// columns, the quarters met through shared memory), at the row counts around the 1,024-row threshold (1,023 runs the first form in both), ragged last 64-row
+/// groups, 8,192 rows and a chunk's tail past it, with and without a bias, with the input types the shared expert has (bf16 into gate/up, fp16 into down).
+#[test]
+fn the_big_second_form_changes_no_bit_on_the_shared_expert_shapes() {
+    gpu!();
+    let st = Stream::new().unwrap();
+    let rows_list = [1023usize, 1024, 1025, 1100, 2047, 3000, 4099, 8191, 8192, 8200];
+    let mut cases = 0;
+    for (name, k, n, xd) in [("gate/up", 2560usize, 640usize, Dtype::BF16), ("down", 640, 2560, Dtype::F16)] {
+        let mut r = Rng(900 + k as u64);
+        let x = input(&mut r, 8200, k, xd);
+        for bits in 4..=8usize {
+            let w = synth(k, n, bits, Codebook::Mul1, bits % 2 == 1, 910 + bits as u64 + 10 * (k / 640) as u64);
+            for &rows in &rows_list {
+                let xr = &x[..rows * k * xd.size()];
+                gb_cuda::exl3_big::set_second_form(Some(false));
+                let first = big_rows(&w, &st, xr, rows, xd, Dtype::F32);
+                gb_cuda::exl3_big::set_second_form(Some(true));
+                let second = big_rows(&w, &st, xr, rows, xd, Dtype::F32);
+                gb_cuda::exl3_big::set_second_form(None);
+                same(&format!("{name} {k}x{n} {bits}-bit, {rows} rows: second form against the first"), &second, &first, n, 4);
+                cases += 1;
+            }
+        }
+    }
+    eprintln!("{cases} shared-expert cases bit-identical between the two forms");
+}
+
+/// And the second form's rows equal the decode path's, at every width the shared expert has (the wide-call test above covers 4097 rows and more at 4, 6 and 8
+/// bits).
+#[test]
+fn the_big_second_form_equals_the_decode_path_at_every_shared_expert_width() {
+    gpu!();
+    let st = Stream::new().unwrap();
+    let mut cases = 0;
+    for (name, k, n, xd) in [("gate/up", 2560usize, 640usize, Dtype::BF16), ("down", 640, 2560, Dtype::F16)] {
+        let mut r = Rng(950 + k as u64);
+        let x = input(&mut r, 1500, k, xd);
+        for bits in 4..=8usize {
+            let w = synth(k, n, bits, Codebook::Mul1, bits % 2 == 0, 960 + bits as u64 + 10 * (k / 640) as u64);
+            for rows in [1024usize, 1100, 1500] {
+                let xr = &x[..rows * k * xd.size()];
+                gb_cuda::exl3_big::set_second_form(Some(true));
+                let got = big_rows(&w, &st, xr, rows, xd, Dtype::F32);
+                gb_cuda::exl3_big::set_second_form(None);
+                let want = decode_rows(&w, &st, xr, rows, xd, Dtype::F32);
+                same(&format!("{name} {k}x{n} {bits}-bit, {rows} rows: second form against the decode path"), &got, &want, n, 4);
+                cases += 1;
+            }
+        }
+    }
+    eprintln!("{cases} shared-expert cases bit-identical to the decode path");
+}
+
 /// The decode plan the kernels use is the decode path's: a shape's workspace need (which includes the split-K partials iff SK > 1) and the
 /// big path's plan agree on SK for the shapes of the model.
 #[test]
@@ -393,24 +449,32 @@ fn bench_big_linear_shared_expert() {
     let st = Stream::new().unwrap();
     let t = EventTimer::new(2).unwrap();
     let rows = 8192usize;
-    for bits in [4usize, 6, 8] {
+    for bits in [4usize, 5, 6, 7, 8] {
         for (name, k, n) in [("shared gate/up", 2560usize, 640usize), ("shared down", 640, 2560)] {
             let w = synth(k, n, bits, Codebook::Mul1, false, 5);
             let mut r = Rng(6);
             let x = DevBuf::from_slice(&input(&mut r, rows, k, Dtype::F16)).unwrap();
             let mut y = DevBuf::zeroed(rows * n * 4).unwrap();
             let mut ws = DevBuf::zeroed(w.big_workspace_bytes(rows)).unwrap();
-            w.forward_big(&x, &mut y, rows, Dtype::F16, Dtype::F32, &mut ws, &st).unwrap();
-            st.sync().unwrap();
-            let mut best = f32::MAX;
-            for _ in 0..6 {
-                t.record(0, &st).unwrap();
+            for second in [false, true] {
+                gb_cuda::exl3_big::set_second_form(Some(second));
                 w.forward_big(&x, &mut y, rows, Dtype::F16, Dtype::F32, &mut ws, &st).unwrap();
-                t.record(1, &st).unwrap();
-                best = best.min(t.ms(0, 1).unwrap());
+                st.sync().unwrap();
+                let mut best = f32::MAX;
+                for _ in 0..6 {
+                    t.record(0, &st).unwrap();
+                    w.forward_big(&x, &mut y, rows, Dtype::F16, Dtype::F32, &mut ws, &st).unwrap();
+                    t.record(1, &st).unwrap();
+                    best = best.min(t.ms(0, 1).unwrap());
+                }
+                let h = y.to_vec::<u32>().unwrap().iter().fold(0xcbf29ce484222325u64, |h, &v| (h ^ v as u64).wrapping_mul(0x100000001b3));
+                println!(
+                    "BENCH shared {name:14} {k}x{n} {bits}-bit R={rows} {}: {:.1} us (rot_in + the kernel) hash {h:016x}",
+                    if second { "second form" } else { "first form " },
+                    best * 1e3
+                );
             }
-            let h = y.to_vec::<u32>().unwrap().iter().fold(0xcbf29ce484222325u64, |h, &v| (h ^ v as u64).wrapping_mul(0x100000001b3));
-            println!("BENCH shared {name:14} {k}x{n} {bits}-bit R={rows}: {:.1} us (rot_in + big_kernel) hash {h:016x}", best * 1e3);
+            gb_cuda::exl3_big::set_second_form(None);
         }
     }
 }
