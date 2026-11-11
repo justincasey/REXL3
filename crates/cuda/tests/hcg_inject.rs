@@ -50,7 +50,7 @@ fn the_fast_pre_mix_equals_the_slab_loop_with_and_without_the_fused_post_inject(
     let mix = fn_mhc::Mixer { norm: &nw, down: &down, up: &up, inject: Some(&inject) };
     let head_mix = fn_mhc::Mixer { norm: &nw, down: &down, up: &up, inject: None };
     let mut rng = Rng(0xbeef);
-    for t in [1usize, 7, 31, 32, 33, 63, 64, 65, 100, 1000, 2049] {
+    for t in [1usize, 7, 31, 32, 33, 63, 64, 65, 100, 1000, 2049, 15, 16, 17, 47, 48, 49, 4033, 4081] {
         // streams with a spread of magnitudes (rows differ by orders), block output and the previous block's inject weights
         let x: Vec<f32> = (0..t * K).map(|i| rng.uniform(-3., 3.) * (1.0 + (i / K) as f32 * 0.01)).collect();
         let block: Vec<u16> = (0..t * H).map(|_| bf(rng.uniform(-2., 2.))).collect();
@@ -88,5 +88,5 @@ fn the_fast_pre_mix_equals_the_slab_loop_with_and_without_the_fused_post_inject(
             }
         }
     }
-    eprintln!("fast pre-mix == slab loop: 11 row counts x {{inject, head}} x {{plain, fused post-inject}}, every output bit equal");
+    eprintln!("fast pre-mix == slab loop: 19 row counts x {{inject, head}} x {{plain, fused post-inject}}, every output bit equal");
 }
