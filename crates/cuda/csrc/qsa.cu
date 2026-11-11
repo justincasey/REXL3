@@ -180,7 +180,77 @@ constexpr int RG = 16;  // rows a scores CTA serves
 
 // grid (ceil(nb_cap / 256), ceil(rows / RG)), block 256: one thread per block j, for every row of the group. Rows of one
 // sequence are adjacent, so a thread reads its key once per run of rows with the same slot.
+// Both operands are f16, so a product is exact in f32 and `dot + q * k` rounded once (an fma) is the same number as the product rounded
+// and then added: one instruction a term instead of two, the chain over the 128 dims in the same order. The queries are read four dims
+// (16 bytes) at a time, one load for four terms instead of one for each.
 __global__ void __launch_bounds__(256) scores_k(const __half* __restrict__ q, const __half* __restrict__ pool,
+                                                const int* __restrict__ table, int max_blocks,
+                                                const int* __restrict__ row_slot, const int* __restrict__ positions,
+                                                float* __restrict__ scores, int rows, int nb_cap, float scale) {
+    __shared__ __align__(16) float qs[RG][NH * DK];
+    __shared__ int nbq_s[RG], slot_s[RG];
+    __shared__ int nbq_max;
+    pdl_trigger();  // the successor may launch: it waits for this grid before it reads or writes anything
+    pdl_wait();     // q, the pool plane, the table and the positions are earlier kernels' outputs; every early exit is after it
+    const int r0 = blockIdx.y * RG, rn = min(RG, rows - r0);
+    if (threadIdx.x < RG) {
+        const int r = r0 + min((int)threadIdx.x, rn - 1);
+        nbq_s[threadIdx.x] = (positions[r] + 1) / CR;
+        slot_s[threadIdx.x] = row_slot[r];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int mx = 0;
+        for (int k = 0; k < rn; ++k) mx = max(mx, nbq_s[k]);
+        nbq_max = mx;
+    }
+    __syncthreads();
+    const int j0 = blockIdx.x * 256;
+    if (j0 >= nbq_max) return;
+    for (int i = threadIdx.x; i < rn * NH * DK; i += 256) qs[i / (NH * DK)][i % (NH * DK)] = __half2float(q[(size_t)r0 * NH * DK + i]);
+    __syncthreads();
+    const int j = j0 + threadIdx.x;
+    if (j >= nbq_max) return;
+    __half2 key[DK / 2];
+    int key_slot = -1;
+    for (int k = 0; k < rn; ++k) {
+        if (j >= nbq_s[k]) continue;
+        if (slot_s[k] != key_slot) {
+            key_slot = slot_s[k];
+            const int page = table[(size_t)key_slot * max_blocks + j / PB];
+            const uint4* kp = reinterpret_cast<const uint4*>(pool + ((size_t)page * PB + j % PB) * DK);
+#pragma unroll
+            for (int c = 0; c < DK / 8; ++c) {
+                const uint4 u = kp[c];
+                const __half2* h2 = reinterpret_cast<const __half2*>(&u);
+#pragma unroll
+                for (int e = 0; e < 4; ++e) key[c * 4 + e] = h2[e];
+            }
+        }
+        float dot[NH] = {0.f, 0.f, 0.f, 0.f};
+        const float4* qk = reinterpret_cast<const float4*>(qs[k]);
+#pragma unroll
+        for (int c = 0; c < DK / 4; ++c) {
+            const float2 k0 = __half22float2(key[2 * c]), k1 = __half22float2(key[2 * c + 1]);
+#pragma unroll
+            for (int h = 0; h < NH; ++h) {
+                const float4 q4 = qk[h * (DK / 4) + c];
+                dot[h] = __fmaf_rn(q4.x, k0.x, dot[h]);
+                dot[h] = __fmaf_rn(q4.y, k0.y, dot[h]);
+                dot[h] = __fmaf_rn(q4.z, k1.x, dot[h]);
+                dot[h] = __fmaf_rn(q4.w, k1.y, dot[h]);
+            }
+        }
+        float sc = 0.f;
+#pragma unroll
+        for (int h = 0; h < NH; ++h) sc = sc + fmaxf(dot[h], 0.f);
+        scores[(size_t)(r0 + k) * nb_cap + j] = sc * scale;
+    }
+}
+
+// The previous scores kernel (`dot + q * k + q * k` as separately rounded operations, the queries read a float at a time): kept as the
+// oracle of scores_k's test.
+__global__ void __launch_bounds__(256) scores_ref_k(const __half* __restrict__ q, const __half* __restrict__ pool,
                                                 const int* __restrict__ table, int max_blocks,
                                                 const int* __restrict__ row_slot, const int* __restrict__ positions,
                                                 float* __restrict__ scores, int rows, int nb_cap, float scale) {
@@ -861,6 +931,17 @@ GB_EXPORT int gb_qsa_scores(const void* q, const void* pool, const int* table, i
     const dim3 grid((nb_cap + 255) / 256, (rows + qsa::RG - 1) / qsa::RG);
     gbp_pdl::launch_pdl(flash_pdl(), qsa::scores_k, grid, dim3(256), 0, gb_stream(stream), (const __half*)q, (const __half*)pool,
                         table, max_blocks, row_slot, positions, (float*)scores, rows, nb_cap, 1.0f / sqrtf((float)qsa::DK));
+    return GB_CHECK_LAUNCH();
+}
+
+// gb_qsa_scores through the kernel it replaced: the reference the tests compare against.
+GB_EXPORT int gb_qsa_scores_ref(const void* q, const void* pool, const int* table, int max_blocks, const int* row_slot,
+                                const int* positions, void* scores, int rows, int nb_cap, void* stream) {
+    if (rows < 0 || nb_cap <= 0) return (int)cudaErrorInvalidValue;
+    if (rows == 0) return 0;
+    const dim3 grid((nb_cap + 255) / 256, (rows + qsa::RG - 1) / qsa::RG);
+    qsa::scores_ref_k<<<grid, 256, 0, gb_stream(stream)>>>((const __half*)q, (const __half*)pool, table, max_blocks, row_slot, positions,
+                                                           (float*)scores, rows, nb_cap, 1.0f / sqrtf((float)qsa::DK));
     return GB_CHECK_LAUNCH();
 }
 

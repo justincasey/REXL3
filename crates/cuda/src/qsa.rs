@@ -48,6 +48,9 @@ mod ffi {
         pub fn gb_qsa_scores(q: *const c_void, pool: *const c_void, table: *const c_void, max_blocks: i32,
                              row_slot: *const c_void, positions: *const c_void, scores: *mut c_void, rows: i32,
                              nb_cap: i32, stream: *mut c_void) -> i32;
+        pub fn gb_qsa_scores_ref(q: *const c_void, pool: *const c_void, table: *const c_void, max_blocks: i32,
+                             row_slot: *const c_void, positions: *const c_void, scores: *mut c_void, rows: i32,
+                             nb_cap: i32, stream: *mut c_void) -> i32;
         pub fn gb_qsa_topk(scores: *const c_void, positions: *const c_void, rows: i32, nb_cap: i32, sel: *mut c_void,
                            sel_n: *mut c_void, stream: *mut c_void) -> i32;
         pub fn gb_qsa_attend(q: *const c_void, k_cache: *const c_void, v_cache: *const c_void, table: *const c_void,
@@ -187,6 +190,40 @@ pub fn scores(
     let sp = scores.ptr();
     CudaError::check(unsafe {
         ffi::gb_qsa_scores(
+            q.ptr(),
+            pool.ptr(),
+            table.buf.ptr(),
+            table.max_blocks as i32,
+            rr.slot.ptr(),
+            rr.pos.ptr(),
+            sp,
+            rows as i32,
+            nb_cap as i32,
+            st.raw(),
+        )
+    })
+}
+
+/// [`scores`] through the kernel it replaced (every product and add rounded separately), the oracle of its test.
+pub fn scores_ref(
+    q: &DevBuf,
+    pool: &DevBuf,
+    pages: usize,
+    table: &BlockTable,
+    rr: &Rows<'_>,
+    scores: &mut DevBuf,
+    nb_cap: usize,
+    st: &Stream,
+) -> Result<(), CudaError> {
+    let rows = rr.rows;
+    need(q, rows * N_HEADS * DK * 2, "qsa scores q")?;
+    need(pool, pages * PAGE_BLOCKS * DK * 2, "qsa scores pool")?;
+    rr.check()?;
+    assert!(nb_cap * CR <= table.max_blocks * BLOCK_TOKENS);
+    need(scores, rows * nb_cap * 4, "qsa scores")?;
+    let sp = scores.ptr();
+    CudaError::check(unsafe {
+        ffi::gb_qsa_scores_ref(
             q.ptr(),
             pool.ptr(),
             table.buf.ptr(),

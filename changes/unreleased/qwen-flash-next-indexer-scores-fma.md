@@ -1,0 +1,3 @@
+## New features and improvements
+
+- Prompt prefill of Qwen3.8-Flash-Next scores the sparse-attention indexer with one fused multiply-add a term and reads the queries four values at a time, with every score bit unchanged (tested equal to the previous kernel for one row, 15 to 17 rows, block and page boundaries, rows of several sequences in one batch and a 4,096-row chunk). Both operands are half precision, so their product is exact in 32-bit floating point and adding it with one fused operation gives the same number as rounding the product and then adding, in the same order over the 128 dimensions. The scores of a 4,096-row chunk at positions 20,000 to 24,095 take 2.34 ms instead of 3.07 ms a layer.
