@@ -83,7 +83,11 @@ fn the_down_kernel_equals_the_slab_loop_on_the_chunk_grid_and_ragged_rows() {
     let mix = fn_mhc::Mixer { norm: &nw, down: &down, up: &up, inject: Some(&inject) };
     let mut rng = Rng(0xfeed);
     let mut checked = 0usize;
-    for t in [1usize, 63, 64, 65, 127, 128, 129, 191, 1000, 2049, 4016, 4095, 4096, 8191, 8192] {
+    // the 32-row tiles of the down kernel and the 16-row tiles of the norm and inject kernel end at every one of these counts in a different place
+    for t in [
+        1usize, 63, 64, 65, 127, 128, 129, 191, 1000, 2049, 4016, 4095, 4096, 8191, 8192, 31, 33, 95, 96, 97, 4017, 4033, 8105, 8107, 8108, 8109, 8128,
+        8129,
+    ] {
         let x = streams(&mut rng, t);
         let block: Vec<u16> = (0..t * H).map(|_| bf(rng.uniform(-4., 4.))).collect();
         let injp: Vec<f32> = (0..t * HC).map(|_| rng.uniform(-1.5, 1.5)).collect();
@@ -115,7 +119,7 @@ fn the_down_kernel_equals_the_slab_loop_on_the_chunk_grid_and_ragged_rows() {
             checked += t * H;
         }
     }
-    eprintln!("down kernel == slab loop: 15 row counts x {{plain, fused post-inject}}, {checked} mixed outputs and their inject rows and streams, every bit equal");
+    eprintln!("down kernel == slab loop: 28 row counts x {{plain, fused post-inject}}, {checked} mixed outputs and their inject rows and streams, every bit equal");
 }
 
 /// One mixer's fp16 weights on the device: norm, down, up, inject.
@@ -143,7 +147,9 @@ fn the_pre_mix_pair_without_the_stream_write_equals_the_in_place_posts_on_the_ch
     let mlp_mix = fn_mhc::Mixer { norm: &mnw, down: &mdown, up: &mup, inject: Some(&minject) };
     let mut rng = Rng(0xfeed2);
     let mut checked = 0usize;
-    for t in [1usize, 15, 16, 17, 63, 64, 65, 127, 129, 1000, 2049, 4016, 4095, 4096, 8191, 8192] {
+    for t in [
+        1usize, 15, 16, 17, 63, 64, 65, 127, 129, 1000, 2049, 4016, 4095, 4096, 8191, 8192, 33, 47, 48, 49, 95, 96, 97, 4033, 8105, 8107, 8108, 8109, 8129,
+    ] {
         let x = streams(&mut rng, t);
         let block_a: Vec<u16> = (0..t * H).map(|_| bf(rng.uniform(-4., 4.))).collect();
         let block_m: Vec<u16> = (0..t * H).map(|_| bf(rng.uniform(-4., 4.))).collect();
@@ -191,5 +197,5 @@ fn the_pre_mix_pair_without_the_stream_write_equals_the_in_place_posts_on_the_ch
         }
         checked += t * H;
     }
-    eprintln!("pre-mix pair without the stream write == in-place posts: 16 row counts, {checked} mixed outputs per pre-mix and their inject rows and the stack, every bit equal");
+    eprintln!("pre-mix pair without the stream write == in-place posts: 29 row counts, {checked} mixed outputs per pre-mix and their inject rows and the stack, every bit equal");
 }
