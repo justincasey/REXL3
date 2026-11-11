@@ -238,10 +238,121 @@ __global__ void __launch_bounds__(256) ring_k(const __half* __restrict__ nb, __h
     ring[((size_t)seq_slot[sq] * ring_len + (p % ring_len)) * ch + c] = nb[(size_t)r * ch + c];
 }
 
-constexpr int GT = 64, GK = 32;  // gemm tile (rows and columns) and k step
+// The prefill projection y = x * w^T (x [rows][k], w [n][k], f16, f32 accumulation, f16 out): every output is the f32 sum over k in
+// ASCENDING order of `acc = acc + x * w`, starting from 0. An f16 x f16 product is exact in f32 (22 significant bits, exponents within
+// 2^-48 .. 2^32), so `acc + x * w` rounded once (an fma) is the same number as the product rounded and then added: one instruction a term
+// instead of two, with every output's bits those of the previous kernel (gemm_ref_k).
+// Tile 128 x 128, k step 16, 256 threads of 8 x 8 outputs (rows 4 ty + 0..3 and 64 + 4 ty + 0..3, the columns alike with tx), operands
+// widened to f32 into shared memory k-major (one 16-byte read an operand quarter a k), the next k's fragments read while the current
+// k's 64 fma run, the next step's rows loaded into registers while the current one is computed. Out-of-range rows, columns and k are
+// zeros, as before.
+constexpr int GB = 128, GS = 16, GLD = GB + 4;
 
+// grid (ceil(n / 128), ceil(rows / 128)), block 256, two blocks an SM
+__global__ void __launch_bounds__(256, 2) gemm_k(const __half* __restrict__ x, const __half* __restrict__ w, __half* __restrict__ y,
+                                                 int rows, int k, int n) {
+    __shared__ __align__(16) float xs[2][GS][GLD];
+    __shared__ __align__(16) float ws[2][GS][GLD];
+    const int tid = threadIdx.x, ty = tid >> 4, tx = tid & 15;
+    const int r0 = blockIdx.y * GB, c0 = blockIdx.x * GB;
+    const int lrow = tid >> 1, lk = (tid & 1) * 8;  // this thread's row of the tile and k offset (8 halves) within a step
+    const int xr = r0 + lrow, wr = c0 + lrow;
+    const bool vec = (k & 7) == 0;
+    auto fetch = [&](const __half* base, int row, int rmax, int k0) {
+        uint4 v = make_uint4(0u, 0u, 0u, 0u);
+        const int kk = k0 + lk;
+        if (row < rmax) {
+            const __half* p = base + (size_t)row * k + kk;
+            if (vec) {
+                if (kk < k) v = *reinterpret_cast<const uint4*>(p);
+            } else {
+                unsigned short h[8];
+#pragma unroll
+                for (int e = 0; e < 8; ++e) h[e] = kk + e < k ? __half_as_ushort(p[e]) : (unsigned short)0;
+                v.x = h[0] | ((unsigned)h[1] << 16);
+                v.y = h[2] | ((unsigned)h[3] << 16);
+                v.z = h[4] | ((unsigned)h[5] << 16);
+                v.w = h[6] | ((unsigned)h[7] << 16);
+            }
+        }
+        return v;
+    };
+    auto put = [&](float (*dst)[GLD], const uint4& v) {
+        const __half2* h = reinterpret_cast<const __half2*>(&v);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const float2 f = __half22float2(h[e]);
+            dst[lk + 2 * e][lrow] = f.x;
+            dst[lk + 2 * e + 1][lrow] = f.y;
+        }
+    };
+    float acc[8][8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[i][j] = 0.f;
+    put(xs[0], fetch(x, xr, rows, 0));
+    put(ws[0], fetch(w, wr, n, 0));
+    __syncthreads();
+    const int steps = (k + GS - 1) / GS;
+    for (int s = 0; s < steps; ++s) {
+        const int cur = s & 1;
+        uint4 xv = make_uint4(0u, 0u, 0u, 0u), wv = xv;
+        if (s + 1 < steps) {
+            xv = fetch(x, xr, rows, (s + 1) * GS);
+            wv = fetch(w, wr, n, (s + 1) * GS);
+        }
+        float4 a[2], b[2];
+        a[0] = *reinterpret_cast<const float4*>(&xs[cur][0][4 * ty]);
+        a[1] = *reinterpret_cast<const float4*>(&xs[cur][0][64 + 4 * ty]);
+        b[0] = *reinterpret_cast<const float4*>(&ws[cur][0][4 * tx]);
+        b[1] = *reinterpret_cast<const float4*>(&ws[cur][0][64 + 4 * tx]);
+#pragma unroll
+        for (int kk = 0; kk < GS; ++kk) {
+            float4 na[2], nb[2];
+            if (kk + 1 < GS) {
+                na[0] = *reinterpret_cast<const float4*>(&xs[cur][kk + 1][4 * ty]);
+                na[1] = *reinterpret_cast<const float4*>(&xs[cur][kk + 1][64 + 4 * ty]);
+                nb[0] = *reinterpret_cast<const float4*>(&ws[cur][kk + 1][4 * tx]);
+                nb[1] = *reinterpret_cast<const float4*>(&ws[cur][kk + 1][64 + 4 * tx]);
+            }
+            const float av[8] = {a[0].x, a[0].y, a[0].z, a[0].w, a[1].x, a[1].y, a[1].z, a[1].w};
+            const float bv[8] = {b[0].x, b[0].y, b[0].z, b[0].w, b[1].x, b[1].y, b[1].z, b[1].w};
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+#pragma unroll
+                for (int j = 0; j < 8; ++j) acc[i][j] = __fmaf_rn(av[i], bv[j], acc[i][j]);
+            if (kk + 1 < GS) {
+                a[0] = na[0];
+                a[1] = na[1];
+                b[0] = nb[0];
+                b[1] = nb[1];
+            }
+        }
+        if (s + 1 < steps) {
+            put(xs[cur ^ 1], xv);
+            put(ws[cur ^ 1], wv);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int r = r0 + 4 * ty + (i & 3) + 64 * (i >> 2);
+        if (r >= rows) continue;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int c = c0 + 4 * tx + (j & 3) + 64 * (j >> 2);
+            if (c < n) y[(size_t)r * n + c] = __float2half_rn(acc[i][j]);
+        }
+    }
+}
+
+constexpr int GT = 64, GK = 32;  // the previous kernel's tile (rows and columns) and k step
+
+// The previous prefill projection (64 x 64 tiles, 4 x 4 outputs a thread, `acc = acc + a * b` as two rounded operations): kept as the
+// oracle the tiled kernel above is tested against bit for bit.
 // grid (ceil(n / 64), ceil(rows / 64)), block 256 (16 x 16 threads, 4 x 4 outputs each)
-__global__ void __launch_bounds__(256) gemm_k(const __half* __restrict__ x, const __half* __restrict__ w, __half* __restrict__ y,
+__global__ void __launch_bounds__(256) gemm_ref_k(const __half* __restrict__ x, const __half* __restrict__ w, __half* __restrict__ y,
                                               int rows, int k, int n) {
     __shared__ float xs[GK][GT + 1], ws[GK][GT + 1];
     const int r0 = blockIdx.y * GT, c0 = blockIdx.x * GT;
@@ -307,8 +418,17 @@ GB_EXPORT int gb_ple_proj(const void* x, const void* w, void* y, int rows, int k
 GB_EXPORT int gb_ple_gemm(const void* x, const void* w, void* y, int rows, int k, int n, void* stream) {
     if (rows < 0 || k <= 0 || n <= 0) return (int)cudaErrorInvalidValue;
     if (rows == 0) return 0;
-    const dim3 grid((n + GT - 1) / GT, (rows + GT - 1) / GT);
+    const dim3 grid((n + GB - 1) / GB, (rows + GB - 1) / GB);
     gemm_k<<<grid, 256, 0, gb_stream(stream)>>>((const __half*)x, (const __half*)w, (__half*)y, rows, k, n);
+    return GB_CHECK_LAUNCH();
+}
+
+// the previous kernel, the oracle of the tiled one's test
+GB_EXPORT int gb_ple_gemm_ref(const void* x, const void* w, void* y, int rows, int k, int n, void* stream) {
+    if (rows < 0 || k <= 0 || n <= 0) return (int)cudaErrorInvalidValue;
+    if (rows == 0) return 0;
+    const dim3 grid((n + GT - 1) / GT, (rows + GT - 1) / GT);
+    gemm_ref_k<<<grid, 256, 0, gb_stream(stream)>>>((const __half*)x, (const __half*)w, (__half*)y, rows, k, n);
     return GB_CHECK_LAUNCH();
 }
 

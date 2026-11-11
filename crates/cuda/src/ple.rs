@@ -31,6 +31,8 @@ mod ffi {
                            stream: *mut c_void) -> i32;
         pub fn gb_ple_gemm(x: *const c_void, w: *const c_void, y: *mut c_void, rows: i32, k: i32, n: i32,
                            stream: *mut c_void) -> i32;
+        pub fn gb_ple_gemm_ref(x: *const c_void, w: *const c_void, y: *mut c_void, rows: i32, k: i32, n: i32,
+                               stream: *mut c_void) -> i32;
         pub fn gb_ple_gate(streams: *const c_void, key: *const c_void, value: *const c_void, wk: *const c_void,
                            wq: *const c_void, wc: *const c_void, sg: *mut c_void, nb: *mut c_void, rows: i32, d: i32,
                            hc: i32, eps: f32, scale: f32, stream: *mut c_void) -> i32;
@@ -93,7 +95,7 @@ pub fn proj_window(
     CudaError::check(unsafe { ffi::gb_ple_proj(x.ptr(), w.ptr(), y.ptr(), rows as i32, k as i32, n as i32, st.raw()) })
 }
 
-/// The same product for a prefill chunk of any size: 64 x 64 tiles, each output summed over `k` in ascending order, so a row's
+/// The same product for a prefill chunk of any size: 128 x 128 tiles, each output summed over `k` in ascending order, so a row's
 /// bits do not depend on how the prompt is chunked (a short last chunk included). They differ from [`proj_window`]'s, as prefill
 /// attention's differ from decode's.
 pub fn proj_prefill(
@@ -109,6 +111,22 @@ pub fn proj_prefill(
     need(w, n * k * 2, "ple proj w")?;
     need(y, rows * n * 2, "ple proj y")?;
     CudaError::check(unsafe { ffi::gb_ple_gemm(x.ptr(), w.ptr(), y.ptr(), rows as i32, k as i32, n as i32, st.raw()) })
+}
+
+/// [`proj_prefill`]'s previous kernel (64 x 64 tiles, `acc = acc + x * w` as two rounded operations), kept as the oracle of its test.
+pub fn proj_prefill_ref(
+    x: &DevBuf,
+    w: &DevBuf,
+    y: &mut DevBuf,
+    rows: usize,
+    k: usize,
+    n: usize,
+    st: &Stream,
+) -> Result<(), CudaError> {
+    need(x, rows * k * 2, "ple proj x")?;
+    need(w, n * k * 2, "ple proj w")?;
+    need(y, rows * n * 2, "ple proj y")?;
+    CudaError::check(unsafe { ffi::gb_ple_gemm_ref(x.ptr(), w.ptr(), y.ptr(), rows as i32, k as i32, n as i32, st.raw()) })
 }
 
 /// The norms used by [`gate`] (each f32 `[hc * d]`, already `1 + w`).
