@@ -1,0 +1,3 @@
+## New features and improvements
+
+- Prompt prefill of Qwen3.8-Flash-Next runs its router and gate projections with the next step's input rows already in flight, with every output bit unchanged (tested equal to the per-row kernel and to the previous many-row kernel at 1 to 4,012 rows and the model's widths). Each thread copies its own slice of the next four input rows into shared memory with asynchronous copies while it reduces the current step, and reads it back at the next step without a barrier, so the global-memory latency that stalled every step is hidden. The router projection of a 4,012-row chunk takes 1.21 ms instead of 1.35 ms and the 48-wide gate projections 0.126 ms instead of 0.139 ms a layer.

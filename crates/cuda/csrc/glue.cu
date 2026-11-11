@@ -575,6 +575,8 @@ __global__ void __launch_bounds__(SL_NT, 2) small_linear_cols_k(const u16* x, co
                                                                 int rows_per_block) {
     __shared__ float sm[2][SL_NT / 32][32];
     __shared__ uint4 w2[NV > 1 ? SLC_J : 1][NV > 1 ? SLC_EXTRA : 1];
+    __shared__ uint4 xs0[SLC_RG][SL_NT];  // each thread's own input vectors of the next step (copied by the thread itself: no barrier)
+    __shared__ uint4 xs1[NV > 1 ? SLC_RG : 1][NV > 1 ? SLC_EXTRA : 1];
     const int j0 = blockIdx.x * SLC_J;
     const int rb = blockIdx.y * rows_per_block;
     const int re = min(rows, rb + rows_per_block);
@@ -594,8 +596,27 @@ __global__ void __launch_bounds__(SL_NT, 2) small_linear_cols_k(const u16* x, co
         }
     }
     __syncthreads();
+    // the thread's vector q of the four rows of the step at r0 (in this lane's row order) into shared memory, zeros where the thread has
+    // no vector or the row is past the slice
+    auto issue_x = [&](int r0) {
+#pragma unroll
+        for (int q = 0; q < NV; ++q) {
+            const int v = threadIdx.x + q * SL_NT;
+            if (q > 0 && threadIdx.x >= SLC_EXTRA) continue;
+#pragma unroll
+            for (int r = 0; r < SLC_RG; ++r) {
+                const bool ok = v < nvec && r0 + (r ^ lr) < re;
+                const uint4* src = (const uint4*)(x + (size_t)(ok ? r0 + (r ^ lr) : rb) * k) + (ok ? v : 0);
+                const unsigned dst = (unsigned)__cvta_generic_to_shared(q == 0 ? &xs0[r][threadIdx.x] : &xs1[NV > 1 ? r : 0][NV > 1 ? threadIdx.x : 0]);
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src), "r"(ok ? 16 : 0));
+            }
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+    issue_x(rb);
     int buf = 0;
     for (int r0 = rb; r0 < re; r0 += SLC_RG, buf ^= 1) {
+        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
         float acc[SLC_RG][SLC_J];
 #pragma unroll
         for (int r = 0; r < SLC_RG; ++r)
@@ -606,12 +627,10 @@ __global__ void __launch_bounds__(SL_NT, 2) small_linear_cols_k(const u16* x, co
             // a warp none of whose lanes has a vector q adds products of zero operands to accumulators that are never -0 (they start at +0
             // and a sum rounded to nearest is -0 only if both addends are): its arithmetic is skipped, not its result changed
             if (wid * 32 + q * SL_NT >= nvec) continue;
-            const int v = threadIdx.x + q * SL_NT;
-            const bool live = v < nvec;
             float xf[SLC_RG][8];
 #pragma unroll
             for (int r = 0; r < SLC_RG; ++r) {
-                const uint4 xu = (live && r0 + (r ^ lr) < re) ? __ldg((const uint4*)(x + (size_t)(r0 + (r ^ lr)) * k) + v) : make_uint4(0u, 0u, 0u, 0u);
+                const uint4 xu = q == 0 ? xs0[r][threadIdx.x] : xs1[NV > 1 ? r : 0][NV > 1 ? (threadIdx.x < SLC_EXTRA ? threadIdx.x : 0) : 0];
                 unpack8(xu, xf[r]);
             }
 #pragma unroll
@@ -633,6 +652,8 @@ __global__ void __launch_bounds__(SL_NT, 2) small_linear_cols_k(const u16* x, co
                     for (int i = 0; i < 8; ++i) acc[r][j] = fmaf(xf[r][i], wf[i], acc[r][j]);
             }
         }
+        if (r0 + SLC_RG < re) issue_x(r0 + SLC_RG);
+        else asm volatile("cp.async.commit_group;\n" ::);
         float s[32];  // register r * SLC_J + j: output (r * SLC_J + j) ^ lane
 #pragma unroll
         for (int it = 0; it < 32; ++it) s[it] = acc[it / SLC_J][it % SLC_J];
