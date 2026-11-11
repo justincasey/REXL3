@@ -157,7 +157,7 @@ pub fn linear(
 }
 
 /// [`linear`] with a forced tile shape (`0`: the kernel's pick, else `BM * 10 + SN`: 641, 642, 1281, 1282, or for the chain order
-/// `10000 +` a configuration of the 128 x 128 chain GEMM: 10001 to 10004). The tile never changes a bit (the tests check that).
+/// `10000 +` a configuration of the 128 x 128 chain GEMM: 10001 to 10007). The tile never changes a bit (the tests check that).
 #[allow(clippy::too_many_arguments)]
 pub fn linear_tiled(
     w: &Exl3Weights,
