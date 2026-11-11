@@ -198,6 +198,15 @@ mod ffi {
             n: i32,
             s: *mut c_void,
         ) -> i32;
+        pub fn gb_small_linear_f16w_rows_ref(
+            x: *const c_void,
+            w: *const c_void,
+            y: *mut c_void,
+            rows: i32,
+            k: i32,
+            n: i32,
+            s: *mut c_void,
+        ) -> i32;
         pub fn gb_topk_workspace_bytes(rows: i32, vocab: i32, count: i32) -> usize;
         pub fn gb_topk_valid_workspace_bytes(rows: i32, valid: i32, count: i32) -> usize;
         pub fn gb_topk_valid(
@@ -476,6 +485,19 @@ pub unsafe fn small_linear_f16w_rows(
     stream: &Stream,
 ) -> Result<(), CudaError> {
     CudaError::check(ffi::gb_small_linear_f16w_rows(x, w, y, i(rows)?, i(k)?, i(n)?, stream.raw()))
+}
+
+/// [`small_linear_f16w_rows`] through the weight-stationary kernel it replaced (selects in the reduce-scatter): the timing and test reference.
+pub unsafe fn small_linear_f16w_rows_ref(
+    x: *const c_void,
+    w: *const c_void,
+    y: *mut c_void,
+    rows: usize,
+    k: usize,
+    n: usize,
+    stream: &Stream,
+) -> Result<(), CudaError> {
+    CudaError::check(ffi::gb_small_linear_f16w_rows_ref(x, w, y, i(rows)?, i(k)?, i(n)?, stream.raw()))
 }
 
 /// [`small_linear_f16w_rows`] with f32 output (the unrounded accumulator, as [`small_linear_f16w_f32out`]).

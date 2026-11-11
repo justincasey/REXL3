@@ -473,10 +473,11 @@ __global__ void __launch_bounds__(SL_NT, SLR_MINB) small_linear_rows_k(const u16
 constexpr int SLC_J = 8;
 constexpr int SLC_RG = 4;
 constexpr int SLC_EXTRA = 128;  // threads that own a second 8-vector (k <= 3,072): their weights sit in shared memory
-// NV = 8-vectors a thread owns (thread t: vectors t, t + 256 of k): its fmaf chain runs over them in that order, as the other kernels'.
+// The kernel below is the previous one (selects in the reduce-scatter, unpermuted registers): kept as the reference of small_linear_cols_k's
+// timing and test. NV = 8-vectors a thread owns (thread t: vectors t, t + 256 of k): its fmaf chain runs over them in that order, as the other kernels'.
 // The first vector's weights stay in registers, the second's (only threads < k / 8 - 256 have one) in shared memory.
 template <bool F32OUT, int NV>
-__global__ void __launch_bounds__(SL_NT, 2) small_linear_cols_k(const u16* x, const __half* w, void* y, int rows, int k, int n,
+__global__ void __launch_bounds__(SL_NT, 2) small_linear_cols_ref_k(const u16* x, const __half* w, void* y, int rows, int k, int n,
                                                                 int rows_per_block) {
     __shared__ float sm[2][SL_NT / 32][32];
     __shared__ uint4 w2[NV > 1 ? SLC_J : 1][NV > 1 ? SLC_EXTRA : 1];
@@ -546,6 +547,99 @@ __global__ void __launch_bounds__(SL_NT, 2) small_linear_cols_k(const u16* x, co
                 const float own = hi ? s[i + half] : s[i];
                 s[i] = own + __shfl_xor_sync(0xffffffffu, send, m);
             }
+        }
+        sm[buf][wid][lane] = s[0];
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            const int it = threadIdx.x;
+            float t = sm[buf][0][it];
+            for (int wv2 = 1; wv2 < SL_NT / 32; ++wv2) t = t + sm[buf][wv2][it];
+            const int r = r0 + it / SLC_J, j = j0 + it % SLC_J;
+            if (r < re && j < n) {
+                const size_t o = (size_t)r * n + j;
+                if (F32OUT) ((float*)y)[o] = t;
+                else ((u16*)y)[o] = f2bf(t);
+            }
+        }
+    }
+}
+
+// NV = 8-vectors a thread owns (thread t: vectors t, t + 256 of k): its fmaf chain runs over them in that order, as the other kernels'.
+// The first vector's weights stay in registers, the second's (only threads < k / 8 - 256 have one) in shared memory.
+// Register (r, j) of a lane L holds the output (r ^ (L >> 3 & 3), j ^ (L & 7)) of the 4 x 8 block, so that the reduce-scatter below needs no
+// selects: at the stage over lane bit b a lane keeps the registers whose index bit b is clear and adds to each the partner's register that
+// differs in that bit (the same outputs' partial sums, in the same additions as small_linear_cols_ref_k's), and after five stages register 0
+// of lane L holds output L as before. The lane's rows and columns are loaded permuted the same way; every output's chain is unchanged.
+template <bool F32OUT, int NV>
+__global__ void __launch_bounds__(SL_NT, 2) small_linear_cols_k(const u16* x, const __half* w, void* y, int rows, int k, int n,
+                                                                int rows_per_block) {
+    __shared__ float sm[2][SL_NT / 32][32];
+    __shared__ uint4 w2[NV > 1 ? SLC_J : 1][NV > 1 ? SLC_EXTRA : 1];
+    const int j0 = blockIdx.x * SLC_J;
+    const int rb = blockIdx.y * rows_per_block;
+    const int re = min(rows, rb + rows_per_block);
+    const int nvec = k / 8;
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    const int lr = (lane >> 3) & 3, lj = lane & 7;  // this lane's row and column permutation (see above)
+    uint4 wv[SLC_J];
+#pragma unroll
+    for (int j = 0; j < SLC_J; ++j)
+        wv[j] = (threadIdx.x < nvec && j0 + (j ^ lj) < n) ? __ldg((const uint4*)(w + (size_t)(j0 + (j ^ lj)) * k) + threadIdx.x) : make_uint4(0u, 0u, 0u, 0u);
+    if (NV > 1) {
+        const int v2 = threadIdx.x + SL_NT;
+        if (threadIdx.x < SLC_EXTRA) {
+#pragma unroll
+            for (int j = 0; j < SLC_J; ++j)
+                w2[j][threadIdx.x] = (v2 < nvec && j0 + (j ^ lj) < n) ? __ldg((const uint4*)(w + (size_t)(j0 + (j ^ lj)) * k) + v2) : make_uint4(0u, 0u, 0u, 0u);
+        }
+    }
+    __syncthreads();
+    int buf = 0;
+    for (int r0 = rb; r0 < re; r0 += SLC_RG, buf ^= 1) {
+        float acc[SLC_RG][SLC_J];
+#pragma unroll
+        for (int r = 0; r < SLC_RG; ++r)
+#pragma unroll
+            for (int j = 0; j < SLC_J; ++j) acc[r][j] = 0.f;
+#pragma unroll
+        for (int q = 0; q < NV; ++q) {
+            // a warp none of whose lanes has a vector q adds products of zero operands to accumulators that are never -0 (they start at +0
+            // and a sum rounded to nearest is -0 only if both addends are): its arithmetic is skipped, not its result changed
+            if (wid * 32 + q * SL_NT >= nvec) continue;
+            const int v = threadIdx.x + q * SL_NT;
+            const bool live = v < nvec;
+            float xf[SLC_RG][8];
+#pragma unroll
+            for (int r = 0; r < SLC_RG; ++r) {
+                const uint4 xu = (live && r0 + (r ^ lr) < re) ? __ldg((const uint4*)(x + (size_t)(r0 + (r ^ lr)) * k) + v) : make_uint4(0u, 0u, 0u, 0u);
+                unpack8(xu, xf[r]);
+            }
+#pragma unroll
+            for (int j = 0; j < SLC_J; ++j) {
+                uint4 wu;
+                if (q == 0) wu = wv[j];
+                else wu = threadIdx.x < SLC_EXTRA ? w2[NV > 1 ? j : 0][NV > 1 ? threadIdx.x : 0] : make_uint4(0u, 0u, 0u, 0u);
+                float wf[8];
+                const __half2* h2 = (const __half2*)&wu;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const float2 f = __half22float2(h2[i]);
+                    wf[2 * i] = f.x;
+                    wf[2 * i + 1] = f.y;
+                }
+#pragma unroll
+                for (int r = 0; r < SLC_RG; ++r)
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) acc[r][j] = fmaf(xf[r][i], wf[i], acc[r][j]);
+            }
+        }
+        float s[32];  // register r * SLC_J + j: output (r * SLC_J + j) ^ lane
+#pragma unroll
+        for (int it = 0; it < 32; ++it) s[it] = acc[it / SLC_J][it % SLC_J];
+#pragma unroll
+        for (int m = 16, half = 16; half >= 1; m >>= 1, half >>= 1) {
+#pragma unroll
+            for (int i = 0; i < half; ++i) s[i] = s[i] + __shfl_xor_sync(0xffffffffu, s[i + half], m);
         }
         sm[buf][wid][lane] = s[0];
         __syncthreads();
@@ -941,7 +1035,7 @@ GB_EXPORT int gb_small_linear_f16w_f32out(const void* x, const void* w, void* y,
 
 // Same results as gb_small_linear_f16w / _f32out bit for bit, faster for many rows (a prefill chunk): weight-stationary blocks for
 // k <= 2,048 (4 rows a step), 4 rows x 8 columns a block above, the per-row kernel for narrow outputs (n < 8).
-static int small_linear_rows(const void* x, const void* w, void* y, int rows, int k, int n, bool f32out, void* stream) {
+static int small_linear_rows(const void* x, const void* w, void* y, int rows, int k, int n, bool f32out, void* stream, bool ref = false) {
     if (rows < 0 || k <= 0 || n < 0 || k % 8 != 0) return ERR_INVALID;
     if (!aligned16(x) || !aligned16(w)) return ERR_INVALID;
     if (rows == 0 || n == 0) return 0;
@@ -957,7 +1051,12 @@ static int small_linear_rows(const void* x, const void* w, void* y, int rows, in
         const int rows_per_block = ((steps + slices - 1) / slices) * SLC_RG;
         const dim3 grid(col_groups, (rows + rows_per_block - 1) / rows_per_block);
 #define GB_SLC(NV_)                                                                                                           \
-    if (f32out)                                                                                                               \
+    if (ref) {                                                                                                                \
+        if (f32out)                                                                                                           \
+            small_linear_cols_ref_k<true, NV_><<<grid, SL_NT, 0, st>>>((const u16*)x, (const __half*)w, y, rows, k, n, rows_per_block); \
+        else                                                                                                                  \
+            small_linear_cols_ref_k<false, NV_><<<grid, SL_NT, 0, st>>>((const u16*)x, (const __half*)w, y, rows, k, n, rows_per_block); \
+    } else if (f32out)                                                                                                        \
         small_linear_cols_k<true, NV_><<<grid, SL_NT, 0, st>>>((const u16*)x, (const __half*)w, y, rows, k, n, rows_per_block); \
     else                                                                                                                      \
         small_linear_cols_k<false, NV_><<<grid, SL_NT, 0, st>>>((const u16*)x, (const __half*)w, y, rows, k, n, rows_per_block);
@@ -977,6 +1076,10 @@ GB_EXPORT int gb_small_linear_f16w_rows(const void* x, const void* w, void* y, i
 }
 GB_EXPORT int gb_small_linear_f16w_f32out_rows(const void* x, const void* w, void* y, int rows, int k, int n, void* stream) {
     return small_linear_rows(x, w, y, rows, k, n, true, stream);
+}
+// gb_small_linear_f16w_rows through the previous weight-stationary kernel (selects in its reduce-scatter): the timing and test reference.
+GB_EXPORT int gb_small_linear_f16w_rows_ref(const void* x, const void* w, void* y, int rows, int k, int n, void* stream) {
+    return small_linear_rows(x, w, y, rows, k, n, false, stream, true);
 }
 
 // Workspace of gb_topk_valid: it depends on the valid columns only (the chunks of a row that are read).
