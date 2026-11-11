@@ -47,11 +47,16 @@ fn bench_pre_mix_on_the_chunk_grid() {
     // where attention or the experts run between two pre-mixes); the wall time then includes the memset, the kernel times (nsys) do not
     let flush_mb: usize = std::env::var("HCG_BENCH_FLUSH").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let mut flush = DevBuf::zeroed(flush_mb.max(1) << 20).unwrap();
+    let lazy = std::env::var("HCG_BENCH_LAZY").map(|v| v == "1").unwrap_or(false);
     let mut run = |xs: &mut DevBuf, y: &mut DevBuf, inj: &mut DevBuf, sc: &mut DevBuf| {
         if flush_mb > 0 {
             flush.memset_async(1, &st).unwrap();
         }
-        hcx::pre_gemm_post(xs, &block, &injp, &mix, y, Some(inj), sc, H, HC, R, 1e-6, t, &st).unwrap();
+        if lazy {
+            hcx::pre_gemm_post_lazy(xs, &block, &injp, &mix, y, inj, sc, H, HC, R, 1e-6, t, &st).unwrap();
+        } else {
+            hcx::pre_gemm_post(xs, &block, &injp, &mix, y, Some(inj), sc, H, HC, R, 1e-6, t, &st).unwrap();
+        }
     };
     for _ in 0..5 {
         run(&mut xs, &mut y, &mut inj, &mut sc);
