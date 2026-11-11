@@ -416,3 +416,36 @@ fn bench_dense_chain_row_counts() {
         }
     }
 }
+
+/// The chain GEMM at the steady chunk's 8,192 rows on the large layers (the profile's `gemm_c_kernel` rows): ms and TFLOP/s.
+#[test]
+#[ignore]
+fn bench_dense_chain_8192() {
+    gpu!();
+    let rows = 8192usize;
+    let st = Stream::new().unwrap();
+    for (i, &(name, k, n, bits, _)) in SHAPES.iter().enumerate() {
+        if n < 2048 || bits != 6 {
+            continue;
+        }
+        let ws_: Vec<Exl3Weights> = (0..4).map(|c| layer(k, n, bits, 7000 + 10 * i as u64 + c)).collect();
+        let x = upload(&acts(3 + i as u64, rows, k, false));
+        let mut y = DevBuf::alloc(rows * n * 2).unwrap();
+        let mut ws = DevBuf::alloc(glm_p2::workspace_bytes(rows, k)).unwrap();
+        let tf = 2.0 * rows as f64 * k as f64 * n as f64 / 1e9;
+        let mut v = Vec::new();
+        for it in 0..6 {
+            st.sync().unwrap();
+            let t = std::time::Instant::now();
+            for r in 0..8 {
+                glm_p2::linear_variant(&ws_[r % 4], &x, &mut y, rows, Dtype::BF16, Dtype::BF16, &mut ws, Variant::Chain, 0, &st).unwrap();
+            }
+            st.sync().unwrap();
+            if it > 0 {
+                v.push(t.elapsed().as_secs_f64() * 1e3 / 8.0);
+            }
+        }
+        let ms = median(v);
+        eprintln!("BENCH gemm_c {name:11} K {k:5} N {n:5} rows {rows}: {ms:.3} ms {:.1} TF/s", tf / ms);
+    }
+}
