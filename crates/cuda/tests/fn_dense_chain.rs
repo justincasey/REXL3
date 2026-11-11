@@ -3,7 +3,7 @@
 //! indexer's qk projection), bf16 in and out as the model calls it.
 //!
 //! Gates (not ignored): the chain GEMM the 3- to 8-bit layers run by default and every one of its configurations (`tile_force`
-//! 10001 ..= 10004) give, bit for bit, what the old fixed-tile kernel gives (`tile_force` 642, 1282: the `gemm_kernel` the Tiled
+//! 10001 ..= 10007) give, bit for bit, what the old fixed-tile kernel gives (`tile_force` 642, 1282: the `gemm_kernel` the Tiled
 //! prefill ran before), on the pack's shapes and on odd strip counts, at row counts that straddle the 64 / 128-row tiles (1, 7, 33,
 //! 127, 128, 129, 1000, 4,096), on random trellis and scales and on adversarial activations (zero rows, rows that overflow fp16 after
 //! the rotation, denormals, NaN and infinity), with and without a bias, for bf16, fp16 and fp32 outputs.
@@ -148,7 +148,7 @@ fn run(w: &Exl3Weights, x: &DevBuf, rows: usize, xd: Dtype, yd: Dtype, tile: i32
 const ROWS: [usize; 8] = [1, 7, 33, 127, 128, 129, 1000, 4096];
 /// The old kernel's tiles (the references) and the chain GEMM's pick and configurations.
 const OLD: [i32; 2] = [642, 1282];
-const NEW: [i32; 5] = [0, 10001, 10002, 10003, 10004];
+const NEW: [i32; 8] = [0, 10001, 10002, 10003, 10004, 10005, 10006, 10007];
 
 /// `what` of rows `rows` of `w` equal between every old tile and every new configuration.
 #[allow(clippy::too_many_arguments)]
@@ -447,5 +447,43 @@ fn bench_dense_chain_8192() {
         }
         let ms = median(v);
         eprintln!("BENCH gemm_c {name:11} K {k:5} N {n:5} rows {rows}: {ms:.3} ms {:.1} TF/s", tf / ms);
+    }
+}
+
+/// The chain GEMM's raster groups on the layers whose A rows do not fit the L2 beside the weights (K = 6,144) and on the K = 2,560 ones, 8,192 rows:
+/// configuration 1 (GM 16) against 5 (GM 8), 6 (GM 4) and 7 (GM 32), ms and TFLOP/s of the rotation-free GEMM launch.
+#[test]
+#[ignore]
+fn bench_dense_chain_raster_groups() {
+    gpu!();
+    let rows = 8192usize;
+    let st = Stream::new().unwrap();
+    for (i, &(name, k, n, bits, _)) in SHAPES.iter().enumerate() {
+        if n < 2048 || bits != 6 {
+            continue;
+        }
+        let ws_: Vec<Exl3Weights> = (0..4).map(|c| layer(k, n, bits, 7100 + 10 * i as u64 + c)).collect();
+        let x = upload(&acts(5 + i as u64, rows, k, false));
+        let mut y = DevBuf::alloc(rows * n * 2).unwrap();
+        let mut ws = DevBuf::alloc(glm_p2::workspace_bytes(rows, k)).unwrap();
+        let tf = 2.0 * rows as f64 * k as f64 * n as f64 / 1e9;
+        let mut line = String::new();
+        for tile in [10001, 10005, 10006, 10007, 10001, 10005, 10006, 10007] {
+            let mut v = Vec::new();
+            for it in 0..6 {
+                st.sync().unwrap();
+                let t = std::time::Instant::now();
+                for r in 0..8 {
+                    glm_p2::linear_variant(&ws_[r % 4], &x, &mut y, rows, Dtype::BF16, Dtype::BF16, &mut ws, Variant::Chain, tile, &st).unwrap();
+                }
+                st.sync().unwrap();
+                if it > 0 {
+                    v.push(t.elapsed().as_secs_f64() * 1e3 / 8.0);
+                }
+            }
+            let ms = median(v);
+            line += &format!(" | cfg {} {ms:.3} ms {:.1} TF/s", tile - 10000, tf / ms);
+        }
+        eprintln!("BENCH raster {name:11} K {k:5} N {n:5}{line}");
     }
 }
