@@ -410,6 +410,23 @@ mod ffi {
             o: *mut c_void,
             stream: *mut c_void,
         ) -> i32;
+        pub fn gb_gdn_prefill_ref(
+            qkv: *const c_void,
+            a: *const c_void,
+            b: *const c_void,
+            conv_w: *const c_void,
+            a_log: *const f32,
+            dt_bias: *const f32,
+            s: *mut f32,
+            conv_pool: *mut c_void,
+            seq_start: *const i32,
+            slot: *const i32,
+            n_seq: i32,
+            rows: i32,
+            workspace: *mut c_void,
+            o: *mut c_void,
+            stream: *mut c_void,
+        ) -> i32;
 
         // the same launchers built for 32 value heads (csrc/gdn_hv32.cu)
         pub fn gb_gdn_pre_hv32(
@@ -594,6 +611,23 @@ mod ffi {
             o: *mut c_void,
             stream: *mut c_void,
         ) -> i32;
+        pub fn gb_gdn_prefill_ref_hv32(
+            qkv: *const c_void,
+            a: *const c_void,
+            b: *const c_void,
+            conv_w: *const c_void,
+            a_log: *const f32,
+            dt_bias: *const f32,
+            s: *mut f32,
+            conv_pool: *mut c_void,
+            seq_start: *const i32,
+            slot: *const i32,
+            n_seq: i32,
+            rows: i32,
+            workspace: *mut c_void,
+            o: *mut c_void,
+            stream: *mut c_void,
+        ) -> i32;
         // the same launchers built for 64 value heads (csrc/gdn_hv64.cu)
         pub fn gb_gdn_pre_hv64(
             qkv: *const c_void,
@@ -761,6 +795,23 @@ mod ffi {
         ) -> i32;
         pub fn gb_gdn_prefill_workspace_bytes_hv64(rows: i32) -> usize;
         pub fn gb_gdn_prefill_hv64(
+            qkv: *const c_void,
+            a: *const c_void,
+            b: *const c_void,
+            conv_w: *const c_void,
+            a_log: *const f32,
+            dt_bias: *const f32,
+            s: *mut f32,
+            conv_pool: *mut c_void,
+            seq_start: *const i32,
+            slot: *const i32,
+            n_seq: i32,
+            rows: i32,
+            workspace: *mut c_void,
+            o: *mut c_void,
+            stream: *mut c_void,
+        ) -> i32;
+        pub fn gb_gdn_prefill_ref_hv64(
             qkv: *const c_void,
             a: *const c_void,
             b: *const c_void,
@@ -1427,13 +1478,51 @@ pub fn prefill_shaped(
     ws: &mut DevBuf,
     o: &mut DevBuf,
 ) -> Result<(), CudaError> {
+    prefill_launch(false, shape, stream, x, w, s_pool, conv_pool, batch, ws, o)
+}
+
+/// [`prefill_shaped`] through the one-value-row-a-thread chain kernel the two-rows-a-thread kernel replaced. Only the tests call it: the two must
+/// agree bit for bit, outputs and recurrent state.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_ref_shaped(
+    shape: GdnShape,
+    stream: &Stream,
+    x: &PreInputs,
+    w: &PreWeights,
+    s_pool: &mut DevBuf,
+    conv_pool: &mut DevBuf,
+    batch: &Batch<'_>,
+    ws: &mut DevBuf,
+    o: &mut DevBuf,
+) -> Result<(), CudaError> {
+    prefill_launch(true, shape, stream, x, w, s_pool, conv_pool, batch, ws, o)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prefill_launch(
+    reference: bool,
+    shape: GdnShape,
+    stream: &Stream,
+    x: &PreInputs,
+    w: &PreWeights,
+    s_pool: &mut DevBuf,
+    conv_pool: &mut DevBuf,
+    batch: &Batch<'_>,
+    ws: &mut DevBuf,
+    o: &mut DevBuf,
+) -> Result<(), CudaError> {
     check_inputs(shape, x, batch.rows);
     check_pre_weights(shape, w);
     need(o, batch.rows * shape.v_dim() * 2, "o");
     need(ws, prefill_workspace_bytes_shaped(shape, batch.rows), "workspace");
     check_pools(shape, batch, s_pool, conv_pool);
+    let run = if reference {
+        launcher!(shape, gb_gdn_prefill_ref, gb_gdn_prefill_ref_hv32, gb_gdn_prefill_ref_hv64)
+    } else {
+        launcher!(shape, gb_gdn_prefill, gb_gdn_prefill_hv32, gb_gdn_prefill_hv64)
+    };
     let rc = unsafe {
-        launcher!(shape, gb_gdn_prefill, gb_gdn_prefill_hv32, gb_gdn_prefill_hv64)(
+        run(
             x.qkv.ptr(),
             x.a.ptr(),
             x.b.ptr(),

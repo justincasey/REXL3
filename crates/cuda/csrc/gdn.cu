@@ -586,6 +586,167 @@ __global__ void __launch_bounds__(TPR * ROWS) chain_kernel(
         *reinterpret_cast<float4*>(sp + 4 * (TPR * j + part)) = make_float4(s[4 * j], s[4 * j + 1], s[4 * j + 2], s[4 * j + 3]);
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// The prefill chain with two value rows a thread. Every row's arithmetic is chain_kernel's, operation for operation: the same state
+// elements in the same registers' roles, the same fmaf chains over the same key chunks (chunk TPR * j + part), the same
+// (m0 + m1) + (m2 + m3) and xor-shuffle sums over the TPR parts, the same bf16 rounding of the result; a thread just carries two
+// independent rows (2r and 2r + 1 of its pair) through each step, so the key and query chunks it reads from shared memory serve both.
+// chain_kernel is bound by shared memory wavefronts (a 16-byte broadcast read costs four however few addresses it covers): with one row a
+// thread each row-step pays 24 of them for the key (twice) and query chunks; with two rows, 12. The step's tile (STEPS keys, queries, values
+// and gates) is double buffered: the next tile's global loads are issued before the current tile's steps and stored into the other buffer
+// after them, so a tile costs one barrier and no exposed load latency.
+// ---------------------------------------------------------------------------------------------------------------
+template <int ROWS, int TPR, int STEPS>
+__global__ void __launch_bounds__(TPR * ROWS / 2) chain_rows_kernel(
+        const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+        const float* __restrict__ g, const float* __restrict__ beta, float* S, const int* __restrict__ seq_start,
+        const int* __restrict__ slot, __nv_bfloat16* __restrict__ o) {
+    constexpr int NT = TPR * ROWS / 2;  // threads per block: TPR threads a row pair
+    constexpr int J = 32 / TPR;         // float4 chunks of a key row each thread owns (chunk index TPR*j + part)
+    constexpr int KI = STEPS * 32 / NT;  // key (and query) chunk items a thread stages per tile
+    constexpr int VI = STEPS * (ROWS / 2) / NT;  // value pairs a thread stages per tile
+    static_assert(TPR == 4 && ROWS == 64 && STEPS * 32 % NT == 0 && STEPS * (ROWS / 2) % NT == 0 && NT == 128 && STEPS <= 32,
+                  "the staging maps below are built for 128 threads, 64 rows and 4 threads a row pair");
+    __shared__ float4 ks[2][STEPS][DK / 4], qs[2][STEPS][DK / 4];
+    __shared__ unsigned vs[2][STEPS][ROWS / 2];  // two bf16 values (rows 2p, 2p + 1) a word
+    __shared__ float gs[2][STEPS], bs[2][STEPS];
+    const int head = blockIdx.x, seq = blockIdx.z;
+    const int begin = seq_start[seq], W = seq_start[seq + 1] - begin;
+    if (W <= 0) return;
+    const int row0 = blockIdx.y * ROWS, pair = threadIdx.x / TPR, part = threadIdx.x % TPR;
+    const int key_head = head / (HV / HK);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    float s[2][4 * J];
+    float* sp0 = S + (size_t)slot[seq] * S_SLOT + ((size_t)head * DK + row0 + 2 * pair) * DK;
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+#pragma unroll
+        for (int j = 0; j < J; ++j) {
+            const float4 t = *reinterpret_cast<const float4*>(sp0 + (size_t)r * DK + 4 * (TPR * j + part));
+            s[r][4 * j] = t.x; s[r][4 * j + 1] = t.y; s[r][4 * j + 2] = t.z; s[r][4 * j + 3] = t.w;
+        }
+    }
+    // tile t0's global loads into registers (steps past the sequence's end read nothing), then their conversion into buffer `buf`
+    uint2 kraw[KI], qraw[KI];
+    unsigned vraw[VI];
+    float gb = 0.0f;
+    auto load_tile = [&](int t0) {
+        const int n = min(STEPS, W - t0);
+#pragma unroll
+        for (int u = 0; u < KI; ++u) {
+            const int st = warp + (NT / 32) * u;
+            if (st < n) {
+                const size_t at = ((size_t)(begin + t0 + st) * HK + key_head) * DK + 4 * lane;
+                kraw[u] = *reinterpret_cast<const uint2*>(k + at);
+                qraw[u] = *reinterpret_cast<const uint2*>(q + at);
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < VI; ++u) {
+            const int st = warp + (NT / 32) * u;
+            if (st < n) vraw[u] = *reinterpret_cast<const unsigned*>(v + ((size_t)(begin + t0 + st) * HV + head) * DK + row0 + 2 * lane);
+        }
+        if (threadIdx.x < n) gb = g[(size_t)(begin + t0 + threadIdx.x) * HV + head];
+        else if (threadIdx.x >= 32 && threadIdx.x < 32 + n) gb = beta[(size_t)(begin + t0 + threadIdx.x - 32) * HV + head];
+    };
+    auto store_tile = [&](int t0, int buf) {
+        const int n = min(STEPS, W - t0);
+#pragma unroll
+        for (int u = 0; u < KI; ++u) {
+            const int st = warp + (NT / 32) * u;
+            if (st < n) {
+                const __nv_bfloat162 ka = *reinterpret_cast<const __nv_bfloat162*>(&kraw[u].x), kb = *reinterpret_cast<const __nv_bfloat162*>(&kraw[u].y);
+                const __nv_bfloat162 qa = *reinterpret_cast<const __nv_bfloat162*>(&qraw[u].x), qb = *reinterpret_cast<const __nv_bfloat162*>(&qraw[u].y);
+                ks[buf][st][lane] = make_float4(__low2float(ka), __high2float(ka), __low2float(kb), __high2float(kb));
+                qs[buf][st][lane] = make_float4(__low2float(qa), __high2float(qa), __low2float(qb), __high2float(qb));
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < VI; ++u) {
+            const int st = warp + (NT / 32) * u;
+            if (st < n) vs[buf][st][lane] = vraw[u];
+        }
+        if (threadIdx.x < n) gs[buf][threadIdx.x] = gb;
+        else if (threadIdx.x >= 32 && threadIdx.x < 32 + n) bs[buf][threadIdx.x - 32] = gb;
+    };
+    load_tile(0);
+    store_tile(0, 0);
+    __syncthreads();
+    for (int t0 = 0, buf = 0; t0 < W; t0 += STEPS, buf ^= 1) {
+        const int n = min(STEPS, W - t0);
+        const bool more = t0 + STEPS < W;
+        if (more) load_tile(t0 + STEPS);
+#pragma unroll 8
+        for (int tt = 0; tt < n; ++tt) {
+            const float gt = gs[buf][tt], bt = bs[buf][tt];
+            const unsigned vw = vs[buf][tt][pair];
+            const float vt[2] = {__uint_as_float(vw << 16), __uint_as_float(vw & 0xffff0000u)};
+            float m[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};
+#pragma unroll
+            for (int j = 0; j < J; ++j) {
+                const float4 kk = ks[buf][tt][TPR * j + part];
+#pragma unroll
+                for (int r = 0; r < 2; ++r) {
+                    s[r][4 * j] = s[r][4 * j] * gt;
+                    s[r][4 * j + 1] = s[r][4 * j + 1] * gt;
+                    s[r][4 * j + 2] = s[r][4 * j + 2] * gt;
+                    s[r][4 * j + 3] = s[r][4 * j + 3] * gt;
+                    m[r][0] = __fmaf_rn(s[r][4 * j], kk.x, m[r][0]);
+                    m[r][1] = __fmaf_rn(s[r][4 * j + 1], kk.y, m[r][1]);
+                    m[r][2] = __fmaf_rn(s[r][4 * j + 2], kk.z, m[r][2]);
+                    m[r][3] = __fmaf_rn(s[r][4 * j + 3], kk.w, m[r][3]);
+                }
+            }
+            float mem[2], delta[2];
+#pragma unroll
+            for (int r = 0; r < 2; ++r) mem[r] = (m[r][0] + m[r][1]) + (m[r][2] + m[r][3]);
+#pragma unroll
+            for (int d = 1; d < TPR; d <<= 1) {
+#pragma unroll
+                for (int r = 0; r < 2; ++r) mem[r] = mem[r] + __shfl_xor_sync(0xffffffffu, mem[r], d);
+            }
+#pragma unroll
+            for (int r = 0; r < 2; ++r) delta[r] = (vt[r] - mem[r]) * bt;
+            float oo[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};
+#pragma unroll
+            for (int j = 0; j < J; ++j) {
+                const float4 kk = ks[buf][tt][TPR * j + part], qq = qs[buf][tt][TPR * j + part];
+#pragma unroll
+                for (int r = 0; r < 2; ++r) {
+                    s[r][4 * j] = __fmaf_rn(kk.x, delta[r], s[r][4 * j]);
+                    s[r][4 * j + 1] = __fmaf_rn(kk.y, delta[r], s[r][4 * j + 1]);
+                    s[r][4 * j + 2] = __fmaf_rn(kk.z, delta[r], s[r][4 * j + 2]);
+                    s[r][4 * j + 3] = __fmaf_rn(kk.w, delta[r], s[r][4 * j + 3]);
+                    oo[r][0] = __fmaf_rn(s[r][4 * j], qq.x, oo[r][0]);
+                    oo[r][1] = __fmaf_rn(s[r][4 * j + 1], qq.y, oo[r][1]);
+                    oo[r][2] = __fmaf_rn(s[r][4 * j + 2], qq.z, oo[r][2]);
+                    oo[r][3] = __fmaf_rn(s[r][4 * j + 3], qq.w, oo[r][3]);
+                }
+            }
+            float out[2];
+#pragma unroll
+            for (int r = 0; r < 2; ++r) out[r] = (oo[r][0] + oo[r][1]) + (oo[r][2] + oo[r][3]);
+#pragma unroll
+            for (int d = 1; d < TPR; d <<= 1) {
+#pragma unroll
+                for (int r = 0; r < 2; ++r) out[r] = out[r] + __shfl_xor_sync(0xffffffffu, out[r], d);
+            }
+            if (part == 0)
+                *reinterpret_cast<__nv_bfloat162*>(o + ((size_t)(begin + t0 + tt) * HV + head) * DK + row0 + 2 * pair) =
+                    __floats2bfloat162_rn(out[0], out[1]);
+        }
+        if (more) store_tile(t0 + STEPS, buf ^ 1);
+        __syncthreads();
+    }
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+#pragma unroll
+        for (int j = 0; j < J; ++j)
+            *reinterpret_cast<float4*>(sp0 + (size_t)r * DK + 4 * (TPR * j + part)) =
+                make_float4(s[r][4 * j], s[r][4 * j + 1], s[r][4 * j + 2], s[r][4 * j + 3]);
+    }
+}
+
 constexpr int PF_ROWS = 64;   // value rows per block
 constexpr int PF_TPR = 4;     // threads per value row
 constexpr int PF_STEPS = 16;  // steps staged in shared memory per round
@@ -753,9 +914,9 @@ GB_EXPORT int GB_GDN_EXPORT(gb_gdn_commit_conv_rows)(const void* qkv, void* conv
 
 GB_EXPORT size_t GB_GDN_EXPORT(gb_gdn_prefill_workspace_bytes)(int rows) { return PrefillWs((size_t)(rows > 0 ? rows : 0)).total; }
 
-GB_EXPORT int GB_GDN_EXPORT(gb_gdn_prefill)(const void* qkv, const void* a, const void* b, const void* conv_w, const float* a_log,
-                             const float* dt_bias, float* S, void* conv_pool, const int* seq_start, const int* slot,
-                             int n_seq, int rows, void* workspace, void* o, void* stream) {
+static int prefill_launch(bool one_row_a_thread, const void* qkv, const void* a, const void* b, const void* conv_w, const float* a_log,
+                          const float* dt_bias, float* S, void* conv_pool, const int* seq_start, const int* slot, int n_seq, int rows,
+                          void* workspace, void* o, void* stream) {
     if (rows <= 0 || n_seq <= 0) return 0;
     cudaStream_t st = gb_stream(stream);
     const PrefillWs w((size_t)rows);
@@ -766,11 +927,29 @@ GB_EXPORT int GB_GDN_EXPORT(gb_gdn_prefill)(const void* qkv, const void* a, cons
                         (const __nv_bfloat16*)conv_w, a_log, dt_bias, (const __nv_bfloat16*)conv_pool, seq_start, slot,
                         n_seq, rows, q, k, v, g, beta, st);
     if (rc) return rc;
-    chain_kernel<PF_ROWS, PF_TPR, PF_STEPS><<<dim3(HV, DK / PF_ROWS, n_seq), PF_TPR * PF_ROWS, 0, st>>>(q, k, v, g, beta, S, seq_start, slot,
-                                                                            (__nv_bfloat16*)o);
+    if (one_row_a_thread) {
+        chain_kernel<PF_ROWS, PF_TPR, PF_STEPS><<<dim3(HV, DK / PF_ROWS, n_seq), PF_TPR * PF_ROWS, 0, st>>>(
+            q, k, v, g, beta, S, seq_start, slot, (__nv_bfloat16*)o);
+    } else {
+        chain_rows_kernel<PF_ROWS, PF_TPR, PF_STEPS><<<dim3(HV, DK / PF_ROWS, n_seq), PF_TPR * PF_ROWS / 2, 0, st>>>(
+            q, k, v, g, beta, S, seq_start, slot, (__nv_bfloat16*)o);
+    }
     rc = GB_CHECK_LAUNCH();
     if (rc) return rc;
     conv_commit_kernel<<<dim3(CONV / 256, n_seq), 256, 0, st>>>((const __nv_bfloat16*)qkv, (__nv_bfloat16*)conv_pool,
                                                                 seq_start, slot, nullptr, nullptr, 0);
     return GB_CHECK_LAUNCH();
+}
+
+GB_EXPORT int GB_GDN_EXPORT(gb_gdn_prefill)(const void* qkv, const void* a, const void* b, const void* conv_w, const float* a_log,
+                             const float* dt_bias, float* S, void* conv_pool, const int* seq_start, const int* slot,
+                             int n_seq, int rows, void* workspace, void* o, void* stream) {
+    return prefill_launch(false, qkv, a, b, conv_w, a_log, dt_bias, S, conv_pool, seq_start, slot, n_seq, rows, workspace, o, stream);
+}
+
+// gb_gdn_prefill with the one-row-a-thread chain kernel it replaced: the reference the tests compare against bit for bit.
+GB_EXPORT int GB_GDN_EXPORT(gb_gdn_prefill_ref)(const void* qkv, const void* a, const void* b, const void* conv_w, const float* a_log,
+                             const float* dt_bias, float* S, void* conv_pool, const int* seq_start, const int* slot,
+                             int n_seq, int rows, void* workspace, void* o, void* stream) {
+    return prefill_launch(true, qkv, a, b, conv_w, a_log, dt_bias, S, conv_pool, seq_start, slot, n_seq, rows, workspace, o, stream);
 }
