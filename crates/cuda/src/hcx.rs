@@ -27,6 +27,27 @@ mod ffi {
             inj_out: *mut f32, scratch: *mut c_void, hidden_size: u32, hc_mult: u32, rank: u32, eps: f32,
             num_tokens: u32, stream: *mut c_void,
         ) -> i32;
+        pub fn gb_hcx_pre_pk(
+            streams: *const c_void, hc_norm_w: *const c_void, down_w: *const c_void, up_w: *const c_void,
+            inject_w: *const c_void, y_out: *mut c_void, inj_out: *mut f32, scratch: *mut c_void,
+            hidden_size: u32, hc_mult: u32, rank: u32, eps: f32, num_tokens: u32, stream: *mut c_void,
+            pk_down: *const c_void, pk_inj: *const c_void, pk_up: *const c_void,
+        ) -> i32;
+        pub fn gb_hcx_pre_post_pk(
+            streams: *mut c_void, block_out: *const c_void, inj_prev: *const f32, hc_norm_w: *const c_void,
+            down_w: *const c_void, up_w: *const c_void, inject_w: *const c_void, y_out: *mut c_void,
+            inj_out: *mut f32, scratch: *mut c_void, hidden_size: u32, hc_mult: u32, rank: u32, eps: f32,
+            num_tokens: u32, stream: *mut c_void, pk_down: *const c_void, pk_inj: *const c_void, pk_up: *const c_void,
+        ) -> i32;
+        pub fn gb_hcx_pk_job_bytes() -> usize;
+        pub fn gb_hcx_pk2_job_bytes() -> usize;
+        pub fn gb_hcx_pk2_pack(w: *const c_void, h: i32, eh0: i32, out: *mut c_void, stream: *mut c_void) -> i32;
+        pub fn gb_hcx_pk2_check(w: *const c_void, packed: *const c_void, h: i32, bad: *mut u64, stream: *mut c_void) -> i32;
+        pub fn gb_hcx_pk_scan(w: *const c_void, n: usize, st: *mut i32, stream: *mut c_void) -> i32;
+        pub fn gb_hcx_pk1_pack(w: *const c_void, rows: i32, h: i32, eh0: i32, out: *mut c_void, stream: *mut c_void) -> i32;
+        pub fn gb_hcx_pk1_check(
+            w: *const c_void, packed: *const c_void, rows: i32, h: i32, bad: *mut u64, stream: *mut c_void,
+        ) -> i32;
         pub fn gb_hcx_pre_ref(
             streams: *const c_void, hc_norm_w: *const c_void, down_w: *const c_void, up_w: *const c_void,
             inject_w: *const c_void, y_out: *mut c_void, inj_out: *mut f32, scratch: *mut c_void,
@@ -182,6 +203,224 @@ pub fn pre_post(
             eps,
             rows as u32,
             st.raw(),
+        )
+    })
+}
+
+/// A mixer's down, inject and up rows in the 13-bit packed layout of `csrc/hcx_pk.cuh`: the fp16 weights are bf16 numbers, so a raw byte and
+/// a five-bit code hold each one exactly and the decode kernels stream 18.75% fewer bytes. The decoded floats are the fp16 weights
+/// widened, so [`pre_packed`] and [`pre_post_packed`] give the bits [`pre`] and [`pre_post`] give. Made by [`pack_mixer`], which checks every
+/// weight with the decode the kernel runs before it hands the buffers out. `inj` is absent for a head collapse (no inject rows).
+pub struct Packed {
+    down: DevBuf,
+    inj: Option<DevBuf>,
+    up: DevBuf,
+}
+
+impl Packed {
+    /// Device bytes of the packed copy.
+    pub fn bytes(&self) -> usize {
+        self.down.bytes() + self.inj.as_ref().map_or(0, DevBuf::bytes) + self.up.bytes()
+    }
+}
+
+/// The shapes the packed kernels cover (the Flash-Next family: hidden size 2,560, four streams, low rank 320).
+pub fn packable(h: usize, hc: usize, rank: usize) -> bool {
+    h == 2560 && hc == 4 && rank == 320
+}
+
+/// Device bytes [`pack_mixer`] allocates for a mixer of this shape (`inject`: with the `hc` inject rows), so a memory plan can account for
+/// them before the weights are loaded. Zero when the shape has no packed form.
+pub fn packed_plan_bytes(h: usize, hc: usize, rank: usize, inject: bool) -> usize {
+    if !packable(h, hc, rank) {
+        return 0;
+    }
+    let (job1, job2) = unsafe { (ffi::gb_hcx_pk_job_bytes(), ffi::gb_hcx_pk2_job_bytes()) };
+    const LUT: usize = 4096;
+    hc * (rank / 4) * job1 + LUT + if inject { hc * job1 + LUT } else { 0 } + (h / 4) * job2 + LUT
+}
+
+/// Which rows a tensor holds: the down / inject rows `[rows][4 * 2,560]` (k1p) or the up rows `[4 * 2,560][320]` (k2tp).
+#[derive(Clone, Copy, PartialEq)]
+enum Rows {
+    Down(usize),
+    Up,
+}
+
+/// One tensor of fp16 into the packed layout: the buffer (the jobs, then the tensor's 4,096-byte table); `None` when a value cannot be held
+/// (more than 7 mantissa bits, a non-finite value, an exponent-pair span past 15) or the packed copy does not decode to the weight.
+fn pack_one(w: &DevBuf, kind: Rows, st: &Stream) -> Result<Option<DevBuf>, CudaError> {
+    let h = 2560usize;
+    let n = match kind {
+        Rows::Down(rows) => rows * 4 * h,
+        Rows::Up => 4 * h * 320,
+    };
+    need(w, n * 2, "hcx pack weight")?;
+    let stats = DevBuf::from_slice(&[i32::MAX, i32::MIN, 0i32])?;
+    crate::rt::device_sync()?;
+    CudaError::check(unsafe { ffi::gb_hcx_pk_scan(w.ptr(), n, stats.ptr() as *mut i32, st.raw()) })?;
+    st.sync()?;
+    let mut s = [0i32; 3];
+    stats.download(&mut s)?;
+    if s[2] != 0 || s[0] > s[1] || s[1] - s[0] + 1 > 15 {
+        return Ok(None);
+    }
+    let eh0 = s[0];
+    let jobs_bytes = unsafe {
+        match kind {
+            Rows::Down(rows) => 4 * (rows / 4) * ffi::gb_hcx_pk_job_bytes(),
+            Rows::Up => (h / 4) * ffi::gb_hcx_pk2_job_bytes(),
+        }
+    };
+    let out = DevBuf::zeroed(jobs_bytes + 4096)?;
+    let bad = DevBuf::zeroed(8)?;
+    crate::rt::device_sync()?;
+    unsafe {
+        match kind {
+            Rows::Down(rows) => {
+                CudaError::check(ffi::gb_hcx_pk1_pack(w.ptr(), rows as i32, h as i32, eh0, out.ptr(), st.raw()))?;
+                CudaError::check(ffi::gb_hcx_pk1_check(w.ptr(), out.ptr(), rows as i32, h as i32, bad.ptr() as *mut u64, st.raw()))?;
+            }
+            Rows::Up => {
+                CudaError::check(ffi::gb_hcx_pk2_pack(w.ptr(), h as i32, eh0, out.ptr(), st.raw()))?;
+                CudaError::check(ffi::gb_hcx_pk2_check(w.ptr(), out.ptr(), h as i32, bad.ptr() as *mut u64, st.raw()))?;
+            }
+        }
+    }
+    st.sync()?;
+    let mut miss = [0u64; 1];
+    bad.download(&mut miss)?;
+    Ok((miss[0] == 0).then_some(out))
+}
+
+/// The packed copy of a pre-mix's rows for the Flash-Next shape (see [`packable`]) when every tensor passes [`pack_one`]; `None`
+/// otherwise (the fp16 weights then serve every call). Run at load, after the weights have landed on the device.
+pub fn pack_mixer(mix: &Mixer<'_>, h: usize, hc: usize, rank: usize) -> Result<Option<Packed>, CudaError> {
+    if !packable(h, hc, rank) {
+        return Ok(None);
+    }
+    mix.check(h, hc, rank, "hcx pack")?;
+    let st = Stream::new()?;
+    let Some(down) = pack_one(mix.down, Rows::Down(rank), &st)? else { return Ok(None) };
+    let inj = match mix.inject {
+        Some(inject) => match pack_one(inject, Rows::Down(hc), &st)? {
+            Some(buf) => Some(buf),
+            None => return Ok(None),
+        },
+        None => None,
+    };
+    let Some(up) = pack_one(mix.up, Rows::Up, &st)? else { return Ok(None) };
+    Ok(Some(Packed { down, inj, up }))
+}
+
+/// [`pre`] on the packed copy of `mix`'s rows (`mix.inject` and `inj_out` as in [`pre`]): the same bits.
+pub fn pre_packed(
+    streams: &DevBuf,
+    mix: &Mixer<'_>,
+    packed: &Packed,
+    y_out: &mut DevBuf,
+    inj_out: Option<&mut DevBuf>,
+    scratch: &mut DevBuf,
+    h: usize,
+    hc: usize,
+    rank: usize,
+    eps: f32,
+    rows: usize,
+    st: &Stream,
+) -> Result<(), CudaError> {
+    if mix.inject.is_some() != inj_out.is_some() || mix.inject.is_some() != packed.inj.is_some() || !packable(h, hc, rank) {
+        eprintln!("rexl3 level=error launch contract: hcx packed pre-mix needs the Flash-Next shape and inject rows, inj_out and the packed inject rows together");
+        return Err(CudaError(1));
+    }
+    mix.check(h, hc, rank, "hcx")?;
+    need(streams, rows * hc * h * 4, "hcx streams")?;
+    need(y_out, rows * h * 2, "hcx y")?;
+    let yp = y_out.ptr();
+    let ip = match inj_out {
+        Some(b) => {
+            need(b, rows * hc * 4, "hcx inj")?;
+            b.ptr() as *mut f32
+        }
+        None => core::ptr::null_mut(),
+    };
+    need(scratch, scratch_bytes(hc, rank), "hcx scratch")?;
+    let sp = scratch.ptr();
+    let inj_w = mix.inject.map_or(core::ptr::null(), |b| b.ptr());
+    CudaError::check(unsafe {
+        ffi::gb_hcx_pre_pk(
+            streams.ptr(),
+            mix.norm.ptr(),
+            mix.down.ptr(),
+            mix.up.ptr(),
+            inj_w,
+            yp,
+            ip,
+            sp,
+            h as u32,
+            hc as u32,
+            rank as u32,
+            eps,
+            rows as u32,
+            st.raw(),
+            packed.down.ptr(),
+            packed.inj.as_ref().map_or(core::ptr::null(), |b| b.ptr()),
+            packed.up.ptr(),
+        )
+    })
+}
+
+/// [`pre_post`] on the packed copy of `mix`'s rows: the same bits.
+pub fn pre_post_packed(
+    streams: &mut DevBuf,
+    block_out: &DevBuf,
+    inj_prev: &DevBuf,
+    mix: &Mixer<'_>,
+    packed: &Packed,
+    y_out: &mut DevBuf,
+    inj_out: &mut DevBuf,
+    scratch: &mut DevBuf,
+    h: usize,
+    hc: usize,
+    rank: usize,
+    eps: f32,
+    rows: usize,
+    st: &Stream,
+) -> Result<(), CudaError> {
+    if mix.inject.is_none() || packed.inj.is_none() || !pre_post_foldable(h, hc, rank) || !packable(h, hc, rank) {
+        eprintln!("rexl3 level=error launch contract: hcx packed pre_post needs the Flash-Next shape and the packed inject rows");
+        return Err(CudaError(1));
+    }
+    mix.check(h, hc, rank, "hcx")?;
+    need(streams, rows * hc * h * 4, "hcx streams")?;
+    need(block_out, rows * h * 2, "hcx post block_out")?;
+    need(inj_prev, rows * hc * 4, "hcx post inj")?;
+    need(y_out, rows * h * 2, "hcx y")?;
+    let yp = y_out.ptr();
+    need(inj_out, rows * hc * 4, "hcx inj")?;
+    let ip = inj_out.ptr() as *mut f32;
+    need(scratch, scratch_bytes(hc, rank), "hcx scratch")?;
+    let sp = scratch.ptr();
+    CudaError::check(unsafe {
+        ffi::gb_hcx_pre_post_pk(
+            streams.ptr(),
+            block_out.ptr(),
+            inj_prev.ptr() as *const f32,
+            mix.norm.ptr(),
+            mix.down.ptr(),
+            mix.up.ptr(),
+            mix.inject.map_or(core::ptr::null(), |b| b.ptr()),
+            yp,
+            ip,
+            sp,
+            h as u32,
+            hc as u32,
+            rank as u32,
+            eps,
+            rows as u32,
+            st.raw(),
+            packed.down.ptr(),
+            packed.inj.as_ref().map_or(core::ptr::null(), |b| b.ptr()),
+            packed.up.ptr(),
         )
     })
 }

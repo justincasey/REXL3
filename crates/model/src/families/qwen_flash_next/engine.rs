@@ -144,6 +144,16 @@ fn draft_head_plan_bytes(
     Ok(super::model::draft_head_prefix_bytes(h.k, nv, bits) as u64)
 }
 
+/// The bytes `FlashNextWeights::pack_hcx` adds on top of the checkpoint's fp16 mixers: a 13-bit packed copy of every hyper-connection
+/// mixer (two a layer, the MTP layer's two, and the head collapse mixers). A mixer that fails its check keeps no copy, so the plan
+/// is the upper bound.
+fn hcx_pack_plan_bytes(cfg: &FlashNextConfig, with_mtp: bool) -> u64 {
+    let (h, hc, rank) = (cfg.hidden, cfg.hc_streams, cfg.hc_lowrank);
+    let layers = cfg.layers + if with_mtp { cfg.mtp_layers } else { 0 };
+    let heads = 1 + usize::from(with_mtp);
+    (2 * layers * gb_cuda::hcx::packed_plan_bytes(h, hc, rank, true) + heads * gb_cuda::hcx::packed_plan_bytes(h, hc, rank, false)) as u64
+}
+
 /// Device memory left for the KV plan after the loaded weights are deducted from the
 /// planning figure (used by the 262K plan before the pool is sized).
 fn free_after_load(cuda_free: u64, host: Option<&MemInfo>, weights: u64) -> u64 {
@@ -347,6 +357,11 @@ pub fn build_engine(o: &ServeOptions) -> Result<Engine<FlashNextBackend>, ModelE
         weight_bytes =
             weight_bytes.checked_add(extra).ok_or_else(|| ModelError::Config("prefix-head accounting overflow".into()))?;
         eprintln!("rexl3 event=mtp_exact_prefix_plan extra_bytes={extra}");
+    }
+    if super::device::hcx_pack_enabled() {
+        let extra = hcx_pack_plan_bytes(&cfg, with_mtp);
+        weight_bytes = weight_bytes.checked_add(extra).ok_or_else(|| ModelError::Config("packed mixer accounting overflow".into()))?;
+        eprintln!("rexl3 event=hcx_pack_plan extra_bytes={extra}");
     }
     let host = MemInfo::read();
     let want_warm = mode != WarmMode::Off

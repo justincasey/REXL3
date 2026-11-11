@@ -2165,7 +2165,7 @@ impl FlashNextModel {
     /// fused one is checked against), so neither can make a chunk's bits depend on its row count; the arm is fixed for
     /// the whole process, never chosen per call. For tiled prefill with the hcg switch on (`hcx::pre_gemm`), the two
     /// low-rank products run as tensor-core GEMMs on fp16 operands; everything else keeps the fp32 `hcx::pre`.
-    fn pre_mix(&mut self, mix: &Mixer<'_>, attn: bool, mode: Mode, rows: usize) -> Result<(), ModelError> {
+    fn pre_mix(&mut self, mix: &Mixer<'_>, packed: Option<&hcx::Packed>, attn: bool, mode: Mode, rows: usize) -> Result<(), ModelError> {
         let (h, hc, rank) = (self.cfg.hidden, self.cfg.hc_streams, self.cfg.hc_lowrank);
         // the previous block's post-inject: fused into the pre-mix's norm pass where hcg takes it, a launch of its own otherwise
         let post = self.pending_post.take();
@@ -2220,8 +2220,40 @@ impl FlashNextModel {
                 }
             } else {
                 let s = &mut self.hcx_scratch;
-                match folded {
-                    Some(PostKind::Attn) => hcx::pre_post(
+                match (folded, packed) {
+                    (Some(PostKind::Attn), Some(pk)) => hcx::pre_post_packed(
+                        &mut self.x_streams,
+                        &self.block_out,
+                        &self.inj_attn,
+                        mix,
+                        pk,
+                        &mut self.x_mixed,
+                        &mut self.inj_mlp,
+                        s,
+                        h,
+                        hc,
+                        rank,
+                        EPS,
+                        rows,
+                        &self.stream,
+                    )?,
+                    (Some(PostKind::Mlp), Some(pk)) => hcx::pre_post_packed(
+                        &mut self.x_streams,
+                        &self.moe_out,
+                        &self.inj_mlp,
+                        mix,
+                        pk,
+                        &mut self.x_mixed,
+                        &mut self.inj_attn,
+                        s,
+                        h,
+                        hc,
+                        rank,
+                        EPS,
+                        rows,
+                        &self.stream,
+                    )?,
+                    (Some(PostKind::Attn), None) => hcx::pre_post(
                         &mut self.x_streams,
                         &self.block_out,
                         &self.inj_attn,
@@ -2236,7 +2268,7 @@ impl FlashNextModel {
                         rows,
                         &self.stream,
                     )?,
-                    Some(PostKind::Mlp) => hcx::pre_post(
+                    (Some(PostKind::Mlp), None) => hcx::pre_post(
                         &mut self.x_streams,
                         &self.moe_out,
                         &self.inj_mlp,
@@ -2251,7 +2283,11 @@ impl FlashNextModel {
                         rows,
                         &self.stream,
                     )?,
-                    None => {
+                    (None, Some(pk)) => {
+                        let inj = if attn { &mut self.inj_attn } else { &mut self.inj_mlp };
+                        hcx::pre_packed(&self.x_streams, mix, pk, &mut self.x_mixed, Some(inj), s, h, hc, rank, EPS, rows, &self.stream)?;
+                    }
+                    (None, None) => {
                         let inj = if attn { &mut self.inj_attn } else { &mut self.inj_mlp };
                         hcx::pre(&self.x_streams, mix, &mut self.x_mixed, Some(inj), s, h, hc, rank, EPS, rows, &self.stream)?;
                     }
@@ -2285,7 +2321,7 @@ impl FlashNextModel {
     }
 
     /// Collapse the stream stack into `x_mixed` through `mix` (no inject rows).
-    fn collapse(&mut self, mix: &Mixer<'_>, mode: Mode, rows: usize) -> Result<(), ModelError> {
+    fn collapse(&mut self, mix: &Mixer<'_>, packed: Option<&hcx::Packed>, mode: Mode, rows: usize) -> Result<(), ModelError> {
         let (h, hc, rank) = (self.cfg.hidden, self.cfg.hc_streams, self.cfg.hc_lowrank);
         if self.fast {
             if hcg_for_mode(self.hcg && self.hcg_scratch.is_some(), mode) {
@@ -2293,7 +2329,10 @@ impl FlashNextModel {
                 hcx::pre_gemm(&self.x_streams, mix, &mut self.x_mixed, None, s, h, hc, rank, EPS, rows, &self.stream)?;
             } else {
                 let s = &mut self.hcx_scratch;
-                hcx::pre(&self.x_streams, mix, &mut self.x_mixed, None, s, h, hc, rank, EPS, rows, &self.stream)?;
+                match packed {
+                    Some(p) => hcx::pre_packed(&self.x_streams, mix, p, &mut self.x_mixed, None, s, h, hc, rank, EPS, rows, &self.stream)?,
+                    None => hcx::pre(&self.x_streams, mix, &mut self.x_mixed, None, s, h, hc, rank, EPS, rows, &self.stream)?,
+                }
             }
         } else {
             let scratch = PreScratch { normed: &mut self.x_normed, low: &mut self.low_buf };
@@ -2322,7 +2361,7 @@ impl FlashNextModel {
         let window = mode == Mode::Window;
 
         // 1. attention hyper-connection pre-mix
-        self.pre_mix(&layer.attn_hc.mixer(), true, mode, rows)?;
+        self.pre_mix(&layer.attn_hc.mixer(), layer.attn_hc.packed.as_ref(), true, mode, rows)?;
 
         // 2. the mixer: a gated delta net or grouped-query attention
         match &layer.mixer {
@@ -2568,7 +2607,7 @@ impl FlashNextModel {
         self.pending_post = Some(PostKind::Attn);
 
         // 4. MLP hyper-connection pre-mix
-        self.pre_mix(&layer.mlp_hc.mixer(), false, mode, rows)?;
+        self.pre_mix(&layer.mlp_hc.mixer(), layer.mlp_hc.packed.as_ref(), false, mode, rows)?;
 
         // 5. router and shared-expert gate: per row on every path, so a chunk's routing never depends on its row count
         let st = &self.stream;
@@ -2697,7 +2736,7 @@ impl FlashNextModel {
         let w = Arc::clone(&self.w);
         self.run_layers(b, mode, from, w.layers.len())?;
         self.flush_post(b.rows)?;
-        self.collapse(&w.head_hc.mixer(), mode, b.rows)
+        self.collapse(&w.head_hc.mixer(), w.head_hc.packed.as_ref(), mode, b.rows)
     }
 
     /// Layers `from..to`; the recurrent and the attention layers before `from` are counted for their pool indices.
@@ -2885,12 +2924,13 @@ impl FlashNextModel {
         mtpk::combine(&self.mtp_h, &self.mtp_e, &mut self.mtp_streams, rows, hc, h, &self.stream)?;
         // the decoder layer and the collapse run on the head's stack, swapped into x_streams
         std::mem::swap(&mut self.x_streams, &mut self.mtp_streams);
-        let mix = mtp.mixer.as_ref().unwrap_or(&w.head_hc).mixer();
+        let head_mix = mtp.mixer.as_ref().unwrap_or(&w.head_hc);
+        let mix = head_mix.mixer();
         // (run_layer leaves the MLP block's post-inject pending: apply it to the head's stack before the collapse reads it)
         let r = self
             .run_layer(&mtp.layer, 0, None, b, mode, None)
             .and_then(|_| self.flush_post(rows))
-            .and_then(|_| self.collapse(&mix, mode, rows));
+            .and_then(|_| self.collapse(&mix, head_mix.packed.as_ref(), mode, rows));
         std::mem::swap(&mut self.x_streams, &mut self.mtp_streams);
         r?;
         // The draft reads only the first MTP_HEAD_N columns; the model's exact draft-head copy evaluates exactly those
@@ -2969,7 +3009,7 @@ impl FlashNextModel {
         mtpk::combine(&self.mtp_h, &self.mtp_e, &mut self.mtp_streams, rows, hc, h, &self.stream)?;
         std::mem::swap(&mut self.x_streams, &mut self.mtp_streams);
         let r = (|| -> Result<(), ModelError> {
-            self.pre_mix(&mtp.layer.attn_hc.mixer(), true, mode, rows)?;
+            self.pre_mix(&mtp.layer.attn_hc.mixer(), mtp.layer.attn_hc.packed.as_ref(), true, mode, rows)?;
             let MixerWeights::Full(m) = &mtp.layer.mixer else { unreachable!() };
             let st = &self.stream;
             lin(&m.k_proj, &self.x_mixed, &mut self.fk, rows, mode, &mut self.ws, &mut self.prefill_ws, st)?;

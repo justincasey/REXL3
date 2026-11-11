@@ -608,6 +608,8 @@ __global__ void __launch_bounds__(K2T_WPB * 32, 2) k2t_kernel(float* x, const ha
     }
 }
 
+#include "hcx_pk.cuh"
+
 }  // namespace hcx
 
 using namespace hcx;
@@ -662,6 +664,53 @@ static int launch_k1u(int nt, const float* x, const half* nw, const half* down, 
     }
 }
 
+// The packed down / inject rows (hcx_pk.cuh) k1p reads instead of the fp16 ones.
+struct PkArgs {
+    const uint4* down;
+    const uint4* inj;
+    const uint4* up;
+};
+
+// k1p launch for 1..3 rows (see launch_k1u; at four rows the packed kernels measured slower in the decode graph): PK_NJ rows a warp, jobs = rank / 4 + ninj / 4 groups a stream.
+static int launch_k1p(int nt, const float* x, const half* nw, const PkArgs& pk, float* P, float* ss, int t0, int H, int hc, int rank,
+                      int ninj, cudaStream_t st, const __nv_bfloat16* bo, const float* ijp) {
+    const int R = rank + ninj;
+    const bool pdl = gbp_pdl::on(gbp_pdl::kHcx);
+    switch (nt) {
+#define K1P_CASE(N)                                                                                                    \
+    case N: {                                                                                                          \
+        const int warps = ((R + PK_NJ - 1) / PK_NJ) * hc + N * hc;                                                     \
+        return bo ? gbp_pdl::launch_pdl(pdl, k1p_kernel<N, true>, dim3(warps), dim3(32), 0, st, x, nw, pk.down, pk.inj, \
+                                        P, ss, t0, H, hc, rank, ninj, bo, ijp)                       \
+                  : gbp_pdl::launch_pdl(pdl, k1p_kernel<N, false>, dim3(warps), dim3(32), 0, st, x, nw, pk.down,       \
+                                        pk.inj, P, ss, t0, H, hc, rank, ninj, bo, ijp);              \
+    }
+        K1P_CASE(1) K1P_CASE(2) K1P_CASE(3)
+#undef K1P_CASE
+        default: return (int)cudaErrorInvalidValue;
+    }
+}
+
+// k2tp launch for 1..3 rows (see launch_k2t).
+static int launch_k2tp(int nt, float* x, const half* nw, const uint4* pup, const float* P, const float* ss, __nv_bfloat16* y,
+                       float* inj_out, int t0, int H, int rank, int ninj, float eps, cudaStream_t st, const __nv_bfloat16* bo,
+                       const float* ijp) {
+    const int blocks = (H + K2T_WPB * K2T_CPW - 1) / (K2T_WPB * K2T_CPW);
+    const size_t smem = (size_t)nt * (256 + 2 * 32) * sizeof(float);
+    const bool pdl = gbp_pdl::on(gbp_pdl::kHcx);
+    switch (nt) {
+#define K2TP_CASE(N)                                                                                                   \
+    case N:                                                                                                            \
+        return bo ? gbp_pdl::launch_pdl(pdl, k2tp_kernel<N, true>, dim3(blocks), dim3(K2T_WPB * 32), smem, st, x, nw,  \
+                                        pup, P, ss, y, inj_out, t0, H, rank, ninj, eps, pdl ? 1 : 0, bo, ijp)          \
+                  : gbp_pdl::launch_pdl(pdl, k2tp_kernel<N, false>, dim3(blocks), dim3(K2T_WPB * 32), smem, st, x, nw, \
+                                        pup, P, ss, y, inj_out, t0, H, rank, ninj, eps, pdl ? 1 : 0, bo, ijp);
+        K2TP_CASE(1) K2TP_CASE(2) K2TP_CASE(3)
+#undef K2TP_CASE
+        default: return (int)cudaErrorInvalidValue;
+    }
+}
+
 // y [T][H] bf16 (and inj [T][hc] when inject_w != null) from streams [T][hc][H] fp32. Same contract as gb_hc_pre.
 // `ref=false` (gb_hcx_pre / gb_hcx_pre_z) launches the decode fast kernels (k1u, then k2t for hc = 4 with rank <= 512, k2c
 // otherwise) unconditionally, bit-identical to k1/k2; `ref=true` (gb_hcx_pre_ref / gb_hcx_pre_z_ref) launches the reference
@@ -669,7 +718,8 @@ static int launch_k1u(int nt, const float* x, const half* nw, const half* down, 
 static int hcx_pre_impl(const void* streams, const void* hc_norm_w, const void* down_w, const void* up_w,
                         const void* inject_w, void* y_out, float* inj_out, void* scratch, unsigned int hidden_size,
                         unsigned int hc_mult, unsigned int rank, float eps, unsigned int num_tokens, void* stream,
-                        bool ref, float* dbg_z, const void* block_out = nullptr, const float* inj_prev = nullptr) {
+                        bool ref, float* dbg_z, const void* block_out = nullptr, const float* inj_prev = nullptr,
+                        const PkArgs* pk = nullptr) {
     if (num_tokens == 0) return 0;
     const int H = (int)hidden_size, hc = (int)hc_mult, rk = (int)rank;
     if (H % 256 || rk % 8 || hc > 8) return (int)cudaErrorInvalidValue;
@@ -685,7 +735,10 @@ static int hcx_pre_impl(const void* streams, const void* hc_norm_w, const void* 
         const bool use_k2b = !ref;
         const bool use_k2t = !ref && hc == 4 && rk <= 512;
         int rc;
-        if (!ref) {
+        if (!ref && pk && nt <= 3) {
+            rc = launch_k1p(nt, (const float*)streams, (const half*)hc_norm_w, *pk, P, ss, t0, H, hc, rk, ninj, st,
+                            (const __nv_bfloat16*)block_out, inj_prev);
+        } else if (!ref) {
             rc = launch_k1u(nt, (const float*)streams, (const half*)hc_norm_w, (const half*)down_w, (const half*)inject_w,
                             P, ss, t0, H, hc, rk, ninj, st, (const __nv_bfloat16*)block_out, inj_prev);
         } else {
@@ -696,7 +749,10 @@ static int hcx_pre_impl(const void* streams, const void* hc_norm_w, const void* 
             rc = GB_CHECK_LAUNCH();
         }
         if (rc) return rc;
-        if (use_k2t) {
+        if (use_k2t && pk && !ref && nt <= 3) {
+            rc = launch_k2tp(nt, (float*)streams, (const half*)hc_norm_w, pk->up, P, ss, (__nv_bfloat16*)y_out,
+                             inject_w ? inj_out : nullptr, t0, H, rk, ninj, eps, st, (const __nv_bfloat16*)block_out, inj_prev);
+        } else if (use_k2t) {
             rc = launch_k2t(nt, (float*)streams, (const half*)hc_norm_w, (const half*)up_w, P, ss,
                             (__nv_bfloat16*)y_out, inject_w ? inj_out : nullptr, t0, H, rk, ninj, eps, dbg_z, st,
                             (const __nv_bfloat16*)block_out, inj_prev);
@@ -733,6 +789,69 @@ GB_EXPORT int gb_hcx_pre_post(void* streams, const void* block_out, const float*
     return hcx_pre_impl(streams, hc_norm_w, down_w, up_w, inject_w, y_out, inj_out, scratch, hidden_size, hc_mult,
                         rank, eps, num_tokens, stream, false, nullptr, block_out, inj_prev);
 }
+
+// The same with the down and inject rows read from the packed copy (hcx_pk.cuh) for up to three rows a pass: the same bits. H = 2,560,
+// hc = 4, rank = 320 (packed_ok on the host).
+GB_EXPORT int gb_hcx_pre_pk(const void* streams, const void* hc_norm_w, const void* down_w, const void* up_w, const void* inject_w,
+                            void* y_out, float* inj_out, void* scratch, unsigned int hidden_size, unsigned int hc_mult,
+                            unsigned int rank, float eps, unsigned int num_tokens, void* stream, const void* pk_down,
+                            const void* pk_inj, const void* pk_up) {
+    const PkArgs pk{(const uint4*)pk_down, (const uint4*)pk_inj, (const uint4*)pk_up};
+    if (hidden_size != 2560 || hc_mult != 4 || rank != 320 || (inject_w && !pk_inj)) return (int)cudaErrorInvalidValue;
+    return hcx_pre_impl(streams, hc_norm_w, down_w, up_w, inject_w, y_out, inj_out, scratch, hidden_size, hc_mult, rank, eps,
+                        num_tokens, stream, false, nullptr, nullptr, nullptr, &pk);
+}
+
+GB_EXPORT int gb_hcx_pre_post_pk(void* streams, const void* block_out, const float* inj_prev, const void* hc_norm_w,
+                                 const void* down_w, const void* up_w, const void* inject_w, void* y_out, float* inj_out,
+                                 void* scratch, unsigned int hidden_size, unsigned int hc_mult, unsigned int rank, float eps,
+                                 unsigned int num_tokens, void* stream, const void* pk_down, const void* pk_inj,
+                                 const void* pk_up) {
+    const PkArgs pk{(const uint4*)pk_down, (const uint4*)pk_inj, (const uint4*)pk_up};
+    if (hidden_size != 2560 || hc_mult != 4 || rank != 320 || (inject_w && !pk_inj)) return (int)cudaErrorInvalidValue;
+    return hcx_pre_impl(streams, hc_norm_w, down_w, up_w, inject_w, y_out, inj_out, scratch, hidden_size, hc_mult, rank, eps,
+                        num_tokens, stream, false, nullptr, block_out, inj_prev, &pk);
+}
+
+// ---- packed rows: sizes, scan, pack, check (see hcx_pk.cuh) ----
+GB_EXPORT size_t gb_hcx_pk_job_bytes() { return PK_JOB_BYTES; }
+
+// st: 3 device ints, {INT_MAX, INT_MIN, 0} on entry (see pk_scan_kernel).
+GB_EXPORT int gb_hcx_pk_scan(const void* w, size_t n, int* st, void* stream) {
+    if (n == 0) return (int)cudaErrorInvalidValue;
+    pk_scan_kernel<<<(unsigned)((n + 255) / 256 < 1024 ? (n + 255) / 256 : 1024), 256, 0, gb_stream(stream)>>>((const half*)w, n, st);
+    return GB_CHECK_LAUNCH();
+}
+
+// Down / inject rows [rows][4 * 2,560]: the jobs, then the tensor's table (rows * 4 / PK_NJ jobs of PK_JOB_BYTES, 4,096 bytes).
+GB_EXPORT int gb_hcx_pk1_pack(const void* w, int rows, int h, int eh0, void* out, void* stream) {
+    if (rows < PK_NJ || rows % PK_NJ || h != 2560) return (int)cudaErrorInvalidValue;
+    pk1_pack_kernel<<<4 * rows / PK_NJ, 32, 0, gb_stream(stream)>>>((const half*)w, rows, h, eh0, (uint4*)out);
+    pk_lut_kernel<<<1, 256, 0, gb_stream(stream)>>>(eh0, (uint32_t*)((uint8_t*)out + (size_t)(4 * rows / PK_NJ) * PK_JOB_BYTES));
+    return GB_CHECK_LAUNCH();
+}
+
+GB_EXPORT int gb_hcx_pk1_check(const void* w, const void* packed, int rows, int h, unsigned long long* bad, void* stream) {
+    if (rows < PK_NJ || rows % PK_NJ || h != 2560) return (int)cudaErrorInvalidValue;
+    pk1_check_kernel<<<4 * rows / PK_NJ, 32, 0, gb_stream(stream)>>>((const half*)w, (const uint4*)packed, rows, h, bad);
+    return GB_CHECK_LAUNCH();
+}
+
+// Up rows [4 * 2,560][320]: 640 jobs of PK2_JOB_BYTES, then the table.
+GB_EXPORT int gb_hcx_pk2_pack(const void* w, int h, int eh0, void* out, void* stream) {
+    if (h != 2560) return (int)cudaErrorInvalidValue;
+    pk2_pack_kernel<<<h / K2T_CPW, 32, 0, gb_stream(stream)>>>((const half*)w, h, eh0, (uint4*)out);
+    pk_lut_kernel<<<1, 256, 0, gb_stream(stream)>>>(eh0, (uint32_t*)((uint8_t*)out + (size_t)(h / K2T_CPW) * PK2_JOB_BYTES));
+    return GB_CHECK_LAUNCH();
+}
+
+GB_EXPORT int gb_hcx_pk2_check(const void* w, const void* packed, int h, unsigned long long* bad, void* stream) {
+    if (h != 2560) return (int)cudaErrorInvalidValue;
+    pk2_check_kernel<<<h / K2T_CPW, 32, 0, gb_stream(stream)>>>((const half*)w, (const uint4*)packed, h, bad);
+    return GB_CHECK_LAUNCH();
+}
+
+GB_EXPORT size_t gb_hcx_pk2_job_bytes() { return PK2_JOB_BYTES; }
 
 GB_EXPORT int gb_hcx_pre_ref(const void* streams, const void* hc_norm_w, const void* down_w, const void* up_w,
                              const void* inject_w, void* y_out, float* inj_out, void* scratch,

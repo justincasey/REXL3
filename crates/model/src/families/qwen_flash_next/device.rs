@@ -19,6 +19,7 @@ use crate::pack::{Pack, PackError};
 use gb_cuda::exl3_linear::Exl3Weights;
 use gb_cuda::fn_mhc::Mixer;
 use gb_cuda::fn_moe::{ktab_k2, ExpertTables};
+use gb_cuda::hcx;
 use gb_cuda::DevBuf;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -27,11 +28,19 @@ use std::sync::Arc;
 /// Prefix of every trunk tensor of the text model.
 pub const LM: &str = "model.language_model";
 
+/// `REXL3_HCX_PACK` (default on, `0` off): the decode window reads the hyper-connection mixers from a 13-bit packed copy that decodes to
+/// the fp16 weights bit for bit (`hcx::pack_mixer`); the fp16 weights stay for every other path. Timing and memory only.
+pub(super) fn hcx_pack_enabled() -> bool {
+    std::env::var("REXL3_HCX_PACK").map_or(true, |v| v.trim() != "0")
+}
+
 /// The head collapse mixer (no inject rows).
 pub struct HeadHcWeights {
     pub norm: DevBuf,
     pub down: DevBuf,
     pub up: DevBuf,
+    /// The packed copy the decode kernels read, when the pack and the shape allow one.
+    pub packed: Option<hcx::Packed>,
 }
 
 /// One layer's hyper-connection pre-mix, with the inject weights the post-inject reads.
@@ -40,6 +49,8 @@ pub struct HcWeights {
     pub down: DevBuf,
     pub up: DevBuf,
     pub inject: DevBuf,
+    /// The packed copy the decode kernels read, when the pack and the shape allow one.
+    pub packed: Option<hcx::Packed>,
 }
 
 impl HeadHcWeights {
@@ -49,6 +60,11 @@ impl HeadHcWeights {
     fn bytes(&self) -> usize {
         self.norm.bytes() + self.down.bytes() + self.up.bytes()
     }
+    /// Packs the mixer's weights; returns the packed bytes (0 when no packed form exists).
+    fn pack(&mut self, cfg: &FlashNextConfig) -> Result<usize, ModelError> {
+        self.packed = hcx::pack_mixer(&self.mixer(), cfg.hidden, cfg.hc_streams, cfg.hc_lowrank)?;
+        Ok(self.packed.as_ref().map_or(0, hcx::Packed::bytes))
+    }
 }
 
 impl HcWeights {
@@ -57,6 +73,11 @@ impl HcWeights {
     }
     fn bytes(&self) -> usize {
         self.norm.bytes() + self.down.bytes() + self.up.bytes() + self.inject.bytes()
+    }
+    /// Packs the mixer's weights; returns the packed bytes (0 when no packed form exists).
+    fn pack(&mut self, cfg: &FlashNextConfig) -> Result<usize, ModelError> {
+        self.packed = hcx::pack_mixer(&self.mixer(), cfg.hidden, cfg.hc_streams, cfg.hc_lowrank)?;
+        Ok(self.packed.as_ref().map_or(0, hcx::Packed::bytes))
     }
 }
 
@@ -380,6 +401,7 @@ fn claim_hc(s: &mut Staged, prefix: &str) -> Result<HcWeights, ModelError> {
         down: s.take(&format!("{prefix}.input_mix_weight_down.weight"))?,
         up: s.take(&format!("{prefix}.input_mix_weight_up.weight"))?,
         inject: s.take(&format!("{prefix}.block_inject_weight.weight"))?,
+        packed: None,
     })
 }
 
@@ -388,6 +410,7 @@ fn claim_head_hc(s: &mut Staged, prefix: &str) -> Result<HeadHcWeights, ModelErr
         norm: s.take(&format!("{prefix}.hc_norm.weight"))?,
         down: s.take(&format!("{prefix}.input_mix_weight_down.weight"))?,
         up: s.take(&format!("{prefix}.input_mix_weight_up.weight"))?,
+        packed: None,
     })
 }
 
@@ -512,6 +535,9 @@ impl FlashNextWeights {
         // the loader's copies run here; every buffer claimed above holds its weight only afterwards
         ctx.finish()?;
         w.init_ptr_tables()?;
+        if hcx_pack_enabled() {
+            w.pack_hcx(cfg)?;
+        }
         if let Some(p) = &w.ple {
             super::ngram::warm_preflight(warm, Some(&p.table))
                 .map_err(|e| ModelError::Config(format!("n-gram warm failed: {e}")))?;
@@ -609,6 +635,35 @@ impl FlashNextWeights {
             )));
         }
         Ok(Self { embed, layers, head_hc, lm_head, mtp, ple, bytes })
+    }
+
+    /// The packed copy of every hyper-connection mixer the decode kernels read (see `hcx::pack_mixer`): each is checked value by value
+    /// against its fp16 weights before it is used, and a mixer that does not pass keeps the fp16 path. Run once the weights have landed.
+    fn pack_hcx(&mut self, cfg: &FlashNextConfig) -> Result<(), ModelError> {
+        let t0 = std::time::Instant::now();
+        let (mut mixers, mut packed, mut fp16) = (0usize, 0usize, 0usize);
+        let mtp_layer = self.mtp.as_mut().map(|m| &mut m.layer);
+        for layer in self.layers.iter_mut().chain(mtp_layer) {
+            for hc in [&mut layer.attn_hc, &mut layer.mlp_hc] {
+                mixers += 1;
+                fp16 += hc.norm.bytes() + hc.down.bytes() + hc.up.bytes() + hc.inject.bytes();
+                packed += hc.pack(cfg)?;
+            }
+        }
+        let mtp_head = self.mtp.as_mut().and_then(|m| m.mixer.as_mut());
+        for hc in std::iter::once(&mut self.head_hc).chain(mtp_head) {
+            mixers += 1;
+            fp16 += hc.norm.bytes() + hc.down.bytes() + hc.up.bytes();
+            packed += hc.pack(cfg)?;
+        }
+        self.bytes += packed;
+        eprintln!(
+            "rexl3 event=hcx_pack mixers={mixers} packed_mib={:.1} fp16_mib={:.1} pack_ms={:.0}",
+            packed as f64 / 1048576.0,
+            fp16 as f64 / 1048576.0,
+            t0.elapsed().as_secs_f64() * 1e3
+        );
+        Ok(())
     }
 
     /// Fill the per-layer expert pointer and bit-width tables the MoE kernels index by expert id (the shared expert is
