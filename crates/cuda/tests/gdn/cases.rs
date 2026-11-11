@@ -1236,6 +1236,102 @@ fn bench_prefill_gated_norm() {
     }
 }
 
+/// The fused prefill (the chain kernel that runs each step's decay and key product inside the previous step's update loop, with the gated
+/// norm at each tile's end) against the unfused prefill followed by the norm kernel, bit for bit (output, state of every slot, conv history),
+/// at row counts that straddle the 8,192-row chunk and its tiles: 8,191, 8,192 + 1, 9,500, a sequence ending one row into a tile next to
+/// one ending on a tile edge and one a full chunk long, several heads' gates (every head has its own a_log / dt_bias), distinct slots.
+/// 48 value heads only.
+#[test]
+fn prefill_gated_chain_equals_chain_then_norm_across_the_chunk_width() {
+    need_gpu!();
+    if SHAPE != GdnShape::Hv48 {
+        return;
+    }
+    let mut rng = Rng(0x8192);
+    let ctx = Ctx::new(Weights::random(&mut rng));
+    let nw = DevBuf::from_slice(&rng.vec(D, 0.4, 1.8)).unwrap();
+    let eps = 1e-6f32;
+    let cases: [(&[usize], &[usize]); 6] = [
+        (&[8191], &[1]),
+        (&[8193], &[2]),
+        (&[9500], &[0]),
+        (&[8192, 17], &[3, 1]),
+        (&[17, 8192, 16, 1], &[2, 0, 3, 1]),
+        (&[4097, 4095, 33], &[1, 2, 0]),
+    ];
+    for (lens, slots) in cases {
+        let total: usize = lens.iter().sum();
+        let inp = Inp::random(&mut rng, total);
+        let zh: Vec<u16> = rng.vec(total * VH * D, -6.0, 6.0).iter().map(|&x| f32_to_bf16(x)).collect();
+        let z = DevBuf::from_slice(&zh).unwrap();
+        let start = HostPools::random(&mut rng, 4);
+        let batch = BatchBuf::new(lens, slots).unwrap();
+        let x = DevInp::new(&inp);
+        let mut ws = DevBuf::zeroed(prefill_workspace_bytes_shaped(SHAPE, total)).unwrap();
+        let mut run = |fused: bool| {
+            let mut pools = DevPools::new(&start);
+            let mut o = DevBuf::zeroed(total * VH * D * 2).unwrap();
+            if fused {
+                prefill_gated(&ctx.st, &x.view(), &ctx.weights(), &mut pools.s, &mut pools.conv, &batch.view(), &mut ws, &z, &nw, eps, &mut o)
+                    .unwrap();
+            } else {
+                prefill_shaped(SHAPE, &ctx.st, &x.view(), &ctx.weights(), &mut pools.s, &mut pools.conv, &batch.view(), &mut ws, &mut o)
+                    .unwrap();
+                gb_cuda::fn_glue::gated_rmsnorm_sigmoid(None, &z, &nw, &mut o, total, VH, D, eps, &ctx.st).unwrap();
+            }
+            ctx.st.sync().unwrap();
+            (o.to_vec::<u16>().unwrap(), pools.host())
+        };
+        let (want_o, want) = run(false);
+        let (got_o, got) = run(true);
+        assert_bits_eq(&format!("lens {lens:?} o"), &got_o, &want_o);
+        assert_f32_bits_eq(&format!("lens {lens:?} S"), &got.s, &want.s);
+        assert_bits_eq(&format!("lens {lens:?} conv"), &got.conv, &want.conv);
+        assert!(got_o.iter().any(|&x| x != 0), "lens {lens:?}: the outputs are all zero");
+    }
+}
+
+/// One layer of an 8,192-row chunk through the fused prefill (pre, chain with the gated norm, conv commit), timed, with the hashes of its
+/// output and state (random inputs, random starting state) so two builds can be compared from their logs.
+///     cargo test --release -p gb-cuda --test gdn -- --ignored --nocapture bench_prefill_gated_8192
+#[test]
+#[ignore]
+fn bench_prefill_gated_8192() {
+    need_gpu!();
+    if SHAPE != GdnShape::Hv48 {
+        return;
+    }
+    let mut rng = Rng(64);
+    let ctx = Ctx::new(Weights::random(&mut rng));
+    let nw = DevBuf::from_slice(&rng.vec(D, 0.4, 1.8)).unwrap();
+    let rows = 8192usize;
+    let inp = Inp::random(&mut rng, rows);
+    let x = DevInp::new(&inp);
+    let zh: Vec<u16> = rng.vec(rows * VH * D, -6.0, 6.0).iter().map(|&x| f32_to_bf16(x)).collect();
+    let z = DevBuf::from_slice(&zh).unwrap();
+    let start = HostPools::random(&mut rng, 1);
+    let mut pools = DevPools::new(&start);
+    let batch = BatchBuf::new(&[rows], &[0]).unwrap();
+    let mut ws = DevBuf::zeroed(prefill_workspace_bytes_shaped(SHAPE, rows)).unwrap();
+    let mut o = DevBuf::zeroed(rows * VH * D * 2).unwrap();
+    {
+        let t = timed(&ctx.st, 20, |_| {
+            prefill_gated(&ctx.st, &x.view(), &ctx.weights(), &mut pools.s, &mut pools.conv, &batch.view(), &mut ws, &z, &nw, 1e-6, &mut o).unwrap()
+        });
+        let mut pools = DevPools::new(&start);
+        prefill_gated(&ctx.st, &x.view(), &ctx.weights(), &mut pools.s, &mut pools.conv, &batch.view(), &mut ws, &z, &nw, 1e-6, &mut o).unwrap();
+        ctx.st.sync().unwrap();
+        let h = pools.host();
+        eprintln!(
+            "BENCH {rows} rows, pre + chain + gated norm + conv commit: {:.3} ms; hashes o {:016x} s {:016x} conv {:016x}",
+            t * 1e3,
+            h_u16(&o.to_vec::<u16>().unwrap()),
+            h_f32(&h.s),
+            h_u16(&h.conv)
+        );
+    }
+}
+
 #[test]
 fn prefill_agrees_with_decode_path_approximately() {
     need_gpu!();
