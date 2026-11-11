@@ -1610,6 +1610,45 @@ fn qwen_shaped_prefill_of_8192_rows_equals_two_calls_of_4096() {
     }
 }
 
+/// The gate/up blocks' per-team stage barrier (the default) and the block-wide barrier it replaced give the same bits: the production form (f32 weights, the shared
+/// expert's finish fused into the combine, bf16 out) and every pair's fp32 output, for both down widths the pack has, on a skewed and a uniform routing, at row
+/// counts that give experts 1 .. 4 tiles and whole 64-row groups.
+#[test]
+fn the_gate_up_team_barrier_changes_no_bit() {
+    gpu!();
+    let st = Stream::new().unwrap();
+    let d = qwen_dims();
+    for (bg, bd, sigma, rows) in [(3usize, 4usize, 0.8f64, 3000usize), (3, 5, 1.4, 1500), (3, 4, 0.0, 777)] {
+        let ex = synth_layer(d, bg, bd, Codebook::Mul1, 760 + bd as u64);
+        let mut r = Rng(761 + bd as u64);
+        let x = qwen_x_bf16(&mut r, rows * d.hidden);
+        let (pick, wts) = qwen_route(&mut r, rows, d.experts, d.topk, sigma);
+        let gate = qwen_x_bf16(&mut r, rows);
+        let shared: Vec<f32> = (0..rows * d.hidden).map(|_| normal(&mut r) as f32).collect();
+        let mut s = PrefillScratch::new(&d, rows).unwrap();
+        s.use_parallel_plan(true);
+        s.set_picks_f32(&pick, &wts).unwrap();
+        let (xd, gd, sd) = (up(&x), up(&gate), up(&shared));
+        let mut got: Vec<(Vec<u16>, Vec<f32>)> = Vec::new();
+        for team in [true, false] {
+            gb_cuda::moe_prefill::set_team_barrier(Some(team));
+            let mut out = DevBuf::zeroed(rows * d.hidden * 2).unwrap();
+            ex.run_prefill_f32_wts_finish(&xd, Dtype::BF16, rows, &sd, &gd, &mut out, &mut s, &st).unwrap();
+            let o: Vec<u16> = sync_dl(&out, &st);
+            let y: Vec<f32> = sync_dl(&s.y_pairs, &st);
+            got.push((o, y[..rows * d.topk * d.hidden].to_vec()));
+        }
+        gb_cuda::moe_prefill::set_team_barrier(None);
+        let (a, b) = (&got[0], &got[1]);
+        if let Some(i) = a.0.iter().zip(&b.0).position(|(p, q)| p != q) {
+            panic!("down {bd} bits, {rows} rows, sigma {sigma}: out differs at row {} column {} between the team barrier and the block barrier", i / d.hidden, i % d.hidden);
+        }
+        if let Some(i) = first_diff(&a.1, &b.1) {
+            panic!("down {bd} bits, {rows} rows, sigma {sigma}: pair output differs at pair {} column {}", i / d.hidden, i % d.hidden);
+        }
+    }
+}
+
 /// Per-stage milliseconds of one Flash-Next layer of 4,096 rows (L2 flushed before each call) and the hashes of its outputs (`REXL3_BENCH_ROWS`,
 /// `REXL3_BENCH_SIGMA`, `REXL3_BENCH_DOWN_BITS`, `REXL3_BENCH_ITERS` change the shape of the run).
 #[test]
