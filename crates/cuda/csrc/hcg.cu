@@ -571,17 +571,20 @@ __global__ void __launch_bounds__(kDxThreads, 2)
 
     // stage j of the loop: split j / 40, its (j % 40)-th stage, which is stage z + 4 i of the 160
     auto stage_of = [](int j) { return j / kDxPerSplit + kDxSplit * (j % kDxPerSplit); };
+    // the down weights of stage j into ring slot j % 3, and the stage's 64 norm weights (norm_w [hc * H]: k0 is the stream's offset too);
+    // neither commits: a group is a loop iteration's loads (B of stage i + 2, W of stage i + 3), so B has two iterations to land
     auto issue_b = [&](int j) {
         if (j < kDxStages) {
             const int slot = j % kDxRing, k0 = stage_of(j) * kDxKB;
 #pragma unroll
-            for (int c = 0; c < 2; ++c) {
+            for (int c = 0; c < 512 / kDxThreads; ++c) {
                 const int idx = tid + c * kDxThreads, n = idx >> 3, q = idx & 7;
                 um_cp16(sB + ((size_t)slot * kDxBN + n) * kDxBPad + 8 * q, down_w + (size_t)(col0 + n) * kDxK + k0 + 8 * q);
             }
-            if (tid < 8) um_cp16(sW + (size_t)slot * kDxKB + 8 * tid, nw + k0 + 8 * tid);  // norm_w [hc * H]: k0 is the stream's offset too
         }
-        asm volatile("cp.async.commit_group;\n" ::);
+    };
+    auto issue_w = [&](int j) {
+        if (j < kDxStages && tid < 8) um_cp16(sW + (size_t)(j % kDxRing) * kDxKB + 8 * tid, nw + stage_of(j) * kDxKB + 8 * tid);
     };
     // thread (row r = tid / 8, float4 columns kq and kq + 8 of the stage's 64): the raw streams of stage j
     const int tr = tid >> 3, tq = tid & 7, trow = row0 + tr;
@@ -629,8 +632,11 @@ __global__ void __launch_bounds__(kDxThreads, 2)
         const half* ahi = sA + (size_t)(j & 1) * 2 * kDxBM * kDxAPad;
         const half* alo = ahi + (size_t)kDxBM * kDxAPad;
         const half* bs = sB + (size_t)slot * kDxBN * kDxBPad + (size_t)(wn * 16) * kDxBPad;
+        // the units in the order 0, 1, 3, 2: every accumulator's next MMA is eight or more MMAs behind its last (chain A takes units 0 and 3,
+        // so with 0, 1, 2, 3 its unit 3 was followed at once by the next stage's unit 0). Each chain still sees its units in the library's order.
 #pragma unroll
-        for (int u = 0; u < 4; ++u) {
+        for (int p = 0; p < 4; ++p) {
+            const int u = p == 2 ? 3 : p == 3 ? 2 : p;
             uint32_t fh[4], fl[4], r4[4];
             const size_t off = (size_t)(wm * 16 + (lane & 15)) * kDxAPad + u * 16 + (lane >> 4) * 8;
             um_ldsm4(fh, ahi + off);
@@ -641,8 +647,8 @@ __global__ void __launch_bounds__(kDxThreads, 2)
             um_mma(acc_lo[c][0], fl, r4[0], r4[1]);
             um_mma(acc_hi[c][1], fh, r4[2], r4[3]);
             um_mma(acc_lo[c][1], fl, r4[2], r4[3]);
-            // the next stage's A tile (half of this thread's elements at units 1 and 3) between the MMAs
-            if ((u & 1) && j + 1 < kDxStages) transform_part(j + 1, u >> 1, nv[u >> 1]);
+            // the next stage's A tile (half of this thread's elements after the second and the fourth unit) between the MMAs
+            if ((p & 1) && j + 1 < kDxStages) transform_part(j + 1, p >> 1, nv[p >> 1]);
         }
     };
     // the split's three accumulators added in the order of the output column's 16-column group, folded into the running total
@@ -671,36 +677,42 @@ __global__ void __launch_bounds__(kDxThreads, 2)
                 for (int e = 0; e < 4; ++e) acc_hi[c][j][e] = acc_lo[c][j][e] = 0.f;
     };
 
-    // pipeline: B stages j + 1 .. j + 2 in flight (cp.async groups), the raw streams of stages j + 1, j + 2 in registers (r1, r2) with
-    // stage j + 3's load issued before stage j + 1 is transformed
-    float4 r0[2], r1[2], r2[2], r3[2];
-    load_raw(0, r0);
-    load_raw(1, r1);
-    load_raw(2, r2);
+    // pipeline: the loads of iteration i are one cp.async group (B of stage i + 2, W of stage i + 3), so at the top of iteration j the groups
+    // up to j - 2 have landed (B of stage j, W of stage j + 1) and the previous iteration's group may still fly. The raw streams of stages
+    // j + 1, j + 2, j + 3 sit in three register sets used round robin (the loop is unrolled by three: no copies between sets): iteration j
+    // transforms stage j + 1 from set (j + 1) % 3 between its MMAs, then loads stage j + 4 into that set.
+    float4 rb[3][2];
+    load_raw(0, rb[0]);
+    load_raw(1, rb[1]);
+    load_raw(2, rb[2]);
     issue_b(0);
+    issue_w(0);
+    issue_w(1);
+    asm volatile("cp.async.commit_group;\n" ::);
     issue_b(1);
+    issue_w(2);
+    asm volatile("cp.async.commit_group;\n" ::);
     asm volatile("cp.async.wait_group 1;\n" ::);
     __syncthreads();
 #pragma unroll
-    for (int i = 0; i < 2; ++i) transform_part(0, i, r0[i]);
+    for (int i = 0; i < 2; ++i) transform_part(0, i, rb[0][i]);
+    load_raw(3, rb[0]);
 #pragma unroll 1
-    for (int z = 0; z < kDxSplit; ++z) {
-#pragma unroll 1
-        for (int i = 0; i < kDxPerSplit; ++i) {
-            const int j = z * kDxPerSplit + i;
-            // (groups committed so far: stages up to j + 1) B stage j + 1 has landed
-            asm volatile("cp.async.wait_group 0;\n" ::);
-            __syncthreads();  // ... for every thread; A tile j (transformed last iteration) is visible
-            issue_b(j + 2);
-            load_raw(j + 3, r3);
-            mma_stage(j, r1);
+    for (int j0 = 0; j0 < kDxStages; j0 += 3) {
 #pragma unroll
-            for (int q = 0; q < 2; ++q) {
-                r1[q] = r2[q];
-                r2[q] = r3[q];
+        for (int u = 0; u < 3; ++u) {
+            const int j = j0 + u;
+            if (j < kDxStages) {
+                asm volatile("cp.async.wait_group 1;\n" ::);
+                __syncthreads();  // A tile j (transformed last iteration) is visible, ring slot (j + 2) % 3 is free
+                issue_b(j + 2);
+                issue_w(j + 3);
+                asm volatile("cp.async.commit_group;\n" ::);
+                mma_stage(j, rb[(u + 1) % 3]);
+                load_raw(j + 4, rb[(u + 1) % 3]);
+                if ((j + 1) % kDxPerSplit == 0) fold_split(j / kDxPerSplit);
             }
         }
-        fold_split(z);
     }
     // output = lo total + hi total, then low_kernel's expressions
     const float inv = 1.f / 4.f;
