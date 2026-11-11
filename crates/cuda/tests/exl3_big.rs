@@ -383,3 +383,34 @@ fn golden_exl3_big_hashes() {
     std::fs::write(&path, lines.join("\n") + "\n").unwrap();
     eprintln!("wrote {} golden lines to {path}", lines.len());
 }
+
+/// The Flash-Next shared expert's projections at the steady chunk's 8,192 rows (gate/up 2,560 -> 640, down 640 -> 2,560), at the pack's
+/// 4 to 8 bit widths: microseconds per call of the large-row linear, with the hash of its output.
+#[test]
+#[ignore]
+fn bench_big_linear_shared_expert() {
+    gpu!();
+    let st = Stream::new().unwrap();
+    let t = EventTimer::new(2).unwrap();
+    let rows = 8192usize;
+    for bits in [4usize, 6, 8] {
+        for (name, k, n) in [("shared gate/up", 2560usize, 640usize), ("shared down", 640, 2560)] {
+            let w = synth(k, n, bits, Codebook::Mul1, false, 5);
+            let mut r = Rng(6);
+            let x = DevBuf::from_slice(&input(&mut r, rows, k, Dtype::F16)).unwrap();
+            let mut y = DevBuf::zeroed(rows * n * 4).unwrap();
+            let mut ws = DevBuf::zeroed(w.big_workspace_bytes(rows)).unwrap();
+            w.forward_big(&x, &mut y, rows, Dtype::F16, Dtype::F32, &mut ws, &st).unwrap();
+            st.sync().unwrap();
+            let mut best = f32::MAX;
+            for _ in 0..6 {
+                t.record(0, &st).unwrap();
+                w.forward_big(&x, &mut y, rows, Dtype::F16, Dtype::F32, &mut ws, &st).unwrap();
+                t.record(1, &st).unwrap();
+                best = best.min(t.ms(0, 1).unwrap());
+            }
+            let h = y.to_vec::<u32>().unwrap().iter().fold(0xcbf29ce484222325u64, |h, &v| (h ^ v as u64).wrapping_mul(0x100000001b3));
+            println!("BENCH shared {name:14} {k}x{n} {bits}-bit R={rows}: {:.1} us (rot_in + big_kernel) hash {h:016x}", best * 1e3);
+        }
+    }
+}
