@@ -874,6 +874,92 @@ fn bench_small_linear_rows() {
     }
 }
 
+/// The weight-stationary many-row kernel (registers permuted per lane, a select-free reduce-scatter) leaves the per-row kernel's bits at the
+/// model's prefill widths and the shapes around them: the router (2,560 -> 512), the delta-net gates (2,560 -> 48), `k` of one vector
+/// a thread (2,048), of two (2,560, 3,072) and ragged in columns (n of 9, 17, 100, 513), row counts around the 4-row step and the row
+/// slices (1 .. 4,012), bf16 and f32 outputs; and it equals the previous weight-stationary kernel on the same inputs.
+#[test]
+fn small_linear_cols_kernel_equals_the_per_row_kernel_and_its_predecessor() {
+    gpu!();
+    let st = Stream::new().unwrap();
+    let mut rng = Rng(31);
+    for &(k, n) in &[
+        (2560usize, 512usize),
+        (2560, 48),
+        (2560, 17),
+        (2560, 9),
+        (2048, 100),
+        (3072, 513),
+        (1024, 24),
+        (2560, 8),
+    ] {
+        let w16 = f16_bits(&rng.vec(n * k, -0.2, 0.2));
+        let dw = up(&w16);
+        for &rows in &[1usize, 2, 3, 4, 5, 7, 8, 9, 31, 63, 64, 65, 200, 1001, 4012] {
+            if rows * n > 1_200_000 && rows != 4012 {
+                continue;
+            }
+            let dx = up(&rand_bf16(&mut rng, rows * k));
+            let (a, af) = (zeros(rows * n * 2), zeros(rows * n * 4));
+            let (b, bf) = (zeros(rows * n * 2), zeros(rows * n * 4));
+            let c = zeros(rows * n * 2);
+            unsafe {
+                glue::small_linear_f16w(cp(&dx), cp(&dw), mp(&a), rows, k, n, &st).unwrap();
+                glue::small_linear_f16w_f32out(cp(&dx), cp(&dw), mp(&af), rows, k, n, &st).unwrap();
+                glue::small_linear_f16w_rows(cp(&dx), cp(&dw), mp(&b), rows, k, n, &st).unwrap();
+                glue::small_linear_f16w_f32out_rows(cp(&dx), cp(&dw), mp(&bf), rows, k, n, &st).unwrap();
+                glue::small_linear_f16w_rows_ref(cp(&dx), cp(&dw), mp(&c), rows, k, n, &st).unwrap();
+            }
+            assert_eq!(dl::<u16>(&a), dl::<u16>(&b), "bf16 out vs per-row, rows {rows} k {k} n {n}");
+            assert_eq!(dl::<u16>(&c), dl::<u16>(&b), "bf16 out vs predecessor, rows {rows} k {k} n {n}");
+            let (want, got) = (dl::<f32>(&af), dl::<f32>(&bf));
+            for (i, (x, y)) in want.iter().zip(&got).enumerate() {
+                assert_eq!(x.to_bits(), y.to_bits(), "f32 out, rows {rows} k {k} n {n} at {i}");
+            }
+        }
+    }
+    st.sync().unwrap();
+}
+
+/// The weight-stationary kernel and its predecessor at the model's prefill widths, 4,012 rows (router, GDN gate projection).
+///     cargo test --release -p gb-cuda --test glue bench_small_linear_cols -- --ignored --nocapture
+#[test]
+#[ignore]
+fn bench_small_linear_cols() {
+    gpu!();
+    let st = Stream::new().unwrap();
+    let mut rng = Rng(32);
+    let (rows, k) = (4012usize, 2560usize);
+    let dx = up(&rand_bf16(&mut rng, rows * k));
+    for &n in &[512usize, 48] {
+        let dw = up(&f16_bits(&rng.vec(n * k, -0.2, 0.2)));
+        let dy = zeros(rows * n * 2);
+        for (name, reference) in [("previous", true), ("permuted", false)] {
+            let run = || unsafe {
+                if reference {
+                    glue::small_linear_f16w_rows_ref(cp(&dx), cp(&dw), mp(&dy), rows, k, n, &st).unwrap()
+                } else {
+                    glue::small_linear_f16w_rows(cp(&dx), cp(&dw), mp(&dy), rows, k, n, &st).unwrap()
+                }
+            };
+            for _ in 0..5 {
+                run();
+            }
+            st.sync().unwrap();
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let t0 = std::time::Instant::now();
+                for _ in 0..10 {
+                    run();
+                }
+                st.sync().unwrap();
+                best = best.min(t0.elapsed().as_secs_f64() * 1e6 / 10.0);
+            }
+            eprintln!("BENCH small_linear_cols n {n:>3} {name}: {best:.1} us");
+        }
+    }
+}
+
 #[test]
 fn small_linear_bit_exact_and_row_invariant() {
     gpu!();
