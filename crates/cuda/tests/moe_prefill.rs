@@ -1778,3 +1778,68 @@ fn bench_l2_capacity() {
         println!("{mb:4} MB: memset {:6.0} GB/s, read {:6.0} GB/s", mb as f64 / 1024.0 * 1.0737 / w * 1e3, mb as f64 / 1024.0 * 1.0737 / r * 1e3);
     }
 }
+
+/// The rotated gate/up inputs (`xs_g`, `xs_u`: every element of a consumed sorted row) of the prefill rotation, hashed over bf16 and fp16
+/// activations, the routing styles and row counts on both sides of the 16-row tile and the 256-pair chunk, are the ones the kernel before
+/// the two matrices shared a block produced (one launch a matrix). The expected hashes were taken from that kernel.
+#[test]
+fn the_prefill_rotation_equals_the_one_matrix_kernel_bit_for_bit() {
+    gpu!();
+    let st = Stream::new().unwrap();
+    let d = qwen_dims();
+    let ex = synth_layer(d, 4, 2, Codebook::Mul1, 500);
+    let mut s = PrefillScratch::new(&d, 2560).unwrap();
+    let mut r = Rng(4321);
+    let mut lines = Vec::new();
+    for &rows in &[129usize, 640, 2049] {
+        for style in [Style::Skewed, Style::Hot, Style::Uniform] {
+            for bf in [false, true] {
+                let (pick, wts) = make_picks(&mut r, style, rows, d.experts, d.topk);
+                let (x, dtype) = if bf {
+                    (up(&qwen_x_bf16(&mut r, rows * d.hidden)), Dtype::BF16)
+                } else {
+                    (up(&rand_f16(&mut r, rows * d.hidden, 2.0)), Dtype::F16)
+                };
+                let sh = up(&(0..rows * d.hidden).map(|_| normal(&mut r) as f32).collect::<Vec<f32>>());
+                s.use_parallel_plan(true);
+                s.set_picks(&pick, &wts).unwrap();
+                let plan = s.plan(&pick, rows, d.experts as i32, &st).unwrap();
+                let mut o = DevBuf::zeroed(rows * d.hidden * 4).unwrap();
+                ex.run_prefill(&x, dtype, rows, Some(&sh), &mut o, &mut s, &st).unwrap();
+                st.sync().unwrap();
+                let sorted_rows = plan.2[3] as usize;
+                let (g, u) = (s.dbg_xs_g().unwrap(), s.dbg_xs_u().unwrap());
+                let hash = |v: &[u16]| {
+                    let m = frag_consumed_mask(&plan.0, sorted_rows, d.hidden, v.len());
+                    gb_exl3::fnv1a(v.iter().zip(&m).filter(|(_, &c)| c).flat_map(|(x, _)| x.to_le_bytes()))
+                };
+                lines.push(format!("{rows} {style:?} {}: xs_g {:016x} xs_u {:016x}", if bf { "bf16" } else { "f16" }, hash(&g), hash(&u)));
+            }
+        }
+    }
+    // the lines of the kernel that rotated one matrix a launch (taken before the change)
+    let want = [
+        "129 Skewed f16: xs_g e0b2a47aa238ff85 xs_u d6e7fc67ec1f8e20",
+        "129 Skewed bf16: xs_g dc955302b875f8fc xs_u cafec80c004c779c",
+        "129 Hot f16: xs_g 31786bd1a02aef58 xs_u 6866c200ce25c12a",
+        "129 Hot bf16: xs_g 4320d66dae298975 xs_u 98d90d009c29a1c9",
+        "129 Uniform f16: xs_g d7c86e3da46f4b3e xs_u d0f418729b2476fc",
+        "129 Uniform bf16: xs_g e586f8a4f8b2e6cc xs_u 45d6637853bcf173",
+        "640 Skewed f16: xs_g 881c6cf59955df04 xs_u 1888345daa08e103",
+        "640 Skewed bf16: xs_g 9b67cd8af392d53c xs_u 8862adee55e850ee",
+        "640 Hot f16: xs_g 21832ce7abf55583 xs_u d590b11e1a73e107",
+        "640 Hot bf16: xs_g 844042e7938e8703 xs_u 7e7a3a073b8fea2b",
+        "640 Uniform f16: xs_g 8fed3a4b35646086 xs_u 21a4b6fb88b4320c",
+        "640 Uniform bf16: xs_g a98229c04f2d9069 xs_u fbaa728d2ee286f4",
+        "2049 Skewed f16: xs_g 29287030461deb8b xs_u 136c012ff2a1849c",
+        "2049 Skewed bf16: xs_g 43fcd5825bbe9b91 xs_u 3189e925864e3269",
+        "2049 Hot f16: xs_g 02e41fde96bfaa08 xs_u c3abe86409f32a9d",
+        "2049 Hot bf16: xs_g 295a14dcdf1371fd xs_u ff9d7c7b57853221",
+        "2049 Uniform f16: xs_g 66d7ba78b341b267 xs_u 802c3037c6c4f5d6",
+        "2049 Uniform bf16: xs_g 5f4db5bc19583d74 xs_u b3786f4b07646593",
+    ];
+    assert_eq!(lines.len(), want.len());
+    for (got, want) in lines.iter().zip(want) {
+        assert_eq!(got, want);
+    }
+}
